@@ -140,6 +140,32 @@ impl Editor {
         self.feedback = None;
     }
 
+    fn stage_snapshot(
+        draft: &mut ProfileDraft,
+        manifest: &Path,
+        home: &str,
+        (host, user, port, fingerprint): (&str, &str, u16, &str),
+    ) -> anyhow::Result<()> {
+        let account = parse_ssh_address(&draft.host, &draft.user, &draft.port)?;
+        anyhow::ensure!(
+            (account.0.as_str(), account.1.as_str(), account.2) == (host, user, port),
+            "This profile's SSH account differs from the connection that saved the bundle"
+        );
+        let fingerprint = profile_dotfiles::approved_fingerprint(fingerprint, &draft.fingerprint)?;
+        validate_dotfiles_home(home)?;
+        let editor = &mut draft.tool_bundle;
+        anyhow::ensure!(
+            editor.work.is_none() && editor.starter.is_none() && editor.local.is_none(),
+            "Finish the open SSH tool edit before selecting the saved bundle"
+        );
+        editor.edited();
+        editor.expanded = true;
+        editor.bundle = manifest.to_string_lossy().into_owned();
+        editor.home = home.into();
+        editor.fingerprint = fingerprint;
+        Ok(())
+    }
+
     pub(super) fn view(
         &self,
         id: TabId,
@@ -380,6 +406,39 @@ impl Editor {
 }
 
 impl TerminalApp {
+    pub(super) fn open_tool_snapshot_profile(
+        &mut self,
+        profile: String,
+        manifest: &Path,
+        home: &str,
+        connection: &w11term::ssh::ConnectionShare,
+        ctx: &ComponentContext<Self>,
+    ) {
+        self.command_reference.close();
+        self.edit_profile(profile.clone(), ctx);
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let Some(AppTab {
+            page: Page::NewProfile(draft),
+            ..
+        }) = self.tabs.get_mut(id)
+        else {
+            return;
+        };
+        if !draft
+            .origin
+            .editing()
+            .is_some_and(|base| base.name == profile)
+        {
+            return;
+        }
+        match Editor::stage_snapshot(draft, manifest, home, connection.verified_endpoint()) {
+            Ok(()) => self.edit_profile_tools(id, Action::Review, ctx),
+            Err(error) => draft.error = Some(format!("{error:#}")),
+        }
+    }
+
     pub(super) fn edit_profile_tools(
         &mut self,
         id: TabId,
@@ -652,5 +711,45 @@ impl TerminalApp {
             }
             Action::Browse | Action::Review | Action::Starter | Action::Approve => (),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_bundle_review_requires_the_same_account_and_host_key() {
+        const KEY: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        const OTHER_KEY: &str = "SHA256:BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut draft = ProfileDraft {
+            host: "ssh.example.test".into(),
+            user: "operator".into(),
+            port: "2222".into(),
+            fingerprint: KEY.into(),
+            ..ProfileDraft::default()
+        };
+        let manifest = Path::new("snapshot.json");
+        let home = "/home/operator";
+        for endpoint in [
+            ("ssh.example.test", "someone-else", 2222, KEY),
+            ("ssh.example.test", "operator", 2223, KEY),
+            ("ssh.example.test", "operator", 2222, OTHER_KEY),
+        ] {
+            assert!(Editor::stage_snapshot(&mut draft, manifest, home, endpoint).is_err());
+            assert!(draft.tool_bundle.bundle.is_empty());
+        }
+        Editor::stage_snapshot(
+            &mut draft,
+            manifest,
+            home,
+            ("ssh.example.test", "operator", 2222, KEY),
+        )
+        .unwrap();
+        assert_eq!(draft.tool_bundle.bundle, "snapshot.json");
+        assert_eq!(draft.tool_bundle.home, home);
+        assert_eq!(draft.tool_bundle.fingerprint, KEY);
+        assert!(draft.tool_bundle.expanded);
+        assert!(draft.tool_bundle.approved.is_none());
     }
 }

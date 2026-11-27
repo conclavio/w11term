@@ -357,7 +357,7 @@ Use **More → Command reference → Install SSH tools** on a connected pane to 
 
 Built-in Linux manuals offer **Review installing** for the selected command. Review the SSH target and the executable hash, download the pinned build for the detected architecture if needed, and confirm installation. Other active tools in the built-in bundle keep their exact binaries and launcher directory. [Command-page installer](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
-Use **Bundle versions → Save pinned bundle on Windows** to capture the active Linux builds as a verified local manifest. Select that manifest in an SSH profile to keep the same pins on subsequent logins. [Save an installed release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+Use **Bundle versions → Save pinned bundle on Windows** to capture the active Linux builds as a verified local manifest. **Review in this SSH profile** opens a review for the authenticated account, ready for approval and saving. [Save an installed release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
 **Manage PATH for new shells** reviews Bash or Zsh startup-file changes for the installed bundle. It can append the verified launcher directory after existing entries or remove its managed blocks while preserving the surrounding settings. [Manual PATH management](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 

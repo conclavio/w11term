@@ -291,7 +291,8 @@ try {
     Wait-Focus $localPane
     $null = Wait-Until 'another pane cannot resume updates' {
         $resume = Find-Element 'Resume automatic updates' $button
-        $resume -and !$resume.Current.IsEnabled
+        $reviewProfile = Find-Element 'Review in this SSH profile' $button
+        $resume -and !$resume.Current.IsEnabled -and $reviewProfile -and !$reviewProfile.Current.IsEnabled
     }
     $null = Control @('focus-pane','--pane',"$remotePane")
     Wait-Focus $remotePane
@@ -300,8 +301,31 @@ try {
         (Find-Element 'Resumed automatic updates for portable') -and
         [IO.File]::ReadAllText($selectorPath).TrimEnd().EndsWith("`nversions/$oldId")
     }
-    Click 'Back to tool installer'
-    Click 'Back to command reference'
+    $originalProfile = ($beforeSave | ConvertFrom-Json).profiles.'palette-ssh'
+    Click 'Review in this SSH profile'
+    $null = Wait-Until 'profile reviews the saved manifest for the authenticated SSH account' {
+        $bundleField = Find-Element 'Tool bundle manifest' $edit
+        $homeField = Find-Element 'Tool bundle SFTP home' $edit
+        $fingerprintField = Find-Element 'Tool bundle host-key fingerprint' $edit
+        $approve = Find-Element 'Approve tool sync' $button
+        $bundleField -and $homeField -and $fingerprintField -and $approve -and $approve.Current.IsEnabled -and
+            $bundleField.GetCurrentPattern($value).Current.Value -ceq $manifest -and
+            $homeField.GetCurrentPattern($value).Current.Value -ceq '/' -and
+            $fingerprintField.GetCurrentPattern($value).Current.Value -ceq $originalProfile.host_key
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $beforeSave) { throw 'Opening review saved the draft automatically' }
+    Click 'Approve tool sync'
+    $null = Wait-Until 'snapshot approved in the editor' { Find-Element 'Approved tool bundle: portable' }
+    if ([IO.File]::ReadAllText($profiles) -cne $beforeSave) { throw 'Approving the draft persisted unsaved changes' }
+    Click 'Save profile changes'
+    $null = Wait-Until 'snapshot becomes the saved profile bundle and retains the PATH preference' {
+        $scope = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.tool_bundle
+        $scope.bundle -ceq $manifest -and $scope.name -ceq 'portable' -and $scope.home -ceq '/' -and
+            $scope.fingerprint -ceq $originalProfile.host_key -and $scope.add_to_path.shell -ceq 'bash'
+    }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    Run-Palette 'Command reference'
     $null = Wait-Until 'rollback invalidates the previously seen launcher' {
         (Find-Element 'netwatch') -and !(Find-Element '/.local/bin/netwatch')
     }
@@ -371,6 +395,13 @@ try {
     Click 'Close command reference'
     $null = Wait-Until 'close command reference' { !(Find-Element 'Search command reference' $edit) }
     Wait-Focus $remotePane
+    $reconnected = (Control @('open','--profile','palette-ssh','--activate')).pane
+    Wait-Text $reconnected 'tools-at-shell:'
+    $sync = (Control @('events','--pane',"$reconnected",'--kind','tool-bundle-sync')).journal.events
+    if ($sync.Count -ne 1 -or $sync[0].data.status -cne 'current' -or $sync[0].data.path -cne 'current' -or
+        ![IO.File]::ReadAllText($selectorPath).TrimEnd().EndsWith("`nversions/$oldId")) {
+        throw "Unexpected pinned bundle sync on a new login: $($sync | ConvertTo-Json -Depth 5 -Compress)"
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

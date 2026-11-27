@@ -14,6 +14,7 @@ pub enum Action {
     Save,
     Saved(Arc<()>, Result<SavedBundle, String>),
     CopyManifest,
+    ReviewProfile,
     Close,
 }
 
@@ -66,6 +67,7 @@ pub struct SwitchReport {
 #[derive(Deserialize)]
 pub struct SavedBundle {
     manifest: PathBuf,
+    home: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,7 +93,7 @@ pub(super) struct Panel {
     review: Option<ReviewedVersion>,
     pending: Option<(Arc<()>, Work)>,
     status: Option<String>,
-    saved: Option<PathBuf>,
+    saved: Option<SavedBundle>,
 }
 
 fn message(action: Action) -> Message {
@@ -140,7 +142,13 @@ impl Panel {
         }
     }
 
-    pub(super) fn view(&self, account: &str, active: bool, ctx: &ViewContext<TerminalApp>) -> View {
+    pub(super) fn view(
+        &self,
+        account: &str,
+        has_profile: bool,
+        active: bool,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
         let available = active && self.pending.is_none();
         let writing = self.pending.as_ref().is_some_and(|(_, kind)| kind.writes());
         let button = |label: &str, enabled, action: fn() -> Action| {
@@ -259,12 +267,19 @@ impl Panel {
                 button("Save pinned bundle on Windows", available, || Action::Save),
             ));
         }
-        if let Some(manifest) = &self.saved {
-            fields.push(detail("saved-manifest", manifest.display().to_string()));
+        if let Some(saved) = &self.saved {
             fields.push(detail(
-                "use-saved-manifest",
-                "Choose this manifest under Edit profile → SSH tools to review it for login sync.",
+                "saved-manifest",
+                saved.manifest.display().to_string(),
             ));
+            if has_profile {
+                fields.push(KeyedView::new(
+                    "review-saved-for-profile",
+                    button("Review in this SSH profile", available, || {
+                        Action::ReviewProfile
+                    }),
+                ));
+            }
             fields.push(KeyedView::new(
                 "copy-manifest",
                 button("Copy saved manifest path", !writing, || {
@@ -378,7 +393,46 @@ impl RollbackReview {
 }
 
 impl TerminalApp {
+    fn review_saved_tool_bundle_for_profile(&mut self, ctx: &ComponentContext<Self>) {
+        let Some(installer) = self.command_reference.tool_install.as_ref() else {
+            return;
+        };
+        let Some(history) = installer
+            .history
+            .as_ref()
+            .filter(|history| history.pending.is_none())
+        else {
+            return;
+        };
+        let Some(saved) = &history.saved else {
+            return;
+        };
+        let Some((pane, session)) = self
+            .reference_tool_target()
+            .filter(|(pane, _)| *pane == installer.target)
+        else {
+            return;
+        };
+        let Some(profile) = self
+            .tabs
+            .active()
+            .and_then(AppTab::ssh_profile_name)
+            .filter(|name| Some(*name) == installer.profile.as_deref())
+        else {
+            return;
+        };
+        let Some(connection) = session.ssh_connection_at(pane.generation) else {
+            return;
+        };
+        let (manifest, home) = (saved.manifest.clone(), saved.home.clone());
+        self.open_tool_snapshot_profile(profile.to_owned(), &manifest, &home, &connection, ctx);
+    }
+
     pub(super) fn tool_bundle_history(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        if matches!(action, Action::ReviewProfile) {
+            self.review_saved_tool_bundle_for_profile(ctx);
+            return;
+        }
         let current = self
             .reference_tool_target()
             .map(|(pane, session)| (pane, session.input.clone()));
@@ -528,19 +582,20 @@ impl TerminalApp {
             Action::Saved(ticket, result) if history.finish(&ticket, Work::Save) => {
                 history.status = Some(match result {
                     Ok(saved) => {
-                        history.saved = Some(saved.manifest);
+                        history.saved = Some(saved);
                         "Saved pinned tool bundle on Windows".into()
                     }
                     Err(error) => error,
                 });
             }
             Action::CopyManifest if history.pending.is_none() => {
-                if let Some(path) = &history.saved {
-                    history.status =
-                        Some(match w11term::clipboard::write(&path.to_string_lossy()) {
+                if let Some(saved) = &history.saved {
+                    history.status = Some(
+                        match w11term::clipboard::write(&saved.manifest.to_string_lossy()) {
                             Ok(()) => "Copied the saved manifest path".into(),
                             Err(error) => format!("Copying the saved manifest path: {error:#}"),
-                        });
+                        },
+                    );
                 }
             }
             Action::Switched(ticket, result) => {

@@ -2927,6 +2927,7 @@ async fn native_command_reference_follows_powershell_and_ssh() {
     fs::write(&trace, []).unwrap();
     let state = tempfile::tempdir().unwrap();
     fs::write(state.path().join("ssh-wire"), trace.to_str().unwrap()).unwrap();
+    fs::write(remote.path().join("utility-shell-probe"), []).unwrap();
     let ssh = super::utilities::reference_tool_profile(source, state.path(), remote.path());
     drive_mixed_gui("command-reference-ui.ps1", &ssh, state.path());
     let snapshots = fs::read_dir(state.path().join("tool-bundle-snapshots"))
@@ -2965,7 +2966,11 @@ async fn native_command_reference_follows_powershell_and_ssh() {
             .ends_with("/portable/current/netwatch\n")
     );
     assert_eq!(fs::read(trace).unwrap(), b"ip address");
-    assert_eq!(transports.load(Ordering::Relaxed), 1, "SSH TCP connections");
+    assert_eq!(
+        transports.load(Ordering::Relaxed),
+        2,
+        "original shell and a new login using the saved tool bundle"
+    );
     server.abort();
 }
 

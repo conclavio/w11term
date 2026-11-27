@@ -1640,10 +1640,10 @@ impl Engine {
                 bundle_sha256,
                 directory,
             } => {
-                let manifest = self
+                let (manifest, home) = self
                     .save_installed_tool_bundle(&name, &bundle_sha256, &directory, cancel)
                     .await?;
-                json!({ "manifest": manifest })
+                json!({ "manifest": manifest, "home": home })
             }
             ReviewToolPath { review } => {
                 let settings = approved_tool_path

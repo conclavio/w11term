@@ -128,6 +128,7 @@ impl BundleSource {
 pub(super) struct Installer {
     target: ToolPane,
     account: String,
+    profile: Option<String>,
     source: BundleSource,
     review: Option<Box<Review>>,
     pending: Option<(Arc<()>, Work)>,
@@ -167,7 +168,12 @@ impl Installer {
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
         if let Some(history) = &self.history {
-            return history.view(&self.account, active == Some(self.target), ctx);
+            return history.view(
+                &self.account,
+                self.profile.is_some(),
+                active == Some(self.target),
+                ctx,
+            );
         }
         if let Some(setup) = self.path_setup.as_ref().filter(|setup| setup.open) {
             return setup.view(self, active == Some(self.target), ctx);
@@ -522,6 +528,7 @@ impl TerminalApp {
                 self.command_reference.tool_install = Some(Installer {
                     target,
                     account: format!("{}@{}:{}", ssh.user, ssh.host, ssh.port),
+                    profile: live.profile_name.clone(),
                     source,
                     review: None,
                     pending: None,

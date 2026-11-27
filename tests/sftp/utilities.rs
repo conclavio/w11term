@@ -494,6 +494,7 @@ async fn installed_tool_bundle_saves_exact_pins_for_profile_reuse() {
     let saved = guarded_job(&pane, Some(generation), save(id))
         .await
         .unwrap();
+    assert_eq!(saved["home"], "/");
     let manifest = std::path::Path::new(saved["manifest"].as_str().unwrap());
     assert!(manifest.starts_with(&destination));
     let exported = UtilityBundle::load(manifest).unwrap();

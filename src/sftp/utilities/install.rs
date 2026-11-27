@@ -351,7 +351,7 @@ impl Engine {
         id: &str,
         directory: &Path,
         cancel: Option<&TransferCancel>,
-    ) -> Result<PathBuf> {
+    ) -> Result<(PathBuf, String)> {
         let id = normalize_sha256(id)?;
         let home = self.dotfile_home().await?;
         let store = managed_tool_store(&home, name)?;
@@ -425,7 +425,7 @@ impl Engine {
             "Saving the tool bundle was cancelled"
         );
         let _ = staging.keep();
-        Ok(manifest)
+        Ok((manifest, home))
     }
 
     pub(super) fn utility_review(&self, report: &Value) -> Result<String> {
