@@ -27,7 +27,7 @@ mod local;
 mod ring;
 pub use local::{
     CaptureComparison, CaptureExcerpt, CaptureExcerptPlan, ConversationChange,
-    ConversationEndpoints, LocalCapture, ip_protocol_label,
+    ConversationEndpoints, ConversationQuery, LocalCapture, ip_protocol_label,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

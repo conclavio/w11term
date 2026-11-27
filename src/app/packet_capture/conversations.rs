@@ -1,4 +1,5 @@
 use super::{compare::ConversationView, *};
+use w11term::ssh::PacketConversationQuery;
 
 const PAGE_SIZE: usize = 10;
 
@@ -139,7 +140,7 @@ impl List {
         match change {
             Change::Filter(query) if query != self.query => {
                 self.query = query;
-                let filter = search::Query::new(&self.query);
+                let filter = PacketConversationQuery::new(&self.query);
                 self.matches = (!filter.is_empty()).then(|| {
                     (0..total)
                         .filter(|&index| {

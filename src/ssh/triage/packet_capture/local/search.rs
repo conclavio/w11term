@@ -1,7 +1,7 @@
+use super::ConversationEndpoints;
 use std::net::{IpAddr, SocketAddr};
-use w11term::ssh::PacketConversationEndpoints;
 
-pub(super) struct Query(Vec<Term>);
+pub struct ConversationQuery(Vec<Term>);
 
 enum Term {
     Protocol(u8),
@@ -12,19 +12,19 @@ enum Term {
     AddressPrefix(String),
 }
 
-impl Query {
-    pub(super) fn new(text: &str) -> Self {
+impl ConversationQuery {
+    pub fn new(text: &str) -> Self {
         Self(text.split_whitespace().map(Term::parse).collect())
     }
 
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    pub(super) fn matches(&self, endpoints: PacketConversationEndpoints) -> bool {
+    pub fn matches(&self, endpoints: ConversationEndpoints) -> bool {
         let (addresses, transport) = match endpoints {
-            PacketConversationEndpoints::Ip { a, b } => ([a, b], None),
-            PacketConversationEndpoints::Transport { protocol, a, b } => {
+            ConversationEndpoints::Ip { a, b } => ([a, b], None),
+            ConversationEndpoints::Transport { protocol, a, b } => {
                 ([a.ip(), b.ip()], Some((protocol, [a, b])))
             }
         };
@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn distinguishes_exact_hosts_ports_protocols_and_socket_endpoints() {
-        let tcp = PacketConversationEndpoints::Transport {
+        let tcp = ConversationEndpoints::Transport {
             protocol: 6,
             a: "192.0.2.10:443".parse().unwrap(),
             b: "192.0.2.20:49152".parse().unwrap(),
@@ -107,7 +107,7 @@ mod tests {
             "192.0.2.20/24 :443",
             "192.0.2.10:443",
         ] {
-            assert!(Query::new(query).matches(tcp), "{query}");
+            assert!(ConversationQuery::new(query).matches(tcp), "{query}");
         }
         for query in [
             "udp",
@@ -118,7 +118,7 @@ mod tests {
             "192.0.2.0/33",
             "198.51.100.0/24",
         ] {
-            assert!(!Query::new(query).matches(tcp), "{query}");
+            assert!(!ConversationQuery::new(query).matches(tcp), "{query}");
         }
     }
 
@@ -126,8 +126,8 @@ mod tests {
     fn handles_ipv6_canonicalization_and_ip_only_conversations() {
         let a = "2001:db8::a".parse().unwrap();
         let b = "2001:db9::1".parse().unwrap();
-        let ip = PacketConversationEndpoints::Ip { a, b };
-        let udp = PacketConversationEndpoints::Transport {
+        let ip = ConversationEndpoints::Ip { a, b };
+        let udp = ConversationEndpoints::Transport {
             protocol: 17,
             a: SocketAddr::new(a, 53),
             b: SocketAddr::new(b, 64300),
@@ -138,13 +138,13 @@ mod tests {
             "2001:DB8::/32",
             "2001:db",
         ] {
-            assert!(Query::new(query).matches(ip), "{query}");
-            assert!(Query::new(query).matches(udp), "{query}");
+            assert!(ConversationQuery::new(query).matches(ip), "{query}");
+            assert!(ConversationQuery::new(query).matches(udp), "{query}");
         }
-        assert!(Query::new("udp [2001:0DB8::A]:53").matches(udp));
-        assert!(!Query::new("[2001:db9::1]:53").matches(udp));
-        assert!(!Query::new("2001:db8::/129").matches(udp));
-        assert!(!Query::new("0.0.0.0/0").matches(udp));
-        assert!(!Query::new("UDP 53").matches(ip));
+        assert!(ConversationQuery::new("udp [2001:0DB8::A]:53").matches(udp));
+        assert!(!ConversationQuery::new("[2001:db9::1]:53").matches(udp));
+        assert!(!ConversationQuery::new("2001:db8::/129").matches(udp));
+        assert!(!ConversationQuery::new("0.0.0.0/0").matches(udp));
+        assert!(!ConversationQuery::new("UDP 53").matches(ip));
     }
 }

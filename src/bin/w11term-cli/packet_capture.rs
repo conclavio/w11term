@@ -9,7 +9,7 @@ use std::{
 use w11term::control::{PacketCaptureOptions, Reply, Request};
 use w11term::ssh::{
     LocalPacketCapture, PacketCaptureComparison, PacketCaptureExcerptPlan,
-    PacketConversationEndpoints, open_capture_in_wireshark,
+    PacketConversationEndpoints, PacketConversationQuery, open_capture_in_wireshark,
 };
 
 pub(super) const HELP: &str = concat!(
@@ -23,8 +23,10 @@ pub(super) const HELP: &str = concat!(
 );
 
 pub(super) const INSPECT_VERB: &str = "inspect-packet-capture";
-pub(super) const INSPECT_HELP: &str =
-    "w11term-cli inspect-packet-capture FILE [--output-file PATH]";
+pub(super) const INSPECT_HELP: &str = concat!(
+    "w11term-cli inspect-packet-capture FILE ",
+    "[--all-conversations | --filter-conversations QUERY] [--output-file PATH]",
+);
 pub(super) const COMPARE_VERB: &str = "compare-packet-captures";
 pub(super) const COMPARE_HELP: &str = concat!(
     "w11term-cli compare-packet-captures BEFORE AFTER [--elapsed-ns START:END] ",
@@ -42,10 +44,19 @@ pub(super) fn inspect_file(args: &[String], stdout: &mut dyn Write) -> Result<()
         .next()
         .context("provide the local PCAP or PCAPNG file")?;
     let options = report_options(INSPECT_VERB, args)?;
+    ensure!(
+        !options.all_conversations || options.conversation_filter.is_none(),
+        "Choose --all-conversations or --filter-conversations"
+    );
+    let query = options
+        .conversation_filter
+        .or(options.all_conversations.then_some(""))
+        .map(PacketConversationQuery::new);
     let capture = LocalPacketCapture::open(path::absolute(path)?)
         .with_context(|| format!("Inspecting packet capture {path}"))?;
-    offline::write_report(stdout, options.output_file, |output| {
-        capture.write_json(output)
+    offline::write_report(stdout, options.output_file, |output| match &query {
+        Some(query) => capture.write_json_with_conversations(output, query),
+        None => capture.write_json(output),
     })
 }
 
@@ -135,6 +146,8 @@ struct ReportOptions<'a> {
     output_file: Option<&'a str>,
     elapsed_ns: Option<&'a str>,
     pair: Option<(&'a str, &'a str)>,
+    all_conversations: bool,
+    conversation_filter: Option<&'a str>,
 }
 
 fn report_options<'a>(
@@ -143,6 +156,14 @@ fn report_options<'a>(
 ) -> Result<ReportOptions<'a>> {
     let mut options = ReportOptions::default();
     while let Some(flag) = args.next() {
+        if verb == INSPECT_VERB && flag == "--all-conversations" {
+            ensure!(
+                !options.all_conversations,
+                "Specify --all-conversations only once"
+            );
+            options.all_conversations = true;
+            continue;
+        }
         if verb == CLIP_VERB && matches!(flag.as_str(), "--ip-pair" | "--tcp-pair" | "--udp-pair") {
             ensure!(options.pair.is_none(), "Specify only one conversation pair");
             let pair = args
@@ -153,6 +174,7 @@ fn report_options<'a>(
         }
         let target = match flag.as_str() {
             "--format" if verb == COMPARE_VERB => &mut options.format,
+            "--filter-conversations" if verb == INSPECT_VERB => &mut options.conversation_filter,
             "--elapsed-ns" if matches!(verb, COMPARE_VERB | CLIP_VERB) => &mut options.elapsed_ns,
             "--output-file" => &mut options.output_file,
             _ => bail!("unknown option {flag} for {verb}"),

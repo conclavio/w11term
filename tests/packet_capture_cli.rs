@@ -207,6 +207,121 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
 }
 
 #[test]
+fn lists_and_filters_ranked_conversations_beyond_the_top_ten() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let file = "many conversations.pcap";
+    let mut tcp = raw_transport_packet(6, 49116, false);
+    tcp[19] = 16;
+    let frames = (2..=16)
+        .map(|host| {
+            let mut frame = raw_transport_packet(17, 49100 + u16::from(host), false);
+            frame[19] = host;
+            frame
+        })
+        .chain([tcp]);
+    fs::write(root.join(file), raw_capture(frames)).unwrap();
+
+    let default = inspect(root, file, &[]);
+    assert!(default.status.success(), "{default:?}");
+    let default: Value = serde_json::from_slice(&default.stdout).unwrap();
+    assert!(default.get("conversation_results").is_none());
+    assert_eq!(
+        default["ip_conversations"]["top"].as_array().unwrap().len(),
+        10
+    );
+    assert_eq!(
+        default["transport_conversations"]["top"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+
+    let all = inspect(root, file, &["--all-conversations"]);
+    assert!(all.status.success(), "{all:?}");
+    let mut all: Value = serde_json::from_slice(&all.stdout).unwrap();
+    let results = all
+        .as_object_mut()
+        .unwrap()
+        .remove("conversation_results")
+        .unwrap();
+    assert_eq!(all, default);
+    let ip = results["ip"].as_array().unwrap();
+    let transport = results["transport"].as_array().unwrap();
+    assert_eq!(ip.len(), 15);
+    assert_eq!(transport.len(), 16);
+    assert_eq!(
+        &ip[..10],
+        default["ip_conversations"]["top"].as_array().unwrap()
+    );
+    assert_eq!(
+        &transport[..10],
+        default["transport_conversations"]["top"]
+            .as_array()
+            .unwrap()
+    );
+    let udp = transport.last().unwrap();
+    assert_eq!(udp["protocol"], 17);
+    assert_eq!(udp["a"], "192.0.2.1:49116");
+    assert_eq!(udp["b"], "192.0.2.16:443");
+
+    let query = "UDP 192.0.2.16/32 :49116";
+    let filtered = inspect(root, file, &["--filter-conversations", query]);
+    assert!(filtered.status.success(), "{filtered:?}");
+    let result: Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(
+        result["conversation_results"],
+        json!({"ip": [], "transport": [udp]})
+    );
+    let output = inspect(
+        root,
+        file,
+        &[
+            "--filter-conversations",
+            query,
+            "--output-file",
+            "matches.json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read(root.join("matches.json")).unwrap(),
+        filtered.stdout
+    );
+
+    let address = inspect(root, file, &["--filter-conversations", "192.0.2.16"]);
+    assert!(address.status.success(), "{address:?}");
+    let report: Value = serde_json::from_slice(&address.stdout).unwrap();
+    assert_eq!(
+        report["conversation_results"]["ip"][0]["a_to_b"]["packets"],
+        2
+    );
+    assert_eq!(
+        report["conversation_results"]["transport"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let empty = inspect(root, file, &["--filter-conversations", "203.0.113.0/24"]);
+    assert!(empty.status.success(), "{empty:?}");
+    let empty: Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(
+        empty["conversation_results"],
+        json!({"ip": [], "transport": []})
+    );
+
+    let conflicting = inspect(
+        root,
+        file,
+        &["--all-conversations", "--filter-conversations", query],
+    );
+    assert!(!conflicting.status.success());
+    assert!(conflicting.stdout.is_empty());
+}
+
+#[test]
 fn saves_exact_classic_records_inside_the_elapsed_bounds_without_replacing_files() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();

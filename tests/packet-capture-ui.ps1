@@ -790,6 +790,11 @@ try {
             Find-Element "192.0.2.1 $bothDirections 192.0.2.16" ([System.Windows.Automation.ControlType]::ListItem)
         }
     }
+    $conversationMatches = & $Cli inspect-packet-capture $manyIpCapture --filter-conversations '192.0.2.16/32' | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $conversationMatches.conversation_results.ip.Count -ne 1 -or
+        $conversationMatches.conversation_results.ip[0].b -cne '192.0.2.16') {
+        throw 'The CLI and standalone IP search differ'
+    }
     $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     $quietPair = Join-Path $State 'quiet IP pair.pcap'
     Save-CaptureExcerpt ('Save conversation excerpt' + [char]0x2026) $quietPair
@@ -816,6 +821,12 @@ try {
         if ($open -and !$open.Current.IsEnabled -and (Find-Element 'Matching port pairs 1 of 15')) {
             Find-Element "UDP${dot}192.0.2.1:50015 $bothDirections 192.0.2.2:443" ([System.Windows.Automation.ControlType]::ListItem)
         }
+    }
+    $conversationMatches = & $Cli inspect-packet-capture $manyPortsCapture --filter-conversations 'UDP 192.0.2.0/24 :50015' | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $conversationMatches.conversation_results.transport.Count -ne 1 -or
+        $conversationMatches.conversation_results.transport[0].a -cne '192.0.2.1:50015' -or
+        $conversationMatches.conversation_results.ip.Count -ne 0) {
+        throw 'The CLI and standalone port search differ'
     }
     $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     Click 'Open port pair in Wireshark'

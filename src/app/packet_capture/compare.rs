@@ -1,5 +1,5 @@
 use super::*;
-use w11term::ssh::PacketConversationChange;
+use w11term::ssh::{PacketConversationChange, PacketConversationQuery};
 
 mod timeline;
 
@@ -140,7 +140,7 @@ impl Comparison {
     }
 
     fn apply_filter(&mut self) {
-        let query = search::Query::new(&self.conversation_query);
+        let query = PacketConversationQuery::new(&self.conversation_query);
         self.matching_rows = (!query.is_empty()).then(|| {
             self.row_groups()
                 .into_iter()

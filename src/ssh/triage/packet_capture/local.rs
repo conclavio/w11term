@@ -13,13 +13,15 @@ use std::{
 
 mod compare;
 mod excerpt;
+mod search;
 mod summary;
 pub use compare::{CaptureComparison, ConversationChange, ConversationEndpoints};
 pub use excerpt::{CaptureExcerpt, CaptureExcerptPlan};
+pub use search::ConversationQuery;
 pub use summary::ip_protocol_label;
 use summary::{
-    Bucket, CaptureCounters, Conversations, IpProtocols, PacketStats, Summary,
-    TransportConversations,
+    Bucket, CaptureCounters, Conversation, Conversations, IpProtocols, PacketStats, Summary,
+    TransportConversation, TransportConversations,
 };
 
 pub struct LocalCapture {
@@ -66,9 +68,17 @@ struct Report<'a> {
     ip_conversations: &'a Conversations,
     ip_protocols: &'a IpProtocols,
     transport_conversations: &'a TransportConversations,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversation_results: Option<ConversationResults<'a>>,
     link_types: &'a BTreeSet<u16>,
     complete: bool,
     issue: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ConversationResults<'a> {
+    ip: Vec<&'a Conversation>,
+    transport: Vec<&'a TransportConversation>,
 }
 
 #[derive(Serialize)]
@@ -171,6 +181,23 @@ impl LocalCapture {
 
     /// Write the bounded packet summary as a versioned JSON report.
     pub fn write_json(&self, output: impl Write) -> io::Result<()> {
+        self.write_report(output, None)
+    }
+
+    /// Include every tracked conversation that matches the supplied query.
+    pub fn write_json_with_conversations(
+        &self,
+        output: impl Write,
+        query: &ConversationQuery,
+    ) -> io::Result<()> {
+        self.write_report(output, Some(query))
+    }
+
+    fn write_report(
+        &self,
+        output: impl Write,
+        query: Option<&ConversationQuery>,
+    ) -> io::Result<()> {
         let summary = &self.summary;
         let report = Report {
             schema_version: 1,
@@ -207,6 +234,29 @@ impl LocalCapture {
             ip_conversations: &summary.conversations,
             ip_protocols: &summary.ip_protocols,
             transport_conversations: &summary.transport_conversations,
+            conversation_results: query.map(|query| ConversationResults {
+                ip: summary
+                    .conversations
+                    .pairs()
+                    .filter(|pair| {
+                        query.matches(ConversationEndpoints::Ip {
+                            a: pair.a,
+                            b: pair.b,
+                        })
+                    })
+                    .collect(),
+                transport: summary
+                    .transport_conversations
+                    .pairs()
+                    .filter(|pair| {
+                        query.matches(ConversationEndpoints::Transport {
+                            protocol: pair.protocol,
+                            a: pair.a,
+                            b: pair.b,
+                        })
+                    })
+                    .collect(),
+            }),
             link_types: &summary.link_types,
             complete: summary.issue.is_none(),
             issue: summary.issue.as_deref(),

@@ -15,7 +15,6 @@ use w11term::{
 
 mod compare;
 mod conversations;
-mod search;
 
 pub(super) const LABEL: &str = "Packet capture";
 

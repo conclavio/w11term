@@ -13,11 +13,11 @@ pub(super) mod pcapng;
 mod protocols;
 mod timeline;
 mod transport;
-pub use conversations::{Conversations, Traffic};
+pub use conversations::{Conversation, Conversations, Traffic};
 pub use protocols::{IpProtocols, TcpFlags, ip_protocol_label};
 pub use timeline::{Bucket, Timeline};
 pub(super) use timeline::{MAX_BUCKETS, RelativeTimeline};
-pub use transport::TransportConversations;
+pub use transport::{TransportConversation, TransportConversations};
 
 const MAX_RECORDS: u32 = 1_000_000;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
