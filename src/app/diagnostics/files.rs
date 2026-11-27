@@ -60,16 +60,11 @@ fn picked_artifact(paths: Vec<PathBuf>, stage: DiagnosticStage) -> Result<Option
         return Ok(None);
     }
     let artifact = artifact(paths)?;
-    match stage {
-        DiagnosticStage::Open => (),
-        DiagnosticStage::Baseline => ensure!(
-            artifact.kind != Kind::PacketCapture,
-            "Choose a CPU profile, Linux triage report, or syscall trace as the baseline"
-        ),
-        DiagnosticStage::Candidate(kind) => ensure!(
+    if let DiagnosticStage::Candidate(kind) = stage {
+        ensure!(
             artifact.kind == kind,
             "Choose a diagnostic of the same type as the baseline"
-        ),
+        );
     }
     Ok(Some(artifact))
 }
@@ -316,8 +311,25 @@ mod tests {
         );
         assert!(picked_artifact(Vec::new(), stage).unwrap().is_none());
         assert!(picked_artifact(vec![root.join("profile.folded")], stage).is_err());
+        let packet = picked_artifact(vec![root.join("before.pcap")], DiagnosticStage::Baseline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.kind, Kind::PacketCapture);
+        let stage = DiagnosticStage::Candidate(packet.kind);
+        assert_eq!(
+            picked_artifact(vec![root.join("after.pcapng")], stage)
+                .unwrap()
+                .unwrap()
+                .paths,
+            [root.join("after.pcapng")]
+        );
+        assert!(picked_artifact(vec![root.join("profile.folded")], stage).is_err());
         assert!(
-            picked_artifact(vec![root.join("network.pcap")], DiagnosticStage::Baseline).is_err()
+            picked_artifact(
+                vec![root.join("after.pcap"), root.join("other.pcap")],
+                stage
+            )
+            .is_err()
         );
     }
 }

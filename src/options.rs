@@ -1123,10 +1123,6 @@ impl DiagnosticLaunch {
             return Ok(Self::Open(before));
         }
         let kind = before.kind;
-        ensure!(
-            kind != DiagnosticKind::PacketCapture,
-            "Choose a CPU profile, Linux triage report or syscall trace to compare"
-        );
         let after = Artifact {
             kind,
             paths: comparison_paths,
@@ -1217,7 +1213,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term --open-cpu-profile PATH [--compare-with PATH]\n  w11term --open-triage-report PATH [--compare-with PATH]\n  w11term --open-packet-capture PATH\n  w11term --open-syscall-trace PATH [--open-syscall-trace PATH ...] [--compare-with PATH ...]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive] [--certificate FILE]\n      [--host-key SHA256:...] [--host-key-alias NAME] [--agent-pipe PIPE]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term --open-cpu-profile PATH [--compare-with PATH]\n  w11term --open-triage-report PATH [--compare-with PATH]\n  w11term --open-packet-capture PATH [--compare-with PATH]\n  w11term --open-syscall-trace PATH [--open-syscall-trace PATH ...] [--compare-with PATH ...]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive] [--certificate FILE]\n      [--host-key SHA256:...] [--host-key-alias NAME] [--agent-pipe PIPE]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -2073,6 +2069,21 @@ mod tests {
             after.paths,
             ["fail.79", "fail.78"].map(|p| std::path::absolute(p).unwrap())
         );
+        let packet = parse(&[
+            "--open-packet-capture",
+            "before.pcap",
+            compare,
+            "after.pcapng",
+        ])
+        .unwrap()
+        .unwrap();
+        let Some(DiagnosticLaunch::Compare { before, after }) = packet.diagnostic else {
+            panic!("Expected a packet capture comparison");
+        };
+        assert_eq!(before.kind, DiagnosticKind::PacketCapture);
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(before.paths, [std::path::absolute("before.pcap").unwrap()]);
+        assert_eq!(after.paths, [std::path::absolute("after.pcapng").unwrap()]);
         for args in [
             &[compare, "after.folded"][..],
             &["--open-cpu-profile", "before.folded", compare],
@@ -2081,6 +2092,8 @@ mod tests {
                 "before.pcap",
                 compare,
                 "after.pcap",
+                compare,
+                "extra.pcapng",
             ],
             &[
                 "--open-triage-report",

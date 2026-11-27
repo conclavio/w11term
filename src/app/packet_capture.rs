@@ -63,7 +63,11 @@ pub enum Outcome {
     Destination(PathBuf),
     Saved(PacketCapture),
     Loaded(Arc<LocalPacketCapture>),
-    Compared(Box<PacketCaptureComparison>),
+    Compared {
+        comparison: Box<PacketCaptureComparison>,
+        baseline: Option<Arc<LocalPacketCapture>>,
+        after: PathBuf,
+    },
     Wireshark(PathBuf),
     Opened,
 }
@@ -241,15 +245,27 @@ impl Panel {
         ticket
     }
 
+    fn install_local(&mut self, capture: Arc<LocalPacketCapture>) {
+        self.loaded = Some(LoadedCapture::Local(capture));
+        self.comparison = None;
+        self.saved_interface = 0;
+        self.timeline_expanded = false;
+        self.timeline_interval = None;
+        self.conversations_expanded = false;
+        self.selected_conversation = None;
+        self.limit_conversation_interval = false;
+        self.activity = None;
+    }
+
     fn view(
         &self,
         active: Option<flame_graph::Connection>,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
-        if let Some(comparison) = &self.comparison {
-            return comparison.view(ctx);
-        }
         let idle = self.pending.is_none();
+        if let Some(comparison) = &self.comparison {
+            return comparison.view(self.status.as_deref(), idle, ctx);
+        }
         let button = |label: &str, enabled, action: fn() -> Action| {
             Button::new()
                 .is_enabled(enabled)
@@ -944,6 +960,27 @@ fn default_wireshark() -> Option<PathBuf> {
 }
 
 impl TerminalApp {
+    pub(super) fn compare_saved_packet_captures(
+        &mut self,
+        before: PathBuf,
+        after: PathBuf,
+        ctx: &ComponentContext<Self>,
+    ) -> bool {
+        if self.packet_capture.pending.is_some() {
+            return false;
+        }
+        self.set_diagnostics_drawer(Some(diagnostics::Drawer::PacketCapture));
+        let ticket = self
+            .packet_capture
+            .begin("Comparing saved packet captures…");
+        work(ctx, ticket, move || {
+            let before =
+                Arc::new(LocalPacketCapture::open(before).context("Opening the before capture")?);
+            compare_captures(before, after, true).map(Some)
+        });
+        true
+    }
+
     pub(super) fn with_packet_capture(&self, content: View, ctx: &ViewContext<Self>) -> View {
         let width = (self.width * 0.4).clamp(285.0, 520.0);
         let panel = self.packet_capture.view(self.profile_connection(), ctx);
@@ -1268,9 +1305,7 @@ impl TerminalApp {
                             LocalPacketCapture::open(path).context("Opening the before capture")?,
                         ),
                     };
-                    let after =
-                        LocalPacketCapture::open(file.path).context("Opening the after capture")?;
-                    Outcome::Compared(Box::new(PacketCaptureComparison::new(&before, &after)))
+                    compare_captures(before, file.path, false)?
                 }
                 FileChoice::Save => Outcome::Destination(file.path),
                 FileChoice::Wireshark => Outcome::Wireshark(file.path),
@@ -1341,23 +1376,33 @@ impl TerminalApp {
             }
             Ok(Some(Outcome::Loaded(capture))) => {
                 let path = capture.path.clone();
-                panel.loaded = Some(LoadedCapture::Local(capture));
-                panel.comparison = None;
-                panel.saved_interface = 0;
-                panel.timeline_expanded = false;
-                panel.timeline_interval = None;
-                panel.conversations_expanded = false;
-                panel.selected_conversation = None;
-                panel.limit_conversation_interval = false;
-                panel.activity = None;
+                panel.install_local(capture);
                 self.remember_diagnostic(
                     w11term::diagnostic_history::Kind::PacketCapture,
                     [path],
                     ctx,
                 );
             }
-            Ok(Some(Outcome::Compared(comparison))) => {
+            Ok(Some(Outcome::Compared {
+                comparison,
+                baseline,
+                after,
+            })) => {
+                if let Some(baseline) = baseline {
+                    panel.install_local(baseline);
+                }
                 panel.comparison = Some(compare::Comparison::new(comparison));
+                let before = panel
+                    .loaded
+                    .as_ref()
+                    .map(|capture| capture.path().to_owned());
+                for path in before.into_iter().chain([after]) {
+                    self.remember_diagnostic(
+                        w11term::diagnostic_history::Kind::PacketCapture,
+                        [path],
+                        ctx,
+                    );
+                }
             }
             Ok(Some(Outcome::Wireshark(path))) => {
                 panel.status = Some(format!("Wireshark executable {}", path.display()));
@@ -1403,6 +1448,19 @@ impl TerminalApp {
                 .map(|capture| Some(Outcome::Saved(capture)))
         });
     }
+}
+
+fn compare_captures(
+    before: Arc<LocalPacketCapture>,
+    after: PathBuf,
+    install_baseline: bool,
+) -> anyhow::Result<Outcome> {
+    let after = LocalPacketCapture::open(after).context("Opening the after capture")?;
+    Ok(Outcome::Compared {
+        comparison: Box::new(PacketCaptureComparison::new(&before, &after)),
+        baseline: install_baseline.then_some(before),
+        after: after.path,
+    })
 }
 
 fn work(

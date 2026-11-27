@@ -1455,7 +1455,7 @@ Use **Back** in the triage, flame graph, or packet capture panel to return to th
 
 In **Diagnostics overview**, choose **Open saved diagnostic…** or drop files into the labelled area. The overview recognizes `.folded`, `.collapsed`, triage `.json`, `.pcap`, `.pcapng`, `.cap`, `.strace`, and split `name.PID` traces. Select one saved file or all the parts of a single split trace. Each viewer validates the file before adding it to recent diagnostics.
 
-Choose **Compare saved diagnostics…** to browse for two CPU profiles, Linux triage reports, or syscall traces. Pick the baseline first. It becomes **Before** in a CPU or triage comparison and **Working** in a syscall comparison. For a split trace, select all the files for that run in its dialog. Cancel either dialog to return to the overview.
+Choose **Compare saved diagnostics…** to browse for two CPU profiles, Linux triage reports, packet captures, or syscall traces. Pick the baseline first. It becomes **Before** in a CPU, triage, or packet comparison and **Working** in a syscall comparison. For a split trace, select all the files for that run in its dialog. Cancel either dialog to return to the overview. For files already in **Recent files** or **Pinned files**, choose **Use as baseline** on one file, then **Compare with baseline** on another of the same type.
 
 Use `w11term.exe` to launch directly into the corresponding offline viewer. Paths can be relative to the working directory or absolute. Repeat `--open-syscall-trace` for all parts of a split trace. A diagnostics-only window uses the full width and starts without opening a terminal or applying the startup profile.
 
@@ -1466,11 +1466,12 @@ Use `w11term.exe` to launch directly into the corresponding offline viewer. Path
 .\w11term.exe --open-syscall-trace '.\run.321' --open-syscall-trace '.\run.322'
 ```
 
-To start in the comparison view, supply the Before or Working files with the `--open-*` option and the After or Failing files with `--compare-with`. For split syscall traces, repeat the option for each side independently. The viewer adds both sources to recent diagnostics. Use the comparison's **Back to flame graph**, **Back to report**, or **Back to working trace** button to return to the baseline.
+To start in the comparison view, supply the Before or Working files with the `--open-*` option and the After or Failing files with `--compare-with`. For split syscall traces, repeat the option for each side independently. The viewer adds both sources to recent diagnostics. Use **Back to flame graph**, **Back to report**, **Back to capture**, or **Back to working trace** to return to the baseline.
 
 ```powershell
 .\w11term.exe --open-cpu-profile '.\before.folded' --compare-with '.\after.folded'
 .\w11term.exe --open-triage-report '.\before.json' --compare-with '.\after.json'
+.\w11term.exe --open-packet-capture '.\before.pcap' --compare-with '.\after.pcapng'
 .\w11term.exe --open-syscall-trace '.\working.321' --open-syscall-trace '.\working.322' --compare-with '.\failing.411' --compare-with '.\failing.412'
 ```
 
@@ -1479,6 +1480,7 @@ Use `open-diagnostic` to open files in a running instance. Get the target ID wit
 ```powershell
 & $ctl --pid 12345 list-windows
 & $ctl --pid 12345 open-diagnostic --window 1 --kind cpu-profile --file '.\before.folded' --compare-with '.\after.folded'
+& $ctl --pid 12345 open-diagnostic --window 1 --kind packet-capture --file '.\before.pcap' --compare-with '.\after.pcapng'
 ```
 
 **Activity** shows jobs started from the app in this window, with the original SSH endpoint, current state, and the latest result still available in each tool. Packet and syscall captures report their stop reason and saved path. Select an activity to return to the running job or its result even after switching panes. Linux performance triage shows the live count of checks that have finished, including checks that returned an error. **Stop and keep report** ends the collection early. The report retains collected output, labels unfinished checks as incomplete, and records that you stopped the collection.

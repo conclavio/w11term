@@ -34,6 +34,17 @@ $failingTrace = @'
 [IO.File]::WriteAllBytes((Join-Path $State 'saved packets.pcap'), [byte[]]@(
     0xd4,0xc3,0xb2,0xa1, 2,0,4,0, 0,0,0,0, 0,0,0,0, 0xff,0xff,0,0, 1,0,0,0
 ))
+$beforePackets = Join-Path $State 'baseline packets.pcap'
+$afterPackets = Join-Path $State 'candidate packets.pcapng'
+$badPackets = Join-Path $State 'invalid packets.pcapng'
+[IO.File]::Copy((Join-Path $State 'saved packets.pcap'), $beforePackets)
+[IO.File]::WriteAllBytes($afterPackets, [byte[]]@(
+    10,13,13,10, 28,0,0,0, 77,60,43,26, 1,0,0,0, 255,255,255,255,255,255,255,255, 28,0,0,0,
+    1,0,0,0, 20,0,0,0, 101,0,0,0, 64,0,0,0, 20,0,0,0,
+    6,0,0,0, 52,0,0,0, 0,0,0,0, 0,0,0,0, 1,0,0,0, 20,0,0,0, 20,0,0,0,
+    69,0,0,20, 0,0,0,0, 64,253,0,0, 192,0,2,1, 192,0,2,2, 52,0,0,0
+))
+[IO.File]::WriteAllText($badPackets, 'invalid capture')
 $ids = @('uptime','dmesg','vmstat','mpstat','pidstat','iostat','free','sar-dev','sar-tcp','top')
 $triage = @{
     version = 1
@@ -90,6 +101,15 @@ function Start-SavedComparison {
     })
 }
 
+function Wait-PacketComparison {
+    $null = Wait-Until 'packet comparison shows the two roles and the recorded change' {
+        (Find-Element "Before${dot}baseline packets.pcap${dot}PCAP") -and
+            (Find-Element "After${dot}candidate packets.pcapng${dot}PCAPNG") -and
+            (Find-Element "Capture change${dot}+1 packets${dot}+20 captured bytes${dot}+0 truncated") -and
+            (Find-Element 'IP conversation changes 1')
+    }
+}
+
 try {
     Open-Artifact @('--open-cpu-profile','"saved CPU.folded"') 'CPU flame graph'
     $null = Wait-Until 'the saved profile fills the window' {
@@ -117,6 +137,17 @@ try {
     $null = Wait-Until 'packet capture details and Wireshark action' {
         (Find-Element "PCAP${dot}24 bytes") -and (Find-Element 'Open in Wireshark' $button)
     }
+    Close-Artifact
+
+    Open-Artifact @('--open-packet-capture','"baseline packets.pcap"','--compare-with','"candidate packets.pcapng"') 'Packet capture'
+    Wait-PacketComparison
+    $null = Wait-Until 'both compared packet captures are remembered as individual files' {
+        $recent = [IO.File]::ReadAllText($history) | ConvertFrom-Json
+        $files = @($recent.entries | ForEach-Object { $_.paths[0] })
+        ($files -contains $beforePackets) -and ($files -contains $afterPackets)
+    }
+    Invoke-Button (Find-Element 'Back to capture' $button)
+    $null = Wait-Until 'back returns to the packet baseline installed at launch' { Find-Element $beforePackets }
     Close-Artifact
 
     Open-Artifact @('--open-syscall-trace','"split trace.301"','--open-syscall-trace','"split trace.300"') 'Syscall trace viewer'
@@ -221,6 +252,16 @@ try {
     Invoke-Button (Find-Element 'Return to diagnostics overview' $button)
 
     Start-SavedComparison
+    Choose-Diagnostic 'Choose baseline diagnostic' $beforePackets
+    Choose-Diagnostic 'Choose after packet capture' $afterPackets
+    Wait-PacketComparison
+    Invoke-Button (Find-Element 'Return to diagnostics overview' $button)
+    Choose-DiagnosticFileAction 'baseline packets.pcap' 'Use as baseline'
+    Choose-DiagnosticFileAction 'candidate packets.pcapng' 'Compare with baseline'
+    Wait-PacketComparison
+    Invoke-Button (Find-Element 'Return to diagnostics overview' $button)
+
+    Start-SavedComparison
     Choose-Diagnostic 'Choose baseline diagnostic' '"picker working.710" "picker working.711"'
     Choose-Diagnostic 'Choose failing syscall trace' '"picker failing.810" "picker failing.811"'
     $null = Wait-Until 'both picked syscall runs show their roles and first result divergence' {
@@ -278,6 +319,23 @@ try {
         $null = Wait-Until 'control opens a saved triage report' { Find-Element 'Opened Linux triage report' }
         $null = Control ($open + @('--kind','packet-capture','--file',(Join-Path $State 'saved packets.pcap')))
         $null = Wait-Until 'control opens a saved packet capture' { Find-Element "PCAP${dot}24 bytes" }
+        $packetForeground = [FixtureMessages]::GetForegroundWindow()
+        $details = Control ($open + @('--kind','packet-capture','--file',$beforePackets,'--compare-with',$afterPackets))
+        if ($details.window_id -ne $windowId -or $details.kind -cne 'packet-capture' -or !$details.comparison) {
+            throw 'Expected a completed packet comparison in the requested window'
+        }
+        Wait-PacketComparison
+        if ($packetForeground -ne $window -and [FixtureMessages]::GetForegroundWindow() -eq $window) {
+            throw 'Opening the packet comparison stole focus'
+        }
+        $invalid = & $Cli --pid $app.Id @open --kind packet-capture --file $beforePackets --compare-with $badPackets | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 1 -or $invalid.ok -or $invalid.error -notmatch 'Opening the after capture') {
+            throw 'Control did not return the packet comparison reader failure'
+        }
+        $null = Wait-Until 'a failed replacement leaves the previous comparison and reports the reader error' {
+            (Find-Element "After${dot}candidate packets.pcapng${dot}PCAPNG") -and
+                (Find-Element 'Opening the after capture: Choose a PCAP or PCAPNG capture file')
+        }
         $null = Control ($open + @('--kind','syscall-trace','--file',(Join-Path $State 'split trace.300'),
             '--file',(Join-Path $State 'split trace.301')))
         $null = Wait-Until 'control opens a split trace' { Find-Element 'Files merged by epoch timestamp' }

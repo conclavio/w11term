@@ -85,7 +85,6 @@ struct RecentRow {
 
 #[derive(Clone, PartialEq, Eq)]
 enum BaselineMenu {
-    Unavailable,
     Choose,
     Selected,
     Compare(Arc<Entry>),
@@ -93,9 +92,6 @@ enum BaselineMenu {
 
 impl Recent {
     fn baseline_menu(&self, entry: &Entry) -> BaselineMenu {
-        if entry.artifact.kind == Kind::PacketCapture {
-            return BaselineMenu::Unavailable;
-        }
         match self.baseline.as_ref() {
             Some(before) if before.artifact == entry.artifact => BaselineMenu::Selected,
             Some(before) if before.artifact.kind == entry.artifact.kind => {
@@ -222,7 +218,6 @@ fn diagnostic_file_menu(
             MenuItem::item("copy-paths", copy),
         ];
         match &baseline {
-            BaselineMenu::Unavailable => (),
             BaselineMenu::Selected => {
                 items.push(MenuItem::item("clear-baseline", "Clear baseline"));
             }
@@ -426,7 +421,7 @@ impl TerminalApp {
                     }
                     RecentAction::CopyPaths => self.copy_diagnostic_paths(&entry.artifact),
                     RecentAction::Forget => self.edit_diagnostics_recent(Edit::Forget(entry), ctx),
-                    RecentAction::SetBaseline if entry.artifact.kind != Kind::PacketCapture => {
+                    RecentAction::SetBaseline => {
                         self.diagnostics_recent.baseline = Some(entry);
                         self.diagnostics_recent.status = None;
                     }
@@ -590,6 +585,9 @@ impl TerminalApp {
             }
             (Kind::CpuProfile, [before], [after]) => {
                 self.compare_saved_profiles(before.clone(), after.clone(), ctx)
+            }
+            (Kind::PacketCapture, [before], [after]) => {
+                self.compare_saved_packet_captures(before.clone(), after.clone(), ctx)
             }
             (Kind::SyscallTrace, before, after) => {
                 self.compare_saved_syscall_traces(before.to_vec(), after.to_vec(), ctx);

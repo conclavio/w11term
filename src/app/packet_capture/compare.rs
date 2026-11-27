@@ -26,14 +26,23 @@ impl Comparison {
         }
     }
 
-    pub(super) fn view(&self, ctx: &ViewContext<TerminalApp>) -> View {
+    pub(super) fn view(
+        &self,
+        status: Option<&str>,
+        idle: bool,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
         let model = &self.model;
         let mut fields = vec![KeyedView::new(
             "back",
             Button::new()
+                .is_enabled(idle)
                 .on_click(ctx.callback(|_| message(Action::BackToCapture)))
                 .content("Back to capture"),
         )];
+        if let Some(status) = status {
+            fields.push(text("status", status));
+        }
         for (side, capture) in [("Before", &model.before), ("After", &model.after)] {
             let span = capture.timestamp_span_ns.map_or_else(
                 || "No usable timestamps".into(),
@@ -102,7 +111,7 @@ impl Comparison {
                     .spacing(6.0)
                     .children((
                         Button::new()
-                            .is_enabled(self.page != 0)
+                            .is_enabled(idle && self.page != 0)
                             .on_click(ctx.callback(move |_| message(Action::ComparePage(previous))))
                             .content("Previous page"),
                         TextBlock::new().text(format!(
@@ -111,7 +120,7 @@ impl Comparison {
                             self.page_count()
                         )),
                         Button::new()
-                            .is_enabled(next < self.page_count())
+                            .is_enabled(idle && next < self.page_count())
                             .on_click(ctx.callback(move |_| message(Action::ComparePage(next))))
                             .content("Next page"),
                     )),

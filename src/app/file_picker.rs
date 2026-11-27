@@ -334,7 +334,13 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                             }),
                         ),
                         Kind::SyscallTrace => (w!("Choose failing syscall trace"), None),
-                        Kind::PacketCapture => anyhow::bail!("Packet captures cannot be compared"),
+                        Kind::PacketCapture => (
+                            w!("Choose after packet capture"),
+                            Some(COMDLG_FILTERSPEC {
+                                pszName: w!("Packet captures"),
+                                pszSpec: w!("*.pcap;*.pcapng;*.cap"),
+                            }),
+                        ),
                     },
                     _ => (w!("Open syscall trace"), None),
                 };
