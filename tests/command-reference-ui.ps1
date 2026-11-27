@@ -233,10 +233,24 @@ try {
             }
         }
     }
+    $beforeRollbackReview = [IO.File]::ReadAllText($selectorPath)
     Click 'Review rollback'
+    $priorManifest = [IO.File]::ReadAllText((Join-Path $State 'fleet.json')) | ConvertFrom-Json
+    $activeManifest = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
+    $oldPin = ($priorManifest.tools | Where-Object name -ceq 'rg').builds[0].sha256
+    $activePin = ($activeManifest.tools | Where-Object name -ceq 'rg').builds[0].sha256
     $null = Wait-Until 'rollback shows the prior contents and update policy' {
-        (Find-Element 'Retained commands mdd, rg') -and
-        (Find-Element 'Restoring this version pauses automatic bundle updates.')
+        (Find-Element 'Changes from the active release') -and
+        (Find-Element 'Keep mdd') -and
+        (Find-Element 'Replace pinned build for rg') -and
+        (Find-Element "Active SHA-256 $activePin${dot}256 bytes") -and
+        (Find-Element "Restored SHA-256 $oldPin${dot}256 bytes") -and
+        (Find-Element 'Deactivate netwatch') -and
+        (Find-Element 'Restoring this version pauses automatic bundle updates.') -and
+        (Find-Element 'Restore reviewed version' $button -Visible)
+    }
+    if ([IO.File]::ReadAllText($selectorPath) -cne $beforeRollbackReview) {
+        throw 'Review switched the active release before approval'
     }
     $null = Control @('focus-pane','--pane',"$localPane")
     Wait-Focus $localPane

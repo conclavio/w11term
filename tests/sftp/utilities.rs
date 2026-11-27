@@ -549,6 +549,13 @@ async fn removing_managed_tools_keeps_exact_pins_and_can_be_rolled_back() {
         .await
         .unwrap();
     assert_eq!(restore["ready"], true);
+    assert_eq!(
+        restore["changes"],
+        json!([
+            {"name": "mdd", "action": "add", "before": null, "after": {"sha256": tool_sha256(&mdd), "bytes": mdd.len()}},
+            {"name": "rg", "action": "add", "before": null, "after": {"sha256": tool_sha256(&rg), "bytes": rg.len()}}
+        ])
+    );
     let restored = guarded_job(&pane, None, rollback(original_id, Some(&restore)))
         .await
         .unwrap();
@@ -1304,9 +1311,26 @@ async fn utility_install_updates_and_rolls_back_one_atomic_selector() {
     fs::remove_file(local.path().join("rg")).unwrap();
     fs::remove_file(local.path().join("jq")).unwrap();
     let original = fs::read(store.join("versions").join(a_id).join("rg")).unwrap();
+    let active_executable = store.join("versions").join(b_id).join("rg");
+    let active_bytes = fs::read(&active_executable).unwrap();
+    let mut damaged = active_bytes.clone();
+    damaged[255] = 99;
+    fs::write(&active_executable, damaged).unwrap();
     let review = guarded_job(&pane, None, rollback(a_id, None))
         .await
         .unwrap();
+    let same_pin = json!({"sha256": tool_sha256(&executable(UtilityArchitecture::X86_64, None)), "bytes": 256});
+    assert_eq!(
+        review["changes"],
+        json!([
+            {"name": "jq", "action": "keep", "before": same_pin, "after": same_pin},
+            {"name": "rg", "action": "change",
+             "before": {"sha256": tool_sha256(&active_bytes), "bytes": active_bytes.len()},
+             "after": {"sha256": tool_sha256(&original), "bytes": original.len()}},
+            {"name": "team-report", "action": "remove", "before": same_pin, "after": null}
+        ])
+    );
+    assert!(selector().ends_with(&format!("versions/{b_id}\n")));
     let old_path = store.join("versions").join(a_id).join("rg");
     let mut changed = original.clone();
     changed[255] = 77;
@@ -1502,6 +1526,20 @@ pub(super) fn reference_tool_profile(
     fs::write(remote.join("posix-rename-version"), "1").unwrap();
     save_login_tools(local, "fleet.json", 1, &["rg", "mdd"]);
     save_login_tools(local, "Tool review.json", 1, &["rg", "mdd", "netwatch"]);
+    let update = local.join("Tool review.json");
+    let mut bundle: UtilityBundle = serde_json::from_slice(&fs::read(&update).unwrap()).unwrap();
+    let architecture = UtilityArchitecture::X86_64;
+    let mut next = executable(architecture, None);
+    next[255] = 2;
+    let mut build = build(local, "rg-next", architecture, next);
+    build.path = "rg-next".into();
+    bundle
+        .tools
+        .iter_mut()
+        .find(|tool| tool.name == "rg")
+        .unwrap()
+        .builds = vec![build];
+    fs::write(update, serde_json::to_vec(&bundle).unwrap()).unwrap();
     let bin = remote.join(".local/bin");
     fs::create_dir_all(&bin).unwrap();
     let conflict = bin.join("netwatch");

@@ -39,6 +39,8 @@ pub struct RollbackReview {
     bundle_sha256: String,
     current: Current,
     retained: Retained,
+    changes: Option<Vec<ToolChange>>,
+    bin_matches_active: bool,
     bin_directory_plan: Directory,
     launchers: Vec<(String, String)>,
     ready: bool,
@@ -50,12 +52,29 @@ pub struct RollbackReview {
 struct Retained {
     architecture: String,
     bin_directory: String,
-    tools: Vec<RetainedTool>,
 }
 
 #[derive(Deserialize)]
-struct RetainedTool {
+struct ToolChange {
     name: String,
+    action: ToolChangeKind,
+    before: Option<Pin>,
+    after: Option<Pin>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ToolChangeKind {
+    Add,
+    Remove,
+    Change,
+    Keep,
+}
+
+#[derive(Deserialize)]
+struct Pin {
+    sha256: String,
+    bytes: u64,
 }
 
 #[derive(Deserialize)]
@@ -260,7 +279,6 @@ impl Panel {
                 ),
             ))
         };
-        fields.push(KeyedView::new("actions", actions));
         if self.selected().is_some_and(|row| row.active) {
             fields.push(KeyedView::new(
                 "save-pinned-bundle",
@@ -287,13 +305,24 @@ impl Panel {
                 }),
             ));
         }
-        fields.push(KeyedView::new(
-            "back",
-            button("Back to tool installer", !writing, || Action::Close),
-        ));
-        Border::new().padding(12.0).content(
-            ScrollViewer::new().content(StackPanel::new().spacing(8.0).keyed_children(fields)),
-        )
+        Grid::new()
+            .rows([GridLength::Star(1.0), GridLength::Auto])
+            .children((
+                ScrollViewer::new().content(
+                    StackPanel::new()
+                        .margin(12.0)
+                        .spacing(8.0)
+                        .keyed_children(fields),
+                ),
+                StackPanel::new()
+                    .grid_row(1)
+                    .margin(12.0)
+                    .spacing(8.0)
+                    .children((
+                        actions,
+                        button("Back to tool installer", !writing, || Action::Close),
+                    )),
+            ))
     }
 }
 
@@ -338,16 +367,17 @@ impl RollbackReview {
                 self.bundle, self.retained.architecture, self.home, self.retained.bin_directory
             ),
         ));
-        let commands: Vec<_> = self
-            .retained
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
-        fields.push(detail(
-            "commands",
-            format!("Retained commands {}", commands.join(", ")),
-        ));
+        if let Some(changes) = &self.changes {
+            fields.push(detail(
+                "rollback-comparison",
+                if self.current.version.is_some() {
+                    "Changes from the active release"
+                } else {
+                    "Commands in the selected release"
+                },
+            ));
+            fields.extend(changes.iter().map(ToolChange::view));
+        }
         if let Some(path) = &self.bin_directory_plan.blocked_at {
             fields.push(detail(
                 "directory",
@@ -363,6 +393,11 @@ impl RollbackReview {
             fields.push(detail(
                 "selector",
                 "This version is already active. Refresh versions.",
+            ));
+        } else if !self.bin_matches_active {
+            fields.push(detail(
+                "selector",
+                "The selected release uses a different launcher directory",
             ));
         } else if self.current.version.is_some() && !self.supports_atomic_replace {
             fields.push(detail(
@@ -389,6 +424,40 @@ impl RollbackReview {
                 "Resolve the conflicts before restoring this version."
             },
         ));
+    }
+}
+
+impl ToolChange {
+    fn view(&self) -> KeyedView {
+        let (verb, before, after) = match self.action {
+            ToolChangeKind::Add => ("Restore", None, self.after.as_ref()),
+            ToolChangeKind::Remove => ("Deactivate", self.before.as_ref(), None),
+            ToolChangeKind::Change => (
+                "Replace pinned build for",
+                self.before.as_ref(),
+                self.after.as_ref(),
+            ),
+            ToolChangeKind::Keep => ("Keep", self.before.as_ref(), None),
+        };
+        let mut fields = vec![detail("command", format!("{verb} {}", self.name))];
+        for (key, label, pin) in [("before", "Active", before), ("after", "Restored", after)] {
+            if let Some(pin) = pin {
+                fields.push(KeyedView::new(
+                    key,
+                    TextBlock::new()
+                        .text(format!(
+                            "{label} SHA-256 {} · {} bytes",
+                            pin.sha256, pin.bytes
+                        ))
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true),
+                ));
+            }
+        }
+        KeyedView::new(
+            format!("change-{}", self.name),
+            StackPanel::new().spacing(2.0).keyed_children(fields),
+        )
     }
 }
 

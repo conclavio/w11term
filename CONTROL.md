@@ -1409,7 +1409,7 @@ After a manual install or a review of an already installed built-in tool, choose
 
 To undo it, choose **Review PATH removal** and then **Remove reviewed PATH blocks**. The review shows exactly which managed blocks will be removed. Other startup content, the files themselves, and the installed tools are preserved. An edited, duplicate, or incomplete block stops the reviewed removal. Profiles configured to manage this directory can add it again during their next connection.
 
-Open **Bundle versions** to see the releases still stored under the SSH account, with the active version marked. Choose an earlier release and select **Review rollback** to verify its binaries and see its commands and launcher paths. **Restore reviewed version** switches to that release and pauses automatic updates for the bundle. Launchers for commands absent from the restored release become dormant.
+Open **Bundle versions** to see the releases still stored under the SSH account, with the active version marked. Choose a retained release and select **Review rollback** to verify its binaries and compare it with the active release. The review shows which commands would return, become inactive, change their pinned build, or keep their pin. It includes the SHA-256 and size of each relevant executable. **Restore reviewed version** switches to that release and pauses automatic updates for the bundle. Launchers for commands absent from the restored release become dormant.
 
 Select the active release and choose **Save pinned bundle on Windows** to use those exact builds in a profile. w11term verifies the executables against the installed release and saves them with a manifest in `tool-bundle-snapshots` beside the profile catalog. The manifest contains the installed architecture. **Review in this SSH profile** opens the original pane's saved profile and reviews the manifest against the authenticated account. Choose **Approve tool sync** and **Save profile changes** to use it on the next login. You can also copy the manifest path and select it under **Edit profile → SSH tools**. If updates are paused, review and resume them from **Bundle versions** after saving the profile. Keep the manifest and its sibling executables together.
 
@@ -1441,6 +1441,8 @@ $restore = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-rollback my
 ```
 
 Rollback uses the retained remote files. The client checks their hashes and executable permissions before activating them. Launchers for commands omitted from the active version remain dormant so older versions can restore them. Installation and rollback require the host's `flock` command and SFTP symlinks. Switching an active version requires OpenSSH's atomic rename extension. Run a fresh preview after changing the manifest, moving to another pane or connection, or retrying an interrupted operation.
+
+The rollback preview includes `changes` in command-name order. Each row has an `action` of `add`, `remove`, `change`, or `keep`, plus `before` and `after` pins with `sha256` and `bytes`. A missing pin is `null`. The before pins come from the active release manifest so the review is available even if an active executable needs repair. `changes` is `null` if the active selector is invalid.
 
 ### Sync a tool bundle on SSH connect
 

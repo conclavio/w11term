@@ -1,5 +1,6 @@
 use super::*;
 use russh::ChannelMsg;
+use std::collections::BTreeMap;
 
 mod remote_digest;
 
@@ -22,7 +23,7 @@ fn valid_tool_permissions(attrs: &FileAttributes) -> bool {
         .is_some_and(|mode| mode & 0o170000 == 0o100000 && mode & 0o100 != 0 && mode & 0o7022 == 0)
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StoredTool {
     pub name: String,
@@ -37,6 +38,30 @@ pub(super) struct Release {
     pub bin_directory: String,
     pub architecture: UtilityArchitecture,
     pub tools: Vec<StoredTool>,
+}
+
+fn rollback_tool_changes(active: &[StoredTool], retained: &[StoredTool]) -> Vec<Value> {
+    let mut by_name = BTreeMap::new();
+    for tool in active {
+        by_name.entry(tool.name.as_str()).or_insert((None, None)).0 = Some(tool);
+    }
+    for tool in retained {
+        by_name.entry(tool.name.as_str()).or_insert((None, None)).1 = Some(tool);
+    }
+    let pin = |tool: &StoredTool| json!({ "sha256": tool.sha256, "bytes": tool.bytes });
+    by_name
+        .into_iter()
+        .map(|(name, (before, after))| {
+            let action = match (before, after) {
+                (Some(before), Some(after)) if before == after => "keep",
+                (Some(_), Some(_)) => "change",
+                (None, Some(_)) => "add",
+                (Some(_), None) => "remove",
+                (None, None) => unreachable!("each command came from at least one release"),
+            };
+            json!({ "name": name, "action": action, "before": before.map(pin), "after": after.map(pin) })
+        })
+        .collect()
 }
 
 impl Release {
@@ -685,24 +710,42 @@ impl Engine {
         let release = self
             .verify_utility_release(session, &store, &name, host.architecture, &id)
             .await?;
+        let previous;
+        let active = match selector.version.as_deref() {
+            Some(active) if active == id => Some(&release),
+            Some(active) => {
+                // Use the recorded pins so rollback can recover from damaged active executables.
+                previous = self
+                    .utility_release_manifest(&store, &name, Some(host.architecture), active)
+                    .await?;
+                Some(&previous)
+            }
+            None => None,
+        };
+        let bin_matches_active =
+            active.is_none_or(|current| current.bin_directory == release.bin_directory);
+        let changes = (!selector.conflict).then(|| {
+            rollback_tool_changes(
+                active.map_or(&[], |current| current.tools.as_slice()),
+                &release.tools,
+            )
+        });
         let bin = self
             .utility_directories(&home, &release.bin_directory)
             .await?;
         let launchers = self.launcher_actions(&home, &store, &release, &bin).await?;
         let atomic = self.extension(editor::POSIX_RENAME, "1").is_ok();
         let ready = !selector.conflict
+            && bin_matches_active
             && bin.blocked_at.is_none()
             && launchers.iter().all(|(_, action)| *action != "conflict")
             && (atomic
                 || (selector.manual && selector.version.as_ref() == Some(&id))
                 || selector.version.is_none());
-        let ready = ready
-            && self
-                .utility_bin_matches_active(&store, &selector, &release)
-                .await?;
         let mut report = json!({
             "operation": "rollback-tool-bundle", "home": home, "bundle": name, "bundle_sha256": id,
             "current": selector, "retained": release, "bin_directory_plan": bin, "launchers": launchers,
+            "changes": changes, "bin_matches_active": bin_matches_active,
             "ready": ready, "supports_atomic_replace": atomic,
         });
         let Some(review) = review else {
