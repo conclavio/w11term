@@ -101,19 +101,39 @@ public static class FixtureDialog {
             // IFileSaveDialog. Never type into the path bar or folder search.
             string suggested = EditText(hwnd);
             if (suggested != suggestedFilename && suggested != Path.GetFileNameWithoutExtension(suggestedFilename)) return true;
-            IntPtr result;
-            SendMessageTimeout(dialog, 0x0028, hwnd, (IntPtr)1, 2, 1000, out result); // WM_NEXTDLGCTL
-            SendMessageTimeout(hwnd, 0x00B1, IntPtr.Zero, (IntPtr)(-1), 2, 1000, out result); // EM_SETSEL
-            // WM_SETTEXT can change the displayed text while the Shell keeps the
-            // suggested file selected. Typing also notifies the containing combo.
-            foreach (char ch in path) {
-                if (SendMessageTimeout(hwnd, 0x0102, (IntPtr)(int)ch, (IntPtr)1, 2, 1000, out result) == IntPtr.Zero)
-                    return false;
-            }
-            changed = EditText(hwnd) == path;
+            changed = TypeFilename(dialog, hwnd, path);
             return !changed;
         }, IntPtr.Zero);
         return changed;
+    }
+
+    public static bool SetCommonDialogFilename(IntPtr dialog, string path) {
+        // The Explorer-style save dialog exposes its File name editor as an
+        // Edit child of the filename ComboBox with control ID 1001 on the Edit.
+        // Its text can change as the dialog initializes or after partial input.
+        const int fileNameEdit = 1001;
+        bool changed = false;
+        EnumChildWindows(dialog, (hwnd, _) => {
+            if (GetDlgCtrlID(hwnd) != fileNameEdit ||
+                !IsControl(hwnd, "Edit") || !IsControl(GetParent(hwnd), "ComboBox")) return true;
+            changed = EditText(hwnd) == path || TypeFilename(dialog, hwnd, path);
+            return false;
+        }, IntPtr.Zero);
+        return changed;
+    }
+
+    private static bool TypeFilename(IntPtr dialog, IntPtr edit, string path) {
+        IntPtr result;
+        SendMessageTimeout(dialog, 0x0028, edit, (IntPtr)1, 2, 1000, out result); // WM_NEXTDLGCTL
+        if (SendMessageTimeout(edit, 0x00B1, IntPtr.Zero, (IntPtr)(-1), 2, 1000, out result) == IntPtr.Zero)
+            return false; // EM_SETSEL
+        // WM_SETTEXT can change the displayed text while the Shell keeps the
+        // suggested file selected. Typing also notifies the containing combo.
+        foreach (char ch in path) {
+            if (SendMessageTimeout(edit, 0x0102, (IntPtr)(int)ch, (IntPtr)1, 2, 1000, out result) == IntPtr.Zero)
+                return false;
+        }
+        return EditText(edit) == path;
     }
 
     public static bool SelectFileType(IntPtr dialog, string label) {
