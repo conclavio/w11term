@@ -1,19 +1,24 @@
 use super::*;
+use crate::events::DotfileSyncStatus;
 
 mod tool_path;
 
 const DIRECTORY: &str = ".config/w11term/dotfiles";
 const PARENTS: [&str; 3] = [".config", ".config/w11term", DIRECTORY];
 const DISABLED: &str = "disabled\n";
+// Startup hooks only load fragments when the first line is a bundle digest.
+const AUTOMATIC: &str = "automatic\n";
 const MANUAL: &str = "manual\n";
+const BASH_LOGIN_FILES: [&str; 3] = [".bash_profile", ".bash_login", ".profile"];
 const BEGIN: &str = "# >>> w11term dotfiles >>>";
 const END: &str = "# <<< w11term dotfiles <<<";
 const MAX_FRAGMENT_BYTES: usize = 16 * 1024;
+const MAX_LISTED_VERSIONS: usize = 64;
 
 pub(crate) async fn sync_login_dotfiles(
     session: &russh::client::Handle<crate::ssh::Handler>,
     settings: &crate::options::DotfileSync,
-) -> Result<&'static str> {
+) -> Result<DotfileSyncStatus> {
     let shell = settings.shell;
     let zdotdir = settings.zdotdir.as_deref();
     validate_zdotdir(shell, zdotdir)?;
@@ -40,7 +45,7 @@ pub(crate) async fn sync_login_dotfiles(
             .as_deref()
             .is_some_and(selector_held)
     {
-        return Ok("held");
+        return Ok(DotfileSyncStatus::Held);
     }
 
     let bundle_path = settings.bundle.clone();
@@ -52,7 +57,7 @@ pub(crate) async fn sync_login_dotfiles(
         .dotfiles_plan_at(home, &bundle, shell, zdotdir)
         .await?;
     if plan.selector.before.as_deref().is_some_and(selector_held) {
-        return Ok("held");
+        return Ok(DotfileSyncStatus::Held);
     }
     if let Some(active) = plan.selector.active_version() {
         engine
@@ -66,9 +71,9 @@ pub(crate) async fn sync_login_dotfiles(
         .await
         .with_context(|| stage.interrupted())?;
     Ok(if changed.is_empty() {
-        "current"
+        DotfileSyncStatus::Current
     } else {
-        "updated"
+        DotfileSyncStatus::Updated
     })
 }
 
@@ -84,6 +89,33 @@ pub enum DotfileShell {
 pub enum DotfileTarget {
     Bundle { sha256: String },
     Disabled,
+    Automatic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DotfileVersionState {
+    Inactive,
+    AwaitingSync,
+    Active,
+    Paused,
+    Disabled,
+    Conflict,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DotfileVersions {
+    pub home: String,
+    pub active_bundle_sha256: Option<String>,
+    pub state: DotfileVersionState,
+    pub versions: Vec<RetainedDotfileVersion>,
+    pub omitted_versions: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RetainedDotfileVersion {
+    pub bundle_sha256: String,
+    pub modified: Option<u32>,
 }
 
 impl DotfileShell {
@@ -102,7 +134,7 @@ impl DotfileShell {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DotfileBundle {
     pub version: u8,
@@ -133,13 +165,33 @@ impl DotfileBundle {
     }
 
     pub fn validate(&self, shell: DotfileShell) -> Result<()> {
-        ensure!(self.version == 1, "Unsupported dotfiles bundle version");
-        let prompt = self.prompt(shell);
+        self.validate_fragments()?;
         ensure!(
-            self.environment.is_some() || prompt.is_some(),
+            self.environment.is_some() || self.prompt(shell).is_some(),
             "The bundle needs an environment or {} fragment",
             shell.name()
         );
+        Ok(())
+    }
+
+    pub fn validate_for_editing(&self) -> Result<()> {
+        self.validate_fragments()?;
+        ensure!(
+            self.environment.is_some() || self.bash.is_some() || self.zsh.is_some(),
+            "Enter at least one dotfile fragment"
+        );
+        Ok(())
+    }
+
+    pub fn save_new(&self, path: &Path) -> Result<()> {
+        self.validate_for_editing()?;
+        let mut contents = serde_json::to_string_pretty(self)?;
+        contents.push('\n');
+        crate::transcript::save(path, &contents, false)
+    }
+
+    fn validate_fragments(&self) -> Result<()> {
+        ensure!(self.version == 1, "Unsupported dotfiles bundle version");
         for fragment in [&self.environment, &self.bash, &self.zsh]
             .into_iter()
             .flatten()
@@ -222,6 +274,20 @@ impl Edit {
 
     fn active_version(&self) -> Option<&str> {
         self.before.as_deref().and_then(selector_version)
+    }
+
+    fn selector(path: String, before: Option<String>, desired: String) -> Self {
+        match before.as_deref() {
+            None if desired == DISABLED => Self::new(path, "unchanged", None, None),
+            None => Self::new(path, "create", None, Some(desired)),
+            Some(text) if text == desired => Self::new(path, "unchanged", before, Some(desired)),
+            Some(text)
+                if matches!(text, DISABLED | AUTOMATIC) || selector_version(text).is_some() =>
+            {
+                Self::new(path, "replace", before, Some(desired))
+            }
+            Some(_) => Self::new(path, "selector-conflict", before, None),
+        }
     }
 
     fn report(&self) -> Value {
@@ -362,6 +428,69 @@ fn hook_change(path: String, original: Option<String>, hook: String) -> Edit {
 }
 
 impl Engine {
+    pub(super) async fn dotfile_versions(
+        &self,
+        shell: DotfileShell,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<DotfileVersions> {
+        let home = self.dotfile_home().await?;
+        let mut result = DotfileVersions {
+            home,
+            active_bundle_sha256: None,
+            state: DotfileVersionState::Inactive,
+            versions: Vec::new(),
+            omitted_versions: 0,
+        };
+        for relative in PARENTS {
+            let path = under_home(&result.home, relative);
+            if !self.dotfile_directory_exists(&path).await? {
+                return Ok(result);
+            }
+        }
+        let entries = self
+            .read_directory(&under_home(&result.home, DIRECTORY), cancel, true)
+            .await?;
+        if let Some(selector) = self
+            .dotfile_text(&selector_path(&result.home, shell))
+            .await?
+        {
+            result.active_bundle_sha256 = selector_version(&selector).map(str::to_owned);
+            result.state = match (selector.as_str(), result.active_bundle_sha256.is_some()) {
+                (AUTOMATIC, _) => DotfileVersionState::AwaitingSync,
+                (DISABLED, _) => DotfileVersionState::Disabled,
+                (text, true) if selector_held(text) => DotfileVersionState::Paused,
+                (_, true) => DotfileVersionState::Active,
+                _ => DotfileVersionState::Conflict,
+            };
+        }
+        let prefix = format!("{}-", shell.name());
+        let mut seen = std::collections::HashSet::new();
+        for entry in entries {
+            if EntryKind::from_permissions(entry.attrs.permissions) == Some(EntryKind::Directory)
+                && let Some(id) = entry
+                    .filename
+                    .strip_prefix(&prefix)
+                    .filter(|id| valid_bundle_id(id))
+                && seen.insert(id.to_owned())
+            {
+                result.versions.push(RetainedDotfileVersion {
+                    bundle_sha256: id.to_owned(),
+                    modified: entry.attrs.mtime,
+                });
+            }
+        }
+        let active = result.active_bundle_sha256.as_deref();
+        result.versions.sort_unstable_by(|a, b| {
+            (active == Some(b.bundle_sha256.as_str()))
+                .cmp(&(active == Some(a.bundle_sha256.as_str())))
+                .then_with(|| b.modified.cmp(&a.modified))
+                .then_with(|| a.bundle_sha256.cmp(&b.bundle_sha256))
+        });
+        result.omitted_versions = result.versions.len().saturating_sub(MAX_LISTED_VERSIONS);
+        result.versions.truncate(MAX_LISTED_VERSIONS);
+        Ok(result)
+    }
+
     pub(super) async fn preview_dotfiles(
         &self,
         bundle: DotfileBundle,
@@ -466,9 +595,11 @@ impl Engine {
         stage: &mut JobStage,
     ) -> Result<Value> {
         validate_zdotdir(shell, zdotdir)?;
-        let id = match target {
-            DotfileTarget::Bundle { sha256 } => Some(normalize_sha256(&sha256)?),
-            DotfileTarget::Disabled => None,
+        let target = match target {
+            DotfileTarget::Bundle { sha256 } => DotfileTarget::Bundle {
+                sha256: normalize_sha256(&sha256)?,
+            },
+            target => target,
         };
         let home = self.dotfile_home().await?;
         for relative in PARENTS {
@@ -478,6 +609,23 @@ impl Engine {
                 "Managed dotfiles directory is missing: {path}"
             );
         }
+        let path = selector_path(&home, shell);
+        let before = self.dotfile_text(&path).await?;
+        let desired = match &target {
+            DotfileTarget::Bundle { sha256 } => format!("{sha256}\n{MANUAL}"),
+            DotfileTarget::Disabled => DISABLED.to_owned(),
+            DotfileTarget::Automatic => {
+                ensure!(
+                    before.as_deref().is_some_and(selector_held),
+                    "Automatic dotfile sync is not paused or disabled on this account. Refresh dotfile versions."
+                );
+                before
+                    .as_deref()
+                    .and_then(selector_version)
+                    .map_or_else(|| AUTOMATIC.to_owned(), |id| format!("{id}\n"))
+            }
+        };
+        let id = selector_version(&desired).map(str::to_owned);
         let files = match &id {
             Some(id) => {
                 self.verified_dotfile_version(&home, shell, zdotdir, id)
@@ -485,15 +633,13 @@ impl Engine {
             }
             None => Vec::new(),
         };
-        let desired = id
-            .as_ref()
-            .map_or_else(|| DISABLED.to_owned(), |id| format!("{id}\n{MANUAL}"));
-        let selector = self.dotfile_selector(&home, shell, desired).await?;
+        let selector = Edit::selector(path, before, desired);
         let atomic_replace = self.extension(editor::POSIX_RENAME, "1").is_ok();
         let mut report = json!({
             "operation": "switch-dotfiles",
             "shell": shell,
             "home": home,
+            "target": target,
             "bundle_sha256": id,
             "active_bundle_sha256": selector.active_version(),
             "selector": selector.report(),
@@ -519,7 +665,9 @@ impl Engine {
             );
             self.write_dotfile(&selector, stage).await?;
         }
-        Ok(json!({"shell": shell, "home": home, "bundle_sha256": id, "changed": changed}))
+        Ok(json!({
+            "shell": shell, "home": home, "target": target, "bundle_sha256": id, "changed": changed
+        }))
     }
 
     async fn verified_dotfile_version(
@@ -558,7 +706,7 @@ impl Engine {
         for hook in &hooks {
             ensure!(
                 hook.action == "unchanged",
-                "Install or repair the managed startup hook at {} before restoring a bundle",
+                "Install or repair the managed startup hook at {} before using this bundle",
                 hook.path
             );
         }
@@ -641,9 +789,9 @@ impl Engine {
             files.push(Edit::new(path, action, original, after));
         }
         files.extend(self.dotfile_hooks(&home, shell, zdotdir).await?);
-        let selector = self
-            .dotfile_selector(&home, shell, format!("{id}\n"))
-            .await?;
+        let path = selector_path(&home, shell);
+        let before = self.dotfile_text(&path).await?;
+        let selector = Edit::selector(path, before, format!("{id}\n"));
         Ok(Plan {
             home,
             id,
@@ -704,7 +852,7 @@ impl Engine {
         let (login, login_original) = match shell {
             DotfileShell::Bash => {
                 let mut selected = (startup(".profile"), None);
-                for name in [".bash_profile", ".bash_login", ".profile"] {
+                for name in BASH_LOGIN_FILES {
                     let path = startup(name);
                     if let Some(contents) = self.dotfile_text(&path).await? {
                         selected = (path, Some(contents));
@@ -722,25 +870,6 @@ impl Engine {
         let rc = startup(&format!(".{}rc", shell.name()));
         let rc_original = self.dotfile_text(&rc).await?;
         Ok([(login, login_original), (rc, rc_original)])
-    }
-
-    async fn dotfile_selector(
-        &self,
-        home: &str,
-        shell: DotfileShell,
-        desired: String,
-    ) -> Result<Edit> {
-        let path = selector_path(home, shell);
-        let before = self.dotfile_text(&path).await?;
-        Ok(match before.as_deref() {
-            None if desired == DISABLED => Edit::new(path, "unchanged", None, None),
-            None => Edit::new(path, "create", None, Some(desired)),
-            Some(text) if text == desired => Edit::new(path, "unchanged", before, Some(desired)),
-            Some(text) if text == DISABLED || selector_version(text).is_some() => {
-                Edit::new(path, "replace", before, Some(desired))
-            }
-            Some(_) => Edit::new(path, "selector-conflict", before, None),
-        })
     }
 
     async fn dotfile_directory_exists(&self, path: &str) -> Result<bool> {
@@ -775,12 +904,14 @@ fn selector_version(text: &str) -> Option<&str> {
     text.strip_suffix(MANUAL)
         .unwrap_or(text)
         .strip_suffix('\n')
-        .filter(|line| {
-            line.len() == 64
-                && line
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
+        .filter(|line| valid_bundle_id(line))
+}
+
+fn valid_bundle_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn selector_held(text: &str) -> bool {
@@ -811,4 +942,37 @@ fn remote_parent(path: &str) -> Result<&str> {
     path.rsplit_once('/')
         .map(|(parent, _)| parent)
         .context("Expected an absolute remote dotfile path")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saves_new_shell_bundles_without_replacing_the_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dotfiles.json");
+        let mut bundle = DotfileBundle {
+            version: 1,
+            environment: None,
+            bash: None,
+            zsh: Some("PROMPT='ops> '\nexport EDITOR=vi\n".into()),
+        };
+        bundle.save_new(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let loaded = DotfileBundle::load(&path).unwrap();
+        assert_eq!(loaded.zsh, bundle.zsh);
+        loaded.validate(DotfileShell::Zsh).unwrap();
+        assert!(loaded.validate(DotfileShell::Bash).is_err());
+
+        bundle.zsh = Some("PROMPT='changed> '\n".into());
+        assert!(bundle.save_new(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+
+        let invalid = directory.path().join("invalid.json");
+        bundle.zsh = Some("x".repeat(MAX_FRAGMENT_BYTES + 1));
+        assert!(bundle.save_new(&invalid).is_err());
+        assert!(!invalid.exists());
+    }
 }

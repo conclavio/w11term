@@ -9,8 +9,9 @@ mod local;
 mod login;
 use build::{LibcVersion, Verified};
 pub use downloads::{
-    ToolBundlePreset, UtilityDownload, builtin_tool_names, export_builtin_tool_bundle,
-    fetch_tool_bundle, prepare_builtin_tool_bundle,
+    ToolBundlePreset, UtilityDownload, builtin_tool_bundle, builtin_tool_names,
+    export_builtin_tool_bundle, fetch_tool_bundle, fetch_tool_bundle_cancellable,
+    prepare_builtin_tool_bundle,
 };
 pub(super) use install::with_lock;
 use install::{InstallPlan, Release, StoredTool};
@@ -25,6 +26,12 @@ const MAX_LOCAL_BUILD_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PROBE: usize = 16 * 1024;
 const PROBE_PREFIX: &str = "w11term-tools-v1";
 const PROBE: &str = r#"/bin/sh -c 'printf "%s\n" w11term-tools-v1; command -p uname -s && command -p uname -m || exit 1; printf "%s\n" "$HOME" "$PATH" "$(command -p getconf GNU_LIBC_VERSION 2>/dev/null || :)"'"#;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallMode {
+    Replace,
+    Add,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +93,14 @@ pub(super) fn valid_bin_directory(directory: &str) -> bool {
         && directory.split('/').count() <= 8
         && directory != STORE
         && !directory.starts_with(&format!("{STORE}/"))
+}
+
+pub(super) fn managed_tool_store(home: &str, bundle: &str) -> Result<String> {
+    ensure!(
+        safe_component(bundle) && !bundle.starts_with('.'),
+        "Invalid tool bundle name"
+    );
+    Ok(under_home(home, &format!("{STORE}/{bundle}")))
 }
 
 fn valid_command_name(name: &str) -> bool {
@@ -311,7 +326,7 @@ async fn inspect_builds(
 ) -> Result<Vec<(String, Vec<Candidate>)>> {
     tokio::task::spawn_blocking(move || {
         let mut remaining = MAX_LOCAL_BUILD_BYTES;
-        let mut tools: Vec<_> = tools
+        tools
             .into_iter()
             .map(|tool| {
                 let candidates = tool
@@ -325,9 +340,7 @@ async fn inspect_builds(
                     .collect();
                 (tool.name, candidates)
             })
-            .collect();
-        tools.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        tools
+            .collect()
     })
     .await
     .context("Validating tool bundles on Windows")
@@ -345,7 +358,13 @@ impl Engine {
         session: &russh::client::Handle<crate::ssh::Handler>,
         bundle: UtilityBundle,
     ) -> Result<Value> {
-        let plan = self.utility_plan(session, bundle).await?;
+        let plan = self
+            .utility_plan(session, bundle, InstallMode::Replace)
+            .await?;
+        self.review_utility_plan(plan)
+    }
+
+    fn review_utility_plan(&self, plan: InstallPlan) -> Result<Value> {
         let mut report = plan.report;
         if report["ready"] == true {
             report["review"] = json!(self.utility_review(&report)?);
@@ -356,7 +375,8 @@ impl Engine {
     async fn utility_plan(
         &self,
         session: &russh::client::Handle<crate::ssh::Handler>,
-        bundle: UtilityBundle,
+        mut bundle: UtilityBundle,
+        mode: InstallMode,
     ) -> Result<InstallPlan> {
         bundle.validate()?;
         let (host, home) = tokio::try_join!(probe(session), self.dotfile_home())?;
@@ -364,20 +384,46 @@ impl Engine {
             home == host.home,
             "SSH probe and SFTP disagree on the account's home"
         );
-        let bin_path = under_home(&home, &bundle.bin_directory);
         let store = format!("{STORE}/{}", bundle.name);
         let versions = format!("{store}/versions");
-        let (bin, managed) = tokio::try_join!(
-            self.utility_directories(&home, &bundle.bin_directory),
-            self.utility_directories(&home, &versions),
-        )?;
+        let managed = self.utility_directories(&home, &versions).await?;
+        let store_path = under_home(&home, &store);
+        let selector = self.utility_selector_state(&store_path, &managed).await?;
+        let mut retained_tools = Vec::new();
+        if mode == InstallMode::Add
+            && let Some(id) = &selector.version
+        {
+            let active = self
+                .verify_utility_release(session, &store_path, &bundle.name, host.architecture, id)
+                .await
+                .context("Checking the tools that will stay installed")?;
+            bundle.bin_directory = active.bin_directory;
+            bundle
+                .tools
+                .retain(|tool| !active.tools.iter().any(|old| old.name == tool.name));
+            retained_tools = active.tools;
+            ensure!(
+                bundle.tools.len() + retained_tools.len() <= 16,
+                "The extended bundle would exceed its 16-tool limit"
+            );
+        }
+        let bin = self
+            .utility_directories(&home, &bundle.bin_directory)
+            .await?;
+        let bin_path = under_home(&home, &bundle.bin_directory);
         let path_position = host.search_path.iter().position(|entry| *entry == bin_path);
         let earlier = &host.search_path[..path_position.unwrap_or(host.search_path.len())];
-        let store_path = under_home(&home, &store);
         let mut reports = Vec::new();
         let mut selected = Vec::new();
         let mut blocked = bin.blocked_at.is_some() || managed.blocked_at.is_some();
-        for (name, candidates) in inspect_builds(bundle.tools, host.architecture).await? {
+        let mut tools = inspect_builds(bundle.tools, host.architecture).await?;
+        tools.extend(
+            retained_tools
+                .iter()
+                .map(|tool| (tool.name.clone(), Vec::new())),
+        );
+        tools.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (name, candidates) in tools {
             let destination = format!("{bin_path}/{name}");
             let expected_link = format!("{store_path}/current/{name}");
             let (launcher, shadowed_by, builds) = tokio::try_join!(
@@ -386,7 +432,10 @@ impl Engine {
                 self.utility_build_reports(candidates, &host),
             )?;
             let choice = builds.iter().position(|build| build.status == "compatible");
-            if let Some(choice) = choice {
+            let retained = retained_tools.iter().find(|tool| tool.name == name);
+            if let Some(tool) = retained {
+                selected.push((tool.clone(), None));
+            } else if let Some(choice) = choice {
                 let choice = &builds[choice];
                 selected.push((
                     StoredTool {
@@ -398,18 +447,24 @@ impl Engine {
                             .expect("compatible build verified")
                             .bytes,
                     },
-                    choice
-                        .path
-                        .clone()
-                        .expect("verified executable has a local path"),
+                    Some(
+                        choice
+                            .path
+                            .clone()
+                            .expect("verified executable has a local path"),
+                    ),
                 ));
             }
-            blocked |= launcher == "conflict" || choice.is_none();
-            reports.push(json!({
+            blocked |= launcher == "conflict" || (choice.is_none() && retained.is_none());
+            let mut report = json!({
                 "name": name, "destination": destination, "launcher": launcher,
                 "launcher_target": expected_link, "earlier_executable": shadowed_by,
                 "selected_build": choice, "builds": builds,
-            }));
+            });
+            if let Some(tool) = retained {
+                report["retained"] = json!(tool);
+            }
+            reports.push(report);
         }
         let release = Release {
             name: bundle.name,
@@ -420,6 +475,10 @@ impl Engine {
         let bundle_sha256 = (selected.len() == reports.len())
             .then(|| release.id())
             .transpose()?;
+        ensure!(
+            release.tools.iter().map(|tool| tool.bytes).sum::<u64>() <= MAX_LOCAL_BUILD_BYTES,
+            "The extended bundle would exceed its 256 MiB executable limit"
+        );
         let atomic_replace = self.extension(editor::POSIX_RENAME, "1").is_ok();
         let version_path = bundle_sha256
             .as_ref()
@@ -429,16 +488,19 @@ impl Engine {
             Some(_) => "present",
             None => "missing",
         };
-        let selector = self.utility_selector_state(&store_path, &managed).await?;
-        let bin_matches_active = self
-            .utility_bin_matches_active(&store_path, &selector, &release)
-            .await?;
+        let manual = mode == InstallMode::Add
+            && (selector.manual || selector.version.as_ref() != bundle_sha256.as_ref());
+        let bin_matches_active = mode == InstallMode::Add
+            || self
+                .utility_bin_matches_active(&store_path, &selector, &release)
+                .await?;
         blocked |= selector.conflict
             || !bin_matches_active
             || selector.version.as_ref().is_some_and(|current| {
-                !atomic_replace && (selector.manual || Some(current) != bundle_sha256.as_ref())
+                !atomic_replace
+                    && (selector.manual != manual || Some(current) != bundle_sha256.as_ref())
             });
-        let report = json!({
+        let mut report = json!({
             "bundle": release.name, "bundle_sha256": bundle_sha256,
             "host": {"os": "Linux", "architecture": host.architecture, "home": home, "glibc": host.glibc.map(|v| v.to_string())},
             "bin_directory": bin_path, "bin_matches_active": bin_matches_active, "path_status": path, "path_source": "ssh-exec",
@@ -446,6 +508,10 @@ impl Engine {
             "bin_directory_plan": bin, "managed_directory_plan": managed,
             "supports_atomic_replace": atomic_replace, "ready": !blocked, "tools": reports,
         });
+        if mode == InstallMode::Add {
+            report["mode"] = json!("add");
+            report["automatic_sync_paused"] = json!(manual);
+        }
         Ok(InstallPlan {
             report,
             release,
@@ -456,6 +522,8 @@ impl Engine {
             home,
             store: store_path,
             id: bundle_sha256,
+            manual,
+            configure_launchers: true,
         })
     }
 

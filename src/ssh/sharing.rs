@@ -154,7 +154,8 @@ impl ConnectionShare {
     pub fn options(&self) -> &SshOptions {
         &self.0.options
     }
-    pub(crate) fn verified_endpoint(&self) -> (&str, &str, u16, &str) {
+    /// Returns the host, user, port, and host-key fingerprint of this authenticated transport.
+    pub fn verified_endpoint(&self) -> (&str, &str, u16, &str) {
         let options = &self.0.options;
         (
             &options.host,

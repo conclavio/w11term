@@ -11,21 +11,25 @@ public static class FixtureClipboard {
     [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint format);
     [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GlobalLock(IntPtr handle);
     [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr handle);
-    public static bool ContainsNewText(uint before, string expected) {
-        if (GetClipboardSequenceNumber() == before) return false;
+    public static string ReadNewText(uint before) {
+        if (GetClipboardSequenceNumber() == before) return null;
         if (!OpenClipboard(IntPtr.Zero)) {
             int error = Marshal.GetLastWin32Error();
-            if (error == 5 || error == 170) return false; // in use, retry within Wait-Until
+            if (error == 5 || error == 170) return null; // in use, retry within Wait-Until
             throw new Win32Exception(error);
         }
         try {
             IntPtr handle = GetClipboardData(13); // CF_UNICODETEXT
-            if (handle == IntPtr.Zero) return false;
+            if (handle == IntPtr.Zero) return null;
             IntPtr text = GlobalLock(handle);
             if (text == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
-            try { return String.Equals(Marshal.PtrToStringUni(text), expected, StringComparison.Ordinal); }
+            try { return Marshal.PtrToStringUni(text); }
             finally { GlobalUnlock(handle); }
         } finally { CloseClipboard(); }
+    }
+    public static bool ContainsNewText(uint before, string expected) {
+        string text = ReadNewText(before);
+        return text != null && String.Equals(text, expected, StringComparison.Ordinal);
     }
 }
 '@

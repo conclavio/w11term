@@ -1,12 +1,16 @@
 use super::*;
 use catalog::{COMMON, Key, LINUX, Loaded, PLATFORMS, PageSource, Platform, WINDOWS};
-use w11term::events::{ToolBundleSyncReport, ToolBundleSyncStatus, ToolPathSyncStatus};
+use w11term::events::{
+    DotfileSyncReport, ToolBundleSyncReport, ToolBundleSyncStatus, ToolPathSyncStatus,
+};
 use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 
 mod catalog;
+mod dotfiles;
 mod download;
 mod private_page;
 mod tool_install;
+mod tool_removal;
 
 pub(super) const LABEL: &str = "Command reference";
 pub(super) const SELECTION: &str = "Look up selected command";
@@ -31,6 +35,8 @@ pub enum Action {
     ToolPage(Arc<()>, usize),
     Private(private_page::Action),
     ToolInstall(tool_install::Action),
+    ToolRemoval(tool_removal::Action),
+    Dotfiles(dotfiles::Action),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,7 +45,7 @@ pub struct ToolPane {
     generation: u64,
 }
 
-fn run_pane_tool_job(
+fn run_pane_sftp_job(
     input: tokio::sync::mpsc::UnboundedSender<Command>,
     target: ToolPane,
     operation: Operation,
@@ -59,14 +65,14 @@ fn run_pane_tool_job(
         .map_err(|_| "SSH session has closed".to_owned())?;
     response
         .blocking_recv()
-        .map_err(|_| "SSH tool operation interrupted".to_owned())?
+        .map_err(|_| "SSH file operation interrupted".to_owned())?
 }
 
 fn tool_sync_summary(report: &ToolBundleSyncReport) -> String {
     let status = match report.status {
         ToolBundleSyncStatus::Updated => "installed",
         ToolBundleSyncStatus::Current => "already current",
-        ToolBundleSyncStatus::Held => "paused after rollback",
+        ToolBundleSyncStatus::Held => "automatic sync paused",
         ToolBundleSyncStatus::Skipped => "sync skipped",
         ToolBundleSyncStatus::Unconfirmed => "sync unconfirmed",
         ToolBundleSyncStatus::NotRun => "skipped for this session",
@@ -111,6 +117,8 @@ pub(super) struct Panel {
     tools: Option<ToolLookup>,
     private_page: Option<private_page::Editor>,
     tool_install: Option<tool_install::Installer>,
+    tool_removal: Option<tool_removal::Panel>,
+    dotfiles: Option<dotfiles::Installer>,
 }
 
 fn pane_platform(source: Option<&Source>) -> Platform {
@@ -137,9 +145,18 @@ impl Panel {
         self.draft = None;
         self.private_page = None;
         self.tool_install = None;
+        self.tool_removal = None;
+        self.dotfiles = None;
         if let Some(lookup) = self.tools.take() {
             lookup.cancel.cancel();
         }
+    }
+
+    fn subpanel_open(&self) -> bool {
+        self.private_page.is_some()
+            || self.tool_install.is_some()
+            || self.tool_removal.is_some()
+            || self.dotfiles.is_some()
     }
 
     fn set_query(&mut self, text: String) {
@@ -222,6 +239,7 @@ impl Panel {
         origin: Option<clipboard_paste::Origin>,
         tool_pane: Option<ToolPane>,
         tool_sync: Option<&ToolBundleSyncReport>,
+        dotfile_sync: Option<&DotfileSyncReport>,
         ctx: &mut ViewContext<TerminalApp>,
     ) -> View {
         if let Some(editor) = &self.private_page {
@@ -229,6 +247,12 @@ impl Panel {
         }
         if let Some(installer) = &self.tool_install {
             return installer.view(tool_pane, tool_sync, ctx);
+        }
+        if let Some(removal) = &self.tool_removal {
+            return removal.view(tool_pane, ctx);
+        }
+        if let Some(installer) = &self.dotfiles {
+            return installer.view(tool_pane, dotfile_sync, ctx);
         }
         let target = if self
             .draft
@@ -280,10 +304,17 @@ impl Panel {
                     Button::new()
                         .on_click(ctx.callback(move |_| {
                             Message::CommandReference(Action::ToolInstall(
-                                tool_install::Action::Open(target),
+                                tool_install::Action::Open(target, None),
                             ))
                         }))
                         .content("Install SSH tools"),
+                    Button::new()
+                        .on_click(ctx.callback(move |_| {
+                            Message::CommandReference(Action::Dotfiles(dotfiles::Action::Open(
+                                target,
+                            )))
+                        }))
+                        .content("Apply SSH dotfiles"),
                 )),
             ));
             if let Some(report) = tool_sync {
@@ -291,6 +322,14 @@ impl Panel {
                     "tool-login-sync",
                     TextBlock::new()
                         .text(tool_sync_summary(report))
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
+            if let Some(report) = dotfile_sync {
+                pieces.push(KeyedView::new(
+                    "dotfile-login-sync",
+                    TextBlock::new()
+                        .text(dotfiles::login_summary(report))
                         .text_wrapping(TextWrapping::Wrap),
                 ));
             }
@@ -355,6 +394,24 @@ impl Panel {
                 ),
             ]);
         }
+        if let (Some(target), Some(key), Some(_)) = (tool_pane, selected, page)
+            && matches!(key.platform, LINUX | COMMON)
+            && w11term::sftp::builtin_tool_names().contains(&key.name)
+        {
+            let name = key.name.clone();
+            let label = format!("Review installing {name}");
+            pieces.push(KeyedView::new(
+                "install-command",
+                Button::new()
+                    .on_click(ctx.callback(move |_| {
+                        Message::CommandReference(Action::ToolInstall(tool_install::Action::Open(
+                            target,
+                            Some(name.clone()),
+                        )))
+                    }))
+                    .content(label),
+            ));
+        }
         if let Some(Ok(installed)) = lookup.and_then(|lookup| lookup.result.as_ref()) {
             let command = match selected {
                 Some(key) if matches!(key.platform, LINUX | COMMON) => Some(key.name.as_str()),
@@ -366,6 +423,9 @@ impl Panel {
                 .iter()
                 .filter(|tool| Some(tool.name.as_str()) == command)
             {
+                let bundle = tool.bundle.clone();
+                let name = tool.name.clone();
+                let label = format!("Review removing {name} from {bundle}");
                 pieces.push(KeyedView::new(
                     format!("managed-launcher-{}", tool.bundle),
                     StackPanel::new().spacing(4.0).children((
@@ -374,6 +434,13 @@ impl Panel {
                             .text(&tool.path)
                             .text_wrapping(TextWrapping::Wrap)
                             .is_text_selection_enabled(true),
+                        Button::new()
+                            .on_click(ctx.callback(move |_| {
+                                Message::CommandReference(Action::ToolRemoval(
+                                    tool_removal::Action::Open(bundle.clone(), name.clone()),
+                                ))
+                            }))
+                            .content(label),
                     )),
                 ));
             }
@@ -634,6 +701,8 @@ impl TerminalApp {
         let tools = self.reference_tool_target();
         let tool_sync =
             tools.and_then(|(target, session)| session.events.tool_bundle_sync(target.generation));
+        let dotfile_sync =
+            tools.and_then(|(target, session)| session.events.dotfile_sync(target.generation));
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
             .keyed_children([
@@ -648,6 +717,7 @@ impl TerminalApp {
                             self.reference_origin(),
                             tools.map(|(target, _)| target),
                             tool_sync.as_deref(),
+                            dotfile_sync.as_deref(),
                             ctx,
                         )),
                 ),
@@ -682,7 +752,7 @@ impl TerminalApp {
 
     fn start_reference_load(&mut self, refresh: bool, ctx: &ComponentContext<Self>) {
         let panel = &mut self.command_reference;
-        if panel.loading || panel.private_page.is_some() || panel.tool_install.is_some() {
+        if panel.loading || panel.subpanel_open() {
             return;
         }
         panel.loading = true;
@@ -740,7 +810,7 @@ impl TerminalApp {
                     if scope.is_cancelled() || cancel.is_cancelled() {
                         return Err("Installed tools lookup cancelled".into());
                     }
-                    let value = run_pane_tool_job(
+                    let value = run_pane_sftp_job(
                         input,
                         target,
                         Operation::InstalledTools,
@@ -775,7 +845,7 @@ impl TerminalApp {
         let panel = &mut self.command_reference;
         match action {
             Action::Open | Action::Selection(_) => {
-                if panel.private_page.is_some() || panel.tool_install.is_some() {
+                if panel.subpanel_open() {
                     return;
                 }
                 let was_open = panel.open;
@@ -841,6 +911,8 @@ impl TerminalApp {
             Action::Refresh => self.start_reference_load(true, ctx),
             Action::Private(action) => panel.author_private_page(action, auto, ctx),
             Action::ToolInstall(action) => self.tool_install_action(action, ctx),
+            Action::ToolRemoval(action) => self.tool_removal_action(action, ctx),
+            Action::Dotfiles(action) => self.reference_dotfiles_action(action, ctx),
             Action::ListTools(target) => self.start_tool_lookup(target, ctx),
             Action::ListedTools(request, result) => {
                 if let Some(lookup) = &mut panel.tools

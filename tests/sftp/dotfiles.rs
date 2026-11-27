@@ -32,10 +32,17 @@ fn apply(prompt: &str, plan: &Value) -> Operation {
 }
 
 fn switch(id: Option<&str>, preview: Option<&Value>) -> Operation {
-    Operation::SwitchDotfiles {
-        target: id.map_or(DotfileTarget::Disabled, |id| DotfileTarget::Bundle {
+    dotfile_switch(
+        id.map_or(DotfileTarget::Disabled, |id| DotfileTarget::Bundle {
             sha256: id.into(),
         }),
+        preview,
+    )
+}
+
+fn dotfile_switch(target: DotfileTarget, preview: Option<&Value>) -> Operation {
+    Operation::SwitchDotfiles {
+        target,
         shell: DotfileShell::Bash,
         zdotdir: None,
         review: preview.map(|plan| plan["review"].as_str().unwrap().into()),
@@ -205,8 +212,16 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
     let managed = root.join(".config/w11term/dotfiles");
     let selector = managed.join("bash-current");
     let startup = root.join(".bashrc");
+    let history = || Operation::ListDotfileVersions {
+        shell: DotfileShell::Bash,
+    };
     fs::write(root.join("posix-rename-version"), "1").unwrap();
     fs::write(&startup, "# original Bash configuration\n").unwrap();
+    let empty = guarded_job(&pane, None, history()).await.unwrap();
+    assert_eq!(empty["home"], "/");
+    assert_eq!(empty["state"], "inactive");
+    assert_eq!(empty["versions"], json!([]));
+    assert!(!managed.exists());
     let preview = |prompt| Operation::PreviewDotfiles {
         bundle: manifest(prompt),
         shell: DotfileShell::Bash,
@@ -283,6 +298,17 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         fs::read_to_string(version.join("prompt.sh")).unwrap(),
         "PS1='first> '\n"
     );
+    fs::create_dir(managed.join(format!("zsh-{}", "a".repeat(64)))).unwrap();
+    fs::create_dir(managed.join("bash-unrelated")).unwrap();
+    fs::write(managed.join(format!("bash-{}", "a".repeat(64))), []).unwrap();
+    let listed = guarded_job(&pane, None, history()).await.unwrap();
+    assert_eq!(listed["state"], "active");
+    assert_eq!(listed["active_bundle_sha256"], new_id);
+    let versions = listed["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0]["bundle_sha256"], new_id);
+    assert_eq!(versions[1]["bundle_sha256"], id);
+
     let restore = guarded_job(&pane, None, switch(Some(id), None))
         .await
         .unwrap();
@@ -312,6 +338,10 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
     assert_eq!(disabled["changed"], true);
     assert!(disabled["bundle_sha256"].is_null());
     assert_eq!(fs::read_to_string(&selector).unwrap(), "disabled\n");
+    let listed = guarded_job(&pane, None, history()).await.unwrap();
+    assert_eq!(listed["state"], "disabled");
+    assert!(listed["active_bundle_sha256"].is_null());
+    assert_eq!(listed["versions"].as_array().unwrap().len(), 2);
     let error = guarded_job(&pane, None, switch(Some(id), Some(&restore)))
         .await
         .unwrap_err();
@@ -330,6 +360,10 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         fs::read_to_string(&selector).unwrap(),
         format!("{id}\nmanual\n")
     );
+    let listed = guarded_job(&pane, None, history()).await.unwrap();
+    assert_eq!(listed["state"], "paused");
+    assert_eq!(listed["active_bundle_sha256"], id);
+    assert_eq!(listed["versions"][0]["bundle_sha256"], id);
     let repeat = guarded_job(&pane, None, switch(Some(id), None))
         .await
         .unwrap();
@@ -337,6 +371,50 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         .await
         .unwrap();
     assert_eq!(repeated["changed"], false);
+
+    let resume = |plan: Option<&Value>| dotfile_switch(DotfileTarget::Automatic, plan);
+    let reviewed = guarded_job(&pane, None, resume(None)).await.unwrap();
+    assert_eq!(reviewed["target"]["kind"], "automatic");
+    assert_eq!(reviewed["active_bundle_sha256"], id);
+    assert_eq!(reviewed["bundle_sha256"], id);
+    assert_eq!(reviewed["selector"]["action"], "replace");
+    assert_eq!(
+        fs::read_to_string(&selector).unwrap(),
+        format!("{id}\nmanual\n")
+    );
+
+    fs::write(&selector, "disabled\n").unwrap();
+    let error = guarded_job(&pane, None, resume(Some(&reviewed)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    assert_eq!(fs::read_to_string(&selector).unwrap(), "disabled\n");
+    fs::write(&selector, format!("{id}\nmanual\n")).unwrap();
+
+    fs::write(&first_prompt, "PS1='edited> '\n").unwrap();
+    let error = guarded_job(&pane, None, resume(Some(&reviewed)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("do not match bundle"), "{error}");
+    assert_eq!(
+        fs::read_to_string(&selector).unwrap(),
+        format!("{id}\nmanual\n")
+    );
+    fs::write(&first_prompt, "PS1='first> '\n").unwrap();
+
+    let resumed = guarded_job(&pane, None, resume(Some(&reviewed)))
+        .await
+        .unwrap();
+    assert_eq!(resumed["target"]["kind"], "automatic");
+    assert_eq!(resumed["bundle_sha256"], id);
+    assert!(resumed["changed"].as_bool().unwrap());
+    assert_eq!(fs::read_to_string(&selector).unwrap(), format!("{id}\n"));
+    let listed = guarded_job(&pane, None, history()).await.unwrap();
+    assert_eq!(listed["state"], "active");
+    assert_eq!(listed["versions"][0]["bundle_sha256"], id);
+    let error = guarded_job(&pane, None, resume(None)).await.unwrap_err();
+    assert!(error.contains("Refresh dotfile versions"), "{error}");
+
     assert_eq!(fs::read_to_string(&startup).unwrap(), installed);
     assert_eq!(
         fs::read_to_string(&first_prompt).unwrap(),
@@ -376,7 +454,7 @@ async fn dotfiles_review_cannot_be_used_on_another_ssh_pane() {
     second_server.abort();
 }
 
-fn connect_options(source: Source, local: &std::path::Path) -> SshOptions {
+pub(super) fn connect_options(source: Source, local: &std::path::Path) -> SshOptions {
     let Source::Ssh(mut options) = source else {
         unreachable!()
     };
@@ -440,12 +518,16 @@ async fn login(options: &SshOptions, selector: &str, expected: &str) -> Session 
         .find(|e| e.kind == "dotfiles-sync")
         .unwrap();
     assert_eq!(sync.data["status"], expected, "{sync:?}");
+    let generation = pane.ssh_connection_generation().unwrap();
+    let report = pane.events.dotfile_sync(generation).unwrap();
+    assert_eq!(report.shell, DotfileShell::Bash);
+    assert_eq!(serde_json::to_value(&*report).unwrap(), sync.data);
     pane
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_sync_activates_before_the_shell_and_respects_manual_selections() {
-    let (source, remote, _, server) = fixture_connections(false, 7).await;
+    let (source, remote, _, server) = fixture_connections(false, 9).await;
     let root = remote.path();
     fs::write(root.join("posix-rename-version"), "1").unwrap();
     fs::write(root.join("dotfiles-shell-probe"), []).unwrap();
@@ -479,6 +561,13 @@ async fn profile_sync_activates_before_the_shell_and_respects_manual_selections(
         .unwrap();
     drop(pane);
     let pane = login(&options, &first, "held").await;
+    let resume = |plan: Option<&Value>| dotfile_switch(DotfileTarget::Automatic, plan);
+    let reviewed = guarded_job(&pane, None, resume(None)).await.unwrap();
+    guarded_job(&pane, None, resume(Some(&reviewed)))
+        .await
+        .unwrap();
+    drop(pane);
+    let pane = login(&options, &second, "updated").await;
     let disable = guarded_job(&pane, None, switch(None, None)).await.unwrap();
     guarded_job(&pane, None, switch(None, Some(&disable)))
         .await
@@ -486,24 +575,33 @@ async fn profile_sync_activates_before_the_shell_and_respects_manual_selections(
     drop(pane);
     fs::remove_file(&path).unwrap();
     let pane = login(&options, "disabled", "held").await;
-
-    write("second");
-    let preview = guarded_job(
+    let reviewed = guarded_job(&pane, None, resume(None)).await.unwrap();
+    assert!(reviewed["active_bundle_sha256"].is_null());
+    assert!(reviewed["bundle_sha256"].is_null());
+    let resumed = guarded_job(&pane, None, resume(Some(&reviewed)))
+        .await
+        .unwrap();
+    assert_eq!(resumed["changed"], true);
+    let listed = guarded_job(
         &pane,
         None,
-        Operation::PreviewDotfiles {
-            bundle: manifest("second"),
+        Operation::ListDotfileVersions {
             shell: DotfileShell::Bash,
-            zdotdir: None,
         },
     )
     .await
     .unwrap();
-    guarded_job(&pane, None, apply("second", &preview))
-        .await
-        .unwrap();
+    assert_eq!(listed["state"], "awaiting-sync");
+    assert!(listed["active_bundle_sha256"].is_null());
     drop(pane);
-    drop(login(&options, &second, "current").await);
+    drop(login(&options, "absent", "skipped").await);
+    assert_eq!(
+        fs::read_to_string(root.join(".config/w11term/dotfiles/bash-current")).unwrap(),
+        "automatic\n"
+    );
+
+    write("second");
+    drop(login(&options, &second, "updated").await);
     let active = root.join(".config/w11term/dotfiles");
     let prompt = active.join(format!("bash-{second}/prompt.sh"));
     fs::write(&prompt, "PS1='remote edit> '\n").unwrap();

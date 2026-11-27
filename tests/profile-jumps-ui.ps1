@@ -82,6 +82,10 @@ function Add-Jump($Peer, [switch]$CheckInvalidPort) {
     Set-Field 'Jump host user' $Peer.user
     Set-Field 'Jump host fingerprint' $Peer.host_key
     Select-JumpAuth 'None (keyless server)'
+    # The native combo selection changes before the editor reconciles its fields.
+    $null = Wait-Until 'keyless jump draft hides the agent pipe' {
+        !(Find-Element 'Jump host SSH agent pipe (optional)' $edit)
+    }
     if ($CheckInvalidPort) {
         Set-Field 'Jump host port' '0'
         Click 'Apply jump host'

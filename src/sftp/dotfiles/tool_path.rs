@@ -1,10 +1,13 @@
 use super::*;
 use crate::options::{ToolPath, ToolSync};
-use crate::sftp::utilities::{valid_bin_directory, with_lock};
+use crate::sftp::{
+    InstalledToolPath,
+    utilities::{managed_tool_store, valid_bin_directory, with_lock},
+};
 use std::ops::Range;
 
 struct PathPlan {
-    edits: [Edit; 2],
+    edits: Vec<Edit>,
     atomic: bool,
 }
 
@@ -12,7 +15,7 @@ impl PathPlan {
     fn check(&self) -> Result<()> {
         for edit in &self.edits {
             ensure!(
-                edit.after.is_some(),
+                edit.action == "unchanged" || edit.after.is_some(),
                 "Resolve the managed PATH conflict at {}",
                 edit.path
             );
@@ -43,8 +46,7 @@ fn path_hook(bin: &str) -> String {
 }
 
 fn managed_block(before: &str, hook: &str) -> Option<Range<usize>> {
-    let begin = hook.lines().next()?;
-    let end = hook.lines().last()?;
+    let [begin, end] = path_markers(hook);
     let mut offset = 0;
     let mut markers = before.split_inclusive('\n').filter_map(|line| {
         let start = offset;
@@ -59,9 +61,26 @@ fn managed_block(before: &str, hook: &str) -> Option<Range<usize>> {
     .then_some(start..finish + last.len())
 }
 
-fn plan_edit(path: String, original: Option<String>, hook: String, repair: bool) -> Edit {
+fn path_markers(hook: &str) -> [&str; 2] {
+    [
+        hook.lines().next().expect("generated opening marker"),
+        hook.lines().last().expect("generated closing marker"),
+    ]
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathEdit {
+    Sync,
+    Repair,
+    Remove,
+}
+
+fn plan_edit(path: String, original: Option<String>, hook: String, mode: PathEdit) -> Edit {
+    if mode == PathEdit::Remove {
+        return remove_path_hook(path, original, &hook);
+    }
     let mut edit = hook_change(path, original, hook);
-    if repair
+    if mode == PathEdit::Repair
         && edit.after.is_none()
         && let (Some(before), Some(hook)) = (&edit.before, &edit.hook)
         && let Some(range) = managed_block(before, hook)
@@ -77,13 +96,35 @@ fn plan_edit(path: String, original: Option<String>, hook: String, repair: bool)
     edit
 }
 
+fn remove_path_hook(path: String, original: Option<String>, hook: &str) -> Edit {
+    let Some(before) = original.as_deref() else {
+        return Edit::new(path, "unchanged", None, None);
+    };
+    let markers = path_markers(hook);
+    if !before.lines().any(|line| markers.contains(&line.trim())) {
+        return Edit::new(path, "unchanged", original.clone(), original);
+    }
+    let Some(range) = managed_block(before, hook) else {
+        return Edit::new(path, "hook-conflict", original, None);
+    };
+    let block = before[range.clone()].to_owned();
+    if block.replace("\r\n", "\n") != hook {
+        return Edit::new(path, "hook-conflict", original, None);
+    }
+    let mut after = before.to_owned();
+    after.replace_range(range, "");
+    let mut edit = Edit::new(path, "remove-hook", original, Some(after));
+    edit.replaced_hook = Some(block);
+    edit
+}
+
 impl Engine {
     async fn plan_tool_path(
         &self,
         home: &str,
         bin: &str,
         settings: &ToolPath,
-        repair: bool,
+        mode: PathEdit,
     ) -> Result<PathPlan> {
         validate_zdotdir(settings.shell, settings.zdotdir.as_deref())?;
         ensure!(
@@ -91,10 +132,24 @@ impl Engine {
             "Invalid approved tool bin directory"
         );
         let hook = path_hook(bin);
-        let edits = self
-            .startup_files(home, settings.shell, settings.zdotdir.as_deref())
-            .await?
-            .map(|(path, original)| plan_edit(path, original, hook.clone(), repair));
+        let files = if mode == PathEdit::Remove && settings.shell == DotfileShell::Bash {
+            // A higher-priority login file may have appeared since setup.
+            let mut files = Vec::with_capacity(4);
+            for name in BASH_LOGIN_FILES.into_iter().chain([".bashrc"]) {
+                let path = under_home(home, name);
+                let original = self.dotfile_text(&path).await?;
+                files.push((path, original));
+            }
+            files
+        } else {
+            self.startup_files(home, settings.shell, settings.zdotdir.as_deref())
+                .await?
+                .into()
+        };
+        let edits = files
+            .into_iter()
+            .map(|(path, original)| plan_edit(path, original, hook.clone(), mode))
+            .collect();
         Ok(PathPlan {
             edits,
             atomic: self.extension(editor::POSIX_RENAME, "1").is_ok(),
@@ -117,7 +172,9 @@ impl Engine {
         bin: &str,
         settings: &ToolPath,
     ) -> Result<bool> {
-        let plan = self.plan_tool_path(home, bin, settings, false).await?;
+        let plan = self
+            .plan_tool_path(home, bin, settings, PathEdit::Sync)
+            .await?;
         let mut stage = JobStage::Checking("Updating managed tool PATH");
         self.apply_tool_path(&plan, &mut stage).await
     }
@@ -138,46 +195,104 @@ impl Engine {
             home == settings.home,
             "SFTP home differs from the approved tool bundle home"
         );
+        let plan =
+            self.review_path_change(&home, &settings.bin_directory, path, None, review, stage);
+        if review.is_some() {
+            with_lock(session, &home, plan).await
+        } else {
+            plan.await
+        }
+    }
+
+    pub(in crate::sftp) async fn review_installed_tool_path(
+        &self,
+        session: &russh::client::Handle<crate::ssh::Handler>,
+        mut installed: InstalledToolPath,
+        review: Option<&str>,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
+        let home = self.dotfile_home().await?;
+        installed.bundle_sha256 = normalize_sha256(&installed.bundle_sha256)?;
+        let plan = async {
+            let bin = self
+                .installed_tool_bin_directory(
+                    &home,
+                    &installed.bundle,
+                    &installed.bundle_sha256,
+                    !installed.remove,
+                )
+                .await?;
+            self.review_path_change(
+                &home,
+                &bin,
+                &installed.path,
+                Some(&installed),
+                review,
+                stage,
+            )
+            .await
+        };
+        if review.is_some() {
+            let store = managed_tool_store(&home, &installed.bundle)?;
+            self.check_entry_parent(&store).await?;
+            with_lock(session, &store, with_lock(session, &home, plan)).await
+        } else {
+            plan.await
+        }
+    }
+
+    async fn review_path_change(
+        &self,
+        home: &str,
+        bin: &str,
+        path: &ToolPath,
+        installed: Option<&InstalledToolPath>,
+        review: Option<&str>,
+        stage: &mut JobStage,
+    ) -> Result<Value> {
         ensure!(
             !home.contains(':'),
             "The account home contains a PATH separator"
         );
-
-        let review_plan = async {
-            let plan = self
-                .plan_tool_path(&home, &settings.bin_directory, path, true)
-                .await?;
-            let block = plan.check().err().map(|error| error.to_string());
-            let ready = block.is_none() && plan.changed().next().is_some();
-            let mut report = json!({
-                "operation": "tool-path",
-                "home": home,
-                "bin_directory": settings.bin_directory,
-                "shell": path.shell,
-                "files": plan.edits.iter().map(Edit::report).collect::<Vec<_>>(),
-                "blocked": block,
-                "ready": ready,
-            });
-            if let Some(review) = review {
-                ensure!(
-                    self.dotfiles_review(&report)? == normalize_sha256(review)?,
-                    "The tool PATH review is stale or belongs to another SFTP connection. Review again."
-                );
-                plan.check()?;
-                ensure!(ready, "The tool PATH is already current");
-                let changed = self.apply_tool_path(&plan, stage).await?;
-                Ok(json!({ "changed": changed }))
-            } else {
-                if ready {
-                    report["review"] = json!(self.dotfiles_review(&report)?);
-                }
-                Ok(report)
-            }
-        };
-        if review.is_some() {
-            with_lock(session, &home, review_plan).await
+        let remove = installed.is_some_and(|target| target.remove);
+        let mode = if remove {
+            PathEdit::Remove
         } else {
-            review_plan.await
+            PathEdit::Repair
+        };
+        let plan = self.plan_tool_path(home, bin, path, mode).await?;
+        let block = plan.check().err().map(|error| error.to_string());
+        let ready = block.is_none() && plan.changed().next().is_some();
+        let mut report = json!({
+            "operation": "tool-path",
+            "home": home,
+            "bin_directory": bin,
+            "shell": path.shell,
+            "files": plan.edits.iter().map(Edit::report).collect::<Vec<_>>(),
+            "blocked": block,
+            "ready": ready,
+        });
+        if let Some(target) = installed {
+            report["bundle"] = json!(target.bundle);
+            report["bundle_sha256"] = json!(target.bundle_sha256);
+            if remove {
+                report["remove"] = json!(true);
+            }
+        }
+        if let Some(review) = review {
+            ensure!(
+                self.dotfiles_review(&report)? == normalize_sha256(review)?,
+                "The tool PATH review is stale or belongs to another SFTP connection. Review again."
+            );
+            plan.check()?;
+            ensure!(ready, "The tool PATH is already current");
+            let changed = self.apply_tool_path(&plan, stage).await?;
+            Ok(json!({ "changed": changed }))
+        } else {
+            if ready {
+                report["review"] = json!(self.dotfiles_review(&report)?);
+            }
+            Ok(report)
         }
     }
 }

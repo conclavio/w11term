@@ -27,14 +27,21 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   sha256 PATH [--max-bytes N]\n\
   preview-tool-bundle BUNDLE.json\n\
   apply-tool-bundle BUNDLE.json --review TOKEN\n\
+  preview-tool-bundle-add BUNDLE.json\n\
+  add-to-tool-bundle BUNDLE.json --review TOKEN\n\
+  preview-tool-bundle-remove NAME TOOL\n\
+  remove-from-tool-bundle NAME TOOL --review TOKEN\n\
   preview-tool-bundle-rollback NAME SHA256\n\
   rollback-tool-bundle NAME SHA256 --review TOKEN\n\
   preview-tool-bundle-resume NAME SHA256\n\
   resume-tool-bundle-updates NAME SHA256 --review TOKEN\n\
+  preview-tool-bundle-pause NAME SHA256\n\
+  pause-tool-bundle-updates NAME SHA256 --review TOKEN\n\
   preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
-  preview-dotfiles-switch SHA256|disabled --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
-  switch-dotfiles SHA256|disabled --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  list-dotfile-versions --shell bash|zsh\n\
+  preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
+  switch-dotfiles SHA256|disabled|automatic --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
   rename FROM TO | hardlink FROM TO | symlink TARGET LINK [--spec-order]\n\
@@ -54,6 +61,14 @@ Transfers stream through the GUI's existing SSH connection. Folder transfers req
 destination. Single files can be replaced with --overwrite. Uploads can leave a partial remote\n\
 file or folder after interruption. Handles are pane-local\n\
 and expire after five idle minutes, timeout, or disconnect. Replies contain result.sftp.";
+
+fn dotfile_shell(value: Option<&str>) -> Result<DotfileShell> {
+    match value {
+        Some("bash") => Ok(DotfileShell::Bash),
+        Some("zsh") => Ok(DotfileShell::Zsh),
+        _ => bail!("--shell requires bash or zsh"),
+    }
+}
 
 pub fn parse(
     args: impl Iterator<Item = String>,
@@ -318,25 +333,44 @@ pub fn parse(
                 fields.insert("max_bytes".into(), json!(limit.parse::<u64>()?));
             }
         }
-        "preview-tool-bundle" | "apply-tool-bundle" => {
-            if command == "apply-tool-bundle" {
+        "preview-tool-bundle"
+        | "apply-tool-bundle"
+        | "preview-tool-bundle-add"
+        | "add-to-tool-bundle" => {
+            if matches!(command.as_str(), "apply-tool-bundle" | "add-to-tool-bundle") {
                 let token = opts
                     .remove("--review")
                     .context("Preview the tool bundle and supply --review")?;
                 fields.insert("review".into(), json!(normalize_sha256(&token)?));
+            }
+            if command == "preview-tool-bundle-add" {
+                fields.insert("op".into(), json!("add-to-tool-bundle"));
             }
             let manifest = path()?;
             let bundle = UtilityBundle::load(std::path::Path::new(&manifest))
                 .with_context(|| format!("Opening the tool bundle {manifest}"))?;
             fields.insert("bundle".into(), json!(bundle));
         }
+        "preview-tool-bundle-remove" | "remove-from-tool-bundle" => {
+            if command == "remove-from-tool-bundle" {
+                let token = opts
+                    .remove("--review")
+                    .context("Preview the tool removal and supply --review")?;
+                fields.insert("review".into(), json!(normalize_sha256(&token)?));
+            }
+            fields.insert("op".into(), json!("remove-from-tool-bundle"));
+            fields.insert("name".into(), json!(path()?));
+            fields.insert("tool".into(), json!(path()?));
+        }
         "preview-tool-bundle-rollback"
         | "rollback-tool-bundle"
         | "preview-tool-bundle-resume"
-        | "resume-tool-bundle-updates" => {
+        | "resume-tool-bundle-updates"
+        | "preview-tool-bundle-pause"
+        | "pause-tool-bundle-updates" => {
             if matches!(
                 command.as_str(),
-                "rollback-tool-bundle" | "resume-tool-bundle-updates"
+                "rollback-tool-bundle" | "resume-tool-bundle-updates" | "pause-tool-bundle-updates"
             ) {
                 let token = opts
                     .remove("--review")
@@ -347,18 +381,23 @@ pub fn parse(
                 "preview-tool-bundle-resume" | "resume-tool-bundle-updates" => {
                     "resume-tool-bundle-updates"
                 }
+                "preview-tool-bundle-pause" | "pause-tool-bundle-updates" => {
+                    "pause-tool-bundle-updates"
+                }
                 _ => "rollback-tool-bundle",
             };
             fields.insert("op".into(), json!(op));
             fields.insert("name".into(), json!(path()?));
             fields.insert("bundle_sha256".into(), json!(normalize_sha256(&path()?)?));
         }
+        "list-dotfile-versions" => {
+            fields.insert(
+                "shell".into(),
+                json!(dotfile_shell(opts.remove("--shell").as_deref())?),
+            );
+        }
         "preview-dotfiles" | "apply-dotfiles" | "preview-dotfiles-switch" | "switch-dotfiles" => {
-            let shell = match opts.remove("--shell").as_deref() {
-                Some("bash") => DotfileShell::Bash,
-                Some("zsh") => DotfileShell::Zsh,
-                _ => bail!("--shell requires bash or zsh"),
-            };
+            let shell = dotfile_shell(opts.remove("--shell").as_deref())?;
             let zdotdir = opts.remove("--zdotdir");
             validate_zdotdir(shell, zdotdir.as_deref())?;
             if matches!(command.as_str(), "apply-dotfiles" | "switch-dotfiles") {
@@ -374,12 +413,12 @@ pub fn parse(
                 "preview-dotfiles-switch" | "switch-dotfiles"
             ) {
                 let value = path()?;
-                let target = if value == "disabled" {
-                    DotfileTarget::Disabled
-                } else {
-                    DotfileTarget::Bundle {
+                let target = match value.as_str() {
+                    "disabled" => DotfileTarget::Disabled,
+                    "automatic" => DotfileTarget::Automatic,
+                    _ => DotfileTarget::Bundle {
                         sha256: normalize_sha256(&value)?,
-                    }
+                    },
                 };
                 fields.insert("op".into(), json!("switch-dotfiles"));
                 fields.insert("target".into(), json!(target));
@@ -524,6 +563,36 @@ mod tests {
         };
         assert_eq!(bundle.bin_directory, ".local/bin");
         assert_eq!(bundle.tools[0].builds[0].path, local.path().join("bins/rg"));
+
+        let path = manifest.to_str().unwrap();
+        let (_, adding) = p(&["--pane", "7", "preview-tool-bundle-add", path]).unwrap();
+        assert!(matches!(
+            adding,
+            Request::Sftp {
+                pane: 7,
+                operation: Operation::AddToToolBundle { review: None, .. },
+                ..
+            }
+        ));
+        let token = "b".repeat(64);
+        assert!(p(&["--pane", "7", "add-to-tool-bundle", path]).is_err());
+        let (_, adding) = p(&[
+            "--pane",
+            "7",
+            "add-to-tool-bundle",
+            path,
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(
+            adding,
+            Request::Sftp {
+                pane: 7,
+                operation: Operation::AddToToolBundle { review: Some(review), .. },
+                ..
+            } if review == token
+        ));
     }
 
     #[test]
@@ -556,6 +625,40 @@ mod tests {
         assert!(matches!(request, Request::Sftp {
             pane: 9, operation: Operation::RollbackToolBundle { review: Some(review), bundle_sha256, .. }, ..
         } if review == token && bundle_sha256 == version));
+    }
+
+    #[test]
+    fn removing_a_tool_requires_a_review_for_one_bundle_and_command() {
+        let (_, preview) =
+            p(&["--pane", "9", "preview-tool-bundle-remove", "fleet", "rg"]).unwrap();
+        assert!(matches!(
+            preview,
+            Request::Sftp {
+                pane: 9,
+                operation: Operation::RemoveFromToolBundle { name, tool, review: None },
+                ..
+            } if name == "fleet" && tool == "rg"
+        ));
+        assert!(p(&["--pane", "9", "remove-from-tool-bundle", "fleet", "rg"]).is_err());
+        let token = "b".repeat(64);
+        let (_, apply) = p(&[
+            "--pane",
+            "9",
+            "remove-from-tool-bundle",
+            "fleet",
+            "rg",
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(
+            apply,
+            Request::Sftp {
+                pane: 9,
+                operation: Operation::RemoveFromToolBundle { name, tool, review: Some(review) },
+                ..
+            } if name == "fleet" && tool == "rg" && review == token
+        ));
     }
 
     #[test]
@@ -595,6 +698,48 @@ mod tests {
         .unwrap();
         assert!(matches!(apply, Request::Sftp {
             pane: 9, operation: Operation::ResumeToolBundleUpdates { bundle_sha256, review: Some(review), .. }, ..
+        } if bundle_sha256 == version && review == token));
+    }
+
+    #[test]
+    fn pausing_tool_updates_requires_a_review_for_one_release() {
+        let version = "a".repeat(64);
+        let token = "b".repeat(64);
+        assert!(
+            p(&[
+                "--pane",
+                "9",
+                "pause-tool-bundle-updates",
+                "fleet",
+                &version
+            ])
+            .is_err()
+        );
+        let (_, preview) = p(&[
+            "--pane",
+            "9",
+            "preview-tool-bundle-pause",
+            "fleet",
+            &version,
+        ])
+        .unwrap();
+        assert!(matches!(preview, Request::Sftp {
+            pane: 9,
+            operation: Operation::PauseToolBundleUpdates { name, bundle_sha256, review: None }, ..
+        } if name == "fleet" && bundle_sha256 == version));
+        let (_, apply) = p(&[
+            "--pane",
+            "9",
+            "pause-tool-bundle-updates",
+            "fleet",
+            &version,
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(apply, Request::Sftp {
+            pane: 9,
+            operation: Operation::PauseToolBundleUpdates { bundle_sha256, review: Some(review), .. }, ..
         } if bundle_sha256 == version && review == token));
     }
 
@@ -667,7 +812,24 @@ mod tests {
     }
 
     #[test]
-    fn switches_dotfiles_only_with_a_reviewed_bundle_or_disable_request() {
+    fn lists_retained_dotfiles_by_shell() {
+        let (_, list) = p(&["--pane", "2", "list-dotfile-versions", "--shell", "zsh"]).unwrap();
+        assert!(matches!(
+            list,
+            Request::Sftp {
+                pane: 2,
+                operation: Operation::ListDotfileVersions {
+                    shell: DotfileShell::Zsh
+                },
+                ..
+            }
+        ));
+        assert!(p(&["--pane", "2", "list-dotfile-versions"]).is_err());
+        assert!(p(&["--pane", "2", "list-dotfile-versions", "--shell", "fish"]).is_err());
+    }
+
+    #[test]
+    fn switches_dotfiles_only_with_a_reviewed_target() {
         let id = "a".repeat(64);
         let token = "b".repeat(64);
         let (_, preview) = p(&[
@@ -709,6 +871,28 @@ mod tests {
                 },
                 ..
             } if review == token
+        ));
+        let (_, resume) = p(&[
+            "--pane",
+            "2",
+            "preview-dotfiles-switch",
+            "automatic",
+            "--shell",
+            "bash",
+        ])
+        .unwrap();
+        assert!(matches!(
+            resume,
+            Request::Sftp {
+                pane: 2,
+                operation: Operation::SwitchDotfiles {
+                    target: DotfileTarget::Automatic,
+                    shell: DotfileShell::Bash,
+                    review: None,
+                    ..
+                },
+                ..
+            }
         ));
         assert!(
             p(&[

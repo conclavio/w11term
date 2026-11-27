@@ -2768,16 +2768,193 @@ async fn native_timed_replay_preserves_ssh_frames_geometry_and_pixels() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "shows the approved dotfiles login result for the pane's current SSH connection"]
+async fn native_command_reference_reports_the_current_dotfile_login_sync() {
+    let (source, remote, _, server) = fixture_connections(false, 2).await;
+    fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
+    fs::write(remote.path().join("disconnect-on-eot"), []).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut ssh = super::dotfiles::connect_options(source, state.path());
+    ssh.player.reconnect = true;
+    let bundle = &ssh.dotfiles.as_ref().unwrap().bundle;
+    fs::write(bundle, br#"{"version":1,"bash":"export EDITOR=vi"}"#).unwrap();
+
+    drive_mixed_gui("ssh-dotfile-login-status-ui.ps1", &ssh, state.path());
+
+    let selector = remote.path().join(".config/w11term/dotfiles/bash-current");
+    let active = fs::read_to_string(selector).unwrap();
+    let id = active.strip_suffix('\n').unwrap();
+    assert_eq!(id.len(), 64);
+    assert_eq!(
+        fs::read_to_string(
+            remote
+                .path()
+                .join(format!(".config/w11term/dotfiles/bash-{id}/prompt.sh"))
+        )
+        .unwrap(),
+        "export EDITOR=vi\n"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews and applies shell dotfiles on a connected SSH pane"]
+async fn native_command_reference_applies_reviewed_ssh_dotfiles() {
+    let (source, remote, _, server) = fixture_server(false).await;
+    let Source::Ssh(ssh) = source else {
+        unreachable!();
+    };
+    fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
+    fs::write(
+        remote.path().join(".bashrc"),
+        "# keep my local shell settings\n",
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::write(
+        state.path().join("dotfiles-remote-folder"),
+        remote.path().to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("ssh-dotfiles-review-ui.ps1", &ssh, state.path());
+
+    let store = remote.path().join(".config/w11term/dotfiles");
+    let active = fs::read_to_string(store.join("bash-current")).unwrap();
+    let id = active.strip_suffix('\n').unwrap();
+    assert_eq!(id.len(), 64);
+    let version = store.join(format!("bash-{id}"));
+    assert_eq!(
+        fs::read_to_string(version.join("environment.sh")).unwrap(),
+        "export EDITOR=vi\n"
+    );
+    assert_eq!(
+        fs::read_to_string(version.join("prompt.sh")).unwrap(),
+        "PS1='verified> '\n"
+    );
+    let shell = fs::read_to_string(remote.path().join(".bashrc")).unwrap();
+    assert!(shell.starts_with("# keep my local shell settings\n"));
+    assert!(shell.contains("bash-current"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "reviews a pinned command on the active SSH pane and repairs its missing launcher"]
+async fn native_command_reference_installs_a_selected_catalog_tool() {
+    use w11term::sftp::{UtilityArchitecture, builtin_tool_bundle};
+
+    let (Source::Ssh(ssh), remote, _, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let pane = Session::start(Source::Ssh(ssh.clone()));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pane.ssh_connection_generation().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let root = remote.path();
+    let id = super::utilities::seed_catalog_tool_for_reference(&pane, state.path(), root).await;
+    drop(pane);
+    let startup = root.join(".bashrc");
+    fs::write(&startup, "# keep the user's startup files\n").unwrap();
+    let login = root.join(".profile");
+    let bin = root.join(".local/bin");
+    fs::remove_file(bin.join("rg")).unwrap();
+    let conflict = bin.join("jq");
+    fs::write(&conflict, "operator-owned command").unwrap();
+    let mut catalog = builtin_tool_bundle("jq").unwrap();
+    let pin = catalog
+        .tools
+        .remove(0)
+        .builds
+        .into_iter()
+        .find(|build| build.architecture == UtilityArchitecture::X86_64)
+        .unwrap()
+        .sha256;
+    fs::write(
+        state.path().join("catalog-tool-fixture.json"),
+        serde_json::to_vec(&json!({
+            "conflict": conflict, "pin": pin, "startup": startup, "login": login,
+            "probe": root.join("utility-probe-response"),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let store = root.join(format!(".local/share/w11term/tools/{}", catalog.name));
+    let original = fs::read(store.join("versions").join(&id).join("rg")).unwrap();
+    drive_mixed_gui("install-command-tool-ui.ps1", &ssh, state.path());
+    let profiles: Value =
+        serde_json::from_slice(&fs::read(state.path().join("profiles.json")).unwrap()).unwrap();
+    assert!(profiles["profiles"]["palette-ssh"]["tool_bundle"].is_null());
+    let launcher = fs::read_to_string(bin.join("rg")).unwrap();
+    assert!(launcher.ends_with("/linux-essentials/current/rg\n"));
+    assert_eq!(
+        fs::read_to_string(&startup).unwrap(),
+        "# keep the user's startup files\n# added after setup\n"
+    );
+    assert_eq!(fs::read_to_string(&login).unwrap(), "");
+    let selector = fs::read_to_string(store.join("current")).unwrap();
+    let version = selector.lines().nth(1).unwrap();
+    if std::env::var("W11TERM_TEST_LIVE_CATALOG_DOWNLOAD").as_deref() == Ok("1") {
+        assert!(version.starts_with("./versions/"));
+        let active = store.join(version);
+        assert_eq!(fs::read(active.join("rg")).unwrap(), original);
+        assert_eq!(
+            super::utilities::tool_sha256(&fs::read(active.join("jq")).unwrap()),
+            pin
+        );
+        assert!(
+            fs::read_to_string(&conflict)
+                .unwrap()
+                .ends_with("/linux-essentials/current/jq\n")
+        );
+    } else {
+        assert_eq!(version, format!("versions/{id}"));
+        assert!(!conflict.exists());
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "looks up offline TLDR and installed SSH tool pages and inserts an edited example without submitting it"]
 async fn native_command_reference_follows_powershell_and_ssh() {
     let transports = Arc::new(AtomicUsize::new(0));
-    let (source, remote, _, server) = fixture_counting_accepts(false, 2, transports.clone()).await;
+    let (source, remote, _, server) = fixture_counting_accepts(false, 3, transports.clone()).await;
     let trace = remote.path().join("keyboard-input.bin");
     fs::write(&trace, []).unwrap();
     let state = tempfile::tempdir().unwrap();
     fs::write(state.path().join("ssh-wire"), trace.to_str().unwrap()).unwrap();
+    fs::write(remote.path().join("utility-shell-probe"), []).unwrap();
     let ssh = super::utilities::reference_tool_profile(source, state.path(), remote.path());
     drive_mixed_gui("command-reference-ui.ps1", &ssh, state.path());
+    let snapshots = fs::read_dir(state.path().join("tool-bundle-snapshots"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let [snapshot] = snapshots.as_slice() else {
+        panic!("expected one saved tool bundle");
+    };
+    let saved = w11term::sftp::UtilityBundle::load(&snapshot.path().join("bundle.json")).unwrap();
+    let original = w11term::sftp::UtilityBundle::load(&state.path().join("fleet.json")).unwrap();
+    assert_eq!(saved.name, original.name);
+    assert_eq!(saved.bin_directory, original.bin_directory);
+    assert_eq!(saved.tools.len(), original.tools.len());
+    for tool in original.tools {
+        let pin = &saved
+            .tools
+            .iter()
+            .find(|saved| saved.name == tool.name)
+            .unwrap()
+            .builds[0];
+        assert_eq!(pin.sha256, tool.builds[0].sha256);
+        assert_eq!(
+            fs::read(&pin.path).unwrap(),
+            fs::read(&tool.builds[0].path).unwrap()
+        );
+    }
     let shell = fs::read_to_string(remote.path().join(".bashrc")).unwrap();
     assert!(shell.starts_with("# preserve my shell changes\n"));
     assert!(shell.ends_with("# trailing user settings\n"));
@@ -2788,8 +2965,21 @@ async fn native_command_reference_follows_powershell_and_ssh() {
             .unwrap()
             .ends_with("/portable/current/netwatch\n")
     );
+    let store = remote.path().join(".local/share/w11term/tools/portable");
+    let current = fs::read_to_string(store.join("current")).unwrap();
+    let selected = store.join(current.lines().nth(1).unwrap());
+    assert!(!selected.join("mdd").exists());
+    assert_eq!(
+        fs::read(selected.join("rg")).unwrap(),
+        fs::read(state.path().join("rg")).unwrap()
+    );
+    assert!(remote.path().join(".local/bin/mdd").exists());
     assert_eq!(fs::read(trace).unwrap(), b"ip address");
-    assert_eq!(transports.load(Ordering::Relaxed), 1, "SSH TCP connections");
+    assert_eq!(
+        transports.load(Ordering::Relaxed),
+        3,
+        "original shell and separate logins before and after removing a tool"
+    );
     server.abort();
 }
 

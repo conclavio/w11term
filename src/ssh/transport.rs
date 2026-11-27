@@ -8,8 +8,8 @@ use super::{
 };
 use crate::{
     events::{
-        AttemptGuard, Events, RetryWait, SshAttemptOutcome, ToolBundleSyncReport,
-        ToolBundleSyncStatus,
+        AttemptGuard, DotfileSyncReport, DotfileSyncStatus, Events, RetryWait, SshAttemptOutcome,
+        ToolBundleSyncReport, ToolBundleSyncStatus,
     },
     options::{AgentFingerprint, AgentPipe, Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
@@ -1626,46 +1626,59 @@ async fn run_channel(
             .close_game_session_on_drop(shell.link.as_ref().clone());
     }
     let mut login_notices = Vec::new();
-    let sync_allowed = !managed && sharing.startup.is_none() && !options.player.rustmush;
-    if sync_allowed && let Some(settings) = options.dotfiles.clone() {
-        output
-            .send(Event::Status("Checking SSH dotfiles".into()))
-            .await?;
-        let sync = tokio::time::timeout(Duration::from_secs(10), async {
-            anyhow::ensure!(
-                settings.approves(shell.link.verified_endpoint()),
-                "The profile's dotfiles approval does not match the verified SSH account"
-            );
-            let _guard = shell.link.lock_dotfiles_sync().await;
-            crate::sftp::sync_login_dotfiles(&shell.link.handle(), &settings).await
-        });
-        let Some(result) = wait_login_sync(sync, input, size, options).await else {
-            return Ok(());
-        };
-        match result {
-            Ok(Ok(status)) => {
-                events.push(
-                    "dotfiles-sync",
-                    serde_json::json!({"generation": generation, "status": status}),
+    let alternate_startup = if managed {
+        Some("This durable SSH session uses its own shell startup.")
+    } else if sharing.startup.is_some() {
+        Some("This workspace runs a startup command in place of the login shell.")
+    } else if options.player.rustmush {
+        Some("This game profile uses its own shell startup.")
+    } else {
+        None
+    };
+    let sync_allowed = alternate_startup.is_none();
+    if let Some(settings) = options.dotfiles.clone() {
+        let (status, detail) = if let Some(reason) = alternate_startup {
+            (DotfileSyncStatus::NotRun, Some(reason.into()))
+        } else {
+            output
+                .send(Event::Status("Checking SSH dotfiles".into()))
+                .await?;
+            let sync = tokio::time::timeout(Duration::from_secs(10), async {
+                ensure!(
+                    settings.approves(shell.link.verified_endpoint()),
+                    "The profile's dotfiles approval does not match the verified SSH account"
                 );
-                if status == "held" {
-                    login_notices.push("Dotfiles sync paused by manual selection".into());
+                let _guard = shell.link.lock_dotfiles_sync().await;
+                crate::sftp::sync_login_dotfiles(&shell.link.handle(), &settings).await
+            });
+            let Some(result) = wait_login_sync(sync, input, size, options).await else {
+                return Ok(());
+            };
+            match result {
+                Ok(Ok(status)) => {
+                    if status == DotfileSyncStatus::Held {
+                        login_notices.push("Dotfiles sync paused by manual selection".into());
+                    }
+                    (status, None)
+                }
+                Ok(Err(error)) => {
+                    let detail = login_sync_detail(&error);
+                    login_notices.push(format!("Dotfiles sync skipped: {detail}"));
+                    (DotfileSyncStatus::Skipped, Some(detail))
+                }
+                Err(_) => {
+                    let detail = "Dotfiles sync reached its 10-second deadline. Preview to check the active bundle.";
+                    login_notices.push(detail.into());
+                    (DotfileSyncStatus::Unconfirmed, Some(detail.into()))
                 }
             }
-            Ok(Err(error)) => {
-                let detail = login_sync_detail(&error);
-                events.push("dotfiles-sync", serde_json::json!({"generation": generation, "status": "skipped", "detail": detail}));
-                login_notices.push(format!("Dotfiles sync skipped: {detail}"));
-            }
-            Err(_) => {
-                let detail = "Dotfiles sync reached its 10-second deadline. Preview to check the active bundle.";
-                events.push(
-                    "dotfiles-sync",
-                    serde_json::json!({"generation": generation, "status": "unconfirmed", "detail": detail}),
-                );
-                login_notices.push(detail.into());
-            }
-        }
+        };
+        events.record_dotfile_sync(DotfileSyncReport {
+            generation,
+            shell: settings.shell,
+            status,
+            detail,
+        });
     }
     if sync_allowed && let Some(settings) = options.tool_bundle.clone() {
         output
@@ -1699,7 +1712,7 @@ async fn run_channel(
                     login_notices.push(format!("Tool PATH skipped: {detail}"));
                     report.detail = Some(detail);
                 } else if result.status == ToolBundleSyncStatus::Held {
-                    login_notices.push("Tool bundle sync paused by rollback".into());
+                    login_notices.push("Tool bundle sync paused by a manual change".into());
                 }
             }
             Ok(Err(error)) => {
@@ -1715,14 +1728,7 @@ async fn run_channel(
             }
         }
         events.record_tool_bundle_sync(report);
-    } else if let Some(settings) = &options.tool_bundle {
-        let detail = if managed {
-            "This durable SSH session uses its own shell startup."
-        } else if sharing.startup.is_some() {
-            "This workspace runs a startup command in place of the login shell."
-        } else {
-            "This game profile uses its own shell startup."
-        };
+    } else if let (Some(detail), Some(settings)) = (alternate_startup, &options.tool_bundle) {
         events.record_tool_bundle_sync(ToolBundleSyncReport {
             generation,
             bundle: crate::events::display_field(&settings.name),

@@ -31,14 +31,16 @@ mod dotfiles;
 mod utilities;
 pub(crate) use dotfiles::sync_login_dotfiles;
 pub use dotfiles::{
-    DotfileBundle, DotfileShell, DotfileTarget, validate_dotfiles_home, validate_zdotdir,
+    DotfileBundle, DotfileShell, DotfileTarget, DotfileVersionState, DotfileVersions,
+    RetainedDotfileVersion, validate_dotfiles_home, validate_zdotdir,
 };
 pub(crate) use utilities::sync_login_tools;
 pub use utilities::{
     InstalledTool, InstalledTools, LocalUtilityBundle, LocalUtilityExecutable, RetainedToolVersion,
     ToolBundlePreset, ToolBundleVersions, UtilityArchitecture, UtilityBuild, UtilityBundle,
-    UtilityDownload, UtilityTool, builtin_tool_names, export_builtin_tool_bundle,
-    fetch_tool_bundle, prepare_builtin_tool_bundle,
+    UtilityDownload, UtilityTool, builtin_tool_bundle, builtin_tool_names,
+    export_builtin_tool_bundle, fetch_tool_bundle, fetch_tool_bundle_cancellable,
+    prepare_builtin_tool_bundle,
 };
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
@@ -279,6 +281,14 @@ pub enum CopyDestination {
     },
 }
 
+#[derive(Debug)]
+pub struct InstalledToolPath {
+    pub bundle: String,
+    pub bundle_sha256: String,
+    pub path: crate::options::ToolPath,
+    pub remove: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Operation {
@@ -286,7 +296,18 @@ pub enum Operation {
     InstalledTools,
     ToolBundleVersions,
     #[serde(skip)]
+    SaveInstalledToolBundle {
+        name: String,
+        bundle_sha256: String,
+        directory: PathBuf,
+    },
+    #[serde(skip)]
     ReviewToolPath {
+        review: Option<String>,
+    },
+    #[serde(skip)]
+    ReviewInstalledToolPath {
+        installed: InstalledToolPath,
         review: Option<String>,
     },
     PreviewToolBundle {
@@ -295,6 +316,16 @@ pub enum Operation {
     ApplyToolBundle {
         bundle: UtilityBundle,
         review: String,
+    },
+    AddToToolBundle {
+        bundle: UtilityBundle,
+        review: Option<String>,
+    },
+    RemoveFromToolBundle {
+        name: String,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
     },
     RollbackToolBundle {
         name: String,
@@ -308,11 +339,20 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         review: Option<String>,
     },
+    PauseToolBundleUpdates {
+        name: String,
+        bundle_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
     PreviewDotfiles {
         bundle: DotfileBundle,
         shell: DotfileShell,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zdotdir: Option<String>,
+    },
+    ListDotfileVersions {
+        shell: DotfileShell,
     },
     ApplyDotfiles {
         bundle: DotfileBundle,
@@ -865,8 +905,11 @@ pub(crate) async fn run(
         } = job;
         if expected_generation.is_none() {
             let missing = match operation {
-                Operation::ReviewToolPath { .. } => {
+                Operation::ReviewToolPath { .. } | Operation::ReviewInstalledToolPath { .. } => {
                     Some("The PATH review needs its original SSH connection")
+                }
+                Operation::SaveInstalledToolBundle { .. } => {
+                    Some("Saving the tool bundle needs its original SSH connection")
                 }
                 Operation::SaveText { .. } => Some("The editor needs its original SSH connection"),
                 Operation::RenameEntry { .. } | Operation::CheckRenameBatch { .. } => {
@@ -1034,7 +1077,12 @@ pub(crate) async fn run(
                 Operation::PreviewDotfiles { .. } => {
                     JobStage::Checking("Dotfiles preview did not finish")
                 }
-                Operation::PreviewToolBundle { .. } => {
+                Operation::ListDotfileVersions { .. } => {
+                    JobStage::Checking("Dotfiles history lookup did not finish")
+                }
+                Operation::PreviewToolBundle { .. }
+                | Operation::AddToToolBundle { review: None, .. }
+                | Operation::RemoveFromToolBundle { review: None, .. } => {
                     JobStage::Checking("Tool bundle preview did not finish")
                 }
                 Operation::InstalledTools => {
@@ -1043,11 +1091,19 @@ pub(crate) async fn run(
                 Operation::ToolBundleVersions => {
                     JobStage::Checking("Tool history lookup did not finish")
                 }
-                Operation::ReviewToolPath { .. } => JobStage::Checking(
-                    "Tool PATH review did not finish. Review the startup files again.",
-                ),
+                Operation::SaveInstalledToolBundle { .. } => {
+                    JobStage::Checking("Saving the installed tool bundle did not finish")
+                }
+                Operation::ReviewToolPath { .. } | Operation::ReviewInstalledToolPath { .. } => {
+                    JobStage::Checking(
+                        "Tool PATH review did not finish. Review the startup files again.",
+                    )
+                }
                 Operation::ApplyToolBundle { .. }
+                | Operation::AddToToolBundle { .. }
+                | Operation::RemoveFromToolBundle { .. }
                 | Operation::RollbackToolBundle { .. }
+                | Operation::PauseToolBundleUpdates { .. }
                 | Operation::ResumeToolBundleUpdates { .. } => {
                     JobStage::Checking("Tool bundle review did not finish")
                 }
@@ -1594,15 +1650,37 @@ impl Engine {
             }
             InstalledTools => serde_json::to_value(self.installed_tools(cancel).await?)?,
             ToolBundleVersions => serde_json::to_value(self.tool_bundle_versions(cancel).await?)?,
+            SaveInstalledToolBundle {
+                name,
+                bundle_sha256,
+                directory,
+            } => {
+                let (manifest, home) = self
+                    .save_installed_tool_bundle(&name, &bundle_sha256, &directory, cancel)
+                    .await?;
+                json!({ "manifest": manifest, "home": home })
+            }
             ReviewToolPath { review } => {
                 let settings = approved_tool_path
                     .context("The verified SSH connection has no matching tool PATH approval")?;
                 self.review_tool_path(session, settings, review.as_deref(), stage)
                     .await?
             }
+            ReviewInstalledToolPath { installed, review } => {
+                self.review_installed_tool_path(session, installed, review.as_deref(), stage)
+                    .await?
+            }
             PreviewToolBundle { bundle } => self.preview_utility_bundle(session, bundle).await?,
             ApplyToolBundle { bundle, review } => {
                 self.apply_utility_bundle(session, bundle, &review, stage)
+                    .await?
+            }
+            AddToToolBundle { bundle, review } => {
+                self.add_to_utility_bundle(session, bundle, review.as_deref(), stage)
+                    .await?
+            }
+            RemoveFromToolBundle { name, tool, review } => {
+                self.remove_from_utility_bundle(session, &name, &tool, review.as_deref(), stage)
                     .await?
             }
             RollbackToolBundle {
@@ -1618,10 +1696,26 @@ impl Engine {
                 bundle_sha256,
                 review,
             } => {
-                self.resume_utility_updates(
+                self.set_utility_updates_paused(
                     session,
                     &name,
                     &bundle_sha256,
+                    false,
+                    review.as_deref(),
+                    stage,
+                )
+                .await?
+            }
+            PauseToolBundleUpdates {
+                name,
+                bundle_sha256,
+                review,
+            } => {
+                self.set_utility_updates_paused(
+                    session,
+                    &name,
+                    &bundle_sha256,
+                    true,
                     review.as_deref(),
                     stage,
                 )
@@ -1753,6 +1847,9 @@ impl Engine {
                 .await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
+            ListDotfileVersions { shell } => {
+                serde_json::to_value(self.dotfile_versions(shell, cancel).await?)?
+            }
             PreviewDotfiles {
                 bundle,
                 shell,

@@ -6,21 +6,31 @@ pub enum Action {
     Listed(Arc<()>, Result<ToolBundleVersions, String>),
     Select(Option<usize>),
     Review,
-    ReviewResume,
+    ReviewPolicy(UpdatePolicy),
     Reviewed(Arc<()>, Result<ReviewedVersion, String>),
     Restore,
-    Resume,
+    SetPolicy(UpdatePolicy),
     Switched(Arc<()>, Result<SwitchReport, String>),
+    Save,
+    Saved(Arc<()>, Result<SavedBundle, String>),
+    CopyManifest,
+    ReviewProfile,
     Close,
 }
 
 pub enum ReviewedVersion {
     Rollback(Box<RollbackReview>),
-    Resume(ResumeReview),
+    UpdatePolicy(UpdatePolicy, PolicyReview),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePolicy {
+    Pause,
+    Resume,
 }
 
 #[derive(Deserialize)]
-pub struct ResumeReview {
+pub struct PolicyReview {
     home: String,
     bundle: String,
     bundle_sha256: String,
@@ -35,6 +45,8 @@ pub struct RollbackReview {
     bundle_sha256: String,
     current: Current,
     retained: Retained,
+    changes: Option<Vec<ToolChange>>,
+    bin_matches_active: bool,
     bin_directory_plan: Directory,
     launchers: Vec<(String, String)>,
     ready: bool,
@@ -46,12 +58,29 @@ pub struct RollbackReview {
 struct Retained {
     architecture: String,
     bin_directory: String,
-    tools: Vec<RetainedTool>,
 }
 
 #[derive(Deserialize)]
-struct RetainedTool {
+struct ToolChange {
     name: String,
+    action: ToolChangeKind,
+    before: Option<Pin>,
+    after: Option<Pin>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ToolChangeKind {
+    Add,
+    Remove,
+    Change,
+    Keep,
+}
+
+#[derive(Deserialize)]
+struct Pin {
+    sha256: String,
+    bytes: u64,
 }
 
 #[derive(Deserialize)]
@@ -60,18 +89,25 @@ pub struct SwitchReport {
     bundle_sha256: String,
 }
 
+#[derive(Deserialize)]
+pub struct SavedBundle {
+    manifest: PathBuf,
+    home: String,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Work {
     List,
     Review,
-    ReviewResume,
+    ReviewPolicy(UpdatePolicy),
     Restore,
-    Resume,
+    SetPolicy(UpdatePolicy),
+    Save,
 }
 
 impl Work {
     fn writes(self) -> bool {
-        matches!(self, Self::Restore | Self::Resume)
+        matches!(self, Self::Restore | Self::SetPolicy(_) | Self::Save)
     }
 }
 
@@ -82,6 +118,7 @@ pub(super) struct Panel {
     review: Option<ReviewedVersion>,
     pending: Option<(Arc<()>, Work)>,
     status: Option<String>,
+    saved: Option<SavedBundle>,
 }
 
 fn message(action: Action) -> Message {
@@ -105,10 +142,10 @@ impl Panel {
         ticket
     }
 
-    fn finish(&mut self, ticket: &Arc<()>, work: Work) -> bool {
+    fn finish(&mut self, ticket: &Arc<()>, accepts: impl FnOnce(Work) -> bool) -> Option<Work> {
         self.pending
-            .take_if(|(pending, kind)| *kind == work && Arc::ptr_eq(pending, ticket))
-            .is_some()
+            .take_if(|(pending, work)| Arc::ptr_eq(pending, ticket) && accepts(*work))
+            .map(|(_, work)| work)
     }
 
     fn selected(&self) -> Option<&RetainedToolVersion> {
@@ -123,14 +160,22 @@ impl Panel {
             {
                 review.review.as_deref()
             }
-            (ReviewedVersion::Resume(review), Work::Resume) if review.ready => {
+            (ReviewedVersion::UpdatePolicy(reviewed, review), Work::SetPolicy(policy))
+                if *reviewed == policy && review.ready =>
+            {
                 review.review.as_deref()
             }
             _ => None,
         }
     }
 
-    pub(super) fn view(&self, account: &str, active: bool, ctx: &ViewContext<TerminalApp>) -> View {
+    pub(super) fn view(
+        &self,
+        account: &str,
+        has_profile: bool,
+        active: bool,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
         let available = active && self.pending.is_none();
         let writing = self.pending.as_ref().is_some_and(|(_, kind)| kind.writes());
         let button = |label: &str, enabled, action: fn() -> Action| {
@@ -156,9 +201,11 @@ impl Panel {
             Some(match work {
                 Work::List => "Reading retained tool bundles…",
                 Work::Review => "Verifying retained tool bundle…",
-                Work::ReviewResume => "Reviewing automatic updates…",
+                Work::ReviewPolicy(_) => "Reviewing automatic updates…",
                 Work::Restore => "Restoring reviewed tool bundle…",
-                Work::Resume => "Resuming automatic updates…",
+                Work::SetPolicy(UpdatePolicy::Pause) => "Pausing automatic updates…",
+                Work::SetPolicy(UpdatePolicy::Resume) => "Resuming automatic updates…",
+                Work::Save => "Saving the pinned Linux executables on Windows…",
             })
         } else if !active {
             Some("Return to the original SSH pane or open a new review")
@@ -213,19 +260,34 @@ impl Panel {
         }
         match &self.review {
             Some(ReviewedVersion::Rollback(review)) => review.describe(&mut fields),
-            Some(ReviewedVersion::Resume(review)) => review.describe(&mut fields),
+            Some(ReviewedVersion::UpdatePolicy(policy, review)) => {
+                review.describe(*policy, &mut fields)
+            }
             None => (),
         }
-        let actions = if self.selected().is_some_and(|row| row.held) {
-            StackPanel::new().spacing(8.0).children((
-                button("Review update resumption", available, || {
-                    Action::ReviewResume
-                }),
-                button(
+        let actions = if let Some(row) = self.selected().filter(|row| row.active) {
+            let (policy, review, confirm) = if row.held {
+                (
+                    UpdatePolicy::Resume,
+                    "Review update resumption",
                     "Resume automatic updates",
-                    available && self.token(Work::Resume).is_some(),
-                    || Action::Resume,
-                ),
+                )
+            } else {
+                (
+                    UpdatePolicy::Pause,
+                    "Review update pause",
+                    "Pause automatic updates",
+                )
+            };
+            StackPanel::new().spacing(8.0).children((
+                Button::new()
+                    .is_enabled(available)
+                    .on_click(ctx.callback(move |_| message(Action::ReviewPolicy(policy))))
+                    .content(review),
+                Button::new()
+                    .is_enabled(available && self.token(Work::SetPolicy(policy)).is_some())
+                    .on_click(ctx.callback(move |_| message(Action::SetPolicy(policy))))
+                    .content(confirm),
             ))
         } else {
             StackPanel::new().spacing(8.0).children((
@@ -241,14 +303,50 @@ impl Panel {
                 ),
             ))
         };
-        fields.push(KeyedView::new("actions", actions));
-        fields.push(KeyedView::new(
-            "back",
-            button("Back to tool installer", !writing, || Action::Close),
-        ));
-        Border::new().padding(12.0).content(
-            ScrollViewer::new().content(StackPanel::new().spacing(8.0).keyed_children(fields)),
-        )
+        if self.selected().is_some_and(|row| row.active) {
+            fields.push(KeyedView::new(
+                "save-pinned-bundle",
+                button("Save pinned bundle on Windows", available, || Action::Save),
+            ));
+        }
+        if let Some(saved) = &self.saved {
+            fields.push(detail(
+                "saved-manifest",
+                saved.manifest.display().to_string(),
+            ));
+            if has_profile {
+                fields.push(KeyedView::new(
+                    "review-saved-for-profile",
+                    button("Review in this SSH profile", available, || {
+                        Action::ReviewProfile
+                    }),
+                ));
+            }
+            fields.push(KeyedView::new(
+                "copy-manifest",
+                button("Copy saved manifest path", !writing, || {
+                    Action::CopyManifest
+                }),
+            ));
+        }
+        Grid::new()
+            .rows([GridLength::Star(1.0), GridLength::Auto])
+            .children((
+                ScrollViewer::new().content(
+                    StackPanel::new()
+                        .margin(12.0)
+                        .spacing(8.0)
+                        .keyed_children(fields),
+                ),
+                StackPanel::new()
+                    .grid_row(1)
+                    .margin(12.0)
+                    .spacing(8.0)
+                    .children((
+                        actions,
+                        button("Back to tool installer", !writing, || Action::Close),
+                    )),
+            ))
     }
 }
 
@@ -264,21 +362,28 @@ fn version_label(row: &RetainedToolVersion) -> String {
     format!("{} · {digest}{suffix}", row.bundle)
 }
 
-impl ResumeReview {
-    fn describe(&self, fields: &mut Vec<KeyedView>) {
+impl PolicyReview {
+    fn describe(&self, policy: UpdatePolicy, fields: &mut Vec<KeyedView>) {
         fields.push(detail(
-            "resume-destination",
+            "update-destination",
             format!(
                 "{} · Home {}\nActive SHA-256 {}",
                 self.bundle, self.home, self.bundle_sha256
             ),
         ));
         fields.push(detail(
-            "resume-effect",
-            if self.ready {
-                "Approved SSH profiles can sync this bundle on their next connection."
+            "update-effect",
+            if !self.ready {
+                "Changing automatic updates requires the server's atomic rename extension."
             } else {
-                "Resuming updates requires the server's atomic rename extension."
+                match policy {
+                    UpdatePolicy::Pause => {
+                        "Keep this release installed and skip this bundle on future SSH logins."
+                    }
+                    UpdatePolicy::Resume => {
+                        "Approved SSH profiles can sync this bundle on their next connection."
+                    }
+                }
             },
         ));
     }
@@ -293,16 +398,17 @@ impl RollbackReview {
                 self.bundle, self.retained.architecture, self.home, self.retained.bin_directory
             ),
         ));
-        let commands: Vec<_> = self
-            .retained
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
-        fields.push(detail(
-            "commands",
-            format!("Retained commands {}", commands.join(", ")),
-        ));
+        if let Some(changes) = &self.changes {
+            fields.push(detail(
+                "rollback-comparison",
+                if self.current.version.is_some() {
+                    "Changes from the active release"
+                } else {
+                    "Commands in the selected release"
+                },
+            ));
+            fields.extend(changes.iter().map(ToolChange::view));
+        }
         if let Some(path) = &self.bin_directory_plan.blocked_at {
             fields.push(detail(
                 "directory",
@@ -318,6 +424,11 @@ impl RollbackReview {
             fields.push(detail(
                 "selector",
                 "This version is already active. Refresh versions.",
+            ));
+        } else if !self.bin_matches_active {
+            fields.push(detail(
+                "selector",
+                "The selected release uses a different launcher directory",
             ));
         } else if self.current.version.is_some() && !self.supports_atomic_replace {
             fields.push(detail(
@@ -347,11 +458,85 @@ impl RollbackReview {
     }
 }
 
+impl ToolChange {
+    fn view(&self) -> KeyedView {
+        let (verb, before, after) = match self.action {
+            ToolChangeKind::Add => ("Restore", None, self.after.as_ref()),
+            ToolChangeKind::Remove => ("Deactivate", self.before.as_ref(), None),
+            ToolChangeKind::Change => (
+                "Replace pinned build for",
+                self.before.as_ref(),
+                self.after.as_ref(),
+            ),
+            ToolChangeKind::Keep => ("Keep", self.before.as_ref(), None),
+        };
+        let mut fields = vec![detail("command", format!("{verb} {}", self.name))];
+        for (key, label, pin) in [("before", "Active", before), ("after", "Restored", after)] {
+            if let Some(pin) = pin {
+                fields.push(KeyedView::new(
+                    key,
+                    TextBlock::new()
+                        .text(format!(
+                            "{label} SHA-256 {} · {} bytes",
+                            pin.sha256, pin.bytes
+                        ))
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true),
+                ));
+            }
+        }
+        KeyedView::new(
+            format!("change-{}", self.name),
+            StackPanel::new().spacing(2.0).keyed_children(fields),
+        )
+    }
+}
+
 impl TerminalApp {
+    fn review_saved_tool_bundle_for_profile(&mut self, ctx: &ComponentContext<Self>) {
+        let Some(installer) = self.command_reference.tool_install.as_ref() else {
+            return;
+        };
+        let Some(history) = installer
+            .history
+            .as_ref()
+            .filter(|history| history.pending.is_none())
+        else {
+            return;
+        };
+        let Some(saved) = &history.saved else {
+            return;
+        };
+        let Some((pane, session)) = self
+            .reference_tool_target()
+            .filter(|(pane, _)| *pane == installer.target)
+        else {
+            return;
+        };
+        let Some(profile) = self
+            .tabs
+            .active()
+            .and_then(AppTab::ssh_profile_name)
+            .filter(|name| Some(*name) == installer.profile.as_deref())
+        else {
+            return;
+        };
+        let Some(connection) = session.ssh_connection_at(pane.generation) else {
+            return;
+        };
+        let (manifest, home) = (saved.manifest.clone(), saved.home.clone());
+        self.open_tool_snapshot_profile(profile.to_owned(), &manifest, &home, &connection, ctx);
+    }
+
     pub(super) fn tool_bundle_history(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        if matches!(action, Action::ReviewProfile) {
+            self.review_saved_tool_bundle_for_profile(ctx);
+            return;
+        }
         let current = self
             .reference_tool_target()
             .map(|(pane, session)| (pane, session.input.clone()));
+        let directory = self.store.path().with_file_name("tool-bundle-snapshots");
         let reference = &mut self.command_reference;
         let Some(installer) = &mut reference.tool_install else {
             return;
@@ -378,9 +563,10 @@ impl TerminalApp {
             }
             Action::Open
             | Action::Review
-            | Action::ReviewResume
+            | Action::ReviewPolicy(_)
             | Action::Restore
-            | Action::Resume => {
+            | Action::SetPolicy(_)
+            | Action::Save => {
                 let Some(input) = input else { return };
                 if history.pending.is_some() {
                     return;
@@ -388,20 +574,35 @@ impl TerminalApp {
                 let work = match action {
                     Action::Open => Work::List,
                     Action::Review => Work::Review,
-                    Action::ReviewResume => Work::ReviewResume,
-                    Action::Resume => Work::Resume,
+                    Action::ReviewPolicy(policy) => Work::ReviewPolicy(policy),
+                    Action::SetPolicy(policy) => Work::SetPolicy(policy),
+                    Action::Save => Work::Save,
                     _ => Work::Restore,
                 };
                 let operation = if work == Work::List {
                     history.versions = None;
                     history.selected = None;
+                    history.saved = None;
                     Operation::ToolBundleVersions
+                } else if work == Work::Save {
+                    let Some(row) = history.selected().filter(|row| row.active) else {
+                        return;
+                    };
+                    Operation::SaveInstalledToolBundle {
+                        name: row.bundle.clone(),
+                        bundle_sha256: row.bundle_sha256.clone(),
+                        directory,
+                    }
                 } else {
-                    let resume = matches!(work, Work::ReviewResume | Work::Resume);
-                    let Some(row) = history
-                        .selected()
-                        .filter(|row| if resume { row.held } else { !row.active })
-                    else {
+                    let policy = match work {
+                        Work::ReviewPolicy(policy) | Work::SetPolicy(policy) => Some(policy),
+                        _ => None,
+                    };
+                    let Some(row) = history.selected().filter(|row| match policy {
+                        Some(UpdatePolicy::Pause) => row.active && !row.held,
+                        Some(UpdatePolicy::Resume) => row.active && row.held,
+                        None => !row.active,
+                    }) else {
                         return;
                     };
                     let review = if work.writes() {
@@ -412,20 +613,27 @@ impl TerminalApp {
                     } else {
                         None
                     };
-                    if resume {
-                        Operation::ResumeToolBundleUpdates {
+                    match policy {
+                        Some(UpdatePolicy::Pause) => Operation::PauseToolBundleUpdates {
                             name: row.bundle.clone(),
                             bundle_sha256: row.bundle_sha256.clone(),
                             review,
-                        }
-                    } else {
-                        Operation::RollbackToolBundle {
+                        },
+                        Some(UpdatePolicy::Resume) => Operation::ResumeToolBundleUpdates {
                             name: row.bundle.clone(),
                             bundle_sha256: row.bundle_sha256.clone(),
                             review,
-                        }
+                        },
+                        None => Operation::RollbackToolBundle {
+                            name: row.bundle.clone(),
+                            bundle_sha256: row.bundle_sha256.clone(),
+                            review,
+                        },
                     }
                 };
+                if work == Work::Save {
+                    history.saved = None;
+                }
                 history.review = None;
                 let ticket = history.begin(work);
                 let rejected = result_message(
@@ -435,16 +643,17 @@ impl TerminalApp {
                 );
                 ctx.spawn_background_with_rejection(
                     move |_| {
-                        let timeout =
-                            Duration::from_secs(if matches!(work, Work::Review | Work::Restore) {
+                        let timeout = Duration::from_secs(
+                            if matches!(work, Work::Review | Work::Restore | Work::Save) {
                                 600
                             } else {
                                 30
-                            });
+                            },
+                        );
                         result_message(
                             ticket,
                             work,
-                            run_pane_tool_job(input, target, operation, timeout, None),
+                            run_pane_sftp_job(input, target, operation, timeout, None),
                         )
                     },
                     rejected,
@@ -460,15 +669,23 @@ impl TerminalApp {
                     history.selected = Some(index);
                     history.review = None;
                     history.status = None;
+                    history.saved = None;
                 }
             }
-            Action::Listed(ticket, result) if history.finish(&ticket, Work::List) => match result {
-                Ok(versions) => history.versions = Some(versions),
-                Err(error) => history.status = Some(error),
-            },
+            Action::Listed(ticket, result)
+                if history.finish(&ticket, |work| work == Work::List).is_some() =>
+            {
+                match result {
+                    Ok(versions) => history.versions = Some(versions),
+                    Err(error) => history.status = Some(error),
+                }
+            }
             Action::Reviewed(ticket, result) => {
-                if !history.finish(&ticket, Work::Review)
-                    && !history.finish(&ticket, Work::ReviewResume)
+                if history
+                    .finish(&ticket, |work| {
+                        matches!(work, Work::Review | Work::ReviewPolicy(_))
+                    })
+                    .is_none()
                 {
                     return;
                 }
@@ -477,17 +694,41 @@ impl TerminalApp {
                     Err(error) => history.status = Some(error),
                 }
             }
-            Action::Switched(ticket, result) => {
-                let held = history.finish(&ticket, Work::Restore);
-                if !held && !history.finish(&ticket, Work::Resume) {
-                    return;
+            Action::Saved(ticket, result)
+                if history.finish(&ticket, |work| work == Work::Save).is_some() =>
+            {
+                history.status = Some(match result {
+                    Ok(saved) => {
+                        history.saved = Some(saved);
+                        "Saved pinned tool bundle on Windows".into()
+                    }
+                    Err(error) => error,
+                });
+            }
+            Action::CopyManifest if history.pending.is_none() => {
+                if let Some(saved) = &history.saved {
+                    history.status = Some(
+                        match w11term::clipboard::write(&saved.manifest.to_string_lossy()) {
+                            Ok(()) => "Copied the saved manifest path".into(),
+                            Err(error) => format!("Copying the saved manifest path: {error:#}"),
+                        },
+                    );
                 }
+            }
+            Action::Switched(ticket, result) => {
+                let Some(work) = history.finish(&ticket, |work| {
+                    matches!(work, Work::Restore | Work::SetPolicy(_))
+                }) else {
+                    return;
+                };
                 history.status = Some(match result {
                     Ok(switch) => {
-                        if held {
+                        if work == Work::Restore {
                             reference.tools = None;
                         }
+                        let held = work != Work::SetPolicy(UpdatePolicy::Resume);
                         installer.review = None;
+                        installer.path_setup = None;
                         installer.status = None;
                         if let Some(versions) = &mut history.versions {
                             for row in versions
@@ -499,10 +740,15 @@ impl TerminalApp {
                                 row.held = row.active && held;
                             }
                         }
-                        if held {
-                            format!("Restored tool bundle {}", switch.bundle)
-                        } else {
-                            format!("Resumed automatic updates for {}", switch.bundle)
+                        match work {
+                            Work::Restore => format!("Restored tool bundle {}", switch.bundle),
+                            Work::SetPolicy(UpdatePolicy::Pause) => {
+                                format!("Paused automatic updates for {}", switch.bundle)
+                            }
+                            Work::SetPolicy(UpdatePolicy::Resume) => {
+                                format!("Resumed automatic updates for {}", switch.bundle)
+                            }
+                            _ => unreachable!("only version and policy changes complete here"),
                         }
                     }
                     Err(error) => error,
@@ -521,7 +767,11 @@ fn result_message(
     message(match work {
         Work::List => Action::Listed(ticket, decode(result)),
         Work::Review => Action::Reviewed(ticket, decode(result).map(ReviewedVersion::Rollback)),
-        Work::ReviewResume => Action::Reviewed(ticket, decode(result).map(ReviewedVersion::Resume)),
-        Work::Restore | Work::Resume => Action::Switched(ticket, decode(result)),
+        Work::ReviewPolicy(policy) => Action::Reviewed(
+            ticket,
+            decode(result).map(|report| ReviewedVersion::UpdatePolicy(policy, report)),
+        ),
+        Work::Restore | Work::SetPolicy(_) => Action::Switched(ticket, decode(result)),
+        Work::Save => Action::Saved(ticket, decode(result)),
     })
 }

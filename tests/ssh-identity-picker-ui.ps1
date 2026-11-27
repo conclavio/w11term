@@ -59,6 +59,49 @@ function File-Sha256([string]$Path) {
         $hash.Dispose()
     }
 }
+function Pick-LinuxExecutable([string]$Action, [string]$Name) {
+    Click $Action
+    $dialog = Wait-OwnedDialog 'Choose a Linux executable'
+    $path = Join-Path $State $Name
+    $null = Wait-Until "enter the absolute path for '$Name'" {
+        [FixtureDialog]::SetFilename($dialog, $path, '')
+    }
+    $null = Wait-Until "accept '$Name' in the native picker" { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+function Wait-DotfileControl([string]$Name, [System.Windows.Automation.ControlType]$Type) {
+    $search = @{ scroll = $null }
+    Wait-Until "visible dotfile control '$Name'" {
+        $control = Find-Element $Name $Type
+        if ($control -and $control.Current.IsEnabled) {
+            if (!$control.Current.IsOffscreen) { return $control }
+            Move-NativeControlIntoView $control $search
+        }
+    }
+}
+function Dotfile-Fragment([string]$Name) {
+    (Wait-DotfileControl $Name $edit).GetCurrentPattern($value).Current.Value -replace '\r\n?', "`n"
+}
+function Set-DotfileFragment([string]$Name, [string]$Text) {
+    $field = Wait-DotfileControl $Name $edit
+    $field.SetFocus()
+    $field.GetCurrentPattern($value).SetValue($Text.Replace("`n", "`r"))
+    $null = Wait-Until "the multiline dotfile fragment '$Name' is retained" { (Dotfile-Fragment $Name) -ceq $Text }
+}
+function Save-DotfilesBundle([string]$Action, [string]$Path) {
+    Invoke-Button (Wait-DotfileControl $Action $button)
+    $dialog = Wait-Until 'owned dotfiles bundle save dialog' { Find-OwnedDialog 'Save new dotfiles bundle' }
+    $null = Wait-Until "enter a draft filename for '$Action'" {
+        [FixtureDialog]::SetCommonDialogFilename($dialog, "$Path.draft")
+    }
+    $null = Wait-Until "replace the draft filename for '$Action'" {
+        [FixtureDialog]::SetCommonDialogFilename($dialog, $Path)
+    }
+    $null = Wait-Until 'save the local dotfiles bundle' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the created bundle is selected in the profile' {
+        $field = Find-Element 'Dotfiles bundle' $edit
+        $field -and [FixtureDialog]::SameFile($Path, $field.GetCurrentPattern($value).Current.Value)
+    }
+}
 function Select-ToolPreset([string]$Name) {
     $presets = Wait-Until 'built-in tool preset selector' { Find-Element 'Built-in Linux tool bundle' $combo }
     $presets.SetFocus()
@@ -162,6 +205,44 @@ try {
             $dotfiles.user -ceq 'test' -and $dotfiles.port -eq 22 -and
             $dotfiles.home -ceq '/home/test' -and $dotfiles.fingerprint -ceq $fingerprint -and
             [FixtureDialog]::SameFile($bundle, $dotfiles.bundle)
+    }
+    Invoke-Button (Wait-DotfileControl 'Create dotfiles bundle' $button)
+    $shared = "export EDITOR=vi`nexport PAGER=less"
+    $bash = "PS1='fleet> '`nalias ll='ls -l'"
+    $zsh = "PROMPT='fleet%# '`nsetopt autocd"
+    Set-DotfileFragment 'Shared environment fragment' $shared
+    Set-DotfileFragment 'Bash startup fragment' $bash
+    Set-DotfileFragment 'Zsh startup fragment' $zsh
+    $created = Join-Path $State 'Authored dotfiles.json'
+    Save-DotfilesBundle 'Save dotfiles bundle' $created
+    $originalHash = File-Sha256 $created
+    $initial = [IO.File]::ReadAllText($created) | ConvertFrom-Json
+    if ($initial.version -ne 1 -or $initial.environment -cne $shared -or
+        $initial.bash -cne $bash -or $initial.zsh -cne $zsh) {
+        throw 'The authored dotfiles did not preserve all three multiline fragments'
+    }
+    Invoke-Button (Wait-DotfileControl 'Revise selected dotfiles bundle' $button)
+    if ((Dotfile-Fragment 'Bash startup fragment') -cne $bash -or
+        (Dotfile-Fragment 'Zsh startup fragment') -cne $zsh) {
+        throw 'The revision editor did not load the complete multiline fragments'
+    }
+    $revisedBash = "PS1='revised> '`nalias ll='ls -lh'"
+    Set-DotfileFragment 'Bash startup fragment' $revisedBash
+    $revision = Join-Path $State 'Revised dotfiles.json'
+    Save-DotfilesBundle 'Save dotfiles revision' $revision
+    $updated = [IO.File]::ReadAllText($revision) | ConvertFrom-Json
+    $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles.bundle
+    if ($updated.environment -cne $shared -or $updated.bash -cne $revisedBash -or
+        $updated.zsh -cne $zsh -or (File-Sha256 $created) -cne $originalHash -or
+        ![FixtureDialog]::SameFile($bundle, $approved)) {
+        throw 'Revising a bundle changed its source, another fragment, or the saved approval'
+    }
+    Invoke-Button (Wait-DotfileControl 'Approve dotfiles sync' $button)
+    $null = Wait-Until 'the revision has been approved' { Find-Element $approval }
+    Click 'Save profile changes'
+    $null = Wait-Until 'the saved profile uses the approved revision' {
+        $path = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles.bundle
+        [FixtureDialog]::SameFile($revision, $path)
     }
     Click 'Disable dotfiles sync'
     $null = Wait-Until 'dotfiles sync disabled in the editor' { Find-Element 'Sync off' }
@@ -310,10 +391,7 @@ try {
     Set-Field 'Linux command name' 'operator'
     $dot = ' ' + [char]0xb7 + ' '
     foreach ($build in @(@('operator-x64', 'x86-64'), @('operator-arm','ARM64'))) {
-        Click 'Add Linux executable'
-        $picker = Wait-Until 'owned Linux executable picker' { Find-OwnedDialog 'Choose a Linux executable' }
-        Select-DialogItem $picker $build[0]
-        $null = Wait-Until 'accept Linux executable file' { [FixtureDialog]::ClickButton($picker, 1) }
+        Pick-LinuxExecutable 'Add Linux executable' $build[0]
         $null = Wait-Until "detected $($build[1]) executable" { Find-Element "operator${dot}$($build[1])" }
     }
     Click 'Save new tool bundle'
@@ -349,10 +427,7 @@ try {
     $null = Wait-Until 'both previous builds loaded' {
         (Find-Element "operator${dot}x86-64") -and (Find-Element "operator${dot}ARM64")
     }
-    Click 'Replace operator x86-64'
-    $picker = Wait-Until 'owned replacement executable picker' { Find-OwnedDialog 'Choose a Linux executable' }
-    Select-DialogItem $picker 'operator-x64-next'
-    $null = Wait-Until 'accept replacement executable' { [FixtureDialog]::ClickButton($picker, 1) }
+    Pick-LinuxExecutable 'Replace operator x86-64' 'operator-x64-next'
     Click 'Save bundle revision'
     $picker = Wait-Until 'owned save revision dialog' { Find-OwnedDialog 'Save new SSH tool bundle' }
     $null = Wait-Until 'save the separate bundle revision' { [FixtureDialog]::ClickButton($picker, 1) }

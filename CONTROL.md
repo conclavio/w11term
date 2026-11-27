@@ -1262,6 +1262,8 @@ Direct pipe clients send
 
 ### Preview and apply SSH dotfiles
 
+From a connected SSH pane, open **More → Command reference → Apply SSH dotfiles**. The panel starts with the profile's bundle and shell if set. You can also choose a local bundle, Bash or Zsh, and an optional startup directory for Zsh. Select **Review dotfiles changes** to see the account, resolved SFTP home, planned file changes, and any conflicts. Check that the resolved directory is the shell account's home, then select **Apply reviewed dotfiles** on the same connection. A changed bundle or remote startup file requires another review. Applying updates the managed startup files for future shells and leaves the profile's login-sync settings in place.
+
 `sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. For a Zsh setup that uses a different startup directory under that home, pass `--zdotdir RELATIVE_DIR`.
 
 Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` fragment is shared by the chosen shells. Set `bash` or `zsh` for the prompt, aliases, and interactive setup specific to that shell. Each fragment supports up to 16 KiB. The preview computes planned file hashes with LF line endings and a final newline on nonempty fragments.
@@ -1292,20 +1294,29 @@ Apply replies with `shell`, `home`, `bundle_sha256` and the ordered `changed_fil
 
 ### Restore or disable SSH dotfiles
 
-Use `preview-dotfiles-switch SHA256|disabled --shell bash|zsh` to review a switch on the pane's SFTP connection. Use an earlier `bundle_sha256` from apply, or find the shell's retained version directories under `~/.config/w11term/dotfiles/`. The preview includes the current `active_bundle_sha256` and the proposed `bundle_sha256`. A null value represents disabled or inactive dotfiles. Pass the same `--zdotdir` used to install Zsh hooks in a custom directory.
+In **Command reference → Apply SSH dotfiles**, choose the shell and its startup directory, then open **Dotfile versions**. Select a retained version and choose **Review dotfile restore** followed by **Restore reviewed dotfiles**. To disable managed fragments, use **Review disabling managed dotfiles** followed by **Disable reviewed dotfiles**. Both actions pause automatic dotfile sync for that shell on the remote account.
+
+Choose **Review resuming automatic dotfile sync** and then **Resume automatic dotfile sync** to allow an approved profile to sync on its next SSH connection. After a restore, the currently selected version stays active. After disabling, managed fragments stay inactive until a bundle is installed. To apply a particular local bundle immediately, return to the installer and review it there.
+
+Use `list-dotfile-versions --shell bash|zsh` to get a shell's SFTP home, active hash, selector state and up to 64 retained versions. The active version appears first, followed by the most recently modified directories. After resuming from disabled, the selector state is `awaiting-sync` until a bundle is installed. The listing identifies candidate directories. **Review dotfile restore** verifies the selected bundle's contents and startup hooks.
+
+Use `preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh` to review a switch on the pane's SFTP connection. The preview includes the current `active_bundle_sha256` and the proposed `bundle_sha256`. A null value represents disabled or inactive dotfiles. Pass the same `--zdotdir` used to install Zsh hooks in a custom directory.
 
 ```powershell
+$versions = & $ctl --pid 12345 sftp --pane $pane list-dotfile-versions --shell bash | ConvertFrom-Json
 $preview = & $ctl --pid 12345 sftp --pane $pane preview-dotfiles-switch $previousBundle --shell bash | ConvertFrom-Json
 $preview.result.sftp
 # Review the currently active and proposed bundles.
 & $ctl --pid 12345 sftp --pane $pane switch-dotfiles $previousBundle --shell bash --review $preview.result.sftp.review
 ```
 
-Use the same two commands with `disabled` to stop loading managed dotfiles in new shells. Switching only changes the selector. The startup hooks and retained files stay available for the next review. Restoring checks that the retained fragments match their bundle hash and that both startup hooks are installed. A stale token or edited fragment prevents activation. The reply reports `shell`, `home`, the selected `bundle_sha256` or null, and `changed`.
+Use the same two commands with `disabled` to stop loading managed dotfiles in new shells, or with `automatic` to lift a hold from a restore or disable. Switching only changes the selector. The startup hooks and retained files stay available for the next review. Restoring a version or lifting its hold checks that the retained fragments match their bundle hash and that both startup hooks are installed. A stale token or edited fragment prevents the change. The reply reports `shell`, `home`, `target`, the selected `bundle_sha256` or null, and `changed`.
 
-Direct pipe clients use `{"op":"switch-dotfiles","shell":"bash","target":{"kind":"disabled"}}` for preview. To target a bundle, provide `"target":{"kind":"bundle","sha256":"SHA256"}`. Include the returned `"review"` to publish the switch.
+Direct pipe clients use `{"op":"list-dotfile-versions","shell":"bash"}` to list the versions and `{"op":"switch-dotfiles","shell":"bash","target":{"kind":"disabled"}}` for preview. To target a bundle, provide `"target":{"kind":"bundle","sha256":"SHA256"}`. To lift a hold, use `"target":{"kind":"automatic"}`. Include the returned `"review"` to publish the switch.
 
 ### Sync dotfiles on SSH connect
+
+In **Settings → Edit profile → SSH dotfiles**, choose **Create dotfiles bundle** and enter a shared environment fragment, a Bash startup fragment, or a Zsh startup fragment. You can fill in more than one. **Save dotfiles bundle** writes a new local file and selects it in the profile. To change an existing bundle, select it and choose **Revise selected dotfiles bundle**. Save the revision to a new file. Profiles that use the original file continue to use it until you approve and save the revision for those profiles.
 
 Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.
 
@@ -1323,7 +1334,9 @@ The same approval can be set in the profile's `dotfiles` object in `profiles.jso
 }
 ```
 
-On an ordinary SSH shell launch or reconnect, w11term checks that the verified host, account, port, fingerprint, and SFTP home match this approval. It then reads the local bundle and stages updates before requesting the shell. Sync verifies the currently active files and hooks before replacing their selection. The operation has a ten-second deadline, and a skipped or timed-out sync leaves opening the SSH shell available. The pane status and its `dotfiles-sync` event explain the result. Sync applies to ordinary SSH shells. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths.
+On an ordinary SSH shell launch or reconnect, w11term checks that the verified host, account, port, fingerprint, and SFTP home match this approval. It then reads the local bundle and stages updates before requesting the shell. Sync verifies the currently active files and hooks before replacing their selection. The operation has a ten-second deadline, and a skipped or timed-out sync leaves opening the SSH shell available.
+
+**More → Command reference** shows the dotfile sync outcome for the active SSH connection. Open **Apply SSH dotfiles** for the reason when sync is skipped or unconfirmed. A rollback or disabled selector appears as **Paused by manual selection** on the next login. The `dotfiles-sync` event remains available to scripts. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths, and the installer explains why login sync was skipped for those sessions.
 
 A reviewed manual switch holds the chosen bundle on later logins, including when you choose `disabled`. Use a fresh manual preview and `apply-dotfiles` with the bundle you want to return to automatic sync.
 
@@ -1390,7 +1403,15 @@ The preview uses the pane's verified SSH connection. A read-only SSH exec probe 
 
 From a connected SSH pane, open **More → Command reference → Install SSH tools**. Choose a Windows manifest or use the bundle from the pane's profile. Select **Review bundle** to see the resolved home, architecture, launcher paths, PATH status, and any blocking conflicts. **Install reviewed bundle** applies that review on the same connection. The installation runs alongside the SSH shell and uses the manual SFTP deadline.
 
-Open **Bundle versions** to see the releases still stored under the SSH account, with the active version marked. Choose an earlier release and select **Review rollback** to verify its binaries and see its commands and launcher paths. **Restore reviewed version** switches to that release and pauses automatic updates for the bundle. Launchers for commands absent from the restored release become dormant.
+From the manual for a built-in Linux tool such as `jq` or `rg`, choose **Review installing jq** or the corresponding action for that tool. The review shows the SSH account, launcher, retained tools, and the pinned build for the host's architecture. Choose **Download pinned Linux build** if the Windows cache needs the executable, then confirm **Install reviewed jq**. The install adds the command to the shared built-in bundle and preserves its active binaries. A new release pauses that bundle's automatic updates until you resume them from **Bundle versions**.
+
+After a manual install or a review of an already installed built-in tool, choose **Manage PATH for new shells**. Pick Bash or Zsh and enter the relative Zsh startup directory if your account uses a custom `ZDOTDIR`. **Review PATH setup** shows the exact startup files and managed blocks. **Apply reviewed PATH setup** appends the verified bundle's launcher directory after your existing PATH entries for new shells. This is a one-time change to the connected account and requires no profile approval.
+
+To undo it, choose **Review PATH removal** and then **Remove reviewed PATH blocks**. The review shows exactly which managed blocks will be removed. Other startup content, the files themselves, and the installed tools are preserved. An edited, duplicate, or incomplete block stops the reviewed removal. Profiles configured to manage this directory can add it again during their next connection.
+
+Open **Bundle versions** to see the releases still stored under the SSH account, with the active version marked. Choose a retained release and select **Review rollback** to verify its binaries and compare it with the active release. The review shows which commands would return, become inactive, change their pinned build, or keep their pin. It includes the SHA-256 and size of each relevant executable. **Restore reviewed version** switches to that release and pauses automatic updates for the bundle. Launchers for commands absent from the restored release become dormant.
+
+Select the active release and choose **Save pinned bundle on Windows** to use those exact builds in a profile. w11term verifies the executables against the installed release and saves them with a manifest in `tool-bundle-snapshots` beside the profile catalog. The manifest contains the installed architecture. **Review in this SSH profile** opens the original pane's saved profile and reviews the manifest against the authenticated account. Choose **Approve tool sync** and **Save profile changes** to use it on the next login. You can also copy the manifest path and select it under **Edit profile → SSH tools**. If updates are paused, review and resume them from **Bundle versions** after saving the profile. Keep the manifest and its sibling executables together.
 
 Review the destinations, PATH status, and selected builds. When the report has `ready: true`, pass its `review` token back to the same pane. The commands below use the default JSON response from `w11term-cli`.
 
@@ -1401,6 +1422,17 @@ $plan = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle '.\Fleet tools
 
 Installation verifies the uploaded files over SFTP and publishes the version under `~/.local/share/w11term/tools/<name>/versions/<sha256>/`. It adds launchers to the bundle's `bin_directory`, preserving entries already owned by the account. Add that directory to the shell's `PATH` if the preview reports it missing. Keep the bin directory fixed across versions of one named bundle. The installer reuses a verified copy when the requested version is already present and copies unchanged tools from the active version when building a new one. The `previous_bundle_sha256` in an update reply identifies the version to restore.
 
+Use `preview-tool-bundle-add BUNDLE.json` and `add-to-tool-bundle BUNDLE.json --review TOKEN` to add tools to the named bundle. The review shows the retained executables and checks their hashes. The addition keeps the active bundle's launcher directory and each existing tool's exact binary, including when the input names an existing tool. It uses the manifest's launcher directory when creating a bundle. A new version pauses automatic sync for that bundle so an older profile manifest cannot remove the added tools on reconnect. Use **Bundle versions** to review a rollback or resume automatic updates.
+
+From **Installed SSH tools**, select a command and choose **Review removing** for its bundle. **Remove reviewed SSH tool** activates a release that keeps the other commands and their exact executable pins. The removed command's managed launcher becomes dormant, including when you remove the last tool. Previous releases remain available for rollback, and automatic sync pauses until you resume it. User-owned launcher paths are left in place. Scripts can use `preview-tool-bundle-remove NAME TOOL` and `remove-from-tool-bundle NAME TOOL --review TOKEN`.
+
+```powershell
+$addition = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-add '.\Extra tools.json' | ConvertFrom-Json).result.sftp
+& $ctl --pid 12345 sftp --pane $pane add-to-tool-bundle '.\Extra tools.json' --review $addition.review
+```
+
+Direct pipe clients use `"op":"add-to-tool-bundle"` with a `bundle` object and include the returned `review` to apply the addition on the same SFTP connection.
+
 For a retained version, w11term can calculate the hashes on the verified SSH host using `head` and `sha256sum`. It checks the manifest and file metadata through SFTP and falls back to hashing the bytes over SFTP when the remote checksum command is unavailable.
 
 ```powershell
@@ -1409,6 +1441,8 @@ $restore = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-rollback my
 ```
 
 Rollback uses the retained remote files. The client checks their hashes and executable permissions before activating them. Launchers for commands omitted from the active version remain dormant so older versions can restore them. Installation and rollback require the host's `flock` command and SFTP symlinks. Switching an active version requires OpenSSH's atomic rename extension. Run a fresh preview after changing the manifest, moving to another pane or connection, or retrying an interrupted operation.
+
+The rollback preview includes `changes` in command-name order. Each row has an `action` of `add`, `remove`, `change`, or `keep`, plus `before` and `after` pins with `sha256` and `bytes`. A missing pin is `null`. The before pins come from the active release manifest so the review is available even if an active executable needs repair. `changes` is `null` if the active selector is invalid.
 
 ### Sync a tool bundle on SSH connect
 
@@ -1436,7 +1470,9 @@ On an ordinary SSH connect or reconnect, w11term checks the verified endpoint an
 
 When the login PATH update is skipped, **Review PATH repair** checks the approved startup files over the current SSH connection. The review shows each file and the current and proposed text for any managed block it would replace. **Apply reviewed PATH repair** validates the review and writes the changes for new shells. Replacement requires one complete marker pair and preserves the text around it. Duplicate or incomplete marker pairs require manual correction.
 
-A manual rollback pauses automatic bundle updates. In **Bundle versions**, select the active release marked **Updates paused**, choose **Review update resumption**, and then **Resume automatic updates**. Approved profiles can sync the bundle on their next SSH connection. Use the manual installation flow to apply a specific bundle immediately. **Disable tool sync** stops automatic updates from that profile.
+A manual rollback, addition, or removal pauses automatic bundle updates. To hold the current release, select it in **Bundle versions**, choose **Review update pause**, and then **Pause automatic updates**. The same release stays installed and future SSH logins skip sync for that bundle on the account. To re-enable sync, select the active release marked **Updates paused**, choose **Review update resumption**, and then **Resume automatic updates**. Approved profiles can sync the bundle on their next SSH connection. Use the manual installation flow to apply a specific bundle immediately. **Disable tool sync** stops automatic updates from that profile.
+
+For scripts, use `preview-tool-bundle-pause NAME SHA256` followed by `pause-tool-bundle-updates NAME SHA256 --review TOKEN`. The pause review applies to the reviewed active release and reports `automatic_sync_paused`. The corresponding resume commands are `preview-tool-bundle-resume` and `resume-tool-bundle-updates`.
 
 ```powershell
 $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-tools $activeSha256 | ConvertFrom-Json).result.sftp

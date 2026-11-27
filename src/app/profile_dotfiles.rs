@@ -6,6 +6,8 @@ use w11term::{
     sftp::{DotfileBundle, DotfileShell, validate_dotfiles_home, validate_zdotdir},
 };
 
+mod bundle;
+
 const TITLE: &str = "SSH dotfiles";
 
 pub(super) fn approved_fingerprint(entered: &str, profile_pin: &str) -> anyhow::Result<String> {
@@ -45,6 +47,7 @@ pub enum Action {
     Picked(Arc<()>, Result<Option<PathBuf>, String>),
     Approve,
     Reviewed(Arc<()>, Box<DotfileSync>, Result<(), String>),
+    Bundle(bundle::Action),
     Disable,
 }
 
@@ -59,6 +62,7 @@ pub(super) struct Editor {
     approved: Option<Box<DotfileSync>>,
     checking: Option<Arc<()>>,
     browsing: Option<Arc<()>>,
+    composer: Option<bundle::Editor>,
     error: Option<String>,
 }
 
@@ -147,6 +151,10 @@ impl Editor {
             ),
             None => (TITLE, "Sync off".into()),
         };
+        if let Some(composer) = &self.composer {
+            return self.section(id, header, composer.view(id, ctx), ctx);
+        }
+        let can_compose = self.browsing.is_none() && self.checking.is_none();
         let mut content = vec![
             KeyedView::new(
                 "bundle",
@@ -158,11 +166,21 @@ impl Editor {
                 ),
             ),
             KeyedView::new(
-                "browse",
-                Button::new()
-                    .is_enabled(self.browsing.is_none())
-                    .on_click(send(Action::Browse))
-                    .content("Browse for dotfiles bundle"),
+                "bundle-actions",
+                StackPanel::new().spacing(6.0).children((
+                    Button::new()
+                        .is_enabled(self.browsing.is_none())
+                        .on_click(send(Action::Browse))
+                        .content("Browse for dotfiles bundle"),
+                    Button::new()
+                        .is_enabled(can_compose)
+                        .on_click(send(Action::Bundle(bundle::Action::Create)))
+                        .content("Create dotfiles bundle"),
+                    Button::new()
+                        .is_enabled(can_compose && !self.bundle.trim().is_empty())
+                        .on_click(send(Action::Bundle(bundle::Action::Revise)))
+                        .content("Revise selected dotfiles bundle"),
+                )),
             ),
             KeyedView::new(
                 "shell",
@@ -239,6 +257,21 @@ impl Editor {
                     .text_wrapping(TextWrapping::Wrap),
             ),
         ]);
+        self.section(
+            id,
+            header,
+            StackPanel::new().spacing(8.0).keyed_children(content),
+            ctx,
+        )
+    }
+
+    fn section(
+        &self,
+        id: TabId,
+        header: &str,
+        content: View,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
         Expander::new()
             .automation_name(TITLE)
             .horizontal_alignment(HorizontalAlignment::Stretch)
@@ -250,10 +283,7 @@ impl Editor {
             )
             .slots([
                 SlotView::new(ExpanderSlot::Header, TextBlock::new().text(header)),
-                SlotView::new(
-                    ExpanderSlot::Content,
-                    StackPanel::new().spacing(8.0).keyed_children(content),
-                ),
+                SlotView::new(ExpanderSlot::Content, content),
             ])
     }
 }
@@ -275,6 +305,13 @@ impl TerminalApp {
             return;
         };
         match action {
+            Action::Bundle(action) => draft.dotfiles.edit_bundle(
+                id,
+                action,
+                owner.map(|window| window.0 as usize),
+                self.store.path(),
+                ctx,
+            ),
             Action::Approve => {
                 if draft.dotfiles.checking.is_some() {
                     return;

@@ -62,7 +62,9 @@ pub(crate) async fn sync_login_tools(
         bundle.name == settings.name && bundle.bin_directory == settings.bin_directory,
         "The manifest name or bin directory changed. Approve the tool bundle again."
     );
-    let plan = engine.utility_plan(session, bundle).await?;
+    let plan = engine
+        .utility_plan(session, bundle, InstallMode::Replace)
+        .await?;
     ensure!(
         plan.home == settings.home,
         "SFTP home differs from the approved tool bundle home"

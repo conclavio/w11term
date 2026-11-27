@@ -17,6 +17,7 @@ public static class FixtureDialog {
     [DllImport("user32.dll")] private static extern int GetDlgCtrlID(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder name, int size);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr hwnd, StringBuilder caption, int size);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr size, StringBuilder text, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
@@ -75,10 +76,42 @@ public static class FixtureDialog {
         return result.ToArray();
     }
 
-    private static bool IsControl(IntPtr hwnd, string type) {
+    private static string WindowClass(IntPtr hwnd) {
         var name = new StringBuilder(128);
         GetClassName(hwnd, name, name.Capacity);
-        return IsWindowVisible(hwnd) && IsWindowEnabled(hwnd) && name.ToString() == type;
+        return name.ToString();
+    }
+
+    private static string WindowCaption(IntPtr hwnd) {
+        var caption = new StringBuilder(512);
+        GetWindowText(hwnd, caption, caption.Capacity);
+        return caption.ToString();
+    }
+
+    public static IntPtr FindOwnedDialog(uint process, IntPtr owner, string title) {
+        const uint gwOwner = 4;
+        foreach (var hwnd in Windows(process)) {
+            // Shell dialogs are Win32 windows, even when their UI Automation
+            // provider has not finished publishing its class and name.
+            if (GetWindow(hwnd, gwOwner) == owner && WindowClass(hwnd) == "#32770" &&
+                String.Equals(WindowCaption(hwnd), title, StringComparison.OrdinalIgnoreCase)) {
+                return hwnd;
+            }
+        }
+        return IntPtr.Zero;
+    }
+
+    public static string DescribeWindows(uint process) {
+        var windows = new List<string>();
+        foreach (var hwnd in Windows(process)) {
+            windows.Add(String.Format("hwnd={0} owner={1} class={2} title={3}",
+                hwnd, GetWindow(hwnd, 4), WindowClass(hwnd), WindowCaption(hwnd)));
+        }
+        return String.Join(" | ", windows);
+    }
+
+    private static bool IsControl(IntPtr hwnd, string type) {
+        return IsWindowVisible(hwnd) && IsWindowEnabled(hwnd) && WindowClass(hwnd) == type;
     }
 
     private static string EditText(IntPtr hwnd) {
@@ -101,19 +134,39 @@ public static class FixtureDialog {
             // IFileSaveDialog. Never type into the path bar or folder search.
             string suggested = EditText(hwnd);
             if (suggested != suggestedFilename && suggested != Path.GetFileNameWithoutExtension(suggestedFilename)) return true;
-            IntPtr result;
-            SendMessageTimeout(dialog, 0x0028, hwnd, (IntPtr)1, 2, 1000, out result); // WM_NEXTDLGCTL
-            SendMessageTimeout(hwnd, 0x00B1, IntPtr.Zero, (IntPtr)(-1), 2, 1000, out result); // EM_SETSEL
-            // WM_SETTEXT can change the displayed text while the Shell keeps the
-            // suggested file selected. Typing also notifies the containing combo.
-            foreach (char ch in path) {
-                if (SendMessageTimeout(hwnd, 0x0102, (IntPtr)(int)ch, (IntPtr)1, 2, 1000, out result) == IntPtr.Zero)
-                    return false;
-            }
-            changed = EditText(hwnd) == path;
+            changed = TypeFilename(dialog, hwnd, path);
             return !changed;
         }, IntPtr.Zero);
         return changed;
+    }
+
+    public static bool SetCommonDialogFilename(IntPtr dialog, string path) {
+        // The Explorer-style save dialog exposes its File name editor as an
+        // Edit child of the filename ComboBox with control ID 1001 on the Edit.
+        // Its text can change as the dialog initializes or after partial input.
+        const int fileNameEdit = 1001;
+        bool changed = false;
+        EnumChildWindows(dialog, (hwnd, _) => {
+            if (GetDlgCtrlID(hwnd) != fileNameEdit ||
+                !IsControl(hwnd, "Edit") || !IsControl(GetParent(hwnd), "ComboBox")) return true;
+            changed = EditText(hwnd) == path || TypeFilename(dialog, hwnd, path);
+            return false;
+        }, IntPtr.Zero);
+        return changed;
+    }
+
+    private static bool TypeFilename(IntPtr dialog, IntPtr edit, string path) {
+        IntPtr result;
+        SendMessageTimeout(dialog, 0x0028, edit, (IntPtr)1, 2, 1000, out result); // WM_NEXTDLGCTL
+        if (SendMessageTimeout(edit, 0x00B1, IntPtr.Zero, (IntPtr)(-1), 2, 1000, out result) == IntPtr.Zero)
+            return false; // EM_SETSEL
+        // WM_SETTEXT can change the displayed text while the Shell keeps the
+        // suggested file selected. Typing also notifies the containing combo.
+        foreach (char ch in path) {
+            if (SendMessageTimeout(edit, 0x0102, (IntPtr)(int)ch, (IntPtr)1, 2, 1000, out result) == IntPtr.Zero)
+                return false;
+        }
+        return EditText(edit) == path;
     }
 
     public static bool SelectFileType(IntPtr dialog, string label) {

@@ -331,7 +331,13 @@ Ship selection explanation and Bash drafting with a shared request preview, then
 
 Use a single SSH profile to bring your shell setup and tools to a Linux account. Under **Settings → Edit profile**, configure **SSH dotfiles** for prompt and shell startup fragments and **SSH tools** for your pinned executables. Review and approve each bundle for the remote account. On an ordinary SSH connect or reconnect, w11term syncs the approved dotfiles first and then syncs the tools over SFTP before starting the shell. Each step reports its own outcome. A skipped sync still lets the shell open. [SSH dotfile sync](../CONTROL.md#sync-dotfiles-on-ssh-connect) · [SSH tool sync](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
 
-From that pane, **More → Command reference** shows the tool sync result and the managed launcher path beside its manual. With Bash or Zsh PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)
+The SSH dotfiles editor can create a bundle locally or revise an existing bundle in a new file. It edits the shared environment and the Bash and Zsh fragments directly. Choosing the new file leaves the profile's saved approval in place until the new selection is approved and saved.
+
+For an already connected SSH pane, **More → Command reference → Apply SSH dotfiles** reviews and applies a bundle on that connection. The review shows the target home, managed files, startup hooks, and conflicts. Open a new shell to use the installed fragments. [Reviewed dotfile installation](../CONTROL.md#preview-and-apply-ssh-dotfiles)
+
+**Dotfile versions** lists the active and retained versions for Bash or Zsh. Review and restore a previous version, or disable managed fragments for the account. Both pause automatic sync. Resume it from the same panel to let approved profiles sync on reconnect. [Dotfile version history](../CONTROL.md#restore-or-disable-ssh-dotfiles)
+
+From that pane, **More → Command reference** shows both login sync results for the current connection. **Apply SSH dotfiles** shows the reason when dotfiles sync was skipped or unconfirmed. The command manual can show the managed launcher path. With Bash or Zsh PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)
 
 **Acceptance.** Use a profile with both bundles enabled on a clean Linux account. At the first prompt, verify that the managed prompt is active and that `command -v` resolves a bundled utility to the expected launcher under `~/.local/bin`. Reconnect and verify both sync results and the same prompt and launcher.
 
@@ -349,7 +355,15 @@ Open **Settings → Edit profile → SSH tools** to choose a preset, select indi
 
 Use **More → Command reference → Install SSH tools** on a connected pane to review, install, or restore a bundle. The preview selects an x86-64 or ARM64 build for the verified Linux account and shows compatibility information, destinations, and conflicts. The installer transfers and verifies the chosen executables over the existing SFTP connection, then publishes them under the account’s home with launchers in `~/.local/bin` by default. User-owned launchers are preserved. Retained versions support rollback. Selecting an installed command shows its launcher path and bundle name beside the reference page for that pane. [Reviewed install and rollback](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
-With profile approval, a connection can sync a bundle before opening the shell. **Manage Bash PATH** or **Manage Zsh PATH** appends the launcher directory after existing entries so tools already on the account’s `PATH` keep precedence. The command-reference panel shows the sync result and offers PATH repair or resuming updates after a reviewed rollback. [Sync approval and PATH behavior](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
+Built-in Linux manuals offer **Review installing** for the selected command. Review the SSH target and the executable hash, download the pinned build for the detected architecture if needed, and confirm installation. Other active tools in the built-in bundle keep their exact binaries and launcher directory. [Command-page installer](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+
+Use **Bundle versions → Save pinned bundle on Windows** to capture the active Linux builds as a verified local manifest. **Review in this SSH profile** opens a review for the authenticated account, ready for approval and saving. [Save an installed release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+
+Select a command from **Installed SSH tools** to review removing it. The new release keeps the remaining pins and pauses automatic updates. Use **Bundle versions** to restore the previous release. [Remove a managed tool](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+
+**Manage PATH for new shells** reviews Bash or Zsh startup-file changes for the installed bundle. It can append the verified launcher directory after existing entries or remove its managed blocks while preserving the surrounding settings. [Manual PATH management](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+
+With profile approval, a connection can sync a bundle before opening the shell. **Manage Bash PATH** or **Manage Zsh PATH** appends the launcher directory after existing entries so tools already on the account's `PATH` keep precedence. The command-reference panel shows the sync result and offers PATH repair or resuming updates after a reviewed rollback. Scripts can also review an addition to an active tool bundle and keep its existing binaries and launcher directory. A new version from an addition pauses login sync until automatic updates are resumed. [Sync approval and PATH behavior](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
 
 **Acceptance.** Install a small bundle on clean Linux x64 and arm64 fixtures and run the intended commands from the next shell prompt. Exercise an incompatible binary and an existing user-owned command. Verify the selected executable through `PATH`, that repeat sync skips unchanged bytes, and that rollback restores the previous managed version.
 
