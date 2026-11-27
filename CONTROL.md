@@ -1296,6 +1296,10 @@ Apply replies with `shell`, `home`, `bundle_sha256` and the ordered `changed_fil
 
 Install and switch previews include `fragment_changes`. Its `baseline` is `verified`, `inactive`, or `unavailable`, and each entry in `fragments` includes its `role` and complete managed `before` and `after` text. A null side has no verified text for that state. An empty string is an empty managed fragment. Disable previews have null proposed text, and resuming a held version shows matching before and after text.
 
+To recover an edited or missing startup hook, choose **Review startup hook repair** in the dotfiles installer and confirm **Repair reviewed startup hooks**. The review shows changed lines inside a replaced block and the full block for a missing hook. Repair uses the selected shell and Zsh startup directory, preserves the surrounding file text, and keeps the active version and update policy. Duplicate, incomplete, or nested w11term markers block repair. Changes to existing files require the server's atomic rename support.
+
+Scripts use `preview-dotfile-hooks --shell bash|zsh [--zdotdir RELATIVE_DIR]` and `repair-dotfile-hooks --shell bash|zsh --review TOKEN` with the same optional `--zdotdir`. The preview includes `ready` and `files`, with the old managed block in `replaced_hook` and replacement in `hook`. Repair returns `changed_files`. A failed or interrupted repair requires a fresh review.
+
 ### Restore or disable SSH dotfiles
 
 In **Command reference → Apply SSH dotfiles**, choose the shell and its startup directory, then open **Dotfile versions**. Select a retained version and choose **Review dotfile restore** followed by **Restore reviewed dotfiles**. To disable managed fragments, use **Review disabling managed dotfiles** followed by **Disable reviewed dotfiles**. Both actions pause automatic dotfile sync for that shell on the remote account.

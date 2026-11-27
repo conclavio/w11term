@@ -367,6 +367,13 @@ pub enum Operation {
         zdotdir: Option<String>,
         review: String,
     },
+    RepairDotfileHooks {
+        shell: DotfileShell,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zdotdir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
     SwitchDotfiles {
         target: DotfileTarget,
         shell: DotfileShell,
@@ -1116,6 +1123,9 @@ pub(crate) async fn run(
                 }
                 Operation::ApplyDotfiles { .. } => JobStage::Checking(
                     "Dotfiles installation did not finish. Preview again to check the active bundle.",
+                ),
+                Operation::RepairDotfileHooks { .. } => JobStage::Checking(
+                    "Startup hook repair did not finish. Review the startup files again.",
                 ),
                 Operation::SwitchDotfiles { .. } => JobStage::Checking(
                     "Dotfiles switch did not finish. Preview again to check the active bundle.",
@@ -1886,6 +1896,14 @@ impl Engine {
                 review,
             } => {
                 self.apply_dotfiles(bundle, shell, zdotdir.as_deref(), &review, stage)
+                    .await?
+            }
+            RepairDotfileHooks {
+                shell,
+                zdotdir,
+                review,
+            } => {
+                self.repair_dotfile_hooks(shell, zdotdir.as_deref(), review.as_deref(), stage)
                     .await?
             }
             SwitchDotfiles {

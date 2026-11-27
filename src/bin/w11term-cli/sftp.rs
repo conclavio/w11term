@@ -41,6 +41,8 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   pause-tool-bundle-updates NAME SHA256 --review TOKEN\n\
   preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  preview-dotfile-hooks --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
+  repair-dotfile-hooks --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   list-dotfile-versions --shell bash|zsh\n\
   preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   switch-dotfiles SHA256|disabled|automatic --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
@@ -406,19 +408,32 @@ pub fn parse(
                 json!(dotfile_shell(opts.remove("--shell").as_deref())?),
             );
         }
-        "preview-dotfiles" | "apply-dotfiles" | "preview-dotfiles-switch" | "switch-dotfiles" => {
+        "preview-dotfiles"
+        | "apply-dotfiles"
+        | "preview-dotfile-hooks"
+        | "repair-dotfile-hooks"
+        | "preview-dotfiles-switch"
+        | "switch-dotfiles" => {
             let shell = dotfile_shell(opts.remove("--shell").as_deref())?;
             let zdotdir = opts.remove("--zdotdir");
             validate_zdotdir(shell, zdotdir.as_deref())?;
-            if matches!(command.as_str(), "apply-dotfiles" | "switch-dotfiles") {
+            if matches!(
+                command.as_str(),
+                "apply-dotfiles" | "repair-dotfile-hooks" | "switch-dotfiles"
+            ) {
                 let review = opts
                     .remove("--review")
-                    .context("--review is required. Preview the bundle first.")?;
+                    .context("--review is required. Preview the changes first.")?;
                 fields.insert("review".into(), json!(normalize_sha256(&review)?));
             }
             fields.insert("shell".into(), json!(shell));
             fields.insert("zdotdir".into(), json!(zdotdir));
             if matches!(
+                command.as_str(),
+                "preview-dotfile-hooks" | "repair-dotfile-hooks"
+            ) {
+                fields.insert("op".into(), json!("repair-dotfile-hooks"));
+            } else if matches!(
                 command.as_str(),
                 "preview-dotfiles-switch" | "switch-dotfiles"
             ) {
@@ -669,6 +684,46 @@ mod tests {
                 ..
             } if name == "fleet" && tool == "rg" && review == token
         ));
+    }
+
+    #[test]
+    fn startup_hook_repair_requires_a_review_without_a_bundle() {
+        let (_, preview) = p(&[
+            "--pane",
+            "2",
+            "preview-dotfile-hooks",
+            "--shell",
+            "zsh",
+            "--zdotdir",
+            "config/zsh",
+        ])
+        .unwrap();
+        assert!(matches!(preview, Request::Sftp {
+            pane: 2,
+            operation: Operation::RepairDotfileHooks {
+                shell: DotfileShell::Zsh, zdotdir: Some(directory), review: None,
+            },
+            ..
+        } if directory == "config/zsh"));
+        assert!(p(&["--pane", "2", "repair-dotfile-hooks", "--shell", "bash"]).is_err());
+        let token = "a".repeat(64);
+        let (_, apply) = p(&[
+            "--pane",
+            "2",
+            "repair-dotfile-hooks",
+            "--shell",
+            "bash",
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(apply, Request::Sftp {
+            pane: 2,
+            operation: Operation::RepairDotfileHooks {
+                shell: DotfileShell::Bash, zdotdir: None, review: Some(review),
+            },
+            ..
+        } if review == token));
     }
 
     #[test]

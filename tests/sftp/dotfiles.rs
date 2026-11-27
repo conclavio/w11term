@@ -49,6 +49,14 @@ fn dotfile_switch(target: DotfileTarget, preview: Option<&Value>) -> Operation {
     }
 }
 
+fn repair_hooks(shell: DotfileShell, zdotdir: Option<&str>, preview: Option<&Value>) -> Operation {
+    Operation::RepairDotfileHooks {
+        shell,
+        zdotdir: zdotdir.map(String::from),
+        review: preview.map(|plan| plan["review"].as_str().unwrap().into()),
+    }
+}
+
 fn file<'a>(preview: &'a Value, path: &str) -> &'a Value {
     preview["files"]
         .as_array()
@@ -214,6 +222,142 @@ async fn preview_dotfiles_uses_the_selected_zsh_startup_directory() {
         rc
     );
     assert!(!root.join(".zshrc").exists());
+    fs::remove_file(root.join("config/zsh/.zshrc")).unwrap();
+    let repair =
+        |preview: Option<&Value>| repair_hooks(DotfileShell::Zsh, Some("config/zsh"), preview);
+    let reviewed = guarded_job(&pane, None, repair(None)).await.unwrap();
+    assert_eq!(reviewed["supports_atomic_replace"], false);
+    assert_eq!(reviewed["ready"], true);
+    assert_eq!(file(&reviewed, "/config/zsh/.zshrc")["action"], "create");
+    let repaired = guarded_job(&pane, None, repair(Some(&reviewed)))
+        .await
+        .unwrap();
+    assert_eq!(repaired["changed_files"], json!(["/config/zsh/.zshrc"]));
+    assert_eq!(
+        fs::read_to_string(root.join("config/zsh/.zshrc")).unwrap(),
+        rc
+    );
+    assert_eq!(
+        fs::read_to_string(managed.join("zsh-current")).unwrap(),
+        format!("{id}\n")
+    );
+    assert!(!root.join(".zshrc").exists());
+    let edited = rc.replace("/prompt.sh", "/custom-prompt.sh");
+    fs::write(root.join("config/zsh/.zshrc"), &edited).unwrap();
+    let blocked = guarded_job(&pane, None, repair(None)).await.unwrap();
+    assert_eq!(
+        file(&blocked, "/config/zsh/.zshrc")["action"],
+        "replace-hook"
+    );
+    assert_eq!(blocked["ready"], false);
+    let error = guarded_job(&pane, None, repair(Some(&blocked)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("cannot atomically replace"), "{error}");
+    assert_eq!(
+        fs::read_to_string(root.join("config/zsh/.zshrc")).unwrap(),
+        edited
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_hook_repair_replaces_only_the_reviewed_managed_block() {
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let root = remote.path();
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    let login = root.join(".bash_profile");
+    let unused_login = root.join(".profile");
+    let startup = root.join(".bashrc");
+    fs::write(&login, "# Bash login prefix\r\n").unwrap();
+    fs::write(&unused_login, "# Unselected profile\n").unwrap();
+    let preview = guarded_job(&pane, None, bundle(DotfileShell::Bash, None))
+        .await
+        .unwrap();
+    guarded_job(&pane, None, apply("managed", &preview))
+        .await
+        .unwrap();
+    let store = root.join(".config/w11term/dotfiles");
+    let selector = store.join("bash-current");
+    let held = format!("{}manual\n", fs::read_to_string(&selector).unwrap());
+    fs::write(&selector, &held).unwrap();
+    let active_prompt = store.join(format!("bash-{}/prompt.sh", held.lines().next().unwrap()));
+    let original_payload = fs::read(&active_prompt).unwrap();
+    let original_login = fs::read(&login).unwrap();
+    let hook = fs::read_to_string(&startup).unwrap();
+
+    let repair = |preview: Option<&Value>| repair_hooks(DotfileShell::Bash, None, preview);
+    let edited = hook.replace("/prompt.sh", "/other-prompt.sh");
+    let nested = edited.replace(
+        "/other-prompt.sh\"\n",
+        "/other-prompt.sh\"\n    # >>> w11term tool PATH another-block >>>\n",
+    );
+    assert_ne!(edited, nested);
+    let malformed = edited
+        .replace("dotfiles >>>", "dotfiles >>")
+        .replace("dotfiles <<<", "dotfiles <<");
+    for ambiguous in [
+        nested,
+        malformed,
+        format!("{edited}# >>> w11term dotfiles >>>\n"),
+    ] {
+        fs::write(&startup, &ambiguous).unwrap();
+        let blocked = guarded_job(&pane, None, repair(None)).await.unwrap();
+        assert_eq!(blocked["ready"], false);
+        assert_eq!(file(&blocked, "/.bashrc")["action"], "hook-conflict");
+        let error = guarded_job(&pane, None, repair(Some(&blocked)))
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("Resolve the startup hook conflict at /.bashrc"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&startup).unwrap(), ambiguous);
+        assert_eq!(fs::read(&login).unwrap(), original_login);
+    }
+
+    let prefix = "# private prefix\r\n";
+    let suffix = "# private suffix without newline";
+    let damaged = format!("{prefix}{edited}{suffix}");
+    fs::write(&startup, &damaged).unwrap();
+    let reviewed = guarded_job(&pane, None, repair(None)).await.unwrap();
+    assert_eq!(reviewed["ready"], true);
+    assert_eq!(file(&reviewed, "/.bash_profile")["action"], "unchanged");
+    let change = file(&reviewed, "/.bashrc");
+    assert_eq!(change["action"], "replace-hook");
+    assert_eq!(change["replaced_hook"], edited);
+    assert_eq!(change["hook"], hook);
+    assert!(!reviewed.to_string().contains("private prefix"));
+    assert!(!reviewed.to_string().contains("private suffix"));
+    assert_eq!(fs::read_to_string(&startup).unwrap(), damaged);
+    assert_eq!(fs::read_to_string(&selector).unwrap(), held);
+
+    let new_prefix = "# updated prefix\r\n";
+    let changed = format!("{new_prefix}{edited}{suffix}");
+    fs::write(&startup, &changed).unwrap();
+    let error = guarded_job(&pane, None, repair(Some(&reviewed)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    assert_eq!(fs::read_to_string(&startup).unwrap(), changed);
+    let fresh = guarded_job(&pane, None, repair(None)).await.unwrap();
+    let repaired = guarded_job(&pane, None, repair(Some(&fresh)))
+        .await
+        .unwrap();
+    assert_eq!(repaired["changed_files"], json!(["/.bashrc"]));
+    assert_eq!(
+        fs::read(&startup).unwrap(),
+        format!("{new_prefix}{hook}{suffix}").as_bytes()
+    );
+    assert_eq!(fs::read_to_string(&selector).unwrap(), held);
+    assert_eq!(fs::read(&login).unwrap(), original_login);
+    assert_eq!(fs::read(&active_prompt).unwrap(), original_payload);
+    assert_eq!(fs::read(&unused_login).unwrap(), b"# Unselected profile\n");
+    let current = guarded_job(&pane, None, repair(None)).await.unwrap();
+    let noop = guarded_job(&pane, None, repair(Some(&current)))
+        .await
+        .unwrap();
+    assert_eq!(noop["changed_files"], json!([]));
     server.abort();
 }
 

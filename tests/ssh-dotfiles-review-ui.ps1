@@ -150,7 +150,9 @@ try {
     $null = Wait-Until 'the reviewed reinstall is a no-op' { Find-Element 'Dotfiles are already current' }
 
     $startup = Join-Path $remote '.bashrc'
-    $installed = [IO.File]::ReadAllText($startup)
+    $installed = [IO.File]::ReadAllText($startup) + "# keep my trailing shell settings"
+    $selectorPath = Join-Path $remoteStore 'bash-current'
+    $beforeHookRepair = [IO.File]::ReadAllText($selectorPath)
     $drift = $installed.Replace('/prompt.sh', '/edited-prompt.sh')
     if ($drift -ceq $installed) { throw 'The installed Bash hook was missing' }
     [IO.File]::WriteAllText($startup, $drift)
@@ -160,9 +162,35 @@ try {
         $apply -and !$apply.Current.IsEnabled -and (Find-Element "Startup hook conflict${dot}/.bashrc")
     }
     if ([IO.File]::ReadAllText($startup) -cne $drift) { throw 'Reading a conflict replaced the edited startup hook' }
-    [IO.File]::WriteAllText($startup, $installed)
+    Click 'Review startup hook repair'
+    $null = Wait-Until 'repair review finds only the edited hook' {
+        (Find-Element "Replace managed startup hook${dot}/.bashrc") -and
+            (Find-Element "Already current${dot}/.profile") -and
+            (Find-Element 'Repair reviewed startup hooks' $button -Visible)
+    }
+    Expand-ReviewDetail "Startup hook changes${dot}/.bashrc"
+    $null = Wait-Until 'review shows the edited and replacement hook lines' {
+        Get-NativeTextLabels | Where-Object { $_.Contains('/edited-prompt.sh') -and $_.Contains('/prompt.sh') }
+    }
+    if (Get-NativeTextLabels | Where-Object { $_.Contains('# keep my trailing shell settings') }) {
+        throw 'The repair review exposed text outside the managed hook'
+    }
+    if ([IO.File]::ReadAllText($startup) -cne $drift) { throw 'The repair review wrote the hook' }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'the local pane cannot confirm SSH startup hook changes' {
+        $repair = Find-Element 'Repair reviewed startup hooks' $button
+        $repair -and !$repair.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$pane")
+    Wait-Focus $pane
+    Click 'Repair reviewed startup hooks'
+    $null = Wait-Until 'repair updates the hook without switching the active bundle' {
+        (Find-Element "Startup hooks repaired${dot}1 file changed") -and
+            [IO.File]::ReadAllText($startup) -ceq $installed -and
+            [IO.File]::ReadAllText($selectorPath) -ceq $beforeHookRepair
+    }
 
-    $selectorPath = Join-Path $remoteStore 'bash-current'
     $first = [IO.File]::ReadAllText($selectorPath).Trim()
     Write-Bundle 'second'
     Click 'Review dotfiles changes'

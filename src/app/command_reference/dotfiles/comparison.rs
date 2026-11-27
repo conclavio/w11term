@@ -40,28 +40,15 @@ impl From<FragmentReport> for Comparison {
             .fragments
             .into_iter()
             .filter_map(|fragment| {
-                let diff = Difference::compare_files(
+                let lines = diff_text(
                     fragment.before.as_deref().unwrap_or_default(),
                     fragment.after.as_deref().unwrap_or_default(),
-                );
-                if diff.changes.is_empty() {
-                    return None;
-                }
-                let mut lines = Vec::with_capacity(diff.changes.len() + 2);
-                if diff.unaligned {
-                    lines.push("Changed sections are too large to align. Lines are grouped by version.".into());
-                }
-                if diff.limited {
-                    lines.push("This view shows the first changed lines. The CLI preview includes the complete fragments.".into());
-                }
-                lines.extend(diff.changes.iter().map(|change| {
-                    let verb = match (report.baseline, change.edit) {
-                        (Baseline::Unavailable, LineEdit::Added) => "Proposed",
-                        _ => change.edit.verb(),
-                    };
-                    format!("{verb} line {} · {}", change.line, change.text)
-                }));
-                Some(FragmentDiff { role: fragment.role, lines: lines.join("\n") })
+                    report.baseline == Baseline::Unavailable,
+                )?;
+                Some(FragmentDiff {
+                    role: fragment.role,
+                    lines,
+                })
             })
             .collect();
         Self {
@@ -69,6 +56,32 @@ impl From<FragmentReport> for Comparison {
             changes,
         }
     }
+}
+
+pub(super) fn diff_text(before: &str, after: &str, proposed_only: bool) -> Option<String> {
+    let diff = Difference::compare_files(before, after);
+    if diff.changes.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::with_capacity(diff.changes.len() + 2);
+    if diff.unaligned {
+        lines.push("Changed sections are too large to align. Lines are grouped by version.".into());
+    }
+    if diff.limited {
+        lines.push(
+            "This view shows the first changed lines. The CLI preview includes the complete text."
+                .into(),
+        );
+    }
+    lines.extend(diff.changes.iter().map(|change| {
+        let verb = if proposed_only && change.edit == LineEdit::Added {
+            "Proposed"
+        } else {
+            change.edit.verb()
+        };
+        format!("{verb} line {} · {}", change.line, change.text)
+    }));
+    Some(lines.join("\n"))
 }
 
 impl Comparison {

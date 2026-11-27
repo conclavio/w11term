@@ -2,6 +2,7 @@ use super::*;
 use crate::events::DotfileSyncStatus;
 
 mod comparison;
+mod hooks;
 mod tool_path;
 use comparison::FragmentBaseline;
 
@@ -408,11 +409,10 @@ fi
 
 fn hook_change(path: String, original: Option<String>, hook: String) -> Edit {
     let text = original.as_deref().unwrap_or_default();
-    let begin = hook.lines().next().expect("generated opening marker");
-    let end = hook.lines().last().expect("generated closing marker");
+    let [begin, end] = hooks::hook_markers(&hook);
     let markers: Vec<_> = text
         .lines()
-        .filter(|line| [begin, end].contains(&line.trim()))
+        .filter(|line| hooks::candidate_marker(line, [begin, end]))
         .take(3)
         .collect();
     let (action, after) = if markers.is_empty() {

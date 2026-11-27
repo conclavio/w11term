@@ -6,7 +6,7 @@ use w11term::sftp::{DotfileBundle, DotfileShell, validate_zdotdir};
 
 mod comparison;
 mod history;
-use comparison::{Comparison, code_details};
+use comparison::{Comparison, code_details, diff_text};
 
 pub enum Action {
     Open(ToolPane),
@@ -15,8 +15,10 @@ pub enum Action {
     Shell(Option<usize>),
     Zdotdir(String),
     Preview,
+    PreviewHooks,
     Previewed(Arc<()>, Result<Box<Review>, String>),
     Apply,
+    ApplyHooks,
     Applied(Arc<()>, Result<Applied, String>),
     History(history::Action),
     Close,
@@ -25,13 +27,24 @@ pub enum Action {
 #[derive(Deserialize)]
 pub struct Review {
     home: String,
-    bundle_sha256: String,
+    #[serde(default)]
+    operation: ReviewOperation,
+    bundle_sha256: Option<String>,
     active_bundle_sha256: Option<String>,
+    #[serde(default)]
     directories_to_create: Vec<String>,
     files: Vec<Edit>,
     supports_atomic_replace: bool,
-    fragment_changes: Comparison,
+    fragment_changes: Option<Comparison>,
     review: String,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ReviewOperation {
+    #[default]
+    Install,
+    RepairDotfileHooks,
 }
 
 #[derive(Deserialize)]
@@ -41,6 +54,9 @@ struct Edit {
     before_sha256: Option<String>,
     after_sha256: Option<String>,
     hook: Option<String>,
+    replaced_hook: Option<String>,
+    #[serde(skip)]
+    hook_diff: Option<String>,
     #[serde(default)]
     add_newline_before_hook: bool,
 }
@@ -69,6 +85,7 @@ impl Edit {
             .unwrap_or(match self.action.as_str() {
                 "create" => "Create",
                 "append-hook" => "Add startup hook",
+                "replace-hook" => "Replace managed startup hook",
                 "unchanged" => "Already current",
                 "replace" => "Switch active bundle",
                 action => action,
@@ -77,6 +94,14 @@ impl Edit {
 }
 
 impl Review {
+    fn prepare(&mut self) {
+        for edit in &mut self.files {
+            if let (Some(before), Some(hook)) = (edit.replaced_hook.take(), &edit.hook) {
+                edit.hook_diff = diff_text(&before, hook, false);
+            }
+        }
+    }
+
     fn ready(&self) -> bool {
         self.files
             .iter()
@@ -88,10 +113,16 @@ impl Review {
         if let Some(active) = &self.active_bundle_sha256 {
             fields.push(detail("active", format!("Active version {active}")));
         }
-        fields.push(detail(
-            "reviewed-version",
-            format!("Reviewed version {}", self.bundle_sha256),
-        ));
+        if let Some(id) = &self.bundle_sha256 {
+            fields.push(detail("reviewed-version", format!("Reviewed version {id}")));
+        }
+        if self.operation == ReviewOperation::RepairDotfileHooks {
+            fields.push(detail(
+                "hook-scope",
+                "Repair updates the startup hooks for new shells and keeps the selected bundle."
+                    .into(),
+            ));
+        }
         if !self.ready() {
             fields.push(detail(
                 "blocked",
@@ -128,8 +159,17 @@ impl Review {
                     hook,
                 ));
             }
+            if let Some(diff) = &edit.hook_diff {
+                fields.push(code_details(
+                    format!("startup-hook-{index}"),
+                    &format!("Startup hook changes · {}", edit.path),
+                    diff,
+                ));
+            }
         }
-        self.fragment_changes.describe(fields);
+        if let Some(comparison) = &self.fragment_changes {
+            comparison.describe(fields);
+        }
     }
 }
 
@@ -142,7 +182,9 @@ pub struct Applied {
 enum Work {
     Browse,
     Preview,
+    PreviewHooks,
     Apply,
+    ApplyHooks,
     ListVersions,
     ReviewSwitch,
     SwitchVersion,
@@ -204,9 +246,9 @@ impl Installer {
     }
 
     fn applying(&self) -> bool {
-        self.pending
-            .as_ref()
-            .is_some_and(|(_, work)| matches!(work, Work::Apply | Work::SwitchVersion))
+        self.pending.as_ref().is_some_and(|(_, work)| {
+            matches!(work, Work::Apply | Work::ApplyHooks | Work::SwitchVersion)
+        })
     }
 
     fn startup_directory(&self) -> Result<Option<String>, String> {
@@ -299,14 +341,22 @@ impl Installer {
                 || Action::Preview,
             ),
         ));
+        fields.push(KeyedView::new(
+            "preview-hooks",
+            button("Review startup hook repair", ready, || Action::PreviewHooks),
+        ));
         let mut footer = Vec::with_capacity(2);
         if let Some(review) = &self.review {
             review.describe(&mut fields);
+            let (label, action): (&str, fn() -> Action) =
+                if review.operation == ReviewOperation::RepairDotfileHooks {
+                    ("Repair reviewed startup hooks", || Action::ApplyHooks)
+                } else {
+                    ("Apply reviewed dotfiles", || Action::Apply)
+                };
             footer.push(KeyedView::new(
                 "apply",
-                button("Apply reviewed dotfiles", ready && review.ready(), || {
-                    Action::Apply
-                }),
+                button(label, ready && review.ready(), action),
             ));
         }
         if !connected {
@@ -321,7 +371,9 @@ impl Installer {
                 match work {
                     Work::Browse => "Selecting a local dotfiles bundle…",
                     Work::Preview => "Reading remote dotfiles…",
+                    Work::PreviewHooks => "Reviewing startup hooks…",
                     Work::Apply => "Applying reviewed dotfiles…",
+                    Work::ApplyHooks => "Repairing reviewed startup hooks…",
                     Work::ListVersions | Work::ReviewSwitch | Work::SwitchVersion => {
                         unreachable!("the history view handles version operations")
                     }
@@ -472,14 +524,29 @@ impl TerminalApp {
                     installer.status = None;
                 }
             }
-            Action::Preview | Action::Apply if idle => {
+            Action::Preview | Action::PreviewHooks | Action::Apply | Action::ApplyHooks if idle => {
                 let Some((_, input)) = current else { return };
-                let Some(path) = installer.bundle.clone() else {
-                    return;
+                let work = match action {
+                    Action::PreviewHooks => Work::PreviewHooks,
+                    Action::ApplyHooks => Work::ApplyHooks,
+                    Action::Apply => Work::Apply,
+                    _ => Work::Preview,
                 };
-                let apply = matches!(action, Action::Apply);
+                let apply = matches!(work, Work::Apply | Work::ApplyHooks);
+                let repairing = matches!(work, Work::PreviewHooks | Work::ApplyHooks);
+                let path = if repairing {
+                    None
+                } else {
+                    let Some(path) = installer.bundle.clone() else {
+                        return;
+                    };
+                    Some(path)
+                };
                 let review = if apply {
-                    let Some(plan) = installer.review.take_if(|plan| plan.ready()) else {
+                    let Some(plan) = installer.review.take_if(|plan| {
+                        plan.ready()
+                            && (plan.operation == ReviewOperation::RepairDotfileHooks) == repairing
+                    }) else {
                         return;
                     };
                     Some(plan.review)
@@ -495,7 +562,7 @@ impl TerminalApp {
                         return;
                     }
                 };
-                let ticket = installer.begin(if apply { Work::Apply } else { Work::Preview });
+                let ticket = installer.begin(work);
                 let rejected = if apply {
                     message(Action::Applied(
                         ticket.clone(),
@@ -510,23 +577,32 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |scope| {
                         let result = (|| {
-                            let bundle = DotfileBundle::load(&path)
-                                .map_err(|error| format!("Reading dotfiles bundle: {error:#}"))?;
                             if scope.is_cancelled() {
                                 return Err("Dotfiles operation cancelled".into());
                             }
-                            let operation = match review {
-                                Some(review) => Operation::ApplyDotfiles {
-                                    bundle,
+                            let operation = if let Some(path) = path {
+                                let bundle = DotfileBundle::load(&path).map_err(|error| {
+                                    format!("Reading dotfiles bundle: {error:#}")
+                                })?;
+                                match review {
+                                    Some(review) => Operation::ApplyDotfiles {
+                                        bundle,
+                                        shell,
+                                        zdotdir,
+                                        review,
+                                    },
+                                    None => Operation::PreviewDotfiles {
+                                        bundle,
+                                        shell,
+                                        zdotdir,
+                                    },
+                                }
+                            } else {
+                                Operation::RepairDotfileHooks {
                                     shell,
                                     zdotdir,
                                     review,
-                                },
-                                None => Operation::PreviewDotfiles {
-                                    bundle,
-                                    shell,
-                                    zdotdir,
-                                },
+                                }
                             };
                             let timeout = Duration::from_secs(if apply { 120 } else { 30 });
                             run_pane_sftp_job(input, target, operation, timeout, None)
@@ -534,14 +610,20 @@ impl TerminalApp {
                         if apply {
                             message(Action::Applied(ticket, decode(result)))
                         } else {
-                            message(Action::Previewed(ticket, decode(result)))
+                            let prepared = decode(result).map(|mut review: Box<Review>| {
+                                review.prepare();
+                                review
+                            });
+                            message(Action::Previewed(ticket, prepared))
                         }
                     },
                     rejected,
                 );
             }
             Action::Previewed(ticket, result) => {
-                if installer.finish(&ticket, Work::Preview) {
+                if installer.finish(&ticket, Work::Preview)
+                    || installer.finish(&ticket, Work::PreviewHooks)
+                {
                     match result {
                         Ok(review) => installer.review = Some(review),
                         Err(error) => installer.status = Some(error),
@@ -549,8 +631,14 @@ impl TerminalApp {
                 }
             }
             Action::Applied(ticket, result) => {
-                if installer.finish(&ticket, Work::Apply) {
+                let repairing = installer.finish(&ticket, Work::ApplyHooks);
+                if repairing || installer.finish(&ticket, Work::Apply) {
                     installer.status = Some(match result {
+                        Ok(applied) if repairing => match applied.changed_files.len() {
+                            0 => "Startup hooks are already current".into(),
+                            1 => "Startup hooks repaired · 1 file changed".into(),
+                            count => format!("Startup hooks repaired · {count} files changed"),
+                        },
                         Ok(applied) if applied.changed_files.is_empty() => {
                             "Dotfiles are already current".into()
                         }
