@@ -109,6 +109,8 @@ try {
     Wait-Focus $remotePane
     $null = Control @('wait-ssh-connected','--pane',"$remotePane",'--timeout','15')
     Wait-Platform 'Auto (Linux)'
+    $loginSummary = "Last login sync${dot}portable installed"
+    $null = Wait-Until 'last SSH tool sync shown in command reference' { Find-Element $loginSummary }
     $null = Wait-Until 'example from the other pane cannot be inserted' {
         $insert = Find-Element 'Insert into terminal' $button
         !$insert -or !$insert.Current.IsEnabled
@@ -123,6 +125,10 @@ try {
     }
     Click 'Install SSH tools'
     $null = Wait-Until 'configured profile manifest offered' { Find-Element (Join-Path $State 'fleet.json') }
+    $null = Wait-Until 'tool installation and blocked PATH are reported separately' {
+        (Find-Element $loginSummary) -and (Find-Element 'Managed PATH skipped') -and
+            (Find-Element 'Resolve the managed PATH conflict at /.bashrc')
+    }
     Click 'Browse for tool bundle'
     $manifestDialog = Wait-Until 'owned tool manifest picker' { Find-OwnedDialog 'Choose SSH tool bundle' }
     Select-DialogItem $manifestDialog 'Tool review.json'
@@ -145,7 +151,7 @@ try {
     Wait-Focus $localPane
     $null = Wait-Until 'the other pane cannot apply the original review' {
         $install = Find-Element 'Install reviewed bundle' $button
-        $install -and !$install.Current.IsEnabled
+        $install -and !$install.Current.IsEnabled -and !(Find-Element $loginSummary)
     }
     $null = Control @('focus-pane','--pane',"$remotePane")
     Wait-Focus $remotePane

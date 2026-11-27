@@ -2568,6 +2568,11 @@ async fn native_command_reference_follows_powershell_and_ssh() {
     let ssh = super::utilities::reference_tool_profile(source, state.path(), remote.path());
     drive_mixed_gui("command-reference-ui.ps1", &ssh, state.path());
     assert!(
+        fs::read_to_string(remote.path().join(".bashrc"))
+            .unwrap()
+            .contains("# preserve my shell changes")
+    );
+    assert!(
         fs::read_to_string(remote.path().join(".local/bin/netwatch"))
             .unwrap()
             .ends_with("/portable/current/netwatch\n")

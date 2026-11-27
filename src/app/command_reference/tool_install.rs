@@ -112,7 +112,12 @@ impl Installer {
         review.review.as_deref()
     }
 
-    pub(super) fn view(&self, active: Option<ToolPane>, ctx: &ViewContext<TerminalApp>) -> View {
+    pub(super) fn view(
+        &self,
+        active: Option<ToolPane>,
+        tool_sync: Option<&ToolBundleSyncReport>,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
         if let Some(history) = &self.history {
             return history.view(&self.account, active == Some(self.target), ctx);
         }
@@ -138,6 +143,37 @@ impl Installer {
                     .text(&self.account)
                     .text_wrapping(TextWrapping::Wrap),
             ),
+        ];
+        if active == Some(self.target)
+            && let Some(report) = tool_sync
+        {
+            fields.push(KeyedView::new(
+                "tool-login-sync",
+                TextBlock::new()
+                    .text(tool_sync_summary(report))
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+            if let Some(path) = report.path {
+                let status = match path {
+                    ToolPathSyncStatus::Updated => "Managed PATH updated",
+                    ToolPathSyncStatus::Current => "Managed PATH already current",
+                    ToolPathSyncStatus::Skipped => "Managed PATH skipped",
+                };
+                fields.push(KeyedView::new(
+                    "tool-login-path",
+                    TextBlock::new().text(status),
+                ));
+            }
+            if let Some(detail) = &report.detail {
+                fields.push(KeyedView::new(
+                    "tool-login-detail",
+                    TextBlock::new()
+                        .text(detail)
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
+        }
+        fields.extend([
             KeyedView::new(
                 "history",
                 button("Bundle versions", available, || {
@@ -164,7 +200,7 @@ impl Installer {
                     ),
                 )),
             ),
-        ];
+        ]);
         let status = if let Some((_, work)) = &self.pending {
             Some(match work {
                 Work::Browse => "Choosing a manifest…",

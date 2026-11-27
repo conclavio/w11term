@@ -1,5 +1,6 @@
 use super::*;
 use catalog::{COMMON, Key, LINUX, Loaded, PLATFORMS, PageSource, Platform, WINDOWS};
+use w11term::events::{ToolBundleSyncReport, ToolBundleSyncStatus, ToolPathSyncStatus};
 use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 
 mod catalog;
@@ -59,6 +60,18 @@ fn run_pane_tool_job(
     response
         .blocking_recv()
         .map_err(|_| "SSH tool operation interrupted".to_owned())?
+}
+
+fn tool_sync_summary(report: &ToolBundleSyncReport) -> String {
+    let status = match report.status {
+        ToolBundleSyncStatus::Updated => "installed",
+        ToolBundleSyncStatus::Current => "already current",
+        ToolBundleSyncStatus::Held => "paused after rollback",
+        ToolBundleSyncStatus::Skipped => "sync skipped",
+        ToolBundleSyncStatus::Unconfirmed => "sync unconfirmed",
+        ToolBundleSyncStatus::NotRun => "skipped for this session",
+    };
+    format!("Last login sync · {} {status}", report.bundle)
 }
 
 struct ToolLookup {
@@ -214,13 +227,14 @@ impl Panel {
         auto: Platform,
         origin: Option<clipboard_paste::Origin>,
         tool_pane: Option<ToolPane>,
+        tool_sync: Option<&ToolBundleSyncReport>,
         ctx: &mut ViewContext<TerminalApp>,
     ) -> View {
         if let Some(editor) = &self.private_page {
             return editor.view(ctx);
         }
         if let Some(installer) = &self.tool_install {
-            return installer.view(tool_pane, ctx);
+            return installer.view(tool_pane, tool_sync, ctx);
         }
         let target = if self
             .draft
@@ -270,6 +284,14 @@ impl Panel {
                         .content("Install SSH tools"),
                 )),
             ));
+            if let Some(report) = tool_sync {
+                pieces.push(KeyedView::new(
+                    "tool-login-sync",
+                    TextBlock::new()
+                        .text(tool_sync_summary(report))
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
             if self.query.is_empty()
                 && let Some(lookup) = lookup
             {
@@ -582,6 +604,9 @@ impl TerminalApp {
         ctx: &mut ViewContext<Self>,
     ) -> View {
         let width = (self.width * 0.38).clamp(245.0, 430.0);
+        let tools = self.reference_tool_target();
+        let tool_sync =
+            tools.and_then(|(target, session)| session.events.tool_bundle_sync(target.generation));
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Pixel(width)])
             .keyed_children([
@@ -594,7 +619,8 @@ impl TerminalApp {
                         .content(self.command_reference.view(
                             self.reference_platform(),
                             self.reference_origin(),
-                            self.reference_tool_target().map(|(target, _)| target),
+                            tools.map(|(target, _)| target),
+                            tool_sync.as_deref(),
                             ctx,
                         )),
                 ),

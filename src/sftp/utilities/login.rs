@@ -1,16 +1,19 @@
 use super::*;
-use crate::options::ToolSync;
+use crate::{
+    events::{ToolBundleSyncStatus, ToolPathSyncStatus},
+    options::ToolSync,
+};
 
 pub(crate) struct ToolSyncResult {
-    pub status: &'static str,
-    pub path: Option<&'static str>,
+    pub status: ToolBundleSyncStatus,
+    pub path: Option<ToolPathSyncStatus>,
     pub path_error: Option<anyhow::Error>,
 }
 
 impl ToolSyncResult {
     fn held() -> Self {
         Self {
-            status: "held",
+            status: ToolBundleSyncStatus::Held,
             path: None,
             path_error: None,
         }
@@ -75,7 +78,11 @@ pub(crate) async fn sync_login_tools(
     let updated =
         result["changed"] == true || result["launchers_created"].as_u64().unwrap_or_default() != 0;
     let mut outcome = ToolSyncResult {
-        status: if updated { "updated" } else { "current" },
+        status: if updated {
+            ToolBundleSyncStatus::Updated
+        } else {
+            ToolBundleSyncStatus::Current
+        },
         path: None,
         path_error: None,
     };
@@ -92,9 +99,15 @@ pub(crate) async fn sync_login_tools(
         })
         .await;
         match result {
-            Ok(changed) => outcome.path = Some(if changed { "updated" } else { "current" }),
+            Ok(changed) => {
+                outcome.path = Some(if changed {
+                    ToolPathSyncStatus::Updated
+                } else {
+                    ToolPathSyncStatus::Current
+                })
+            }
             Err(error) => {
-                outcome.path = Some("skipped");
+                outcome.path = Some(ToolPathSyncStatus::Skipped);
                 outcome.path_error = Some(error);
             }
         }

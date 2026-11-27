@@ -7,7 +7,10 @@ use super::{
     SshKeySource, VerifiedSshAuthentication, agent,
 };
 use crate::{
-    events::{AttemptGuard, Events, RetryWait, SshAttemptOutcome},
+    events::{
+        AttemptGuard, Events, RetryWait, SshAttemptOutcome, ToolBundleSyncReport,
+        ToolBundleSyncStatus,
+    },
     options::{AgentFingerprint, AgentPipe, Authentication, SshOptions},
     prompts::{Answer, Challenge, Prompts, Question},
     terminal::{ScopedInput, TransportInput},
@@ -1680,35 +1683,53 @@ async fn run_channel(
         let Some(result) = wait_login_sync(sync, input, size, options).await else {
             return Ok(());
         };
-        let mut data = serde_json::json!({"generation": generation});
+        let mut report = ToolBundleSyncReport {
+            generation,
+            bundle: crate::events::display_field(&settings.name),
+            status: ToolBundleSyncStatus::Skipped,
+            path: None,
+            detail: None,
+        };
         match result {
             Ok(Ok(result)) => {
-                data["status"] = result.status.into();
-                if let Some(path) = result.path {
-                    data["path"] = path.into();
-                }
+                report.status = result.status;
+                report.path = result.path;
                 if let Some(error) = result.path_error {
                     let detail = login_sync_detail(&error);
                     login_notices.push(format!("Tool PATH skipped: {detail}"));
-                    data["detail"] = detail.into();
-                } else if result.status == "held" {
+                    report.detail = Some(detail);
+                } else if result.status == ToolBundleSyncStatus::Held {
                     login_notices.push("Tool bundle sync paused by rollback".into());
                 }
             }
             Ok(Err(error)) => {
                 let detail = login_sync_detail(&error);
                 login_notices.push(format!("Tool bundle sync skipped: {detail}"));
-                data["status"] = "skipped".into();
-                data["detail"] = detail.into();
+                report.detail = Some(detail);
             }
             Err(_) => {
                 let detail = "Tool bundle sync reached its 20-second deadline. Preview to check the active bundle.";
                 login_notices.push(detail.into());
-                data["status"] = "unconfirmed".into();
-                data["detail"] = detail.into();
+                report.status = ToolBundleSyncStatus::Unconfirmed;
+                report.detail = Some(detail.into());
             }
         }
-        events.push("tool-bundle-sync", data);
+        events.record_tool_bundle_sync(report);
+    } else if let Some(settings) = &options.tool_bundle {
+        let detail = if managed {
+            "This durable SSH session uses its own shell startup."
+        } else if sharing.startup.is_some() {
+            "This workspace runs a startup command in place of the login shell."
+        } else {
+            "This game profile uses its own shell startup."
+        };
+        events.record_tool_bundle_sync(ToolBundleSyncReport {
+            generation,
+            bundle: crate::events::display_field(&settings.name),
+            status: ToolBundleSyncStatus::NotRun,
+            path: None,
+            detail: Some(detail.into()),
+        });
     }
     let channel = shell.channel.channel();
     let (sftp_tx, sftp_rx) = mpsc::channel(8);

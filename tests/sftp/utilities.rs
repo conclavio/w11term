@@ -890,9 +890,11 @@ pub(super) fn reference_tool_profile(
         conflict.to_str().unwrap(),
     )
     .unwrap();
-    let mut profile = approved_login(source, local);
-    profile.tool_bundle.as_mut().unwrap().add_to_path = None;
-    profile
+    let path_marker = tool_sha256(b".local/bin");
+    fs::write(remote.join(".bashrc"), format!(
+        "# >>> w11term tool PATH {path_marker} >>>\n# preserve my shell changes\n# <<< w11term tool PATH {path_marker} <<<\n"
+    )).unwrap();
+    approved_login(source, local)
 }
 
 async fn wait_tool_login(pane: &Session, generation: u64, status: &str, path: Option<&str>) {
@@ -925,6 +927,9 @@ async fn wait_tool_login(pane: &Session, generation: u64, status: &str, path: Op
         .unwrap();
     assert_eq!(sync.data["status"], status, "{sync:?}");
     assert_eq!(sync.data["path"].as_str(), path, "{sync:?}");
+    let report = pane.events.tool_bundle_sync(generation).unwrap();
+    assert_eq!(report.bundle, "portable");
+    assert_eq!(serde_json::to_value(report.as_ref()).unwrap(), sync.data);
 }
 
 fn connect_tools(options: &SshOptions) -> Session {
@@ -995,6 +1000,7 @@ async fn approved_tool_sync_installs_before_shell_and_respects_manual_rollback()
     let updated = if cfg!(feature = "ui-smoke") {
         fs::remove_file(root.join("keep-first-connection")).unwrap();
         wait_tool_login(&pane, 2, "updated", Some("current")).await;
+        assert!(pane.events.tool_bundle_sync(1).is_none());
         pane
     } else {
         let updated = connect_tools(&options);

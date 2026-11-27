@@ -1432,6 +1432,8 @@ Profiles can store the same approval under `tool_bundle`. Paths to local manifes
 
 On an ordinary SSH connect or reconnect, w11term checks the verified endpoint and SFTP home, syncs the approved bundle, and then opens the shell. An unavailable or unconfirmed sync still allows login. The 20-second deadline covers the bundle and PATH work together. The `tool-bundle-sync` event reports the bundle outcome and, when configured, the PATH outcome. PATH management appends a marked block to the shell's login and interactive startup files and reports edits to that block for review. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths.
 
+**More → Command reference** shows the last login sync for the selected SSH connection. Open **Install SSH tools** for the PATH result and any error detail. Manual installs and rollbacks show their own results in the installer and version history.
+
 A manual rollback pauses automatic bundle updates. Preview and apply the desired bundle manually to resume syncing. **Disable tool sync** stops automatic updates from that profile.
 
 ### Run SFTP operations
