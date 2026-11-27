@@ -27,6 +27,8 @@ use tokio::{
 
 mod atomic_upload;
 mod directory;
+mod dotfiles;
+pub use dotfiles::{DotfileBundle, DotfileShell, validate_zdotdir};
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
 mod group_upload;
@@ -220,6 +222,12 @@ pub enum CopyDestination {
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Operation {
     Info,
+    PreviewDotfiles {
+        bundle: DotfileBundle,
+        shell: DotfileShell,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zdotdir: Option<String>,
+    },
     /// Explicit Save from the editor. An absent original requests a new file.
     #[serde(skip)]
     SaveText {
@@ -918,6 +926,9 @@ pub(crate) async fn run(
                 },
                 Operation::Put { .. } => JobStage::Upload,
                 Operation::Get { resume: true, .. } => JobStage::ResumableDownload,
+                Operation::PreviewDotfiles { .. } => {
+                    JobStage::Checking("Dotfiles preview did not finish")
+                }
                 Operation::PreviewText { .. } => JobStage::Checking("Text preview did not finish"),
                 Operation::PreviewImage { .. } => {
                     JobStage::Checking("Image preview did not finish")
@@ -1573,6 +1584,14 @@ impl Engine {
                 .await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
+            PreviewDotfiles {
+                bundle,
+                shell,
+                zdotdir,
+            } => {
+                self.preview_dotfiles(bundle, shell, zdotdir.as_deref())
+                    .await?
+            }
             PreviewImage { path } => self.read_preview_image(&path, cancel).await?,
             PreviewTail { path } => {
                 serde_json::to_value(self.read_file_tail(&path, cancel).await?)?

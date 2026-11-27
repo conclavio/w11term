@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use w11term::{
     control::Request,
     sftp::{
-        Attributes, DEFAULT_TIMEOUT, EntryKind, FileSizeRange, FilenameFilter, ModifiedDateRange,
-        Operation, normalize_sha256,
+        Attributes, DEFAULT_TIMEOUT, DotfileBundle, DotfileShell, EntryKind, FileSizeRange,
+        FilenameFilter, ModifiedDateRange, Operation, normalize_sha256, validate_zdotdir,
     },
 };
 
@@ -24,6 +24,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
        [--modified-from YYYY-MM-DD] [--modified-through YYYY-MM-DD]\n\
        [--contains TEXT]\n\
   sha256 PATH [--max-bytes N]\n\
+  preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
   rename FROM TO | hardlink FROM TO | symlink TARGET LINK [--spec-order]\n\
@@ -307,6 +308,27 @@ pub fn parse(
                 fields.insert("max_bytes".into(), json!(limit.parse::<u64>()?));
             }
         }
+        "preview-dotfiles" => {
+            let shell = match opts.remove("--shell").as_deref() {
+                Some("bash") => DotfileShell::Bash,
+                Some("zsh") => DotfileShell::Zsh,
+                _ => bail!("--shell requires bash or zsh"),
+            };
+            let zdotdir = opts.remove("--zdotdir");
+            validate_zdotdir(shell, zdotdir.as_deref())?;
+            let manifest = path()?;
+            let bytes = super::read_limited(
+                std::fs::File::open(&manifest)
+                    .with_context(|| format!("Opening dotfiles bundle {manifest}"))?,
+            )?;
+            let bundle: DotfileBundle =
+                serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
+                    .context("Reading the dotfiles bundle JSON")?;
+            bundle.validate(shell)?;
+            fields.insert("shell".into(), json!(shell));
+            fields.insert("bundle".into(), json!(bundle));
+            fields.insert("zdotdir".into(), json!(zdotdir));
+        }
         "opendir" | "stat" | "lstat" | "setstat" | "mkdir" | "remove-file" | "remove-dir"
         | "realpath" | "readlink" | "statvfs" | "expand-path" | "open" => {
             fields.insert("path".into(), json!(path()?));
@@ -406,6 +428,51 @@ mod tests {
     use super::*;
     fn p(s: &[&str]) -> Result<(Option<u32>, Request)> {
         parse(s.iter().map(|s| s.to_string()), None, None)
+    }
+
+    #[test]
+    fn previews_a_versioned_windows_dotfiles_bundle_on_one_ssh_pane() {
+        let local = tempfile::tempdir().unwrap();
+        let manifest = local.path().join("Fleet bundle.json");
+        std::fs::write(
+            &manifest,
+            "\u{feff}{\"version\":1,\"zsh\":\"PROMPT='fleet> '\"}",
+        )
+        .unwrap();
+        let path = manifest.to_str().unwrap();
+        let (_, request) = p(&[
+            "--pane",
+            "2",
+            "preview-dotfiles",
+            path,
+            "--shell",
+            "zsh",
+            "--zdotdir",
+            "etc/zsh",
+        ])
+        .unwrap();
+        assert!(matches!(
+            request,
+            Request::Sftp {
+                pane: 2,
+                operation: Operation::PreviewDotfiles { bundle, shell: DotfileShell::Zsh, zdotdir },
+                ..
+            } if bundle.zsh.as_deref() == Some("PROMPT='fleet> '") && zdotdir.as_deref() == Some("etc/zsh")
+        ));
+        assert!(p(&["--pane", "2", "preview-dotfiles", path, "--shell", "bash"]).is_err());
+        assert!(
+            p(&[
+                "--pane",
+                "2",
+                "preview-dotfiles",
+                path,
+                "--shell",
+                "zsh",
+                "--zdotdir",
+                "/etc/zsh"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

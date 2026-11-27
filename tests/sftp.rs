@@ -1504,6 +1504,8 @@ async fn guarded_job(
 mod cancellation;
 #[path = "sftp/checksum.rs"]
 mod checksum;
+#[path = "sftp/dotfiles.rs"]
+mod dotfiles;
 #[path = "sftp/download_folder.rs"]
 mod download_folder;
 #[path = "sftp/filesystem_space.rs"]

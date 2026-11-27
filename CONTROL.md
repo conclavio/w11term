@@ -1260,6 +1260,29 @@ Direct pipe clients send
 `{"verb":"cancel-sftp-transfer","transfer_id":"7:2:11"}`. To wait, send
 `{"verb":"wait-sftp-transfer","transfer_id":"7:2:11","timeout_seconds":30}`.
 
+### Preview SSH dotfiles
+
+`sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. For a Zsh setup that uses a different startup directory under that home, pass `--zdotdir RELATIVE_DIR`.
+
+Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` fragment is shared by the chosen shells. Set `bash` or `zsh` for the prompt, aliases, and interactive setup specific to that shell. Each fragment supports up to 16 KiB. The preview computes planned file hashes with LF line endings and a final newline on nonempty fragments.
+
+```json
+{
+  "version": 1,
+  "environment": "export EDITOR=vim\n",
+  "bash": "PS1='ops \\u@\\h> '\n",
+  "zsh": "PROMPT='ops %n@%m> '\n"
+}
+```
+
+```powershell
+& $ctl --pid 12345 sftp --pane $pane preview-dotfiles '.\Fleet dotfiles.json' --shell bash
+```
+
+In `result.sftp`, `directories_to_create` names missing managed directories and `files` gives the absolute paths, proposed actions, and before/after SHA-256 hashes. For Bash, the preview selects the first existing login file in the order `.bash_profile`, `.bash_login`, `.profile`, and plans a new `.profile` if none exists. It also previews `.bashrc`. Zsh previews `.zprofile` and `.zshrc`. Startup entries include the exact `hook` block, and a changed or duplicated marker block is reported as `hook-conflict`. The `supports_atomic_replace` field reports whether the server offers the OpenSSH atomic replacement extension.
+
+This command is read-only. It reports `create`, `replace`, `append-hook`, `unchanged`, or `hook-conflict`. A missing fragment is planned as an empty managed file. Direct pipe clients can send `{"op":"preview-dotfiles","shell":"bash","bundle":{"version":1,"bash":"PS1='ops> '"}}` with the normal SFTP request fields.
+
 ### Run SFTP operations
 
 ```powershell
