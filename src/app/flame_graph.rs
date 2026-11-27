@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use w11term::ssh::{CaptureStop, CpuProfileSummary};
 
 mod capture;
+mod compare;
 mod plot;
 mod profile;
 pub(super) use capture::Connection;
@@ -15,6 +16,8 @@ pub enum Action {
     Open,
     Close,
     OpenFile,
+    CompareFile,
+    Compare(compare::Action),
     Export,
     Capture(capture::Action),
     Stop(Arc<()>),
@@ -29,6 +32,8 @@ pub enum Action {
 
 pub enum Outcome {
     Opened(Arc<Profile>, PathBuf),
+    Compared(Box<compare::ViewState>),
+    ComparisonFiltered(String, Vec<usize>),
     Reviewed(Box<capture::Review>),
     Destination(Box<capture::Recording>),
     Captured(Arc<Profile>, PathBuf, CpuProfileSummary),
@@ -47,6 +52,7 @@ pub(super) struct Panel {
     pub open: bool,
     pub(super) activity: Option<diagnostics::Activity>,
     loaded: Option<Loaded>,
+    comparison: Option<compare::ViewState>,
     pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
     status: Option<String>,
@@ -72,6 +78,7 @@ impl Panel {
     }
 
     fn load(&mut self, profile: Arc<Profile>, path: PathBuf, capture: Option<CpuProfileSummary>) {
+        self.comparison = None;
         self.zoom(0);
         self.query.clear();
         self.search = Arc::default();
@@ -134,7 +141,9 @@ impl Panel {
                     .content("Stop and save profile"),
             ));
         }
-        if let Some(capture) = &self.capture {
+        if let Some(comparison) = &self.comparison {
+            fields.extend(comparison.fields(idle, ctx));
+        } else if let Some(capture) = &self.capture {
             fields.extend(capture.fields(active, idle, ctx));
         } else {
             fields.push(KeyedView::new(
@@ -161,6 +170,13 @@ impl Panel {
                     .content("Capture from SSH"),
             ));
             if let Some(loaded) = &self.loaded {
+                fields.push(KeyedView::new(
+                    "compare",
+                    Button::new()
+                        .is_enabled(idle)
+                        .on_click(send(|| Action::CompareFile))
+                        .content("Compare profiles"),
+                ));
                 self.graph(loaded, window_height, ctx, &mut fields);
             } else if self.status.is_none() {
                 fields.push(text(
@@ -440,8 +456,8 @@ impl TerminalApp {
                     panel.status = Some("Stop requested. Saving collected CPU samples…".into());
                 }
             }
-            Action::OpenFile | Action::Export => {
-                if panel.pending.is_some() {
+            Action::OpenFile | Action::CompareFile | Action::Export => {
+                if panel.pending.is_some() || panel.comparison.is_some() {
                     return;
                 }
                 let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
@@ -452,10 +468,13 @@ impl TerminalApp {
                     .as_ref()
                     .map_or_else(|| self.store.path().into(), |loaded| loaded.path.clone());
                 let export = matches!(action, Action::Export);
+                let compare_path = matches!(action, Action::CompareFile).then(|| path.clone());
                 let profile = panel.loaded.as_ref().map(|loaded| loaded.profile.clone());
                 let zoom = panel.zoom;
                 let ticket = panel.begin(if export {
                     "Choose an SVG destination…"
+                } else if compare_path.is_some() {
+                    "Choose the after profile…"
                 } else {
                     "Choose a folded stacks file…"
                 });
@@ -481,6 +500,14 @@ impl TerminalApp {
                                     profile.context("Open folded stacks before exporting")?;
                                 plot::export(&profile, zoom, &file.path)?;
                                 Ok(Some(Outcome::Exported))
+                            } else if let Some(before_path) = compare_path {
+                                let before = profile.context("Open a before profile to compare")?;
+                                let after = Arc::new(Profile::open(&file.path)?);
+                                Ok(Some(Outcome::Compared(Box::new(compare::ViewState::new(
+                                    before,
+                                    after,
+                                    [before_path, file.path],
+                                )))))
                             } else {
                                 Ok(Some(Outcome::Opened(
                                     Arc::new(Profile::open(&file.path)?),
@@ -493,6 +520,46 @@ impl TerminalApp {
                     },
                     rejected,
                 );
+            }
+            Action::Compare(action) => {
+                let Some(view) = panel
+                    .comparison
+                    .as_mut()
+                    .filter(|_| panel.pending.is_none())
+                else {
+                    return;
+                };
+                match action {
+                    compare::Action::Back => {
+                        panel.comparison = None;
+                        panel.status = None;
+                    }
+                    compare::Action::Query(query) => view.query = query,
+                    compare::Action::Page(forward) => view.page(forward),
+                    compare::Action::Select(comparison, id) => view.select(&comparison, id),
+                    compare::Action::Filter => {
+                        let query = view.query.trim().to_owned();
+                        if query == view.applied {
+                            return;
+                        }
+                        let comparison = view.comparison.clone();
+                        let ticket = panel.begin("Filtering changed call stacks…");
+                        let rejected = message(Action::Finished(
+                            ticket.clone(),
+                            Err("Filter worker unavailable".into()),
+                        ));
+                        ctx.spawn_background_with_rejection(
+                            move |scope| {
+                                let outcome = (!scope.is_cancelled()).then(|| {
+                                    let rows = comparison.filter(&query);
+                                    Outcome::ComparisonFiltered(query, rows)
+                                });
+                                message(Action::Finished(ticket, Ok(outcome)))
+                            },
+                            rejected,
+                        );
+                    }
+                }
             }
             Action::Finished(ticket, result) => {
                 if panel
@@ -518,6 +585,14 @@ impl TerminalApp {
                     Ok(Some(Outcome::Opened(profile, path))) => {
                         panel.activity = None;
                         panel.load(profile, path, None);
+                    }
+                    Ok(Some(Outcome::Compared(comparison))) => {
+                        panel.comparison = Some(*comparison);
+                    }
+                    Ok(Some(Outcome::ComparisonFiltered(query, rows))) => {
+                        if let Some(comparison) = &mut panel.comparison {
+                            comparison.filtered(query, rows);
+                        }
                     }
                     Ok(Some(Outcome::Reviewed(review))) => {
                         if let Some(form) = &mut panel.capture {

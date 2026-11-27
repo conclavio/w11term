@@ -1,5 +1,10 @@
 use anyhow::{Context, Result, ensure};
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs::File,
+    io::Read,
+    path::Path,
+};
 
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DEPTH: usize = 513;
@@ -16,6 +21,7 @@ struct Node<'a> {
 pub(super) struct Frame {
     pub name: String,
     pub samples: u64,
+    pub own_samples: u64,
     pub parent: usize,
     pub depth: usize,
     pub start: u64,
@@ -31,6 +37,7 @@ impl Frame {
 pub struct Profile {
     frames: Vec<Frame>,
     rows: Vec<Vec<usize>>,
+    raw_symbols: HashMap<usize, String>,
 }
 
 impl Profile {
@@ -52,7 +59,7 @@ impl Profile {
         Self::parse(input.trim_start_matches('\u{feff}'))
     }
 
-    fn parse(input: &str) -> Result<Self> {
+    pub(super) fn parse(input: &str) -> Result<Self> {
         let mut nodes = vec![Node {
             name: "All samples",
             ..Node::default()
@@ -71,13 +78,19 @@ impl Profile {
 
         let mut frames: Vec<Frame> = Vec::with_capacity(nodes.len());
         let mut rows = Vec::<Vec<usize>>::new();
+        let mut raw_symbols = HashMap::new();
         let mut stack = vec![(0, 0, 0, 0)];
         while let Some((node_id, parent, depth, start)) = stack.pop() {
             let node = &nodes[node_id];
             let id = frames.len();
+            let name = display_symbol(node.name);
+            if name != node.name {
+                raw_symbols.insert(id, node.name.to_owned());
+            }
             frames.push(Frame {
-                name: display_symbol(node.name),
+                name,
                 samples: node.samples,
+                own_samples: node.own_samples,
                 parent,
                 depth,
                 start,
@@ -101,7 +114,11 @@ impl Profile {
             let (parent, depth) = (frame.parent, frame.last_depth);
             frames[parent].last_depth = frames[parent].last_depth.max(depth);
         }
-        Ok(Self { frames, rows })
+        Ok(Self {
+            frames,
+            rows,
+            raw_symbols,
+        })
     }
 
     fn insert<'a>(nodes: &mut Vec<Node<'a>>, line: &'a str) -> Result<()> {
@@ -147,6 +164,12 @@ impl Profile {
         &self.frames[id]
     }
 
+    pub(super) fn symbol(&self, id: usize) -> &str {
+        self.raw_symbols
+            .get(&id)
+            .map_or(&self.frame(id).name, String::as_str)
+    }
+
     pub fn has_frame(&self, id: usize) -> bool {
         id < self.frames.len()
     }
@@ -161,20 +184,18 @@ impl Profile {
         &frames[begin..end]
     }
 
-    pub(super) fn search(&self, query: &str) -> Search {
-        let query = query.trim();
-        let end = query
-            .char_indices()
-            .nth(256)
-            .map_or(query.len(), |(index, _)| index);
-        let query = &query[..end];
-        if query.is_empty() {
-            return Search::default();
+    pub(super) fn matching_paths(&self, needle: &regex::Regex) -> Vec<bool> {
+        let mut matched = vec![false; self.frames.len()];
+        for (id, frame) in self.frames.iter().enumerate().skip(1) {
+            matched[id] = matched[frame.parent] || needle.is_match(&frame.name);
         }
-        let needle = regex::RegexBuilder::new(&regex::escape(query))
-            .case_insensitive(true)
-            .build()
-            .expect("short literal symbol search");
+        matched
+    }
+
+    pub(super) fn search(&self, query: &str) -> Search {
+        let Some(needle) = symbol_pattern(query) else {
+            return Search::default();
+        };
         let mut result = Search {
             highlighted: vec![false; self.frames.len()],
             ..Search::default()
@@ -193,6 +214,20 @@ impl Profile {
             .sort_unstable_by_key(|&id| (std::cmp::Reverse(self.frame(id).samples), id));
         result
     }
+}
+
+pub(super) fn symbol_pattern(query: &str) -> Option<regex::Regex> {
+    let query = query.trim();
+    let end = query
+        .char_indices()
+        .nth(256)
+        .map_or(query.len(), |(index, _)| index);
+    (end != 0).then(|| {
+        regex::RegexBuilder::new(&regex::escape(&query[..end]))
+            .case_insensitive(true)
+            .build()
+            .expect("short literal symbol search")
+    })
 }
 
 #[derive(Default)]

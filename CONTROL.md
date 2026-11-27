@@ -1573,6 +1573,8 @@ Open **CPU flame graph** from **More** or the command palette, then choose **Ope
 
 Width represents samples. Callers are below their callees. Hover for the sample count and share of the full capture, or click a frame to zoom. Use **Up** to return to its caller and **Reset zoom** for the full capture. **Shallower** and **Deeper** move through stacks taller than the panel. Search highlights symbols and counts each matching sample once, even when multiple frames in that stack match. Use **Previous** and **Next** to zoom to matches by sample count. **Export SVG** saves the current branch at every depth to a new file. [CPU flame graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html)
 
+Choose **Compare profiles** to use the open recording as **Before** and pick a second folded file as **After**. The offline comparison ranks exact call stacks by their change in share of total samples. Each sample contributes to its full recorded stack once. The detail shows both counts, their shares, and the change in percentage points. Use recordings of comparable workloads and sampling configurations to interpret the result. Filter by any symbol in the call chain, or choose **Back to flame graph** to resume the original zoom and search. [Normalizing CPU profiles](https://www.brendangregg.com/blog/2014-11-09/differential-flame-graphs.html)
+
 ### Run SFTP operations
 
 ```powershell
