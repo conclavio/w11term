@@ -60,6 +60,10 @@ pub(super) enum Purpose {
     OpenRecording,
     OpenTriageReport(PathBuf),
     SaveTriageReport(PathBuf),
+    FlameGraph {
+        path: PathBuf,
+        export: bool,
+    },
 }
 
 fn is_local_folder(folder: &Path) -> bool {
@@ -213,6 +217,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::CompareLocalFolder
                 | Purpose::OpenRecording
                 | Purpose::OpenTriageReport(_)
+                | Purpose::FlameGraph { export: false, .. }
                 | Purpose::SshConfig(_)
                 | Purpose::DotfilesBundle(_)
                 | Purpose::ToolBundle(_)
@@ -234,6 +239,38 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
         let multiple = matches!(purpose, Purpose::UploadFiles);
         let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
         let cookie = match purpose {
+            Purpose::FlameGraph { path, export } => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if export {
+                    dialog.SetTitle(w!("Export CPU flame graph"))?;
+                    dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                        pszName: w!("Scalable Vector Graphics"),
+                        pszSpec: w!("*.svg"),
+                    }])?;
+                    dialog.SetDefaultExtension(w!("svg"))?;
+                    dialog.SetFileName(w!("cpu-flame-graph.svg"))?;
+                    options |= FOS_NOTESTFILECREATE;
+                    options &= !FOS_OVERWRITEPROMPT;
+                } else {
+                    dialog.SetTitle(w!("Open folded stacks"))?;
+                    dialog.SetFileTypes(&[
+                        COMDLG_FILTERSPEC {
+                            pszName: w!("Folded stacks"),
+                            pszSpec: w!("*.folded;*.collapsed"),
+                        },
+                        COMDLG_FILTERSPEC {
+                            pszName: w!("All files"),
+                            pszSpec: w!("*.*"),
+                        },
+                    ])?;
+                    options |= FOS_FILEMUSTEXIST;
+                }
+                if let Some(folder) = path.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
             Purpose::OpenTriageReport(ref current) | Purpose::SaveTriageReport(ref current) => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
                 dialog.SetFileTypes(&[COMDLG_FILTERSPEC {

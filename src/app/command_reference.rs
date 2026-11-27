@@ -742,6 +742,7 @@ impl TerminalApp {
         match action {
             Action::Open | Action::Selection(_) => {
                 self.triage.open = false;
+                self.flame_graph.open = false;
                 if panel.private_page.is_some() || panel.tool_install.is_some() {
                     return;
                 }

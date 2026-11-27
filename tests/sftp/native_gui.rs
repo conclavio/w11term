@@ -23,6 +23,37 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "captures a CPU profile over SSH and opens and exports it in the native graph viewer"]
+async fn native_cpu_flame_graph_reopens_profiles_offline_and_exports_the_zoom() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    let hot_sample = concat!(
+        " 42 22.01: cpu-clock:u:\n",
+        "\t   deadbeef hot_loop (/tmp/worker)\n",
+        "\t   12ab34cd main (/tmp/worker)\n\n",
+    );
+    let cold_sample = " 42 22.02: cpu-clock:u:    aa wait_for_work (/tmp/worker)\n";
+    fs::write(
+        remote.path().join("profile-response"),
+        format!(
+            "w11term-cpu-profile-v1\t800\td29ya2Vy\n{}{}\nw11term-cpu-profile-end\n",
+            hot_sample.repeat(3),
+            cold_sample,
+        ),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    drive_mixed_gui("cpu-flame-graph-ui.ps1", &ssh, state.path());
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    assert_eq!(channels.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "collects a reviewed SSH triage report and reopens it without an SSH pane"]
 async fn native_linux_triage_reviews_collects_and_reopens_a_report() {
     let transports = Arc::new(AtomicUsize::new(0));

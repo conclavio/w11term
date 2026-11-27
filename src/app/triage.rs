@@ -392,6 +392,7 @@ impl TerminalApp {
     pub(super) fn triage_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         if matches!(action, Action::Open) {
             self.command_reference.close();
+            self.flame_graph.open = false;
             self.triage.open = true;
             if self.triage.content.is_some() || self.triage.pending.is_some() {
                 return;

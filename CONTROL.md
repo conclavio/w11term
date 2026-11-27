@@ -1474,7 +1474,13 @@ $plan
 
 The defaults are 10 seconds, 99 Hz, and frame pointers. Choose 1–30 seconds, 1–199 Hz, or `dwarf` for DWARF unwinding with an 8 KiB stack snapshot. The remote Linux host needs `perf`, Bash, GNU coreutils, and permission to sample the process. w11term samples user-space CPU activity on the selected process and checks that its start time matches before and after recording. It runs under the signed-in SSH account. [perf record](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-record.txt) · [Linux perf permissions](https://docs.kernel.org/admin-guide/perf-security.html)
 
-The capture uses a sibling SSH exec channel, with up to 32 MiB for the temporary recording and 4 MiB for the `perf script` output. The worker has a deadline and its private files are removed at completion. w11term folds the captured stacks into a new Windows file and reports the sample count, unresolved frames, and any diagnostics printed by perf, including lost-sample warnings when reported. Open the folded stacks with a flame-graph tool. [perf script](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-script.txt) · [CPU flame graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html)
+The capture uses a sibling SSH exec channel, with up to 32 MiB for the temporary recording and 4 MiB for the `perf script` output. The worker has a deadline and its private files are removed at completion. w11term folds the captured stacks into a new Windows file and reports the sample count, unresolved frames, and any diagnostics printed by perf, including lost-sample warnings when reported. [perf script](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-script.txt)
+
+#### View and share the flame graph
+
+Open **CPU flame graph** from **More** or the command palette, then choose **Open folded stacks**. The viewer reads local UTF-8 folded stacks from w11term and tools that use the same format. It works offline and accepts files up to 16 MiB.
+
+Width represents samples. Callers are below their callees. Hover for the sample count and share of the full capture, or click a frame to zoom. Use **Up** to return to its caller and **Reset zoom** for the full capture. **Shallower** and **Deeper** move through stacks taller than the panel. Search highlights symbols and counts each matching sample once, even when multiple frames in that stack match. Use **Previous** and **Next** to zoom to matches by sample count. **Export SVG** saves the current branch at every depth to a new file. [CPU flame graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html)
 
 ### Run SFTP operations
 

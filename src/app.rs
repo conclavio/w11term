@@ -87,6 +87,7 @@ mod directory_split;
 mod disconnect_ssh;
 mod durable_view;
 mod explorer;
+mod flame_graph;
 #[cfg(feature = "ui-smoke")]
 mod ime_smoke;
 mod inspector;
@@ -1044,6 +1045,7 @@ fn tab_menu_message(label: String) -> Message {
         "Terminal inspector" => Message::ToggleInspector,
         command_reference::LABEL => Message::CommandReference(command_reference::Action::Open),
         triage::LABEL => Message::Triage(triage::Action::Open),
+        flame_graph::LABEL => Message::FlameGraph(flame_graph::Action::Open),
         command_reference::SELECTION => {
             Message::CommandReference(command_reference::Action::Selection(None))
         }
@@ -1352,6 +1354,7 @@ pub struct TerminalApp {
     saved_commands: w11term::saved_commands::Commands,
     command_reference: command_reference::Panel,
     triage: triage::Panel,
+    flame_graph: flame_graph::Panel,
     dividers: Rc<RefCell<pane_view::DividerState>>,
     measured_layout: Option<Rc<pane_view::PaneGeometry>>,
     rotation_hover: Option<pane_view::RotationHover>,
@@ -1538,6 +1541,7 @@ pub enum Message {
     SavedCommands(saved_commands::Edit),
     CommandReference(command_reference::Action),
     Triage(triage::Action),
+    FlameGraph(flame_graph::Action),
     WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
@@ -4714,6 +4718,7 @@ impl TerminalApp {
             ),
             MenuItem::item("command-reference", command_reference::LABEL),
             MenuItem::item("linux-triage", triage::LABEL),
+            MenuItem::item("cpu-flame-graph", flame_graph::LABEL),
             command_menu_item(
                 "command-reference-selection",
                 command_reference::SELECTION,
@@ -5929,6 +5934,7 @@ impl Component for TerminalApp {
             saved_commands: Default::default(),
             command_reference: Default::default(),
             triage: Default::default(),
+            flame_graph: Default::default(),
             dividers: Rc::default(),
             measured_layout: None,
             rotation_hover: None,
@@ -6373,10 +6379,20 @@ impl Component for TerminalApp {
             Message::PickerFocus(attempt) => self.focus_picker_input(attempt, context),
             Message::PickerFromMenu(shortcut) => self.open_picker_from_menu(shortcut, context),
             Message::SetTitleFiles(pane, open) => {
-                if matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(live))
-                    if live.session.pane_id == pane && (live.files.open && !self.command_reference.open && !self.triage.open) != open)
+                if let Some(Page::Terminal(live)) = self.tabs.active().map(|tab| &tab.page)
+                    && live.session.pane_id == pane
                 {
-                    self.file_action(FileAction::Toggle, context);
+                    if open {
+                        self.flame_graph.open = false;
+                    }
+                    if (live.files.open
+                        && !self.command_reference.open
+                        && !self.triage.open
+                        && !self.flame_graph.open)
+                        != open
+                    {
+                        self.file_action(FileAction::Toggle, context);
+                    }
                 }
             }
             Message::PickerFocusAfterMenu(launch) => self.focus_picker_after_menu(&launch),
@@ -7760,6 +7776,7 @@ impl Component for TerminalApp {
             Message::SavedCommands(edit) => self.edit_saved_commands(edit),
             Message::CommandReference(action) => self.command_reference_action(action, context),
             Message::Triage(action) => self.triage_action(action, context),
+            Message::FlameGraph(action) => self.flame_graph_action(action, context),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 self.refresh_notification_visibility();
@@ -8519,7 +8536,9 @@ impl Component for TerminalApp {
         } else {
             Border::new().into()
         };
-        let content = if self.triage.open {
+        let content = if self.flame_graph.open {
+            self.with_flame_graph(content, context)
+        } else if self.triage.open {
             self.with_triage(content, context)
         } else if self.command_reference.open {
             self.with_command_reference(content, context)
