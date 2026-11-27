@@ -1028,6 +1028,10 @@ pub(crate) fn parse_profiles(bytes: &[u8], path: &Path) -> Result<Profiles> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Keep the commonly used SSH source inline and allocate startup approvals only when configured"
+)]
 pub enum Source {
     Demo,
     Replay(PathBuf),
