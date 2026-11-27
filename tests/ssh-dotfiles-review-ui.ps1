@@ -31,6 +31,39 @@ function Wait-Review {
         (Find-Element $target) -and (Find-Element 'SFTP home /') -and $apply -and $apply.Current.IsEnabled
     }
 }
+function Select-RetainedDotfile([int]$Pane, [string]$Id) {
+    $report = (Control @('sftp','--pane',"$Pane",'list-dotfile-versions','--shell','bash')).sftp
+    $version = $report.versions | Where-Object bundle_sha256 -ceq $Id
+    if (!$version) { throw "Missing retained dotfile version $Id" }
+    $label = $Id.Substring(0,12)
+    if ($report.active_bundle_sha256 -ceq $Id) { $label += "${dot}Active" }
+    if ($null -ne $version.modified) {
+        $time = [DateTimeOffset]::FromUnixTimeSeconds($version.modified).UtcDateTime
+        $label += $dot + $time.ToString("yyyy-MM-dd HH:mm 'UTC'", [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $comboType = [System.Windows.Automation.ControlType]::ComboBox
+    $itemType = [System.Windows.Automation.ControlType]::ListItem
+    $expandPattern = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $selectPattern = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    $search = @{ scroll = $null }
+    $null = Wait-Until "select retained dotfile '$label'" {
+        if (Find-Element "Selected version $Id") { return $true }
+        $selector = Find-Element 'Retained dotfile versions' $comboType
+        if (!$selector -or !$selector.Current.IsEnabled) { return }
+        if ($selector.Current.IsOffscreen) {
+            Move-NativeControlIntoView $selector $search
+            return
+        }
+        try {
+            $popup = $selector.GetCurrentPattern($expandPattern)
+            if ($popup.Current.ExpandCollapseState -eq 'Collapsed') { $popup.Expand() }
+            $row = Find-Element $label $itemType -Visible
+            if ($row) { $row.GetCurrentPattern($selectPattern).Select() }
+        } catch [System.Windows.Automation.ElementNotAvailableException] {
+            # Wait for the replacement automation elements after the popup opens.
+        }
+    }
+}
 
 Write-Bundle 'reviewed'
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -98,6 +131,52 @@ try {
     }
     if ([IO.File]::ReadAllText($startup) -cne $drift) { throw 'Reading a conflict replaced the edited startup hook' }
     [IO.File]::WriteAllText($startup, $installed)
+
+    $selectorPath = Join-Path $remoteStore 'bash-current'
+    $first = [IO.File]::ReadAllText($selectorPath).Trim()
+    Write-Bundle 'second'
+    Click 'Review dotfiles changes'
+    Wait-Review
+    Click 'Apply reviewed dotfiles'
+    $null = Wait-Until 'a second version is active' { Find-Element "Dotfiles applied${dot}3 files changed" }
+    $second = [IO.File]::ReadAllText($selectorPath).Trim()
+    if ($first -ceq $second) { throw 'Installing the second version did not switch the selector' }
+
+    Click 'Dotfile versions'
+    $null = Wait-Until 'history shows the current version' { Find-Element "Active version $second" }
+    Select-RetainedDotfile $pane $first
+    Click 'Review dotfile restore'
+    $null = Wait-Until 'restore reviews the before and after versions' {
+        (Find-Element "Reviewed active version $second") -and (Find-Element "Restore version $first") -and
+            (Find-Element 'This choice pauses automatic dotfile sync on reconnect.')
+    }
+    if ([IO.File]::ReadAllText($selectorPath).Trim() -cne $second) { throw 'Review changed the selector' }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot restore the reviewed version' {
+        $restore = Find-Element 'Restore reviewed dotfiles' $button
+        $restore -and !$restore.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$pane")
+    Wait-Focus $pane
+    Click 'Restore reviewed dotfiles'
+    $null = Wait-Until 'the prior version is active and automatic sync is paused' {
+        (Find-Element "Active version $first") -and (Find-Element 'Automatic dotfile sync paused')
+    }
+    if ([IO.File]::ReadAllText($selectorPath) -cne "$first`nmanual`n") { throw 'Restore did not hold the first version' }
+
+    Click 'Review disabling managed dotfiles'
+    $null = Wait-Until 'disabling can be confirmed' { Find-Element 'Disable managed dotfiles for new shells' }
+    Click 'Disable reviewed dotfiles'
+    $null = Wait-Until 'history shows disabled dotfiles' { Find-Element 'Managed dotfiles disabled' }
+    if ([IO.File]::ReadAllText($selectorPath) -cne "disabled`n") { throw 'Disable did not switch the selector' }
+    Select-RetainedDotfile $pane $first
+    Click 'Review dotfile restore'
+    Click 'Restore reviewed dotfiles'
+    $null = Wait-Until 'a retained version restores from the disabled state' {
+        (Find-Element "Active version $first") -and (Find-Element 'Automatic dotfile sync paused')
+    }
+    if ([IO.File]::ReadAllText($startup) -cne $installed) { throw 'Switching versions changed the startup hooks' }
 } finally {
     if ($app) { Close-FixtureApp $app }
 }

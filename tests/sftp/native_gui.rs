@@ -2790,7 +2790,8 @@ async fn native_command_reference_applies_reviewed_ssh_dotfiles() {
 
     let store = remote.path().join(".config/w11term/dotfiles");
     let active = fs::read_to_string(store.join("bash-current")).unwrap();
-    let version = store.join(format!("bash-{}", active.trim()));
+    let id = active.strip_suffix("\nmanual\n").unwrap();
+    let version = store.join(format!("bash-{id}"));
     assert_eq!(
         fs::read_to_string(version.join("environment.sh")).unwrap(),
         "export EDITOR=vi\n"

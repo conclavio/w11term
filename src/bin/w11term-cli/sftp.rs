@@ -33,6 +33,7 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   resume-tool-bundle-updates NAME SHA256 --review TOKEN\n\
   preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  list-dotfile-versions --shell bash|zsh\n\
   preview-dotfiles-switch SHA256|disabled --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   switch-dotfiles SHA256|disabled --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
@@ -54,6 +55,14 @@ Transfers stream through the GUI's existing SSH connection. Folder transfers req
 destination. Single files can be replaced with --overwrite. Uploads can leave a partial remote\n\
 file or folder after interruption. Handles are pane-local\n\
 and expire after five idle minutes, timeout, or disconnect. Replies contain result.sftp.";
+
+fn dotfile_shell(value: Option<&str>) -> Result<DotfileShell> {
+    match value {
+        Some("bash") => Ok(DotfileShell::Bash),
+        Some("zsh") => Ok(DotfileShell::Zsh),
+        _ => bail!("--shell requires bash or zsh"),
+    }
+}
 
 pub fn parse(
     args: impl Iterator<Item = String>,
@@ -353,12 +362,14 @@ pub fn parse(
             fields.insert("name".into(), json!(path()?));
             fields.insert("bundle_sha256".into(), json!(normalize_sha256(&path()?)?));
         }
+        "list-dotfile-versions" => {
+            fields.insert(
+                "shell".into(),
+                json!(dotfile_shell(opts.remove("--shell").as_deref())?),
+            );
+        }
         "preview-dotfiles" | "apply-dotfiles" | "preview-dotfiles-switch" | "switch-dotfiles" => {
-            let shell = match opts.remove("--shell").as_deref() {
-                Some("bash") => DotfileShell::Bash,
-                Some("zsh") => DotfileShell::Zsh,
-                _ => bail!("--shell requires bash or zsh"),
-            };
+            let shell = dotfile_shell(opts.remove("--shell").as_deref())?;
             let zdotdir = opts.remove("--zdotdir");
             validate_zdotdir(shell, zdotdir.as_deref())?;
             if matches!(command.as_str(), "apply-dotfiles" | "switch-dotfiles") {
@@ -664,6 +675,23 @@ mod tests {
             } if review == token
         ));
         assert!(p(&["--pane", "2", "apply-dotfiles", path, "--shell", "zsh"]).is_err());
+    }
+
+    #[test]
+    fn lists_retained_dotfiles_by_shell() {
+        let (_, list) = p(&["--pane", "2", "list-dotfile-versions", "--shell", "zsh"]).unwrap();
+        assert!(matches!(
+            list,
+            Request::Sftp {
+                pane: 2,
+                operation: Operation::ListDotfileVersions {
+                    shell: DotfileShell::Zsh
+                },
+                ..
+            }
+        ));
+        assert!(p(&["--pane", "2", "list-dotfile-versions"]).is_err());
+        assert!(p(&["--pane", "2", "list-dotfile-versions", "--shell", "fish"]).is_err());
     }
 
     #[test]

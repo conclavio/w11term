@@ -205,8 +205,16 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
     let managed = root.join(".config/w11term/dotfiles");
     let selector = managed.join("bash-current");
     let startup = root.join(".bashrc");
+    let history = || Operation::ListDotfileVersions {
+        shell: DotfileShell::Bash,
+    };
     fs::write(root.join("posix-rename-version"), "1").unwrap();
     fs::write(&startup, "# original Bash configuration\n").unwrap();
+    let empty = guarded_job(&pane, None, history()).await.unwrap();
+    assert_eq!(empty["home"], "/");
+    assert_eq!(empty["state"], "inactive");
+    assert_eq!(empty["versions"], json!([]));
+    assert!(!managed.exists());
     let preview = |prompt| Operation::PreviewDotfiles {
         bundle: manifest(prompt),
         shell: DotfileShell::Bash,
@@ -283,6 +291,17 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         fs::read_to_string(version.join("prompt.sh")).unwrap(),
         "PS1='first> '\n"
     );
+    fs::create_dir(managed.join(format!("zsh-{}", "a".repeat(64)))).unwrap();
+    fs::create_dir(managed.join("bash-unrelated")).unwrap();
+    fs::write(managed.join(format!("bash-{}", "a".repeat(64))), []).unwrap();
+    let listed = guarded_job(&pane, None, history()).await.unwrap();
+    assert_eq!(listed["state"], "active");
+    assert_eq!(listed["active_bundle_sha256"], new_id);
+    let versions = listed["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0]["bundle_sha256"], new_id);
+    assert_eq!(versions[1]["bundle_sha256"], id);
+
     let restore = guarded_job(&pane, None, switch(Some(id), None))
         .await
         .unwrap();
@@ -312,6 +331,10 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
     assert_eq!(disabled["changed"], true);
     assert!(disabled["bundle_sha256"].is_null());
     assert_eq!(fs::read_to_string(&selector).unwrap(), "disabled\n");
+    let listed = guarded_job(&pane, None, history()).await.unwrap();
+    assert_eq!(listed["state"], "disabled");
+    assert!(listed["active_bundle_sha256"].is_null());
+    assert_eq!(listed["versions"].as_array().unwrap().len(), 2);
     let error = guarded_job(&pane, None, switch(Some(id), Some(&restore)))
         .await
         .unwrap_err();
@@ -330,6 +353,10 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         fs::read_to_string(&selector).unwrap(),
         format!("{id}\nmanual\n")
     );
+    let listed = guarded_job(&pane, None, history()).await.unwrap();
+    assert_eq!(listed["state"], "paused");
+    assert_eq!(listed["active_bundle_sha256"], id);
+    assert_eq!(listed["versions"][0]["bundle_sha256"], id);
     let repeat = guarded_job(&pane, None, switch(Some(id), None))
         .await
         .unwrap();

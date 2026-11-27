@@ -31,7 +31,8 @@ mod dotfiles;
 mod utilities;
 pub(crate) use dotfiles::sync_login_dotfiles;
 pub use dotfiles::{
-    DotfileBundle, DotfileShell, DotfileTarget, validate_dotfiles_home, validate_zdotdir,
+    DotfileBundle, DotfileShell, DotfileTarget, DotfileVersionState, DotfileVersions,
+    RetainedDotfileVersion, validate_dotfiles_home, validate_zdotdir,
 };
 pub(crate) use utilities::sync_login_tools;
 pub use utilities::{
@@ -313,6 +314,9 @@ pub enum Operation {
         shell: DotfileShell,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zdotdir: Option<String>,
+    },
+    ListDotfileVersions {
+        shell: DotfileShell,
     },
     ApplyDotfiles {
         bundle: DotfileBundle,
@@ -1034,6 +1038,9 @@ pub(crate) async fn run(
                 Operation::PreviewDotfiles { .. } => {
                     JobStage::Checking("Dotfiles preview did not finish")
                 }
+                Operation::ListDotfileVersions { .. } => {
+                    JobStage::Checking("Dotfiles history lookup did not finish")
+                }
                 Operation::PreviewToolBundle { .. } => {
                     JobStage::Checking("Tool bundle preview did not finish")
                 }
@@ -1753,6 +1760,9 @@ impl Engine {
                 .await?
             }
             PreviewText { path } => json!({"text": self.read_preview_text(&path, cancel).await?}),
+            ListDotfileVersions { shell } => {
+                serde_json::to_value(self.dotfile_versions(shell, cancel).await?)?
+            }
             PreviewDotfiles {
                 bundle,
                 shell,

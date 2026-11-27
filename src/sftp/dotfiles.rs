@@ -9,6 +9,7 @@ const MANUAL: &str = "manual\n";
 const BEGIN: &str = "# >>> w11term dotfiles >>>";
 const END: &str = "# <<< w11term dotfiles <<<";
 const MAX_FRAGMENT_BYTES: usize = 16 * 1024;
+const MAX_LISTED_VERSIONS: usize = 64;
 
 pub(crate) async fn sync_login_dotfiles(
     session: &russh::client::Handle<crate::ssh::Handler>,
@@ -84,6 +85,31 @@ pub enum DotfileShell {
 pub enum DotfileTarget {
     Bundle { sha256: String },
     Disabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DotfileVersionState {
+    Inactive,
+    Active,
+    Paused,
+    Disabled,
+    Conflict,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DotfileVersions {
+    pub home: String,
+    pub active_bundle_sha256: Option<String>,
+    pub state: DotfileVersionState,
+    pub versions: Vec<RetainedDotfileVersion>,
+    pub omitted_versions: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RetainedDotfileVersion {
+    pub bundle_sha256: String,
+    pub modified: Option<u32>,
 }
 
 impl DotfileShell {
@@ -382,6 +408,71 @@ fn hook_change(path: String, original: Option<String>, hook: String) -> Edit {
 }
 
 impl Engine {
+    pub(super) async fn dotfile_versions(
+        &self,
+        shell: DotfileShell,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<DotfileVersions> {
+        let home = self.dotfile_home().await?;
+        let mut result = DotfileVersions {
+            home,
+            active_bundle_sha256: None,
+            state: DotfileVersionState::Inactive,
+            versions: Vec::new(),
+            omitted_versions: 0,
+        };
+        for relative in PARENTS {
+            let path = under_home(&result.home, relative);
+            if !self.dotfile_directory_exists(&path).await? {
+                return Ok(result);
+            }
+        }
+        let entries = self
+            .read_directory(&under_home(&result.home, DIRECTORY), cancel, true)
+            .await?;
+        if let Some(selector) = self
+            .dotfile_text(&selector_path(&result.home, shell))
+            .await?
+        {
+            result.active_bundle_sha256 = selector_version(&selector).map(str::to_owned);
+            result.state = match (
+                result.active_bundle_sha256.is_some(),
+                selector_held(&selector),
+            ) {
+                (true, true) => DotfileVersionState::Paused,
+                (true, false) => DotfileVersionState::Active,
+                (false, true) => DotfileVersionState::Disabled,
+                (false, false) => DotfileVersionState::Conflict,
+            };
+        }
+        let prefix = format!("{}-", shell.name());
+        let mut seen = std::collections::HashSet::new();
+        for entry in entries {
+            if EntryKind::from_permissions(entry.attrs.permissions) == Some(EntryKind::Directory)
+                && let Some(id) = entry
+                    .filename
+                    .strip_prefix(&prefix)
+                    .filter(|id| valid_bundle_id(id))
+                && seen.insert(id.to_owned())
+            {
+                result.versions.push(RetainedDotfileVersion {
+                    bundle_sha256: id.to_owned(),
+                    modified: entry.attrs.mtime,
+                });
+            }
+        }
+        let active = result.active_bundle_sha256.as_deref();
+        result.versions.sort_unstable_by(|a, b| {
+            (active == Some(b.bundle_sha256.as_str()))
+                .cmp(&(active == Some(a.bundle_sha256.as_str())))
+                .then_with(|| b.modified.cmp(&a.modified))
+                .then_with(|| a.bundle_sha256.cmp(&b.bundle_sha256))
+        });
+        result.omitted_versions = result.versions.len().saturating_sub(MAX_LISTED_VERSIONS);
+        result.versions.truncate(MAX_LISTED_VERSIONS);
+        Ok(result)
+    }
+
     pub(super) async fn preview_dotfiles(
         &self,
         bundle: DotfileBundle,
@@ -795,12 +886,14 @@ fn selector_version(text: &str) -> Option<&str> {
     text.strip_suffix(MANUAL)
         .unwrap_or(text)
         .strip_suffix('\n')
-        .filter(|line| {
-            line.len() == 64
-                && line
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
+        .filter(|line| valid_bundle_id(line))
+}
+
+fn valid_bundle_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn selector_held(text: &str) -> bool {

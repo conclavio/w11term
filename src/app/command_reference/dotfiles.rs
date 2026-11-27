@@ -3,6 +3,8 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use w11term::sftp::{DotfileBundle, DotfileShell, validate_zdotdir};
 
+mod history;
+
 pub enum Action {
     Open(ToolPane),
     Browse,
@@ -13,6 +15,7 @@ pub enum Action {
     Previewed(Arc<()>, Result<Box<Review>, String>),
     Apply,
     Applied(Arc<()>, Result<Applied, String>),
+    History(history::Action),
     Close,
 }
 
@@ -37,7 +40,7 @@ struct Edit {
 
 impl Edit {
     fn blocker(&self, atomic_replace: bool) -> Option<&'static str> {
-        if self.after_sha256.is_none() {
+        if self.after_sha256.is_none() && self.action != "unchanged" {
             Some(match self.action.as_str() {
                 "hook-conflict" => "Startup hook conflict",
                 "payload-conflict" => "Managed fragment conflict",
@@ -117,6 +120,9 @@ enum Work {
     Browse,
     Preview,
     Apply,
+    ListVersions,
+    ReviewSwitch,
+    SwitchVersion,
 }
 
 pub(super) struct Installer {
@@ -128,6 +134,7 @@ pub(super) struct Installer {
     pending: Option<(Arc<()>, Work)>,
     review: Option<Box<Review>>,
     status: Option<String>,
+    history: Option<history::Panel>,
 }
 
 fn message(action: Action) -> Message {
@@ -160,11 +167,21 @@ impl Installer {
     fn applying(&self) -> bool {
         self.pending
             .as_ref()
-            .is_some_and(|(_, work)| *work == Work::Apply)
+            .is_some_and(|(_, work)| matches!(work, Work::Apply | Work::SwitchVersion))
+    }
+
+    fn startup_directory(&self) -> Result<Option<String>, String> {
+        let path = self.zdotdir.trim();
+        let path = (self.shell == DotfileShell::Zsh && !path.is_empty()).then_some(path);
+        validate_zdotdir(self.shell, path).map_err(|error| format!("{error:#}"))?;
+        Ok(path.map(str::to_owned))
     }
 
     pub(super) fn view(&self, current: Option<ToolPane>, ctx: &ViewContext<TerminalApp>) -> View {
         let connected = current == Some(self.target);
+        if let Some(history) = &self.history {
+            return history.view(self, connected, ctx);
+        }
         let ready = connected && self.pending.is_none();
         let button = |label: &str, enabled, action: fn() -> Action| {
             Button::new()
@@ -217,6 +234,12 @@ impl Installer {
             ));
         }
         fields.push(KeyedView::new(
+            "versions",
+            button("Dotfile versions", ready, || {
+                Action::History(history::Action::Open)
+            }),
+        ));
+        fields.push(KeyedView::new(
             "preview",
             button(
                 "Review dotfiles changes",
@@ -246,6 +269,9 @@ impl Installer {
                     Work::Browse => "Selecting a local dotfiles bundle…",
                     Work::Preview => "Reading remote dotfiles…",
                     Work::Apply => "Applying reviewed dotfiles…",
+                    Work::ListVersions | Work::ReviewSwitch | Work::SwitchVersion => {
+                        unreachable!("the history view handles version operations")
+                    }
                 }
                 .to_owned()
             })
@@ -276,6 +302,10 @@ impl TerminalApp {
         let current = self
             .reference_tool_target()
             .map(|(target, session)| (target, session.input.clone()));
+        if let Action::History(action) = action {
+            self.dotfile_history_action(action, current, ctx);
+            return;
+        }
         if let Action::Open(target) = action {
             if current.as_ref().is_none_or(|(pane, _)| *pane != target)
                 || !self.command_reference.open
@@ -302,6 +332,7 @@ impl TerminalApp {
                 pending: None,
                 review: None,
                 status: None,
+                history: None,
             });
             return;
         }
@@ -310,6 +341,9 @@ impl TerminalApp {
         let Some(installer) = &mut panel.dotfiles else {
             return;
         };
+        if installer.history.is_some() {
+            return;
+        }
         let target = installer.target;
         let connected = current.as_ref().is_some_and(|(pane, _)| *pane == target);
         let idle = connected && installer.pending.is_none();
@@ -386,14 +420,13 @@ impl TerminalApp {
                     None
                 };
                 let shell = installer.shell;
-                let zdotdir = installer.zdotdir.trim();
-                let zdotdir =
-                    (shell == DotfileShell::Zsh && !zdotdir.is_empty()).then_some(zdotdir);
-                if let Err(error) = validate_zdotdir(shell, zdotdir) {
-                    installer.status = Some(format!("{error:#}"));
-                    return;
-                }
-                let zdotdir = zdotdir.map(str::to_owned);
+                let zdotdir = match installer.startup_directory() {
+                    Ok(path) => path,
+                    Err(error) => {
+                        installer.status = Some(error);
+                        return;
+                    }
+                };
                 let ticket = installer.begin(if apply { Work::Apply } else { Work::Preview });
                 let rejected = if apply {
                     message(Action::Applied(
