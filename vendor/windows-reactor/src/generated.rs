@@ -9760,6 +9760,14 @@ impl MountedPropsExt for MountedProps {
                 );
             }
             Self::TextBox(values) => {
+                // WinUI truncates an initial multiline value while AcceptsReturn is false.
+                visit(
+                    PropertyId::TextBoxAcceptsReturn,
+                    match &values.accepts_return {
+                        Property::Inherited => None,
+                        Property::Set(value) => Some(PropertyValueRef::Bool(*value)),
+                    },
+                );
                 visit(
                     PropertyId::TextBoxText,
                     match &values.text {
@@ -9777,13 +9785,6 @@ impl MountedPropsExt for MountedProps {
                 visit(
                     PropertyId::TextBoxIsEnabled,
                     match &values.is_enabled {
-                        Property::Inherited => None,
-                        Property::Set(value) => Some(PropertyValueRef::Bool(*value)),
-                    },
-                );
-                visit(
-                    PropertyId::TextBoxAcceptsReturn,
-                    match &values.accepts_return {
                         Property::Inherited => None,
                         Property::Set(value) => Some(PropertyValueRef::Bool(*value)),
                     },

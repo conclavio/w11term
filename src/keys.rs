@@ -102,7 +102,7 @@ pub fn current_user_acl(path: &Path) -> Result<()> {
     }
 }
 use std::os::windows::ffi::OsStrExt;
-fn crypt(data: &[u8], protect: bool) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn crypt(data: &[u8], protect: bool) -> Result<Zeroizing<Vec<u8>>> {
     ensure!(data.len() <= u32::MAX as usize, "DPAPI input too large");
     let input = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
@@ -113,7 +113,7 @@ fn crypt(data: &[u8], protect: bool) -> Result<Zeroizing<Vec<u8>>> {
         if protect {
             CryptProtectData(
                 &input,
-                w!("w11term device key"),
+                w!("w11term credential"),
                 None,
                 None,
                 None,

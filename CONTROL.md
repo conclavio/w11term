@@ -1505,6 +1505,14 @@ $report.collection.samples | Select-Object id, status, exit_status
 
 The collector uses a sibling SSH channel with a 60-second client deadline and a 50-second remote collection deadline. It runs the ten checklist probes in parallel with Bash and GNU coreutils, captures up to 16 KiB per command per stream, and uses a private temporary directory. The report keeps the verified endpoint, commands, timing, output, and individual outcomes such as missing utilities or denied kernel logs. It marks streams that reached their byte limit and keeps the original bytes in base64 when they contain invalid UTF-8. [Linux Performance Analysis in 60,000 Milliseconds](https://www.brendangregg.com/Articles/Netflix_Linux_Perf_Analysis_60s.pdf)
 
+### Review terminal text with OpenRouter
+
+Open **Settings → OpenRouter assistance** to save an API key protected by Windows and enter a model ID. **Refresh model catalog** fetches the public model list. **Save OpenRouter settings** remembers the model and routing preference. Zero Data Retention routing is required by default, and each request asks OpenRouter to exclude providers that collect data. [OpenRouter routing and data collection](https://openrouter.ai/docs/guides/routing/provider-selection) · [Zero Data Retention](https://openrouter.ai/docs/guides/features/zdr)
+
+Open **More → Draft a Bash command with OpenRouter** to describe a task, or select terminal text and choose **Explain selected text with OpenRouter**. In a Linux performance report, **Review report with OpenRouter…** starts with local findings and excerpts from the selected sample. Review and edit the preview, which accepts up to 16 KiB of text. **Review OpenRouter request** shows the destination, model, and privacy policy. **Send reviewed request** submits the displayed text.
+
+The response appears as selectable text. **Copy response** puts it on the Windows clipboard for manual use. Token usage appears when OpenRouter returns it. **Stop waiting** discards the eventual response in w11term. A request already sent can still finish at OpenRouter.
+
 ### Capture a Linux CPU profile
 
 In the Windows app, select a connected Linux SSH pane and open **More → CPU flame graph → Capture from SSH**. Enter a PID, duration, frequency, and unwind mode. You can also choose a process under **Busy processes during triage** in the CPU findings. That list ranks processes by their peak reported interval CPU usage and fills in the PID from the live report. [pidstat manual](https://github.com/sysstat/sysstat/blob/master/man/pidstat.in)

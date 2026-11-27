@@ -90,6 +90,22 @@ try {
     $null = Wait-Until 'saved triage reopened without the SSH pane' { Find-Element 'Opened Linux triage report' }
     Show-CpuEvidence
     Show-KernelCheck
+    Click ('Review report with OpenRouter' + [char]0x2026)
+    try {
+        $null = Wait-Until 'review pane summarizes the saved report and selected sample' {
+            $field = Find-Element 'OpenRouter request preview' ([System.Windows.Automation.ControlType]::Edit)
+            if (!$field -or !$field.Current.IsEnabled) { return }
+            $preview = $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value
+            $preview.Contains('Locally observed findings') -and $preview.Contains('Peak CPU busy') -and
+                $preview.Contains('dmesg stderr excerpt') -and $preview.Contains('Operation not permitted') -and
+                (Find-Element 'Triage samples' $combo)
+        }
+    } catch {
+        $field = Find-Element 'OpenRouter request preview' ([System.Windows.Automation.ControlType]::Edit)
+        $text = if ($field) { $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value }
+        throw "$_ Preview exists: $($null -ne $field). Enabled: $($field.Current.IsEnabled). Triage open: $($null -ne (Find-Element 'Triage samples' $combo)). Preview: $text"
+    }
+    if (Find-Element 'Send reviewed request' $button) { throw 'Opening the report created a reviewed request' }
 } finally {
     Close-FixtureApp $app
 }

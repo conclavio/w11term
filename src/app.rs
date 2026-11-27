@@ -95,6 +95,7 @@ mod keyboard_copy;
 mod keyboard_hints;
 #[cfg(feature = "ui-smoke")]
 mod local_smoke;
+mod openrouter_assistance;
 mod packet_capture;
 mod pane_broadcast;
 mod pane_colors;
@@ -424,6 +425,7 @@ enum Page {
     LocalProfile(local_profile::Draft),
     ImportConfig(config_import::ImportPage),
     SyscallTrace(Box<syscall_view::PageState>),
+    OpenRouter(Box<openrouter_assistance::PageState>),
     Workspaces(workspace_view::WorkspacePage),
     Settings(Option<SettingsEditor>),
     NewProfile(ProfileDraft),
@@ -1051,6 +1053,12 @@ fn tab_menu_message(label: String) -> Message {
         flame_graph::LABEL => Message::FlameGraph(flame_graph::Action::Open),
         packet_capture::LABEL => Message::PacketCapture(packet_capture::Action::Open),
         syscall_view::LABEL => Message::SyscallView(syscall_view::Action::Show),
+        openrouter_assistance::DRAFT => Message::OpenRouter(openrouter_assistance::Action::Show(
+            w11term::openrouter::Task::Draft,
+        )),
+        openrouter_assistance::EXPLAIN => Message::OpenRouter(openrouter_assistance::Action::Show(
+            w11term::openrouter::Task::Explain,
+        )),
         command_reference::SELECTION => {
             Message::CommandReference(command_reference::Action::Selection(None))
         }
@@ -1550,6 +1558,7 @@ pub enum Message {
     FlameGraph(flame_graph::Action),
     PacketCapture(packet_capture::Action),
     SyscallView(syscall_view::Action),
+    OpenRouter(openrouter_assistance::Action),
     WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
@@ -2650,6 +2659,9 @@ impl TerminalApp {
         let appearance = self.appearance.read().unwrap().clone();
         let mut children:Vec<View>=vec![
             TextBlock::new().text("Settings").font_size(26.0).into(),
+            Button::new().on_click(context.callback(|_| Message::OpenRouter(openrouter_assistance::Action::Show(
+                    w11term::openrouter::Task::Draft,
+                )))).content(openrouter_assistance::LABEL),
             TextBlock::new().text("Terminal font").font_size(18.0).into(),
             ComboBox::new().width(360.0).automation_name("Terminal font")
                 .items_source(self.fonts.iter().cloned())
@@ -4729,6 +4741,12 @@ impl TerminalApp {
             MenuItem::item("cpu-flame-graph", flame_graph::LABEL),
             MenuItem::item("packet-capture", packet_capture::LABEL),
             MenuItem::item("syscall-trace-viewer", syscall_view::LABEL),
+            MenuItem::item("openrouter-draft", openrouter_assistance::DRAFT),
+            command_menu_item(
+                "openrouter-explain",
+                openrouter_assistance::EXPLAIN,
+                self.active_selection(),
+            ),
             command_menu_item(
                 "command-reference-selection",
                 command_reference::SELECTION,
@@ -7791,6 +7809,7 @@ impl Component for TerminalApp {
             Message::FlameGraph(action) => self.flame_graph_action(action, context),
             Message::PacketCapture(action) => self.packet_capture_action(action, context),
             Message::SyscallView(action) => self.syscall_view_action(action, context),
+            Message::OpenRouter(action) => self.openrouter_action(action, context),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 self.refresh_notification_visibility();
@@ -8549,6 +8568,7 @@ impl Component for TerminalApp {
                     page.view(id, targets, context)
                 }
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
+                Page::OpenRouter(page) => page.view(id, context),
                 Page::QuickConnect(draft) => {
                     quick_connect::view(id, draft, self.identity_picker.is_none(), context)
                 }

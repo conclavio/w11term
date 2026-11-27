@@ -6,6 +6,8 @@ use drive::{drive_gui, drive_mixed_gui};
 mod agent_key_ui;
 #[path = "mixed_drop_ui.rs"]
 mod mixed_drop_ui;
+#[path = "openrouter_ui.rs"]
+mod openrouter_ui;
 #[path = "recording_ui.rs"]
 mod recording_ui;
 #[path = "replay_controls.rs"]

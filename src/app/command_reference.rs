@@ -628,6 +628,13 @@ impl TerminalApp {
     }
 
     fn reference_selection(&self, origin: clipboard_paste::Origin) -> Option<String> {
+        let text = self.pane_selection_text(origin)?;
+        let text = text.trim();
+        (!text.is_empty() && text.len() <= 128 && !text.chars().any(char::is_control))
+            .then(|| text.to_owned())
+    }
+
+    pub(super) fn pane_selection_text(&self, origin: clipboard_paste::Origin) -> Option<String> {
         let tab = self.pane_paste_target(self.tabs.active_id()?, origin)?;
         let frame = tab.session.frames.load();
         let selection = self
@@ -643,10 +650,7 @@ impl TerminalApp {
         if !selection.can_copy(&frame) {
             return None;
         }
-        let text = selection.text(&frame, true);
-        let text = text.trim();
-        (!text.is_empty() && text.len() <= 128 && !text.chars().any(char::is_control))
-            .then(|| text.to_owned())
+        Some(selection.text(&frame, true))
     }
 
     fn start_reference_load(&mut self, refresh: bool, ctx: &ComponentContext<Self>) {

@@ -13,6 +13,7 @@ pub mod hints;
 pub mod https;
 pub mod interaction;
 pub mod keys;
+pub mod openrouter;
 pub mod options;
 pub mod pane_layout;
 pub mod profiles;

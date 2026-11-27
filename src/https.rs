@@ -56,30 +56,61 @@ pub(crate) fn parse(address: &str) -> Result<Url> {
 /// Read a public HTTPS response under a byte budget and a caller cancellation check.
 pub fn get(address: &str, max_bytes: usize, cancelled: impl Fn() -> bool) -> Result<Vec<u8>> {
     let url = parse(address)?;
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let (status, bytes) = request(&url, Request::Download, max_bytes, cancelled)?;
+    ensure!(status == 200, "Download returned HTTP {status}");
+    Ok(bytes)
+}
+
+pub(crate) enum Request<'a> {
+    Download,
+    Json {
+        headers: &'a [u16],
+        body: Option<&'a [u8]>,
+    },
+}
+
+pub(crate) fn request(
+    url: &Url,
+    request: Request<'_>,
+    max_bytes: usize,
+    cancelled: impl Fn() -> bool,
+) -> Result<(u32, Vec<u8>)> {
+    let download = matches!(request, Request::Download);
+    let deadline = Instant::now() + Duration::from_secs(if download { 45 } else { 60 });
     let check = || {
-        ensure!(!cancelled(), "HTTPS download cancelled");
-        ensure!(Instant::now() < deadline, "HTTPS download timed out");
+        ensure!(!cancelled(), "HTTPS request cancelled");
+        ensure!(Instant::now() < deadline, "HTTPS request timed out");
         Ok::<_, anyhow::Error>(())
     };
     check()?;
+    let proxy = if url.scheme() == "https" {
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+    } else {
+        WINHTTP_ACCESS_TYPE_NO_PROXY
+    };
     let session = Handle::new(unsafe {
-        WinHttpOpen(
-            w!("w11term"),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        )
+        WinHttpOpen(w!("w11term"), proxy, PCWSTR::null(), PCWSTR::null(), 0)
     })
     .context("Opening the Windows HTTPS session")?;
     // Allow CDN redirects and retain normal HTTPS certificate validation.
     session.option(
         WINHTTP_OPTION_REDIRECT_POLICY,
-        WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP,
+        if download {
+            WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP
+        } else {
+            WINHTTP_OPTION_REDIRECT_POLICY_NEVER
+        },
     )?;
     session.option(WINHTTP_OPTION_REJECT_USERPWD_IN_URL, 1)?;
-    unsafe { WinHttpSetTimeouts(session.as_ptr(), 8_000, 8_000, 8_000, 10_000) }?;
+    unsafe {
+        WinHttpSetTimeouts(
+            session.as_ptr(),
+            8_000,
+            8_000,
+            8_000,
+            if download { 10_000 } else { 30_000 },
+        )
+    }?;
     let host = HSTRING::from(url.host_str().expect("validated host"));
     let port = url.port_or_known_default().expect("validated HTTPS port");
     let server = Handle::new(unsafe { WinHttpConnect(session.as_ptr(), &host, port, 0) })
@@ -90,15 +121,28 @@ pub fn get(address: &str, max_bytes: usize, cancelled: impl Fn() -> bool) -> Res
         url.path().to_owned()
     };
     let object = HSTRING::from(object);
+    let (headers, body) = match request {
+        Request::Download => (None, None),
+        Request::Json { headers, body } => (Some(headers), body),
+    };
+    let method = if body.is_some() {
+        w!("POST")
+    } else {
+        w!("GET")
+    };
     let request = Handle::new(unsafe {
         WinHttpOpenRequest(
             server.as_ptr(),
-            w!("GET"),
+            method,
             &object,
             PCWSTR::null(),
             PCWSTR::null(),
             null(),
-            WINHTTP_FLAG_SECURE,
+            if url.scheme() == "https" {
+                WINHTTP_FLAG_SECURE
+            } else {
+                WINHTTP_OPEN_REQUEST_FLAGS(0)
+            },
         )
     })
     .context("Opening the HTTPS download request")?;
@@ -113,8 +157,18 @@ pub fn get(address: &str, max_bytes: usize, cancelled: impl Fn() -> bool) -> Res
     // All buffer sizes match the pointed-to variables. WinHTTP uses the live
     // request handle synchronously and does not retain those pointers.
     unsafe {
-        WinHttpSendRequest(request.as_ptr(), None, None, 0, 0, 0)?;
+        let size = body.map_or(Ok(0), |body| u32::try_from(body.len()))?;
+        WinHttpSendRequest(
+            request.as_ptr(),
+            headers,
+            body.map(|body| body.as_ptr().cast()),
+            size,
+            size,
+            0,
+        )?;
+        check()?;
         WinHttpReceiveResponse(request.as_ptr(), null_mut())?;
+        check()?;
         WinHttpQueryHeaders(
             request.as_ptr(),
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
@@ -124,7 +178,10 @@ pub fn get(address: &str, max_bytes: usize, cancelled: impl Fn() -> bool) -> Res
             &mut index,
         )?;
     }
-    ensure!(status == 200, "Download returned HTTP {status}");
+    if status != 200 {
+        // Error bodies may echo user data or credentials. Callers classify status codes.
+        return Ok((status, Vec::new()));
+    }
 
     let mut archive = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
@@ -142,7 +199,7 @@ pub fn get(address: &str, max_bytes: usize, cancelled: impl Fn() -> bool) -> Res
         }
         if length == 0 {
             check()?;
-            return Ok(archive);
+            return Ok((status, archive));
         }
         let length = length as usize;
         ensure!(

@@ -18,6 +18,7 @@ pub enum Action {
     Resource(usize),
     Finding(usize),
     Profile(NonZeroU32),
+    OpenRouter,
     Finished(Arc<()>, Result<Option<Outcome>, String>),
 }
 
@@ -247,6 +248,13 @@ impl Panel {
         self.findings_view(report, fields, ctx);
         self.profile_buttons(active, fields, ctx);
         fields.push(KeyedView::new(
+            "openrouter",
+            Button::new()
+                .is_enabled(self.pending.is_none())
+                .on_click(ctx.callback(|_| message(Action::OpenRouter)))
+                .content("Review report with OpenRouter…"),
+        ));
+        fields.push(KeyedView::new(
             "samples",
             ComboBox::new()
                 .automation_name("Triage samples")
@@ -434,6 +442,15 @@ impl TerminalApp {
     }
 
     pub(super) fn triage_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
+        if matches!(action, Action::OpenRouter) {
+            if self.triage.pending.is_none()
+                && let Some(Content::Report(report)) = &self.triage.content
+            {
+                let report = report.clone();
+                self.review_triage_with_openrouter(&report, Some(self.triage.sample), ctx);
+            }
+            return;
+        }
         if let Action::Profile(pid) = action {
             if let Some(source) = self.triage.profile_source
                 && self.triage.pending.is_none()
