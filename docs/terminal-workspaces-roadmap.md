@@ -22,7 +22,7 @@ The [SSH host groups roadmap](#ssh-host-groups) covers running the same command 
 
 The [SSH diagnostics roadmap](#ssh-diagnostics) covers packet capture, syscall tracing, Linux performance triage, and flame graphs. The [LLM assistance roadmap](#llm-assistance) covers reviewing selected terminal evidence and drafting Bash commands.
 
-The [command reference](#command-reference) puts short manuals beside the terminal. [Managed SSH utilities](#managed-ssh-utilities) covers bringing a personal command-line toolkit to a Linux host.
+The [SSH shell setup](#ssh-shell-setup) brings your dotfiles and command-line tools to a Linux account. The [command reference](#command-reference) puts short manuals beside the terminal.
 
 ## Current capabilities
 
@@ -326,6 +326,14 @@ Add optional Windows-side OpenRouter settings. Store the user’s API key with W
 - **Review a performance report.** Send the user-approved summary and excerpts. Ask the model to call out anomalies, link to evidence by command and sample, and identify missing measurements. Keep those comments beside the locally produced report so readers can inspect the supporting numbers.
 
 Ship selection explanation and Bash drafting with a shared request preview, then add optional performance review. Test with a stub provider that captures the exact outbound payload, exercises cancellation and provider errors, and returns shell-looking text. Verify that requests require review and that the response alone never submits a command.
+
+## SSH shell setup
+
+Use a single SSH profile to bring your shell setup and tools to a Linux account. Under **Settings → Edit profile**, configure **SSH dotfiles** for prompt and shell startup fragments and **SSH tools** for your pinned executables. Review and approve each bundle for the remote account. On an ordinary SSH connect or reconnect, w11term syncs the approved dotfiles first and then syncs the tools over SFTP before starting the shell. Each step reports its own outcome. A skipped sync still lets the shell open. [SSH dotfile sync](../CONTROL.md#sync-dotfiles-on-ssh-connect) · [SSH tool sync](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
+
+From that pane, **More → Command reference** shows the tool sync result and the managed launcher path beside its manual. With Bash or Zsh PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)
+
+**Acceptance.** Use a profile with both bundles enabled on a clean Linux account. At the first prompt, verify that the managed prompt is active and that `command -v` resolves a bundled utility to the expected launcher under `~/.local/bin`. Reconnect and verify both sync results and the same prompt and launcher.
 
 ## Command reference
 
