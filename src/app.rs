@@ -8540,7 +8540,14 @@ impl Component for TerminalApp {
                 Page::LocalProfile(draft) => self.local_profile_view(id, draft, context),
                 Page::Workspaces(page) => self.workspace_view(id, page, context),
                 Page::ImportConfig(page) => self.import_view(id, page, context),
-                Page::SyscallTrace(page) => page.view(id, context),
+                Page::SyscallTrace(page) => {
+                    let targets = if page.capture_open() {
+                        self.syscall_capture_targets()
+                    } else {
+                        Vec::new()
+                    };
+                    page.view(id, targets, context)
+                }
                 Page::NewProfile(draft) => self.profile_form(id, draft, context),
                 Page::QuickConnect(draft) => {
                     quick_connect::view(id, draft, self.identity_picker.is_none(), context)

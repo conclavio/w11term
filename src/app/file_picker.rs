@@ -64,6 +64,7 @@ pub(super) enum Purpose {
     SavePacketCapture(PathBuf),
     WiresharkExecutable(PathBuf),
     OpenSyscallTrace(PathBuf),
+    SaveSyscallTrace(PathBuf),
     FlameGraph {
         path: PathBuf,
         export: bool,
@@ -245,6 +246,22 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
         let multiple = matches!(purpose, Purpose::UploadFiles | Purpose::OpenSyscallTrace(_));
         let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
         let cookie = match purpose {
+            Purpose::SaveSyscallTrace(path) => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                dialog.SetTitle(w!("Save syscall trace"))?;
+                dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                    pszName: w!("Syscall trace"),
+                    pszSpec: w!("*.strace"),
+                }])?;
+                dialog.SetDefaultExtension(w!("strace"))?;
+                dialog.SetFileName(w!("syscall-trace.strace"))?;
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT | FOS_NOTESTFILECREATE;
+                options &= !FOS_OVERWRITEPROMPT;
+                if let Some(folder) = path.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
             Purpose::OpenSyscallTrace(path) => {
                 dialog.SetTitle(w!("Open syscall trace"))?;
                 options |= FOS_FILEMUSTEXIST

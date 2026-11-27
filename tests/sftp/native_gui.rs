@@ -22,6 +22,35 @@ use shared::run_gui;
 #[path = "properties_ui.rs"]
 mod properties_ui;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews a native SSH trace, requests Stop and opens the verified capture"]
+async fn native_syscall_capture_reviews_stops_and_opens_the_verified_trace() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, _, server) =
+        fixture_counting_accepts(false, 1, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let started = remote.path().join("syscall-started");
+    fs::write(
+        state.path().join("syscall-start-marker"),
+        started.to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("syscall-capture-ui.ps1", &ssh, state.path());
+    let request = fs::read_to_string(started).unwrap();
+    assert!(request.starts_with("capture 30 1048576 64 'all' '/home/test' '/bin/sh'"));
+    assert!(request.ends_with("'one argument' '$literal' '--flag'"));
+    assert_eq!(
+        fs::read(state.path().join("stopped capture.strace")).unwrap(),
+        SYSCALL_FIXTURE
+    );
+    assert!(remote.path().join("syscall-verified").is_file());
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
 #[test]
 #[ignore = "opens combined and per-process strace files and reviews grouped calls offline"]
 fn native_syscall_trace_viewer_groups_calls_and_keeps_original_records() {

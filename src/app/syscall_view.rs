@@ -2,6 +2,7 @@ use super::*;
 use std::fmt::Write as _;
 use trace::{Filter, Group, Raw, Trace};
 
+mod capture;
 mod compare;
 mod handles;
 mod trace;
@@ -24,6 +25,7 @@ pub enum Action {
     Originals(TabId, bool),
     Handles(handles::Action),
     Compare(compare::Action),
+    Capture(capture::Action),
 }
 
 #[derive(Default)]
@@ -39,11 +41,13 @@ pub(super) struct PageState {
     selected: Option<usize>,
     descriptors: handles::ViewState,
     comparison: compare::ViewState,
+    capture: capture::ViewState,
 }
 
 impl TerminalApp {
     pub(super) fn syscall_view_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         if matches!(action, Action::Show) {
+            let origin = self.profile_connection();
             self.command_reference.close();
             self.triage.open = false;
             self.flame_graph.open = false;
@@ -54,13 +58,17 @@ impl TerminalApp {
                 .iter()
                 .find(|entry| matches!(entry.value.page, Page::SyscallTrace(_)))
                 .map(|entry| entry.id);
-            if let Some(current) = current {
+            let tab = if let Some(current) = current {
                 self.tabs.select(current);
+                current
             } else {
                 self.tabs.insert(AppTab {
                     label: LABEL.into(),
                     page: Page::SyscallTrace(Box::default()),
-                });
+                })
+            };
+            if let Some(page) = self.syscall_page(tab) {
+                page.capture.offer(origin);
             }
             self.sync_selection(ctx);
             self.activate(ctx);
@@ -76,13 +84,7 @@ impl TerminalApp {
                 {
                     match result {
                         Ok(Some(trace)) => {
-                            page.visible = (0..trace.groups.len()).collect();
-                            page.loaded = Some(trace);
-                            page.query.clear();
-                            page.filter = Filter::default();
-                            page.descriptors = Default::default();
-                            page.comparison = Default::default();
-                            page.reset_position();
+                            page.load(trace);
                         }
                         Ok(None) => (),
                         Err(error) => page.status = Some(error),
@@ -144,6 +146,7 @@ impl TerminalApp {
             }
             Action::Handles(action) => self.syscall_handles_action(action, ctx),
             Action::Compare(action) => self.syscall_compare_action(action, ctx),
+            Action::Capture(action) => self.syscall_capture_action(action, ctx),
             Action::Show => (),
         }
     }
@@ -232,6 +235,21 @@ fn send(action: Action) -> Message {
 }
 
 impl PageState {
+    pub(super) fn capture_open(&self) -> bool {
+        self.capture.open
+    }
+
+    fn load(&mut self, trace: Arc<Trace>) {
+        self.visible = (0..trace.groups.len()).collect();
+        self.loaded = Some(trace);
+        self.query.clear();
+        self.filter = Filter::default();
+        self.descriptors = Default::default();
+        self.comparison = Default::default();
+        self.capture.back();
+        self.reset_position();
+    }
+
     fn begin(&mut self, status: &str) -> Arc<()> {
         let ticket = Arc::new(());
         self.pending = Some(ticket.clone());
@@ -260,7 +278,12 @@ impl PageState {
         self.loaded.as_ref()?.groups.get(self.selected?)
     }
 
-    pub(super) fn view(&self, id: TabId, ctx: &ViewContext<TerminalApp>) -> View {
+    pub(super) fn view(
+        &self,
+        id: TabId,
+        targets: Vec<capture::Candidate>,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
         let idle = self.pending.is_none();
         let mut header = vec![
             KeyedView::new("title", TextBlock::new().text(LABEL).font_size(20.0)),
@@ -279,6 +302,10 @@ impl PageState {
                     .text(status)
                     .text_wrapping(TextWrapping::Wrap),
             ));
+        }
+        header.push(self.capture.switch(id, idle, ctx));
+        if self.capture.open {
+            return self.capture.view(id, targets, header, idle, ctx);
         }
         let Some(trace) = &self.loaded else {
             header.push(KeyedView::new(

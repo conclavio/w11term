@@ -82,19 +82,19 @@ pub(super) fn parse(
             .map(|value| value.parse())
             .transpose()
             .context("Invalid trace duration")?
-            .unwrap_or(15),
+            .unwrap_or(SyscallOptions::DEFAULT_SECONDS),
         max_mib: flags
             .remove("--max-mib")
             .map(|value| value.parse())
             .transpose()
             .context("Invalid trace budget")?
-            .unwrap_or(16),
+            .unwrap_or(SyscallOptions::DEFAULT_MAX_MIB),
         string_size: flags
             .remove("--string-size")
             .map(|value| value.parse())
             .transpose()
             .context("Invalid trace string size")?
-            .unwrap_or(128),
+            .unwrap_or(SyscallOptions::DEFAULT_STRING_SIZE),
         filter: match flags.remove("--filter").as_deref() {
             None | Some("all") => SyscallFilter::All,
             Some("files") => SyscallFilter::Files,

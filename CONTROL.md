@@ -1464,6 +1464,8 @@ SFTP transfers the completed file over the existing SSH connection. w11term chec
 
 ### Capture Linux syscalls
 
+In the Windows app, open **More → Syscall trace viewer → Capture over SSH…**. Select a connected SSH pane, enter a Linux executable and its arguments as a JSON array of strings, and choose a working directory, preset and limits. **Review syscall capture** verifies the endpoint and shows the resolved executable and exact strace arguments. **Trace and save…** asks for a new Windows file before starting. **Stop syscall capture** ends the launched command and saves the records collected so far. The viewer opens the verified trace automatically and shows the stop reason.
+
 Use a connected Linux SSH pane with SFTP and a version of strace that supports `--kill-on-exit`. Review the working directory, executable identity, exact arguments, and capture bounds first. `--arg` can be repeated and each value is passed literally. The command runs as the remote SSH account with stdin, stdout, and stderr disconnected from the terminal.
 
 ```powershell
