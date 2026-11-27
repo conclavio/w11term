@@ -182,6 +182,16 @@ function Select-Capture([string]$Path, [string]$Trigger = $openCaptureLabel, [st
     $null = Wait-Until 'source capture picker closed' { !(Find-OwnedDialog $Title) }
 }
 
+function Test-CaptureFile([string]$Path) {
+    $filename = [IO.Path]::GetFileName($Path)
+    foreach ($label in Get-NativeTextLabels) {
+        if ($label.EndsWith($filename, [StringComparison]::OrdinalIgnoreCase) -and
+            [FixtureDialog]::SameFile($Path, $label)) {
+            return $true
+        }
+    }
+}
+
 function Select-Viewer([switch]$FromComparison) {
     $type = if ($FromComparison) { [System.Windows.Automation.ControlType]::Hyperlink } else { $button }
     Click $chooseViewerLabel $type
@@ -393,7 +403,7 @@ try {
     }
     Select-Capture $conversationCapture
     $null = Wait-Until 'the conversation capture opens offline' {
-        Find-Element $conversationCapture
+        Test-CaptureFile $conversationCapture
     }
     $conversationTimeline = Open-PacketSection 'packet-timeline'
     $intervals = Wait-CaptureCombo 'Packet timeline intervals'
@@ -499,7 +509,7 @@ try {
     }
     Click 'Back to capture'
     $null = Wait-Until 'comparison returns to the original before capture' {
-        Find-Element $conversationCapture
+        Test-CaptureFile $conversationCapture
     }
     Select-Capture $slowerCapture $compareCaptureLabel 'Choose after packet capture'
     $null = Wait-Until 'equal packet counts show slower rates across the longer capture window' {
@@ -666,7 +676,7 @@ try {
     }
     Click 'Back to capture'
     Select-Capture $protocolCapture
-    $null = Wait-Until 'the standalone protocol fixture opens' { Find-Element $protocolCapture }
+    $null = Wait-Until 'the standalone protocol fixture opens' { Test-CaptureFile $protocolCapture }
     $expander = Open-PacketSection 'packet-ip-protocols'
     $null = Wait-Until 'protocol totals and TCP flag coverage are visible' {
         (Find-Element "TCP${dot}5 packets${dot}200 captured bytes") -and

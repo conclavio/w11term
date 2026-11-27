@@ -309,7 +309,7 @@ function Set-NativeExpansion([string]$Name, [bool]$Expanded) {
         if ($Expanded) { $options.Expand() } else { $options.Collapse() }
     }
 }
-function Get-TransferDetailLabels {
+function Get-NativeTextLabels {
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $kind = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
@@ -319,7 +319,7 @@ function Get-TransferDetailLabels {
 }
 function Test-TransferDestination([string]$Path) {
     $prefix = 'Windows ' + [char]0xb7 + ' '
-    foreach ($name in Get-TransferDetailLabels) {
+    foreach ($name in Get-NativeTextLabels) {
         if ($name.StartsWith($prefix, [StringComparison]::Ordinal) -and
             [FixtureDialog]::SameDestination($Path, $name.Substring($prefix.Length))) {
             return $true

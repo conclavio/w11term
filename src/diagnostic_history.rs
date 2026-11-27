@@ -5,7 +5,7 @@ use std::{
     io::{ErrorKind, Read},
     path::PathBuf,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_RECENT: usize = 12;
@@ -181,7 +181,8 @@ impl Store {
     fn update(&self, change: impl Fn(&mut Vec<Entry>) -> Result<()>) -> Result<Vec<Entry>> {
         // Two open windows can finish captures together. Retry contention
         // briefly, and always read the catalog under the write lock.
-        for attempt in 0..=20 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
             let result = crate::stored_json::update(&self.path, LABEL, || {
                 let mut catalog = self.load()?;
                 change(&mut catalog.entries)?;
@@ -189,7 +190,7 @@ impl Store {
             });
             match result {
                 Err(error)
-                    if attempt < 20
+                    if Instant::now() < deadline
                         && matches!(
                             error.downcast_ref::<TryLockError>(),
                             Some(TryLockError::WouldBlock)
@@ -200,7 +201,6 @@ impl Store {
                 result => return result.map(|catalog| catalog.entries),
             }
         }
-        unreachable!("the final attempt returns its result")
     }
 }
 
@@ -261,6 +261,34 @@ mod tests {
                 .iter()
                 .all(|artifact| entries.iter().any(|entry| entry.artifact == *artifact))
         );
+    }
+
+    #[test]
+    fn history_waits_for_a_temporarily_busy_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.json");
+        let lock = File::create(path.with_extension("lock")).unwrap();
+        lock.lock().unwrap();
+        let store = Store { path };
+        let artifact = Artifact {
+            kind: Kind::CpuProfile,
+            paths: vec![dir.path().join("after.folded")],
+        };
+        thread::scope(|scope| {
+            let (started, waiting) = std::sync::mpsc::channel();
+            let (store, artifact) = (&store, &artifact);
+            let writer = scope.spawn(move || {
+                started.send(()).unwrap();
+                store.remember(artifact)
+            });
+            waiting.recv().unwrap();
+            // Model the interval that a slow sync or scheduler stall can
+            // keep a previous writer's lock held.
+            thread::sleep(Duration::from_secs(1));
+            lock.unlock().unwrap();
+            writer.join().unwrap().unwrap();
+        });
+        assert_eq!(store.list().unwrap()[0].artifact, artifact);
     }
 
     #[test]

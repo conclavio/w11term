@@ -94,6 +94,18 @@ function Choose-Diagnostic([string]$Title, [string]$Filename) {
     $null = Wait-Until "accept '$Title'" { [FixtureDialog]::ClickButton($dialog, 1) }
 }
 
+function Find-RecentArtifact($Entries, [string[]]$Names) {
+    $expected = @($Names | ForEach-Object { Join-Path $State $_ })
+    foreach ($entry in $Entries) {
+        if ($entry.paths.Count -ne $expected.Count) { continue }
+        $found = @($expected | Where-Object {
+            $path = $_
+            $entry.paths | Where-Object { [FixtureDialog]::SameFile($path, $_) } | Select-Object -First 1
+        })
+        if ($found.Count -eq $expected.Count) { return $entry }
+    }
+}
+
 function Start-SavedComparison {
     Invoke-Button (Wait-Until 'comparison picker is enabled' {
         $start = Find-Element ('Compare saved diagnostics' + [char]0x2026) $button
@@ -271,11 +283,10 @@ try {
     }
     $null = Wait-Until 'both picked split sets enter history and the cancelled baseline stays out' {
         $recent = [IO.File]::ReadAllText($history) | ConvertFrom-Json
-        $working = $recent.entries | Where-Object { $_.paths -contains (Join-Path $State 'picker working.710') }
-        $failing = $recent.entries | Where-Object { $_.paths -contains (Join-Path $State 'picker failing.810') }
-        $cancelled = $recent.entries | Where-Object { $_.paths -contains (Join-Path $State 'cancelled CPU.folded') }
-        !$cancelled -and ($working.paths -contains (Join-Path $State 'picker working.711')) -and
-            ($failing.paths -contains (Join-Path $State 'picker failing.811'))
+        $working = Find-RecentArtifact $recent.entries @('picker working.710', 'picker working.711')
+        $failing = Find-RecentArtifact $recent.entries @('picker failing.810', 'picker failing.811')
+        $cancelled = Find-RecentArtifact $recent.entries @('cancelled CPU.folded')
+        !$cancelled -and $working -and $failing
     }
     Close-Artifact
 
