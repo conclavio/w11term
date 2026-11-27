@@ -28,6 +28,7 @@ pub enum Action {
     Edit(Field, String),
     ListInterfaces,
     SelectInterface(flame_graph::Connection, String),
+    SelectSavedInterface(PathBuf, usize),
     Tmpfs(bool),
     Review,
     Save,
@@ -171,6 +172,7 @@ pub(super) struct Panel {
     interfaces: Option<(flame_graph::Connection, PacketCaptureInterfaces)>,
     review: Option<Review>,
     loaded: Option<LoadedCapture>,
+    saved_interface: usize,
     wireshark: Option<PathBuf>,
     pub(super) pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
@@ -464,6 +466,7 @@ impl Panel {
             }
         } else if let Some(LoadedCapture::Local(capture)) = &self.loaded {
             let summary = &capture.summary;
+            let stats = &summary.stats;
             files.extend([
                 text("local-capture-path", capture.path.display().to_string()),
                 text(
@@ -474,24 +477,24 @@ impl Panel {
                     "local-packet-counts",
                     format!(
                         "Packets {} · {} captured bytes · {} truncated",
-                        summary.packets, summary.captured_bytes, summary.truncated_packets
+                        stats.packets, stats.captured_bytes, stats.truncated_packets
                     ),
                 ),
             ]);
-            if let Some(span) = summary.span_ns() {
+            if let Some(span) = stats.span_ns() {
                 files.push(text(
                     "local-packet-span",
                     format!(
                         "Timestamp span {} s · {} of {} packets timestamped",
                         seconds_text(span),
-                        summary.timestamped_packets,
-                        summary.packets
+                        stats.timestamped_packets,
+                        stats.packets
                     ),
                 ));
-            } else if summary.packets != 0 {
+            } else if stats.packets != 0 {
                 files.push(text("local-packet-span", "No usable packet timestamps"));
             }
-            if summary.interfaces != 0 {
+            if !summary.interfaces.is_empty() {
                 let mut types: Vec<_> = summary
                     .link_types
                     .iter()
@@ -505,8 +508,82 @@ impl Panel {
                 }
                 files.push(text(
                     "local-link-types",
-                    format!("Interfaces {} · {}", summary.interfaces, types.join(", ")),
+                    format!(
+                        "Interfaces {} · {}",
+                        summary.interfaces.len(),
+                        types.join(", ")
+                    ),
                 ));
+            }
+            let multiple_interfaces = summary.interfaces.len() > 1;
+            if multiple_interfaces {
+                let labels = summary.interfaces.iter().map(|interface| {
+                    let mut label = format!("Interface {}", interface.interface_id);
+                    if let Some(section) = interface.section {
+                        label = format!("Section {section} · {label}");
+                    }
+                    if let Some(name) = &interface.name {
+                        label.push_str(" · ");
+                        label.push_str(name);
+                    }
+                    label
+                });
+                let path = capture.path.clone();
+                files.push(KeyedView::new(
+                    "saved-interfaces",
+                    ComboBox::new()
+                        .automation_name("Saved capture interfaces")
+                        .items_source(labels)
+                        .selected_index(Some(self.saved_interface))
+                        .is_enabled(idle)
+                        .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                            index.map_or(Message::ControlIdle, |index| {
+                                message(Action::SelectSavedInterface(path.clone(), index))
+                            })
+                        })),
+                ));
+            }
+            if let Some(interface) = summary.interfaces.get(self.saved_interface) {
+                let snap = interface.snap_length.map_or_else(
+                    || "Unlimited snap length".into(),
+                    |length| format!("Snap length {length} bytes"),
+                );
+                let details = if multiple_interfaces {
+                    format!("{} · {snap}", link_type(interface.link_type))
+                } else {
+                    snap
+                };
+                let label = match &interface.name {
+                    Some(name) => format!("{name} · {details}"),
+                    None => details,
+                };
+                files.push(text("saved-interface-link", label));
+                if multiple_interfaces {
+                    let stats = &interface.stats;
+                    files.push(text(
+                        "saved-interface-counts",
+                        format!(
+                            "Interface packets {} · {} captured bytes · {} truncated",
+                            stats.packets, stats.captured_bytes, stats.truncated_packets
+                        ),
+                    ));
+                    if let Some(span) = stats.span_ns() {
+                        files.push(text(
+                            "saved-interface-span",
+                            format!(
+                                "Interface span {} s · {} of {} packets timestamped",
+                                seconds_text(span),
+                                stats.timestamped_packets,
+                                stats.packets
+                            ),
+                        ));
+                    } else if stats.packets != 0 {
+                        files.push(text(
+                            "saved-interface-span",
+                            "No usable timestamps on this interface",
+                        ));
+                    }
+                }
             }
             if let Some(issue) = &summary.issue {
                 files.push(text(
@@ -652,6 +729,14 @@ impl TerminalApp {
                     panel.inputs.interface = name;
                     panel.review = None;
                     panel.status = None;
+                }
+            }
+            Action::SelectSavedInterface(path, index) => {
+                if let Some(LoadedCapture::Local(capture)) = &panel.loaded
+                    && capture.path == path
+                    && index < capture.summary.interfaces.len()
+                {
+                    panel.saved_interface = index;
                 }
             }
             Action::Review => self.review_packet_capture(ctx),
@@ -841,6 +926,7 @@ impl TerminalApp {
             Ok(Some(Outcome::Loaded(capture))) => {
                 let path = capture.path.clone();
                 panel.loaded = Some(LoadedCapture::Local(capture));
+                panel.saved_interface = 0;
                 panel.activity = None;
                 self.remember_diagnostic(
                     w11term::diagnostic_history::Kind::PacketCapture,

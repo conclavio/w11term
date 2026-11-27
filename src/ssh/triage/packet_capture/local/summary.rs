@@ -12,13 +12,27 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 #[derive(Default)]
 pub struct Summary {
+    pub stats: PacketStats,
+    pub interfaces: Vec<InterfaceSummary>,
+    pub link_types: BTreeSet<u16>,
+    pub issue: Option<String>,
+}
+
+pub struct InterfaceSummary {
+    pub section: Option<u32>,
+    pub interface_id: u32,
+    pub link_type: u16,
+    pub snap_length: Option<u32>,
+    pub name: Option<String>,
+    pub stats: PacketStats,
+}
+
+#[derive(Default)]
+pub struct PacketStats {
     pub packets: u32,
     pub captured_bytes: u64,
     pub truncated_packets: u32,
     pub timestamped_packets: u32,
-    pub interfaces: u32,
-    pub link_types: BTreeSet<u16>,
-    pub issue: Option<String>,
     earliest: Option<i128>,
     latest: Option<i128>,
 }
@@ -37,15 +51,18 @@ impl Summary {
         summary
     }
 
-    pub fn span_ns(&self) -> Option<u128> {
-        Some(self.latest?.abs_diff(self.earliest?))
-    }
-
     fn pcap(&mut self, file: &mut (impl Read + Seek), bytes: u64) -> Result<()> {
         let mut header = [0; 24];
         file.read_exact(&mut header)?;
         let format = ClassicPcap::parse(&header)?;
-        self.interface(format.link_type);
+        self.interface(InterfaceSummary {
+            section: None,
+            interface_id: 0,
+            link_type: format.link_type,
+            snap_length: Some(format.snap),
+            name: None,
+            stats: PacketStats::default(),
+        });
         let fraction_limit = if format.nanoseconds {
             1_000_000_000
         } else {
@@ -53,7 +70,7 @@ impl Summary {
         };
         let mut remaining = bytes - 24;
         while remaining > 0 {
-            check_record_limit(self.packets)?;
+            check_record_limit(self.stats.packets)?;
             let [seconds, fraction, captured, original] =
                 format.read_packet(file, &mut remaining)?;
             let timestamp = (fraction < fraction_limit).then(|| {
@@ -61,17 +78,30 @@ impl Summary {
                     + i128::from(fraction)
                         * i128::from(NANOS_PER_SECOND / u64::from(fraction_limit))
             });
-            self.packet(captured, original, timestamp);
+            self.packet(0, captured, original, timestamp);
         }
         Ok(())
     }
 
-    fn interface(&mut self, link_type: u16) {
-        self.interfaces += 1;
-        self.link_types.insert(link_type);
+    fn interface(&mut self, interface: InterfaceSummary) {
+        self.link_types.insert(interface.link_type);
+        self.interfaces.push(interface);
     }
 
-    fn packet(&mut self, captured: u32, original: u32, timestamp: Option<i128>) {
+    fn packet(&mut self, interface: usize, captured: u32, original: u32, timestamp: Option<i128>) {
+        self.stats.record(captured, original, timestamp);
+        self.interfaces[interface]
+            .stats
+            .record(captured, original, timestamp);
+    }
+}
+
+impl PacketStats {
+    pub fn span_ns(&self) -> Option<u128> {
+        Some(self.latest?.abs_diff(self.earliest?))
+    }
+
+    fn record(&mut self, captured: u32, original: u32, timestamp: Option<i128>) {
         self.packets += 1;
         self.captured_bytes += u64::from(captured);
         self.truncated_packets += u32::from(captured < original);
@@ -143,15 +173,18 @@ mod tests {
             assert!(summary.issue.is_none());
             assert_eq!(
                 (
-                    summary.packets,
-                    summary.captured_bytes,
-                    summary.truncated_packets
+                    summary.stats.packets,
+                    summary.stats.captured_bytes,
+                    summary.stats.truncated_packets
                 ),
                 (2, 3, 1)
             );
             assert_eq!(summary.link_types, [1].into());
+            assert_eq!(summary.interfaces[0].snap_length, Some(64));
+            assert_eq!(summary.interfaces[0].section, None);
+            assert_eq!(summary.interfaces[0].stats.packets, 2);
             assert_eq!(
-                summary.span_ns(),
+                summary.stats.span_ns(),
                 Some(if fraction == 500_000 {
                     500_000_000
                 } else {
@@ -160,7 +193,7 @@ mod tests {
             );
             bytes.pop();
             let partial = scan(&bytes, Format::Pcap);
-            assert_eq!(partial.packets, 1);
+            assert_eq!(partial.stats.packets, 1);
             assert!(partial.issue.unwrap().contains("packet is incomplete"));
         }
     }
@@ -212,6 +245,10 @@ mod tests {
                 data.extend(enc16(1));
                 data.extend(enc16(0));
                 data.extend(enc32(4));
+                let name = "eth\u{202e}0\n".as_bytes();
+                data.extend(enc16(2));
+                data.extend(enc16(name.len() as u16));
+                data.extend(name);
             });
             block(bytes, enc32, 6, |data| {
                 data.extend([0, 0, 1_000_000, 4, 8, 0].into_iter().flat_map(enc32))
@@ -243,20 +280,29 @@ mod tests {
         assert!(summary.issue.is_none(), "{:?}", summary.issue);
         assert_eq!(
             (
-                summary.packets,
-                summary.timestamped_packets,
-                summary.captured_bytes
+                summary.stats.packets,
+                summary.stats.timestamped_packets,
+                summary.stats.captured_bytes
             ),
             (3, 2, 9)
         );
-        assert_eq!(summary.truncated_packets, 2);
-        assert_eq!(summary.interfaces, 2);
+        assert_eq!(summary.stats.truncated_packets, 2);
+        assert_eq!(summary.interfaces.len(), 2);
+        let first = &summary.interfaces[0];
+        let second = &summary.interfaces[1];
+        assert_eq!((first.section, first.interface_id), (Some(1), 0));
+        assert_eq!((second.section, second.interface_id), (Some(2), 0));
+        assert_eq!(first.name.as_deref(), Some("eth0"));
+        assert_eq!((first.stats.packets, first.stats.captured_bytes), (2, 8));
+        assert_eq!((second.stats.packets, second.stats.captured_bytes), (1, 1));
+        assert_eq!(second.snap_length, None);
         assert_eq!(summary.link_types, [1, 276].into());
-        assert_eq!(summary.span_ns(), Some(500_000_000));
+        assert_eq!(summary.stats.span_ns(), Some(500_000_000));
 
         *bytes.last_mut().unwrap() ^= 4;
         let partial = scan(&bytes, Format::PcapNg);
-        assert_eq!(partial.packets, 2);
+        assert_eq!(partial.stats.packets, 2);
+        assert_eq!(partial.interfaces[1].stats.packets, 0);
         assert!(partial.issue.unwrap().contains("block lengths disagree"));
     }
 }

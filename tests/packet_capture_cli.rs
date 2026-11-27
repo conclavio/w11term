@@ -56,6 +56,18 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
             "timestamped_packets": 2,
             "timestamp_span_ns": "1250000000",
             "interfaces": 1,
+            "interface_details": [{
+                "section": null,
+                "interface_id": 0,
+                "name": null,
+                "link_type": 1,
+                "snap_length": 64,
+                "packets": 2,
+                "captured_bytes": 6,
+                "truncated_packets": 1,
+                "timestamped_packets": 2,
+                "timestamp_span_ns": "1250000000"
+            }],
             "link_types": [1],
             "complete": true,
             "issue": null

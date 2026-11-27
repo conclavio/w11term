@@ -1493,6 +1493,8 @@ Choose **Open capture file…** in the same panel to reopen a local PCAP or PCAP
 
 Use `inspect-packet-capture` to read the same summary as schema-version-1 JSON without a running w11term instance. The report records the local filename, numeric link types, and the timestamp span in nanoseconds as a decimal string. A missing span is `null`. An incomplete scan returns the verified prefix with `complete: false` and the reason in `issue`. A file with an invalid capture header returns a nonzero exit code. Use `--output-file` to save the report to a new file and get its absolute path in the CLI reply.
 
+Use **Saved capture interfaces** when a capture contains multiple interfaces. Each entry shows the recorded name when available, link type, snap length, packet count, bytes, truncation, and timestamp coverage. The JSON `interface_details` array includes the same breakdown. PCAPNG sections are numbered starting at one, and interface IDs start at zero within each section. A classic PCAP file has one implicit interface with a `null` section. A `null` snap length means the PCAPNG interface has no limit.
+
 ```powershell
 $summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
 $summary.packets

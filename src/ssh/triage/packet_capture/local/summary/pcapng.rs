@@ -1,10 +1,11 @@
-use super::{NANOS_PER_SECOND, Summary, check_record_limit};
+use super::{InterfaceSummary, NANOS_PER_SECOND, PacketStats, Summary, check_record_limit};
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{Read, Seek};
 
 const SECTION: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
-const MAX_INTERFACES: u32 = 4096;
+const MAX_INTERFACES: usize = 4096;
 const MAX_INTERFACE_OPTIONS: u64 = 64 * 1024;
+const MAX_NAME_BYTES: usize = 256;
 
 #[derive(Clone, Copy)]
 enum Order {
@@ -46,6 +47,7 @@ impl Order {
 struct Interface {
     link_type: u16,
     snap: u32,
+    name: Option<String>,
     resolution: u8,
     offset_seconds: i64,
 }
@@ -69,6 +71,7 @@ enum Entry {
     Section(Order),
     Interface(Interface),
     Packet {
+        interface: usize,
         captured: u32,
         original: u32,
         timestamp: Option<i128>,
@@ -84,6 +87,8 @@ pub(super) fn scan(
     let mut order = None;
     let mut interfaces = Vec::new();
     let mut blocks = 0;
+    let mut section_number = 0;
+    let mut section_start = 0;
     while remaining > 0 {
         check_record_limit(blocks)?;
         ensure!(remaining >= 12, "Incomplete PCAPNG block header");
@@ -123,7 +128,7 @@ pub(super) fn scan(
             match endian.u32(kind) {
                 1 => {
                     ensure!(
-                        summary.interfaces < MAX_INTERFACES,
+                        summary.interfaces.len() < MAX_INTERFACES,
                         "Reached the PCAPNG scan limit of {MAX_INTERFACES} interfaces"
                     );
                     Entry::Interface(block.interface()?)
@@ -139,17 +144,27 @@ pub(super) fn scan(
             Entry::Section(endian) => {
                 order = Some(endian);
                 interfaces.clear();
+                section_number += 1;
+                section_start = summary.interfaces.len();
             }
-            Entry::Interface(interface) => {
-                summary.interface(interface.link_type);
+            Entry::Interface(mut interface) => {
+                summary.interface(InterfaceSummary {
+                    section: Some(section_number),
+                    interface_id: interfaces.len() as u32,
+                    link_type: interface.link_type,
+                    snap_length: (interface.snap != 0).then_some(interface.snap),
+                    name: interface.name.take(),
+                    stats: PacketStats::default(),
+                });
                 interfaces.push(interface);
             }
             Entry::Packet {
+                interface,
                 captured,
                 original,
                 timestamp,
             } => {
-                summary.packet(captured, original, timestamp);
+                summary.packet(section_start + interface, captured, original, timestamp);
             }
             Entry::Other => (),
         }
@@ -167,11 +182,17 @@ struct Block<'a, T> {
 
 impl<T: Read + Seek> Block<'_, T> {
     fn read<const N: usize>(&mut self) -> Result<[u8; N]> {
-        ensure!(self.remaining >= N as u64, "Incomplete PCAPNG block");
         let mut field = [0; N];
-        self.file.read_exact(&mut field)?;
-        self.remaining -= N as u64;
+        self.read_into(&mut field)?;
         Ok(field)
+    }
+
+    fn read_into(&mut self, field: &mut [u8]) -> Result<()> {
+        let bytes = field.len() as u64;
+        ensure!(self.remaining >= bytes, "Incomplete PCAPNG block");
+        self.file.read_exact(field)?;
+        self.remaining -= bytes;
+        Ok(())
     }
 
     fn u16(&mut self) -> Result<u16> {
@@ -203,6 +224,7 @@ impl<T: Read + Seek> Block<'_, T> {
         let mut interface = Interface {
             link_type,
             snap: self.u32()?,
+            name: None,
             resolution: 6,
             offset_seconds: 0,
         };
@@ -215,6 +237,7 @@ impl<T: Read + Seek> Block<'_, T> {
             let size = u64::from(self.u16()?);
             match (code, size) {
                 (0, 0) => break,
+                (2, _) if interface.name.is_none() => interface.name = self.interface_name(size)?,
                 (9, 1) => {
                     interface.resolution = self.read::<1>()?[0];
                     self.skip(3)?;
@@ -225,6 +248,27 @@ impl<T: Read + Seek> Block<'_, T> {
             }
         }
         Ok(interface)
+    }
+
+    fn interface_name(&mut self, size: u64) -> Result<Option<String>> {
+        let mut buffer = [0; MAX_NAME_BYTES];
+        let keep = size.min(MAX_NAME_BYTES as u64) as usize;
+        self.read_into(&mut buffer[..keep])?;
+        self.skip(size.next_multiple_of(4) - keep as u64)?;
+        let mut name: String = String::from_utf8_lossy(&buffer[..keep])
+            .chars()
+            .filter(|&c| {
+                !c.is_control()
+                    && !matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            })
+            .collect();
+        if name.trim().is_empty() {
+            return Ok(None);
+        }
+        if keep as u64 != size {
+            name.push('…');
+        }
+        Ok(Some(name))
     }
 
     fn timed_packet(&mut self, interfaces: &[Interface], obsolete: bool) -> Result<Entry> {
@@ -246,6 +290,7 @@ impl<T: Read + Seek> Block<'_, T> {
             "Incomplete PCAPNG packet data"
         );
         Ok(Entry::Packet {
+            interface: id as usize,
             captured,
             original,
             timestamp: Some(interface.timestamp_ns(ticks)),
@@ -267,6 +312,7 @@ impl<T: Read + Seek> Block<'_, T> {
             "Invalid PCAPNG simple packet length"
         );
         Ok(Entry::Packet {
+            interface: 0,
             captured,
             original,
             timestamp: None,

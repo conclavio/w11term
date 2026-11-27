@@ -10,7 +10,7 @@ use std::{
 };
 
 mod summary;
-use summary::Summary;
+use summary::{PacketStats, Summary};
 
 pub struct LocalCapture {
     pub path: PathBuf,
@@ -32,15 +32,46 @@ struct Report<'a> {
     format: &'a Format,
     file_name: Cow<'a, str>,
     file_bytes: u64,
+    #[serde(flatten)]
+    stats: StatsReport,
+    interfaces: usize,
+    interface_details: Vec<InterfaceReport<'a>>,
+    link_types: &'a BTreeSet<u16>,
+    complete: bool,
+    issue: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct InterfaceReport<'a> {
+    section: Option<u32>,
+    interface_id: u32,
+    name: Option<&'a str>,
+    link_type: u16,
+    snap_length: Option<u32>,
+    #[serde(flatten)]
+    stats: StatsReport,
+}
+
+#[derive(Serialize)]
+struct StatsReport {
     packets: u32,
     captured_bytes: u64,
     truncated_packets: u32,
     timestamped_packets: u32,
     timestamp_span_ns: Option<String>,
-    interfaces: u32,
-    link_types: &'a BTreeSet<u16>,
-    complete: bool,
-    issue: Option<&'a str>,
+}
+
+impl From<&PacketStats> for StatsReport {
+    fn from(stats: &PacketStats) -> Self {
+        Self {
+            packets: stats.packets,
+            captured_bytes: stats.captured_bytes,
+            truncated_packets: stats.truncated_packets,
+            timestamped_packets: stats.timestamped_packets,
+            // Use a decimal string to preserve precision outside 53-bit JSON readers.
+            timestamp_span_ns: stats.span_ns().map(|span| span.to_string()),
+        }
+    }
 }
 
 impl LocalCapture {
@@ -76,13 +107,20 @@ impl LocalCapture {
             format: &self.format,
             file_name: self.path.file_name().unwrap_or_default().to_string_lossy(),
             file_bytes: self.bytes,
-            packets: summary.packets,
-            captured_bytes: summary.captured_bytes,
-            truncated_packets: summary.truncated_packets,
-            timestamped_packets: summary.timestamped_packets,
-            // A decimal string preserves the full span for consumers with 53-bit numbers.
-            timestamp_span_ns: summary.span_ns().map(|span| span.to_string()),
-            interfaces: summary.interfaces,
+            stats: (&summary.stats).into(),
+            interfaces: summary.interfaces.len(),
+            interface_details: summary
+                .interfaces
+                .iter()
+                .map(|interface| InterfaceReport {
+                    section: interface.section,
+                    interface_id: interface.interface_id,
+                    name: interface.name.as_deref(),
+                    link_type: interface.link_type,
+                    snap_length: interface.snap_length,
+                    stats: (&interface.stats).into(),
+                })
+                .collect(),
             link_types: &summary.link_types,
             complete: summary.issue.is_none(),
             issue: summary.issue.as_deref(),
