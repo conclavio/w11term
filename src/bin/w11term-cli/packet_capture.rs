@@ -12,7 +12,7 @@ pub(super) const HELP: &str = concat!(
     "--connection-generation N --review-id ID --output-file PATH [--job-id HEX] [--wireshark PATH]\n",
     "w11term-cli [--pid PID] stop-packet-capture --pane ID --connection-generation N --job-id HEX\n",
     "CAPTURE OPTIONS: [--filter EXPR] [--snap-length BYTES] [--seconds N] [--max-mib N] ",
-    "[--packet-limit N] [--scratch-directory PATH] [--tmpfs]",
+    "[--packet-limit N] [--rotate-files 2..16] [--scratch-directory PATH] [--tmpfs]",
 );
 
 pub(super) fn parse(
@@ -40,6 +40,7 @@ pub(super) fn parse(
                         | "--seconds"
                         | "--max-mib"
                         | "--packet-limit"
+                        | "--rotate-files"
                         | "--scratch-directory"
                 )
             || (capture || stop) && matches!(flag.as_str(), "--connection-generation" | "--job-id")
@@ -113,6 +114,11 @@ pub(super) fn parse(
             .map(|value| value.parse())
             .transpose()
             .context("invalid packet limit")?,
+        rotate_files: flags
+            .remove("--rotate-files")
+            .map(|value| value.parse())
+            .transpose()
+            .context("invalid rolling capture file count")?,
         scratch_directory: flags
             .remove("--scratch-directory")
             .unwrap_or_else(|| PacketCaptureOptions::default_scratch_directory(tmpfs).into()),

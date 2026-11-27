@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -38,34 +38,57 @@ const SYSCALL_FIXTURE: &[u8] =
 const PCAP_FIXTURE: &[u8] = b"\xd4\xc3\xb2\xa1\x02\0\x04\0\0\0\0\0\0\0\0\0\xc0\0\0\0\x01\0\0\0\
     \x01\0\0\0\0\0\0\0\x04\0\0\0\x04\0\0\0\xab\xcd\xef\x01";
 
+fn packet_ring_segment(slot: u8) -> Vec<u8> {
+    let mut bytes = PCAP_FIXTURE.to_vec();
+    *bytes.last_mut().unwrap() = slot + 10;
+    bytes
+}
+
+fn packet_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn packet_capture_ready(
     session: &mut server::Session,
     channel: ChannelId,
     reason: &str,
     bad_digest: bool,
+    rolling: bool,
 ) -> anyhow::Result<()> {
-    use sha2::{Digest, Sha256};
-    let sha256 = if bad_digest {
-        "0".repeat(64)
+    let line = if rolling {
+        let segments = [(1, 1), (2, 0)].map(|(sequence, slot)| {
+            let bytes = packet_ring_segment(slot);
+            json!({"sequence": sequence, "bytes": bytes.len(), "sha256": packet_digest(&bytes)})
+        });
+        let manifest = json!({"packets": 3, "segments": segments});
+        format!("w11term-packet-ring-v1\t{reason}\t{manifest}\n")
     } else {
-        Sha256::digest(PCAP_FIXTURE)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    };
-    session.extended_data(
-        channel,
-        1,
-        b"1 packet captured\n2 packets received by filter\n0 packets dropped by kernel\n".to_vec(),
-    )?;
-    session.data(
-        channel,
+        let sha256 = if bad_digest {
+            "0".repeat(64)
+        } else {
+            packet_digest(PCAP_FIXTURE)
+        };
         format!(
             "w11term-packet-ready-v1\t{reason}\t{}\t{sha256}\n",
             PCAP_FIXTURE.len()
         )
-        .into_bytes(),
+    };
+    session.extended_data(
+        channel,
+        1,
+        if rolling {
+            b"3 packets captured\n3 packets received by filter\n0 packets dropped by kernel\n"
+                .to_vec()
+        } else {
+            b"1 packet captured\n2 packets received by filter\n0 packets dropped by kernel\n"
+                .to_vec()
+        },
     )?;
+    session.data(channel, line.into_bytes())?;
     Ok(())
 }
 
@@ -306,7 +329,13 @@ impl server::Handler for Peer {
                 s.eof(c)?;
                 s.close(c)?;
             } else {
-                let job = args.rsplit_once(' ').unwrap().1.trim_matches('\'');
+                let ring = args.rsplit_once(" w11term-ring-v1 ");
+                let job = ring
+                    .map_or(args, |(prefix, _)| prefix)
+                    .rsplit_once(' ')
+                    .unwrap()
+                    .1
+                    .trim_matches('\'');
                 anyhow::ensure!(
                     job.len() == 32 && job.bytes().all(|byte| byte.is_ascii_hexdigit())
                 );
@@ -317,7 +346,16 @@ impl server::Handler for Peer {
                     .join("shm")
                     .join(format!("w11term-pcap-{job}"));
                 fs::create_dir_all(&remote)?;
-                fs::write(remote.join("capture.pcap"), PCAP_FIXTURE)?;
+                if ring.is_some() {
+                    for slot in 0..2 {
+                        fs::write(
+                            remote.join(format!("segment-{slot}.pcap")),
+                            packet_ring_segment(slot),
+                        )?;
+                    }
+                } else {
+                    fs::write(remote.join("capture.pcap"), PCAP_FIXTURE)?;
+                }
                 fs::write(
                     self.root.join(format!("pcap-ack-{c}")),
                     remote.to_str().unwrap(),
@@ -328,6 +366,7 @@ impl server::Handler for Peer {
                         c,
                         "packets",
                         self.root.join("pcap-bad-digest").is_file(),
+                        ring.is_some(),
                     )?;
                 }
             }
@@ -676,18 +715,29 @@ impl server::Handler for Peer {
     ) -> anyhow::Result<()> {
         let capture_marker = self.root.join(format!("pcap-ack-{c}"));
         if data == b"stop\n"
-            && capture_marker.is_file()
             && self.root.join("pcap-wait-for-stop").is_file()
+            && let Ok(remote) = fs::read_to_string(&capture_marker)
         {
             fs::write(self.root.join("pcap-stopped"), [])?;
-            packet_capture_ready(s, c, "stopped", false)?;
+            packet_capture_ready(
+                s,
+                c,
+                "stopped",
+                false,
+                Path::new(&remote).join("segment-0.pcap").is_file(),
+            )?;
             return Ok(());
         }
         if data == b"verified\n"
             && let Ok(remote) = fs::read_to_string(&capture_marker)
         {
             let remote = PathBuf::from(remote);
-            fs::remove_file(remote.join("capture.pcap"))?;
+            if remote.join("segment-0.pcap").is_file() {
+                fs::remove_file(remote.join("segment-0.pcap"))?;
+                fs::remove_file(remote.join("segment-1.pcap"))?;
+            } else {
+                fs::remove_file(remote.join("capture.pcap"))?;
+            }
             fs::remove_dir(remote)?;
             fs::remove_file(capture_marker)?;
             fs::write(self.root.join("pcap-verified"), [])?;
@@ -2182,6 +2232,7 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
         seconds: 5,
         max_mib: 1,
         packet_limit: Some(1),
+        rotate_files: None,
         scratch_directory: "/dev/shm".into(),
         require_tmpfs: true,
     };

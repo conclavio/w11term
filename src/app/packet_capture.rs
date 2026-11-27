@@ -15,6 +15,7 @@ pub enum Field {
     Snapshot,
     Budget,
     PacketLimit,
+    RotateFiles,
     Scratch,
 }
 
@@ -46,6 +47,7 @@ struct Inputs {
     snapshot: String,
     budget: String,
     packet_limit: String,
+    rotate_files: String,
     scratch: String,
     tmpfs: bool,
 }
@@ -59,6 +61,7 @@ impl Default for Inputs {
             snapshot: PacketCaptureOptions::DEFAULT_SNAP_LENGTH.to_string(),
             budget: PacketCaptureOptions::DEFAULT_MAX_MIB.to_string(),
             packet_limit: String::new(),
+            rotate_files: String::new(),
             scratch: String::new(),
             tmpfs: false,
         }
@@ -93,6 +96,16 @@ impl Inputs {
                         .trim()
                         .parse()
                         .context("Enter a positive packet limit")?,
+                )
+            },
+            rotate_files: if self.rotate_files.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    self.rotate_files
+                        .trim()
+                        .parse()
+                        .context("Enter 2 to 16 rolling capture files")?,
                 )
             },
             scratch_directory: if self.scratch.is_empty() {
@@ -222,6 +235,12 @@ impl Panel {
                 "Packet limit (optional)",
                 &inputs.packet_limit,
             ),
+            input(
+                "rotate-files",
+                Field::RotateFiles,
+                "Rolling capture files (optional)",
+                &inputs.rotate_files,
+            ),
             KeyedView::new(
                 "tmpfs",
                 CheckBox::new()
@@ -268,6 +287,10 @@ impl Panel {
         if let Some(review) = &self.review {
             let plan = &review.plan;
             let ready = review.matches(active);
+            let limit = plan.effective_packet_limit.map_or_else(
+                || "No packet limit".into(),
+                |count| format!("Packet ceiling {count}"),
+            );
             fields.extend([
                 text(
                     "endpoint",
@@ -283,8 +306,8 @@ impl Panel {
                 text(
                     "limits",
                     format!(
-                        "{} seconds · {} MiB · Packet ceiling {}",
-                        plan.options.seconds, plan.options.max_mib, plan.effective_packet_limit
+                        "{} seconds · {} MiB · {limit}",
+                        plan.options.seconds, plan.options.max_mib
                     ),
                 ),
                 text(
@@ -296,6 +319,12 @@ impl Panel {
                     button("Capture and save…", idle && ready, || Action::Save),
                 ),
             ]);
+            if let Some(rotation) = plan.rotation {
+                fields.push(text("rotation", format!(
+                    "Keep up to {} files · {} bytes per file. The oldest file is replaced when the buffer fills.",
+                    rotation.files, rotation.bytes_per_file
+                )));
+            }
             if !ready {
                 fields.push(text(
                     "stale",
@@ -314,12 +343,17 @@ impl Panel {
                 "byte-budget" => "Packet ceiling for the byte budget reached",
                 _ => "Capture ended",
             };
+            let packets = if saved.rotation.is_some() {
+                "Packets retained"
+            } else {
+                "Packets captured"
+            };
             fields.extend([
                 text("saved-path", saved.path.display().to_string()),
                 text(
                     "saved-counts",
                     format!(
-                        "{reason}\nPackets captured {} · {} bytes",
+                        "{reason}\n{packets} {} · {} bytes",
                         saved.packets, saved.bytes
                     ),
                 ),
@@ -328,6 +362,17 @@ impl Panel {
                 fields.push(text(
                     "drops",
                     format!("Packets dropped by kernel {dropped}"),
+                ));
+            }
+            if let Some(rotation) = &saved.rotation {
+                fields.push(text(
+                    "rotation-saved",
+                    format!(
+                        "Rolling capture · {} captured · {} files kept · {} overwritten",
+                        rotation.captured_packets,
+                        rotation.retained_files,
+                        rotation.overwritten_files
+                    ),
                 ));
             }
             fields.extend([
@@ -431,6 +476,7 @@ impl TerminalApp {
                     Field::Snapshot => &mut panel.inputs.snapshot,
                     Field::Budget => &mut panel.inputs.budget,
                     Field::PacketLimit => &mut panel.inputs.packet_limit,
+                    Field::RotateFiles => &mut panel.inputs.rotate_files,
                     Field::Scratch => &mut panel.inputs.scratch,
                 };
                 if *current != value {

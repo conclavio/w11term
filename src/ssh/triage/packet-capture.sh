@@ -6,6 +6,8 @@ mode=$1 interface=$2 snaplen=$3 count=$4 seconds=$5 budget_kib=$6
 require_tmpfs=$7 root=$8 filter=$9
 shift 9
 expected_mount=$1 job=$2
+slots=0
+if [[ ${3:-} == w11term-ring-v1 ]]; then slots=$4 ring_worker=$5; fi
 
 fail() {
     printf '%s\n' "$*" >&2
@@ -15,6 +17,16 @@ fail() {
 for tool in tcpdump flock timeout mkdir stat df tail id sha256sum mkfifo head cat wc rm; do
     command -v "$tool" >/dev/null || fail "Packet capture requires $tool."
 done
+if [[ $slots != 0 ]]; then
+    [[ $slots =~ ^[0-9]{1,2}$ ]] && (( slots >= 2 && slots <= 16 )) \
+        || fail 'Rolling packet capture requires 2 to 16 files.'
+    command -v python3 >/dev/null || fail 'Rolling packet capture requires Python 3.8 or later.'
+    timeout -k 1s 2s python3 -I -S -c 'import sys; sys.exit(sys.version_info < (3, 8))' \
+        || fail 'Rolling packet capture requires Python 3.8 or later.'
+    slot_limit=$((budget_kib * 1024 / slots))
+    (( slot_limit >= 24 + 16 + snaplen )) || fail 'A rolling capture file cannot fit one reviewed packet.'
+    [[ -n $ring_worker ]] || fail 'Rolling packet capture worker is missing.'
+fi
 cd -P -- "$root" || fail 'The selected scratch directory is unavailable.'
 root=$PWD
 [[ -w $root ]] || fail 'The selected scratch directory is not writable.'
@@ -54,26 +66,51 @@ flock -n 9 || fail 'Another packet capture is active for this Linux account.'
 capacity
 work=${root%/}/w11term-pcap-$job
 mkdir -m 700 -- "$work" || fail 'Could not create private capture storage.'
-capture= monitor= sink=
+capture= monitor= sink= writer=
 cleanup() {
     if [[ -n $capture ]]; then kill -TERM "$capture" 2>/dev/null || :; fi
     if [[ -n $monitor ]]; then kill "$monitor" 2>/dev/null || :; fi
     if [[ -n $sink ]]; then kill "$sink" 2>/dev/null || :; fi
+    if [[ -n $writer ]]; then kill "$writer" 2>/dev/null || :; fi
     rm -rf -- "$work"
 }
 trap cleanup EXIT
 trap 'exit 1' PIPE TERM HUP
 exec 8<&0
 mkfifo -- "$work/stderr"
-(head -c 8192; cat >/dev/null) < "$work/stderr" > "$work/diagnostics" &
+exec 7<>"$work/stderr"
+exec 6<"$work/stderr" 4>"$work/stderr"
+exec 7>&-
+(head -c 8192; cat >/dev/null) <&6 6<&- 4>&- > "$work/diagnostics" &
 sink=$!
+exec 6<&-
+if [[ $slots != 0 ]]; then
+    mkfifo -- "$work/packets"
+    # Open both ends before spawning either process. An immediate Stop can
+    # close the only writer even if tcpdump has never reached its first packet.
+    exec 7<>"$work/packets"
+    exec 6<"$work/packets" 5>"$work/packets"
+    exec 7>&-
+    (
+        ulimit -f "$(((slot_limit + 1023) / 1024))"
+        ulimit -c 0
+        exec python3 -I -S -c "$ring_worker" "$work" "$slot_limit" "$slots" "$snaplen"
+    ) <&6 6<&- 5>&- 4>&- >"$work/ring.manifest" 2>"$work/ring-error" &
+    writer=$!
+    exec 6<&-
+else
+    exec 5>"$work/capture.pcap"
+fi
+packet_limit=()
+if [[ $count != 0 ]]; then packet_limit=(-c "$count"); fi
 (
     ulimit -f "$budget_kib"
     ulimit -c 0
     exec timeout -k 2s "${seconds}s" tcpdump "${args[@]}" \
-        -c "$count" -w - -- "${expression[@]}"
-) </dev/null > "$work/capture.pcap" 2> "$work/stderr" &
+        "${packet_limit[@]}" -w - -- "${expression[@]}"
+) </dev/null >&5 5>&- 2>&4 4>&- &
 capture=$!
+exec 5>&- 4>&-
 (
     if IFS= read -r request <&8; then
         if [[ $request == stop ]]; then
@@ -107,13 +144,23 @@ case "$status" in
     124) stop=time ;;
     *) fail "tcpdump failed (status $status)." ;;
 esac
-size=$(wc -c < "$work/capture.pcap")
-if [[ $stop == stopped ]] && (( size < 24 )); then
-    fail 'Packet capture stopped before tcpdump produced a capture.'
+if [[ $slots != 0 ]]; then
+    if ! wait "$writer"; then
+        writer=
+        head -c 2048 -- "$work/ring-error" >&2
+        fail 'Could not finalize the rolling packet capture.'
+    fi
+    writer=
+    printf 'w11term-packet-ring-v1\t%s\t%s\n' "$stop" "$(cat -- "$work/ring.manifest")"
+else
+    size=$(wc -c < "$work/capture.pcap")
+    if [[ $stop == stopped ]] && (( size < 24 )); then
+        fail 'Packet capture stopped before tcpdump produced a capture.'
+    fi
+    (( size >= 24 && size <= budget_kib * 1024 )) || fail 'The capture is empty or exceeded its byte budget.'
+    digest=$(sha256sum < "$work/capture.pcap")
+    printf 'w11term-packet-ready-v1\t%s\t%s\t%s\n' "$stop" "$size" "${digest%% *}"
 fi
-(( size >= 24 && size <= budget_kib * 1024 )) || fail 'The capture is empty or exceeded its byte budget.'
-digest=$(sha256sum < "$work/capture.pcap")
-printf 'w11term-packet-ready-v1\t%s\t%s\t%s\n' "$stop" "$size" "${digest%% *}"
 # The SSH client verifies the SFTP artifact before acknowledging. EOF also
 # releases the lease, and the deadline cleans abandoned files on a broken link.
 read_acknowledgement() {

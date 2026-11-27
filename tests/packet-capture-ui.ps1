@@ -66,9 +66,12 @@ try {
 
     Set-Field 'Capture filter (optional)' 'udp and dst port 4321'
     $null = Wait-Until 'editing options invalidates the earlier review' { !(Find-Element $saveLabel $button) }
+    Set-Field 'Packet limit (optional)' '3'
+    Set-Field 'Rolling capture files (optional)' '2'
     Click 'Review packet capture'
-    $null = Wait-Until 'BPF filter is visible in the reviewed command' {
-        Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","1","-w","-","--","udp and dst port 4321"]'
+    $null = Wait-Until 'BPF filter and rolling limits are visible in the review' {
+        (Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","3","-w","-","--","udp and dst port 4321"]') -and
+            (Find-Element "Keep up to 2 files${dot}524288 bytes per file. The oldest file is replaced when the buffer fills.")
     }
     $null = Control @('focus-pane','--pane',"$local")
     Wait-Focus $local
@@ -89,7 +92,8 @@ try {
     Click 'Stop and save'
     $null = Wait-Until 'verified capture published on Windows' {
         (Find-Element 'Saved packet capture') -and (Find-Element 'Packets dropped by kernel 0') -and
-            (Find-Element "Stopped by request`nPackets captured 1${dot}44 bytes") -and
+            (Find-Element "Stopped by request`nPackets retained 2${dot}64 bytes") -and
+            (Find-Element "Rolling capture${dot}3 captured${dot}2 files kept${dot}1 overwritten") -and
             [IO.File]::Exists($destination)
     }
 

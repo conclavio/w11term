@@ -1,25 +1,33 @@
 """Exercise the remote packet worker with a real loopback exchange."""
 
 import hashlib
+import json
 from pathlib import Path
+import re
 import select
 import shlex
 import socket
 import subprocess
+import struct
+import sys
 import tempfile
 import threading
 import time
 import uuid
 
 SCRIPT = Path("src/ssh/triage/packet-capture.sh").read_text()
+RING = Path("src/ssh/triage/packet-ring.py").read_text()
 
 
-def run(mode, root, port, *, mount="", job="", count=3, seconds=8, script=SCRIPT):
-    return [
+def run(mode, root, port, *, mount="", job="", count=3, seconds=8, script=SCRIPT, slots=None):
+    args = [
         "/bin/bash", "-c", script, "w11term-packet-capture", mode, "lo", "192",
         str(count), str(seconds), "1024", "yes", str(root), f"udp and dst port {port}",
         mount, job,
     ]
+    if slots is not None:
+        args.extend(["w11term-ring-v1", str(slots), RING])
+    return args
 
 
 def line(process):
@@ -33,6 +41,80 @@ def wait_for_file(path, *, minimum_size=0):
     while not path.exists() or path.stat().st_size < minimum_size:
         assert time.monotonic() < deadline, path
         time.sleep(0.02)
+
+
+def verify_ring_writer():
+    # Big-endian nanosecond pcap and deliberately reversed timestamps.
+    # The ring must preserve record order without sorting by time.
+    header = bytes.fromhex("a1b23c4d") + struct.pack(">HHIIII", 2, 4, 0, 0, 64, 1)
+    records = [
+        struct.pack(">IIII", 100 - index, 0, 48, 80) + bytes([index]) * 48
+        for index in range(7)
+    ]
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        runner = [sys.executable, "-I", "-S", "-c", RING, str(root), "152", "2", "64"]
+        proc = subprocess.run(runner, input=header + b"".join(records),
+                              capture_output=True, check=True)
+        manifest = json.loads(proc.stdout)
+        assert manifest["packets"] == 7
+        assert [entry["sequence"] for entry in manifest["segments"]] == [2, 3]
+        assert (root / "segment-0.pcap").read_bytes() == header + b"".join(records[4:6])
+        assert (root / "segment-1.pcap").read_bytes() == header + records[6]
+        assert sum(path.stat().st_size for path in root.glob("*.pcap")) <= 304
+        proc = subprocess.run(runner, input=header + records[0][:-1], capture_output=True)
+        assert proc.returncode != 0 and not proc.stdout and b"incomplete packet" in proc.stderr
+
+
+def live_ring(root, port, mount):
+    job = uuid.uuid4().hex
+    work = root / f"w11term-pcap-{job}"
+    done = threading.Event()
+
+    def send():
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            index = 0
+            while not done.wait(0.0003):
+                payload = f"fixture-ring-{index:07}".encode() + b" " * 300
+                sender.sendto(payload, ("127.0.0.1", port))
+                index += 1
+
+    traffic = threading.Thread(target=send, daemon=True)
+    with subprocess.Popen(run("capture", root, port, mount=mount, job=job,
+                              slots=2, count=6500, seconds=20),
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE) as capture:
+        traffic.start()
+        try:
+            marker, reason, metadata = line(capture).split("\t")
+            assert (marker, reason) == ("w11term-packet-ring-v1", "packets")
+            manifest = json.loads(metadata)
+            assert manifest["packets"] == 6500
+            segments = manifest["segments"]
+            assert len(segments) == 2
+            assert segments[0]["sequence"] > 0
+            assert segments[0]["sequence"] + 1 == segments[1]["sequence"]
+            assert len(list(work.glob("*.pcap"))) == 2
+            assert sum((work / f"segment-{slot}.pcap").stat().st_size for slot in range(2)) <= 1024 * 1024
+            packet_ids = []
+            for segment in segments:
+                path = work / f"segment-{segment['sequence'] % 2}.pcap"
+                data = path.read_bytes()
+                assert len(data) == segment["bytes"] <= 512 * 1024
+                assert hashlib.sha256(data).hexdigest() == segment["sha256"]
+                decoded = subprocess.run(["tcpdump", "-n", "-r", path, "-A"],
+                                         capture_output=True, check=True, timeout=5)
+                packet_ids.extend(map(int, re.findall(rb"fixture-ring-(\d{7})", decoded.stdout)))
+            assert 0 < len(packet_ids) < 6500
+            assert all(a < b for a, b in zip(packet_ids, packet_ids[1:]))
+            out, err = capture.communicate(b"verified\n", timeout=5)
+            assert capture.returncode == 0 and out == b"w11term-packet-complete-v1\n", (out, err)
+            assert not work.exists()
+        finally:
+            done.set()
+            traffic.join(timeout=1)
+            if capture.poll() is None:
+                capture.kill()
 
 
 def smoke():
@@ -148,8 +230,12 @@ def smoke():
             low = subprocess.run(run("inspect", root, port, script=worker),
                                  capture_output=True, timeout=5)
             assert low.returncode != 0 and b"cannot meet the capture budget" in low.stderr
+            live_ring(root, port, mount_id)
+            print("Real tcpdump rolled and reopened the retained packet files in capture order within 1 MiB.")
             print("Real tcpdump passed packet and time limits, early stop, late stop acknowledgement, and disconnect cleanup.")
 
 
 if __name__ == "__main__":
-    smoke()
+    verify_ring_writer()
+    if sys.argv[1:] != ["--ring-unit"]:
+        smoke()

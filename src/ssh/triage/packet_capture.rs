@@ -13,10 +13,12 @@ use std::{
 };
 
 const SCRIPT: &str = include_str!("packet-capture.sh");
+const RING_WORKER: &str = include_str!("packet-ring.py");
 const CAPTURE_FILE: &str = "capture.pcap";
 const METADATA_BYTES: usize = 4096;
 const CAPTURE_OVERHEAD_SECONDS: u64 = 72;
 pub(crate) const CONTROL_SECONDS: u64 = 155;
+mod ring;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +29,8 @@ pub struct PacketCaptureOptions {
     pub seconds: u8,
     pub max_mib: u8,
     pub packet_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotate_files: Option<u8>,
     pub scratch_directory: String,
     pub require_tmpfs: bool,
 }
@@ -74,6 +78,16 @@ impl PacketCaptureOptions {
             self.packet_limit != Some(0),
             "The packet limit must be positive"
         );
+        if let Some(files) = self.rotate_files {
+            ensure!(
+                (2..=16).contains(&files),
+                "Rolling packet capture requires 2 to 16 files"
+            );
+            ensure!(
+                self.budget_bytes() / u64::from(files) >= 24 + 16 + u64::from(self.snap_length),
+                "The byte budget and file count leave no room for one maximum-size packet per file"
+            );
+        }
         ensure!(
             self.scratch_directory.starts_with('/')
                 && self.scratch_directory.len() <= 2048
@@ -93,10 +107,22 @@ impl PacketCaptureOptions {
         ((self.budget_bytes() - 24) / (16 + u64::from(self.snap_length))) as u32
     }
 
-    fn effective_packets(&self) -> u32 {
+    fn effective_packets(&self) -> Option<u32> {
+        if self.rotate_files.is_some() {
+            return self.packet_limit;
+        }
         let ceiling = self.budget_packets();
-        self.packet_limit
-            .map_or(ceiling, |requested| requested.min(ceiling))
+        Some(
+            self.packet_limit
+                .map_or(ceiling, |requested| requested.min(ceiling)),
+        )
+    }
+
+    fn rotation(&self) -> Option<Rotation> {
+        self.rotate_files.map(|files| Rotation {
+            files,
+            bytes_per_file: self.budget_bytes() / u64::from(files),
+        })
     }
 
     fn tcpdump_arguments(&self) -> Vec<String> {
@@ -107,17 +133,22 @@ impl PacketCaptureOptions {
             "-p".into(),
             "-s".into(),
             self.snap_length.to_string(),
-            "-c".into(),
-            self.effective_packets().to_string(),
-            "-w".into(),
-            "-".into(),
-            "--".into(),
         ];
+        if let Some(count) = self.effective_packets() {
+            args.extend(["-c".into(), count.to_string()]);
+        }
+        args.extend(["-w".into(), "-".into(), "--".into()]);
         if !self.filter.is_empty() {
             args.push(self.filter.clone());
         }
         args
     }
+}
+
+#[derive(Clone, Copy, Serialize)]
+pub struct Rotation {
+    pub files: u8,
+    pub bytes_per_file: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -132,7 +163,9 @@ pub struct Plan {
     pub scratch_filesystem: String,
     #[serde(skip)]
     scratch_id: String,
-    pub effective_packet_limit: u32,
+    pub effective_packet_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<Rotation>,
     pub tcpdump_arguments: Vec<String>,
     pub review_id: String,
 }
@@ -143,12 +176,27 @@ pub struct Capture {
     pub bytes: u64,
     pub sha256: String,
     pub packets: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<RotationResult>,
     pub received_by_filter: Option<u64>,
     pub dropped_by_kernel: Option<u64>,
     pub stop_reason: &'static str,
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Serialize)]
+pub struct RotationResult {
+    pub retained_files: usize,
+    pub overwritten_files: u64,
+    pub captured_packets: u64,
+}
+
+struct CaptureFile {
+    file: tempfile::NamedTempFile,
+    bytes: u64,
+    sha256: String,
+    packets: u32,
+}
 impl Target {
     pub fn preview_packet_capture_blocking(
         mut self,
@@ -231,6 +279,7 @@ impl Target {
             scratch_filesystem: (*filesystem).into(),
             scratch_id: (*id).into(),
             effective_packet_limit: options.effective_packets(),
+            rotation: options.rotation(),
             tcpdump_arguments: options.tcpdump_arguments(),
             options,
             review_id: String::new(),
@@ -329,12 +378,12 @@ fn command(
     id: &str,
     job: &str,
 ) -> String {
-    format!(
+    let mut command = format!(
         "/bin/bash -c {} w11term-packet-capture {mode} {} {} {} {} {} {} {} {} {} {}",
         quote(SCRIPT),
         quote(&options.interface),
         options.snap_length,
-        options.effective_packets(),
+        options.effective_packets().unwrap_or(0),
         options.seconds,
         options.budget_bytes() / 1024,
         if options.require_tmpfs { "yes" } else { "no" },
@@ -342,7 +391,12 @@ fn command(
         quote(&options.filter),
         quote(id),
         quote(job),
-    )
+    );
+    if let Some(files) = options.rotate_files {
+        use std::fmt::Write;
+        write!(command, " w11term-ring-v1 {files} {}", quote(RING_WORKER)).unwrap();
+    }
+    command
 }
 
 async fn capture_and_download(
@@ -385,33 +439,34 @@ async fn capture_and_download(
     let mut messages = ArtifactMessages::new("Packet capture");
     let line = stop.ready(&mut messages, channel).await?;
     drop(registration);
-    let parts: Vec<_> = line.split('\t').collect();
-    let ["w11term-packet-ready-v1", reason, size, hash] = parts.as_slice() else {
-        bail!("Invalid packet capture completion record");
-    };
-    let size: u64 = size.trim().parse().context("Reading packet capture size")?;
+    let (kind, reason, data) = parse_ready(&line)?;
     ensure!(
-        (24..=plan.options.budget_bytes()).contains(&size),
-        "Remote packet capture exceeded its reviewed byte budget"
-    );
-    ensure!(
-        matches!(*reason, "time" | "packets" | "stopped"),
+        matches!(reason, "time" | "packets" | "stopped"),
         "Unknown packet capture stop reason"
     );
-    let sha256 = crate::sftp::normalize_sha256(hash)?;
     let remote = format!(
-        "{}/w11term-pcap-{job}/{CAPTURE_FILE}",
+        "{}/w11term-pcap-{job}",
         plan.scratch_directory.trim_end_matches('/')
     );
-    let file =
-        crate::sftp::stage_diagnostic_download(&handle, &remote, parent, size, &sha256).await?;
-    let (file, packets) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let packets = count_packets(file.reopen()?, size)?;
-        Ok((file, packets))
-    })
-    .await??;
+    let (capture, rotation) = match (kind, plan.rotation) {
+        ("w11term-packet-ready-v1", None) => {
+            let file =
+                download_capture(&handle, &remote, parent, plan.options.budget_bytes(), data)
+                    .await?;
+            (file, None)
+        }
+        ("w11term-packet-ring-v1", Some(limits)) => {
+            let (file, summary) = ring::download(&handle, &remote, parent, limits, data).await?;
+            (file, Some(summary))
+        }
+        _ => bail!("Packet capture format differs from the reviewed settings"),
+    };
+    let captured_packets = rotation
+        .as_ref()
+        .map_or(u64::from(capture.packets), |ring| ring.captured_packets);
     ensure!(
-        packets <= plan.effective_packet_limit,
+        plan.effective_packet_limit
+            .is_none_or(|limit| captured_packets <= u64::from(limit)),
         "Capture exceeded the reviewed packet limit"
     );
     channel.data(b"verified\n".as_slice()).await?;
@@ -421,21 +476,25 @@ async fn capture_and_download(
         "The packet capture cleanup was not acknowledged"
     );
     messages.finish(channel).await?;
-    let stop_reason = match *reason {
+    let reached_ceiling = plan
+        .effective_packet_limit
+        .is_some_and(|limit| captured_packets == u64::from(limit));
+    let stop_reason = match reason {
         "time" => "time-limit",
         "stopped" => "stopped",
-        _ if packets != plan.effective_packet_limit => "capture-ended",
-        _ if plan.options.packet_limit == Some(plan.effective_packet_limit) => "packet-limit",
+        _ if !reached_ceiling => "capture-ended",
+        _ if plan.options.packet_limit == plan.effective_packet_limit => "packet-limit",
         _ => "byte-budget",
     };
     let stderr = String::from_utf8_lossy(&messages.stderr);
     Ok((
-        file,
+        capture.file,
         Capture {
             path: PathBuf::new(),
-            bytes: size,
-            sha256,
-            packets,
+            bytes: capture.bytes,
+            sha256: capture.sha256,
+            packets: capture.packets,
+            rotation,
             stop_reason,
             received_by_filter: count_stat(&stderr, "received by filter"),
             dropped_by_kernel: count_stat(&stderr, "dropped by kernel"),
@@ -446,6 +505,45 @@ async fn capture_and_download(
                 .collect(),
         },
     ))
+}
+
+fn parse_ready(line: &str) -> Result<(&str, &str, &str)> {
+    let mut fields = line.splitn(3, '\t');
+    match (fields.next(), fields.next(), fields.next()) {
+        (Some(kind), Some(reason), Some(data)) => Ok((kind, reason, data)),
+        _ => bail!("Invalid packet capture completion record"),
+    }
+}
+
+async fn download_capture(
+    handle: &russh::client::Handle<crate::ssh::Handler>,
+    remote: &str,
+    parent: &Path,
+    budget: u64,
+    data: &str,
+) -> Result<CaptureFile> {
+    let (size, hash) = data
+        .split_once('\t')
+        .context("Incomplete packet capture record")?;
+    let bytes: u64 = size.trim().parse().context("Reading packet capture size")?;
+    ensure!(
+        (24..=budget).contains(&bytes),
+        "Remote packet capture exceeded its reviewed byte budget"
+    );
+    let sha256 = crate::sftp::normalize_sha256(hash)?;
+    let path = format!("{remote}/{CAPTURE_FILE}");
+    let file =
+        crate::sftp::stage_diagnostic_download(handle, &path, parent, bytes, &sha256).await?;
+    tokio::task::spawn_blocking(move || {
+        let packets = count_packets(file.reopen()?, bytes)?;
+        Ok(CaptureFile {
+            file,
+            bytes,
+            sha256,
+            packets,
+        })
+    })
+    .await?
 }
 
 fn count_stat(stderr: &str, label: &str) -> Option<u64> {
@@ -462,6 +560,14 @@ fn count_packets(file: std::fs::File, size: u64) -> Result<u32> {
     let mut file = BufReader::new(file);
     let mut header = [0; 24];
     file.read_exact(&mut header)?;
+    count_packet_records(&mut file, &header, size)
+}
+
+fn count_packet_records(
+    file: &mut BufReader<std::fs::File>,
+    header: &[u8; 24],
+    size: u64,
+) -> Result<u32> {
     let little = match &header[..4] {
         [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1] => true,
         [0xa1, 0xb2, 0xc3, 0xd4] | [0xa1, 0xb2, 0x3c, 0x4d] => false,
@@ -508,14 +614,23 @@ mod tests {
             seconds: 5,
             max_mib: 1,
             packet_limit: None,
+            rotate_files: None,
             scratch_directory: "/tmp".into(),
             require_tmpfs: false,
         };
         let packet_bytes = u64::from(options.snap_length) + 16;
-        let packet_limit = u64::from(options.effective_packets());
+        let packet_limit = u64::from(options.effective_packets().unwrap());
         assert!(24 + packet_bytes * packet_limit <= options.budget_bytes());
         assert!(24 + packet_bytes * (packet_limit + 1) > options.budget_bytes());
         options.packet_limit = Some(2);
-        assert_eq!(options.effective_packets(), 2);
+        assert_eq!(options.effective_packets(), Some(2));
+        options.rotate_files = Some(4);
+        assert!(options.clone().validate().is_err());
+        options.snap_length = 192;
+        options.packet_limit = None;
+        let options = options.validate().unwrap();
+        assert_eq!(options.effective_packets(), None);
+        assert_eq!(options.rotation().unwrap().bytes_per_file, 256 * 1024);
+        assert!(!options.tcpdump_arguments().contains(&"-c".into()));
     }
 }

@@ -79,12 +79,15 @@ async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
     .unwrap();
     drive_mixed_gui("packet-capture-ui.ps1", &ssh, state.path());
     let request = fs::read_to_string(started).unwrap();
-    assert!(request.contains("capture 'lo' 192 1 15 1024 yes '/dev/shm' 'udp and dst port 4321'"));
+    assert!(request.contains("capture 'lo' 192 3 15 1024 yes '/dev/shm' 'udp and dst port 4321'"));
+    assert!(request.contains(" w11term-ring-v1 2 "));
     assert!(remote.path().join("pcap-stopped").is_file());
     assert!(remote.path().join("pcap-verified").is_file());
+    let mut expected = packet_ring_segment(1);
+    expected.extend_from_slice(&packet_ring_segment(0)[24..]);
     assert_eq!(
         fs::read(state.path().join("reviewed capture.pcap")).unwrap(),
-        PCAP_FIXTURE
+        expected
     );
     assert_eq!(transports.load(Ordering::Relaxed), 1);
     server.abort();
