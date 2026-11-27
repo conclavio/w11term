@@ -1,5 +1,6 @@
 //! Local, current-user-only automation. Control requests never focus a desktop window.
 use crate::{
+    options::TabColor,
     pane_layout::{Axis, Direction},
     session::{Command, PaneDescription},
     tabs::TabTitle,
@@ -169,6 +170,17 @@ pub enum Request {
         pane: u64,
         #[serde(deserialize_with = "Option::deserialize")]
         name: Option<TabTitle>,
+    },
+    PinTab {
+        window_id: WindowId,
+        tab_id: crate::tabs::TabId,
+        pinned: bool,
+    },
+    SetTabColor {
+        window_id: WindowId,
+        tab_id: crate::tabs::TabId,
+        #[serde(deserialize_with = "Option::deserialize")]
+        color: Option<TabColor>,
     },
     ResizeSplit {
         pane: u64,
@@ -488,6 +500,11 @@ pub enum UiRequest {
         order: Option<Vec<crate::tabs::TabId>>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    TabAppearance {
+        tab_id: crate::tabs::TabId,
+        change: TabAppearanceChange,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     OpenWorkspace {
         name: String,
         activate: bool,
@@ -636,6 +653,7 @@ impl UiRequest {
             | Self::OpenSshGroup { reply, .. }
             | Self::SaveWorkspace { reply, .. }
             | Self::TabOrder { reply, .. }
+            | Self::TabAppearance { reply, .. }
             | Self::OpenWorkspace { reply, .. }
             | Self::OpenWorkspaceWindow { reply, .. }
             | Self::GetSshGroupRoster { reply, .. }
@@ -697,6 +715,12 @@ impl UiRequest {
     }
 }
 
+#[derive(Debug)]
+pub enum TabAppearanceChange {
+    Pin(bool),
+    Color(Option<TabColor>),
+}
+
 pub use ssh_groups::{
     SshGroupCommandOptions, SshGroupDispatchOverrides, SshGroupExpectedOutput, SshGroupOutput,
     SshGroupQueueAction, SshGroupReadiness, SshGroupReportFormat, SshGroupReportWriter,
@@ -750,6 +774,26 @@ pub struct Pane {
     pub capture: Option<CapturePng>,
 }
 impl Registry {
+    async fn tab_appearance(
+        &self,
+        window_id: WindowId,
+        tab_id: crate::tabs::TabId,
+        change: TabAppearanceChange,
+    ) -> Result<Value> {
+        let ui = self.window_ui(window_id)?;
+        let (reply, response) = oneshot::channel();
+        ui(UiRequest::TabAppearance {
+            tab_id,
+            change,
+            reply,
+        });
+        tokio::time::timeout(TIMEOUT, response)
+            .await
+            .context("tab appearance request timed out; use list-tabs to check the tab")?
+            .context("GUI is closed")?
+            .map_err(anyhow::Error::msg)
+    }
+
     async fn tab_order(
         &self,
         window_id: WindowId,
@@ -988,6 +1032,22 @@ impl Registry {
                     .context("rename-pane timed out; use list to check the pane name")?
                     .context("GUI is closed")?
                     .map_err(anyhow::Error::msg)
+            }
+            Request::PinTab {
+                window_id,
+                tab_id,
+                pinned,
+            } => {
+                self.tab_appearance(window_id, tab_id, TabAppearanceChange::Pin(pinned))
+                    .await
+            }
+            Request::SetTabColor {
+                window_id,
+                tab_id,
+                color,
+            } => {
+                self.tab_appearance(window_id, tab_id, TabAppearanceChange::Color(color))
+                    .await
             }
             Request::ResizeSplit {
                 pane,

@@ -126,8 +126,9 @@ impl TerminalApp {
         }
         match label.split("    ").next().unwrap_or(label) {
             RENAME => self.edit_tab_title(tab_title::Action::ShowGroup(group), context),
-            PIN => self.set_tab_pinned(group, true, context),
-            UNPIN => self.set_tab_pinned(group, false, context),
+            action @ (PIN | UNPIN) => {
+                self.set_tab_pinned(group, action == PIN, context);
+            }
             tab_windows::NEW_WINDOW_LABEL => self.move_tab_group_to_window(group, None, context),
             label if label == KeyAction::DuplicateTabLayout.binding().label => {
                 self.duplicate_tab_from_menu(group, DuplicateTabDestination::Tab, context);
@@ -136,10 +137,8 @@ impl TerminalApp {
                 self.duplicate_tab_from_menu(group, DuplicateTabDestination::Window, context);
             }
             label => {
-                if let Some(color) = tab_colors::from_menu(label)
-                    && self.tabs.set_group_color(group, color)
-                {
-                    self.refresh_open_commands();
+                if let Some(color) = tab_colors::from_menu(label) {
+                    self.set_tab_color(group, color);
                 }
             }
         }
@@ -150,11 +149,13 @@ impl TerminalApp {
         group: TabId,
         pinned: bool,
         context: &ComponentContext<Self>,
-    ) {
-        if self.tabs.set_group_pinned(group, pinned) {
+    ) -> bool {
+        let changed = self.tabs.set_group_pinned(group, pinned);
+        if changed {
             self.sync_selection(context);
             self.refresh_open_commands();
         }
+        changed
     }
 
     pub(super) fn duplicate_tab_from_menu(

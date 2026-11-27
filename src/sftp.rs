@@ -2080,6 +2080,7 @@ impl Engine {
             }
         }
         if cancelled() {
+            drop(file.into_std().await);
             return Ok(staging.cancelled_reply(&local, &remote, resumed_from));
         }
         let h = self
@@ -2100,7 +2101,7 @@ impl Engine {
             };
             let total = attrs.size;
             report(progress, resumed_from, total);
-            let offset = self
+            let transferred = self
                 .read_contents(
                     &h,
                     &mut file,
@@ -2115,7 +2116,12 @@ impl Engine {
                         Ok(())
                     },
                 )
-                .await?;
+                .await;
+            // Tokio can acknowledge write_all before the background write finishes.
+            // The caller must be able to reopen a retained checkpoint after this reply.
+            let flushed = file.flush().await;
+            let offset = transferred?;
+            flushed?;
             if !cancelled() {
                 file.sync_all().await?;
             }
@@ -2125,10 +2131,11 @@ impl Engine {
         let closed = self.raw.close(h).await;
         let (bytes, mtime) = copied?;
         closed?;
+        let file = file.into_std().await;
         if cancelled() {
+            drop(file);
             return Ok(staging.cancelled_reply(&local, &remote, bytes));
         }
-        let file = file.into_std().await;
         let verified_sha256 = digest.map(digest_hex);
         if let (Some(expected), Some(actual)) = (&checks.sha256, &verified_sha256)
             && actual != expected

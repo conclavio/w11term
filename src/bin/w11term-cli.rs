@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -73,6 +73,8 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "reorder-tabs"
             | "rename-tab"
             | "rename-pane"
+            | "pin-tab"
+            | "set-tab-color"
             | "focus-pane"
             | "zoom-pane"
             | "get-tab-layout"
@@ -463,6 +465,51 @@ mod tests {
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn pins_tabs_and_keeps_hidden_colors_distinct_from_profile_defaults() {
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        let (_, pin) = parse_line("pin-tab --window 12 --tab 14 --off").unwrap();
+        assert_eq!(
+            serde_json::to_value(pin).unwrap(),
+            serde_json::json!({"verb":"pin-tab","window_id":12,"tab_id":14,"pinned":false})
+        );
+        for (option, expected) in [
+            ("--color BLUE", serde_json::json!("blue")),
+            ("--color none", serde_json::json!("none")),
+            ("--reset", serde_json::Value::Null),
+        ] {
+            let (_, command) =
+                parse_line(&format!("set-tab-color --window 12 --tab 14 {option}")).unwrap();
+            let value = serde_json::to_value(command).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({"verb":"set-tab-color","window_id":12,"tab_id":14,"color":expected})
+            );
+            assert!(matches!(
+                serde_json::from_value::<Request>(value),
+                Ok(Request::SetTabColor { .. })
+            ));
+        }
+        for invalid in [
+            "pin-tab --window 12 --tab 14",
+            "pin-tab --tab 14 --on",
+            "pin-tab --window 12 --on",
+            "pin-tab --window 12 --tab 14 --on --off",
+            "set-tab-color --window 12 --tab 14",
+            "set-tab-color --window 12 --tab 14 --color chartreuse",
+            "set-tab-color --window 12 --tab 14 --color blue --reset",
+            "set-tab-color --window 12 --tab 14 --color blue --color red",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+        assert!(
+            serde_json::from_value::<Request>(
+                serde_json::json!({"verb":"set-tab-color","window_id":12,"tab_id":14})
+            )
+            .is_err()
+        );
     }
 
     #[test]

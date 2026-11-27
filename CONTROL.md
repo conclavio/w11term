@@ -24,7 +24,7 @@ Omit `--pid` when exactly one process is running. Each process serves all its wi
 
 `list-windows` returns the registered windows ordered by `window_id`, including windows with only utility tabs. Each entry has `name` and `active_tab_title` (nullable), `tab_count` including utility tabs, terminal `pane_count`, and `active` for the most recently active window in the process.
 
-`list-tabs --window ID` returns `window_id` and the left-to-right `tabs` array for that window. Each item gives its `tab_id`, displayed `title`, `selected`, `pinned`, `zoomed`, `pane_count`, and remembered `focused_pane`. A utility tab such as Settings has zero panes and a null `focused_pane`.
+`list-tabs --window ID` returns `window_id` and the left-to-right `tabs` array for that window. Each item gives its `tab_id`, displayed `title`, `selected`, `pinned`, `zoomed`, `pane_count`, and remembered `focused_pane`. The effective `color` and explicit `color_override` use the named tab palette. A null override follows the focused pane's profile. A utility tab such as Settings has zero panes and a null `focused_pane`.
 
 `reorder-tabs --window ID --tab ID [--tab ID ...]` sets the entire strip order, including utility tabs. Provide every current tab ID once and keep pinned tabs before unpinned tabs. Invalid orders leave the strip intact. The reply gives `window_id`, ordered `tab_ids`, and `changed`. Both commands preserve tab selection and desktop focus, including in a background window.
 
@@ -38,6 +38,10 @@ Direct pipe clients can send `{"verb":"list-tabs","window_id":2}` or `{"verb":"r
 `rename-tab --window ID --tab ID (--name NAME | --reset)` sets or clears the explicit title of a terminal tab. `rename-pane --pane ID (--name NAME | --reset)` sets or clears the name of one pane, including after it moves. The commands target hidden tabs and background panes without selecting them or changing desktop focus. Names can contain 1–128 characters, with no control characters or surrounding spaces.
 
 Replies include `window_id`, `tab_id`, the explicit `name` (null after reset), and `changed`. Pane replies also include `pane`. The names appear in later listings and workspace saves. Direct pipe clients must supply the `name` field. Send `{"verb":"rename-tab","window_id":2,"tab_id":10,"name":"Fleet Ops"}` or `{"verb":"rename-pane","pane":42,"name":null}` to reset a pane.
+
+`pin-tab --window ID --tab ID (--on | --off)` pins or unpins a terminal tab. Pinning puts it at the end of the pinned section and protects it from tab close actions. Unpinning puts it at the start of the unpinned section.
+
+`set-tab-color --window ID --tab ID (--color NAME | --reset)` uses the tab palette `red`, `orange`, `yellow`, `green`, `blue`, or `purple`. Use `--color none` to hide the marker and `--reset` to follow the focused pane's profile. Both commands preserve selection and desktop focus, including in background windows, and both settings are included in workspace saves. Replies give `window_id`, `tab_id`, `pinned`, `color_override`, effective `color`, and `changed`. Direct pipe clients can send `{"verb":"pin-tab","window_id":2,"tab_id":10,"pinned":true}` or `{"verb":"set-tab-color","window_id":2,"tab_id":10,"color":"blue"}`. Send `"color":null` to restore the profile color.
 
 `open --profile NAME --window ID` opens in that window and returns its `window_id` alongside the pane ID and grid. Omitting `--window` uses the most recently active window. An unknown or closed ID fails. `--activate` selects the newly opened tab in the target window. Pipe requests preserve desktop focus.
 
