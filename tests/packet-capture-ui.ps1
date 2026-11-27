@@ -566,6 +566,41 @@ try {
     $null = Wait-Until 'the full comparison returns without choosing the files again' {
         (Find-Element 'IP conversation changes 3') -and !(Find-Element 'Compare whole captures' $button)
     }
+    $ending = Wait-CaptureCombo 'Compared timeline range end'
+    $ending.SetFocus()
+    $ending.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $boundary = Wait-Until 'an end boundary several buckets later is selectable' {
+        Find-Element '+3.145728 s' ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $boundary.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'the selected range sums all covered packets on both charts' {
+        (Find-Element "Before interval${dot}3 packets${dot}106 captured bytes") -and
+        (Find-Element "After interval${dot}1 packets${dot}38 captured bytes")
+    }
+    Click 'Open Before interval in Wireshark'
+    $null = Wait-Until 'Wireshark receives the whole elapsed range on the Before clock' {
+        $filterPath = $conversationCapture + '.filter'
+        [IO.File]::ReadAllText($filterPath) -ceq
+            'frame.time >= "1970-01-01T00:00:01.786432000Z" && frame.time < "1970-01-01T00:00:04.145728000Z"'
+    }
+    Click 'Compare selected interval'
+    $null = Wait-Until 'the report compares the complete selected range' {
+        (Find-Element "Comparing elapsed interval${dot}+0.786432 to +3.145728 s") -and
+        (Find-Element "Capture change${dot}-2 packets${dot}-68 captured bytes${dot}+0 truncated") -and
+        (Find-Element 'IP conversation changes 1') -and
+        (Find-Element "2001:db8::1 $bothDirections 2001:db8::2")
+    }
+    $rangeBase = Join-Path $State 'elapsed range comparison'
+    Save-PacketComparison $rangeBase -Json
+    $rangePath = "$rangeBase.json"
+    $null = Wait-Until 'the range export was published' { [IO.File]::Exists($rangePath) }
+    $cliRangePath = Join-Path $State 'elapsed range cli.json'
+    $null = & $Cli compare-packet-captures $conversationCapture $slowerCapture --elapsed-ns '786432000:3145728000' --output-file $cliRangePath
+    if ($LASTEXITCODE -ne 0 -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($rangePath)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliRangePath))) {
+        throw 'The elapsed range export differs from the CLI'
+    }
+    Click 'Compare whole captures'
     Click 'Back to capture'
     Select-Capture $partialCapture $compareCaptureLabel 'Choose after packet capture'
     $null = Wait-Until 'partial comparison preserves the issue and withholds capture deltas' {

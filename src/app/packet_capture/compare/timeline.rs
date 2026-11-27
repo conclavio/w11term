@@ -4,16 +4,18 @@ const CHART_HEIGHT: f64 = 48.0;
 const SIDE_LABELS: [&str; 2] = ["Before", "After"];
 
 impl Comparison {
-    pub(super) fn selected_timeline_interval(&self) -> Option<usize> {
-        self.timeline_interval
-            .or_else(|| self.model.timeline.as_ref()?.peak_index())
+    pub(super) fn selected_timeline_range(&self) -> Option<RangeInclusive<usize>> {
+        self.timeline_range.clone().or_else(|| {
+            let peak = self.model.timeline.as_ref()?.peak_index()?;
+            Some(peak..=peak)
+        })
     }
 
     pub(super) fn selected_timeline_label(&self) -> Option<String> {
         self.model
             .timeline
             .as_ref()?
-            .offset_interval(self.selected_timeline_interval()?)
+            .offset_range(self.selected_timeline_range()?)
             .map(interval_label)
     }
 
@@ -25,7 +27,10 @@ impl Comparison {
         let timeline = self.model.timeline.as_ref()?;
         let mut fields = Vec::new();
         if self.timeline_expanded {
-            let selected = self.selected_timeline_interval()?;
+            let selected = self.selected_timeline_range()?;
+            let first = *selected.start();
+            let last = *selected.end();
+            let interval_count = last - first + 1;
             let intervals: Vec<_> = (0..timeline.buckets.len())
                 .filter_map(|index| timeline.offset_interval(index))
                 .map(interval_label)
@@ -67,7 +72,7 @@ impl Comparison {
                             .map(|bucket| bucket.before.map(|counts| counts.packets)),
                         timeline.buckets.len(),
                         peak,
-                        selected,
+                        &selected,
                         Color::rgb(96, 165, 230),
                     ),
                 ),
@@ -88,18 +93,19 @@ impl Comparison {
                             .map(|bucket| bucket.after.map(|counts| counts.packets)),
                         timeline.buckets.len(),
                         peak,
-                        selected,
+                        &selected,
                         Color::rgb(120, 193, 152),
                     ),
                 ),
             ]);
             let revision = Arc::clone(&self.revision);
+            fields.push(text("range-start-label", "Start interval"));
             fields.push(KeyedView::new(
                 "interval",
                 ComboBox::new()
                     .automation_name("Compared timeline intervals")
                     .items_source(intervals)
-                    .selected_index(Some(selected))
+                    .selected_index(Some(first))
                     .is_enabled(idle)
                     .on_selection_changed(ctx.callback(move |index: Option<usize>| {
                         index.map_or(Message::ControlIdle, |index| {
@@ -110,9 +116,35 @@ impl Comparison {
                         })
                     })),
             ));
+            let end_boundaries: Vec<_> = (first..timeline.buckets.len())
+                .filter_map(|index| timeline.offset_interval(index))
+                .map(|interval| format!("{} s", signed_seconds(interval.end)))
+                .collect();
+            let revision = Arc::clone(&self.revision);
+            fields.push(text("range-end-label", "Range ends at"));
+            fields.push(KeyedView::new(
+                format!("range-end-{first}"),
+                ComboBox::new()
+                    .automation_name("Compared timeline range end")
+                    .items_source(end_boundaries)
+                    .selected_index(Some(last - first))
+                    .is_enabled(idle)
+                    .on_selection_changed(ctx.callback(move |index: Option<usize>| {
+                        index.map_or(Message::ControlIdle, |index| {
+                            message(Action::Comparison(
+                                revision.clone(),
+                                Change::TimelineEnd {
+                                    first,
+                                    last: first + index,
+                                },
+                            ))
+                        })
+                    })),
+            ));
             let can_compare =
                 timeline.before_origin_unix_ns.is_some() && timeline.after_origin_unix_ns.is_some();
             let revision = Arc::clone(&self.revision);
+            let comparison_range = selected.clone();
             fields.push(KeyedView::new(
                 "compare-elapsed",
                 Button::new()
@@ -121,12 +153,12 @@ impl Comparison {
                             && self
                                 .elapsed_model
                                 .as_ref()
-                                .is_none_or(|(index, _)| *index != selected),
+                                .is_none_or(|(range, _)| range != &selected),
                     )
                     .on_click(ctx.callback(move |_| {
                         message(Action::Comparison(
                             revision.clone(),
-                            Change::CompareElapsed(selected),
+                            Change::CompareElapsed(comparison_range.clone()),
                         ))
                     }))
                     .content("Compare selected interval"),
@@ -138,17 +170,28 @@ impl Comparison {
                 ));
             }
             for (side, label) in SIDE_LABELS.into_iter().enumerate() {
-                let observation = timeline.buckets[selected].observation(side);
+                let observation = timeline.observe_range(side, selected.clone());
+                let has_packets = observation
+                    .as_ref()
+                    .is_some_and(|observed| observed.totals.packets != 0);
                 let detail = observation.map_or_else(
                     || "Outside timestamped coverage".to_owned(),
-                    |bucket| {
-                        format!(
+                    |observed| {
+                        let mut detail = format!(
                             "{} packets · {} captured bytes",
-                            bucket.packets, bucket.captured_bytes
-                        )
+                            observed.totals.packets, observed.totals.captured_bytes
+                        );
+                        if observed.covered_buckets < interval_count {
+                            detail.push_str(&format!(
+                                " · {} of {interval_count} intervals with timestamped coverage",
+                                observed.covered_buckets
+                            ));
+                        }
+                        detail
                     },
                 );
                 let revision = Arc::clone(&self.revision);
+                let range = selected.clone();
                 fields.push(text(
                     &format!("count-{side}"),
                     format!("{label} interval · {detail}"),
@@ -156,11 +199,11 @@ impl Comparison {
                 fields.push(KeyedView::new(
                     format!("open-{side}"),
                     Button::new()
-                        .is_enabled(idle && observation.is_some_and(|bucket| bucket.packets != 0))
+                        .is_enabled(idle && has_packets)
                         .on_click(ctx.callback(move |_| {
                             message(Action::Comparison(
                                 revision.clone(),
-                                Change::OpenTimelineInterval(side, selected),
+                                Change::OpenTimelineInterval(side, range.clone()),
                             ))
                         }))
                         .content(format!("Open {label} interval in Wireshark")),
@@ -212,11 +255,11 @@ fn chart(
     counts: impl Iterator<Item = Option<u32>>,
     intervals: usize,
     peak: u32,
-    selected: usize,
+    selected: &RangeInclusive<usize>,
     bar_color: Color,
 ) -> View {
     let cells = counts.enumerate().map(|(column, count)| {
-        let background = match (count.is_some(), column == selected) {
+        let background = match (count.is_some(), selected.contains(&column)) {
             (true, true) => Color::rgb(74, 76, 90),
             (true, false) => Color::rgb(44, 44, 48),
             (false, true) => Color::rgb(51, 51, 57),

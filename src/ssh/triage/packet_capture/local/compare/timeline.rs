@@ -1,6 +1,10 @@
 use super::super::summary::{Bucket, MAX_BUCKETS, RelativeTimeline};
 use serde::{Serialize, Serializer};
-use std::{cmp::Reverse, io, ops::Range};
+use std::{
+    cmp::Reverse,
+    io,
+    ops::{Range, RangeInclusive},
+};
 
 #[derive(Serialize)]
 pub struct TimelineComparison {
@@ -19,6 +23,11 @@ pub struct TimelineComparison {
 pub struct TimelineBucket {
     pub before: Option<Bucket>,
     pub after: Option<Bucket>,
+}
+
+pub struct TimelineRangeObservation {
+    pub totals: Bucket,
+    pub covered_buckets: usize,
 }
 
 impl TimelineBucket {
@@ -103,18 +112,58 @@ impl TimelineComparison {
     }
 
     pub fn occupied_interval(&self, side: usize, index: usize) -> Option<Range<i128>> {
-        if self.buckets.get(index)?.observation(side)?.packets == 0 {
-            return None;
-        }
-        self.source_interval(side, index)
+        self.occupied_range(side, index..=index)
     }
 
     pub fn source_interval(&self, side: usize, index: usize) -> Option<Range<i128>> {
+        self.source_range(side, index..=index)
+    }
+
+    pub fn offset_range(&self, range: RangeInclusive<usize>) -> Option<Range<i128>> {
+        if range.is_empty() {
+            return None;
+        }
+        let first = self.offset_interval(*range.start())?;
+        let last = self.offset_interval(*range.end())?;
+        Some(first.start..last.end)
+    }
+
+    pub fn observe_range(
+        &self,
+        side: usize,
+        range: RangeInclusive<usize>,
+    ) -> Option<TimelineRangeObservation> {
+        let mut totals = Bucket::default();
+        let mut covered_buckets = 0;
+        for bucket in self
+            .buckets
+            .get(range)?
+            .iter()
+            .filter_map(|bucket| bucket.observation(side))
+        {
+            totals.packets += bucket.packets;
+            totals.captured_bytes += bucket.captured_bytes;
+            covered_buckets += 1;
+        }
+        (covered_buckets != 0).then_some(TimelineRangeObservation {
+            totals,
+            covered_buckets,
+        })
+    }
+
+    pub fn occupied_range(&self, side: usize, range: RangeInclusive<usize>) -> Option<Range<i128>> {
+        if self.observe_range(side, range.clone())?.totals.packets == 0 {
+            return None;
+        }
+        self.source_range(side, range)
+    }
+
+    pub fn source_range(&self, side: usize, range: RangeInclusive<usize>) -> Option<Range<i128>> {
         let origin = [self.before_origin_unix_ns, self.after_origin_unix_ns]
             .get(side)
             .copied()
             .flatten()?;
-        let interval = self.offset_interval(index)?;
+        let interval = self.offset_range(range)?;
         Some(origin + interval.start..origin + interval.end)
     }
 
@@ -159,4 +208,65 @@ fn serialize_optional_ns<S: Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     ns.map(|ns| ns.to_string()).serialize(serializer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_totals_keep_elapsed_bounds_and_distinguish_empty_from_uncovered_buckets() {
+        let bucket = |packets, captured_bytes| {
+            Some(Bucket {
+                packets,
+                captured_bytes,
+            })
+        };
+        let timeline = TimelineComparison {
+            start_offset_ns: -1_000,
+            bucket_width_ns: 1_000,
+            before_origin_unix_ns: Some(10_000),
+            after_origin_unix_ns: Some(20_000),
+            buckets: vec![
+                TimelineBucket {
+                    before: bucket(2, 28),
+                    after: None,
+                },
+                TimelineBucket {
+                    before: bucket(0, 0),
+                    after: bucket(1, 14),
+                },
+                TimelineBucket {
+                    before: bucket(1, 14),
+                    after: bucket(0, 0),
+                },
+            ],
+        };
+        assert_eq!(timeline.offset_range(0..=2), Some(-1_000..2_000));
+        assert_eq!(timeline.occupied_range(0, 0..=2), Some(9_000..12_000));
+        assert_eq!(timeline.occupied_range(1, 0..=2), Some(19_000..22_000));
+        let before = timeline.observe_range(0, 0..=2).unwrap();
+        let after = timeline.observe_range(1, 0..=2).unwrap();
+        assert_eq!(
+            (
+                before.totals.packets,
+                before.totals.captured_bytes,
+                before.covered_buckets
+            ),
+            (3, 42, 3)
+        );
+        assert_eq!(
+            (
+                after.totals.packets,
+                after.totals.captured_bytes,
+                after.covered_buckets
+            ),
+            (1, 14, 2)
+        );
+        assert!(timeline.observe_range(1, 0..=0).is_none());
+        assert_eq!(timeline.observe_range(1, 2..=2).unwrap().totals.packets, 0);
+        assert!(timeline.occupied_range(1, 2..=2).is_none());
+        assert!(timeline.offset_range(0..=3).is_none());
+        assert!(timeline.offset_range(RangeInclusive::new(1, 0)).is_none());
+    }
 }

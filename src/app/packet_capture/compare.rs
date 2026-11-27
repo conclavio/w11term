@@ -47,22 +47,26 @@ pub enum Change {
     ProtocolsExpanded(bool),
     TimelineExpanded(bool),
     TimelineInterval(usize),
-    OpenTimelineInterval(usize, usize),
-    CompareElapsed(usize),
+    TimelineEnd {
+        first: usize,
+        last: usize,
+    },
+    OpenTimelineInterval(usize, RangeInclusive<usize>),
+    CompareElapsed(RangeInclusive<usize>),
     CompareWholeCaptures,
     LimitElapsedInterval(bool),
     Open {
         list: u64,
         row: Option<usize>,
         source: usize,
-        elapsed: Option<usize>,
+        elapsed: Option<RangeInclusive<usize>>,
     },
     Export,
 }
 
 pub(super) struct Comparison {
     model: Arc<PacketCaptureComparison>,
-    elapsed_model: Option<(usize, Arc<PacketCaptureComparison>)>,
+    elapsed_model: Option<(RangeInclusive<usize>, Arc<PacketCaptureComparison>)>,
     paths: [PathBuf; 2],
     revision: Arc<()>,
     conversation_view: ConversationView,
@@ -74,7 +78,7 @@ pub(super) struct Comparison {
     source: usize,
     protocols_expanded: bool,
     timeline_expanded: bool,
-    timeline_interval: Option<usize>,
+    timeline_range: Option<RangeInclusive<usize>>,
     limit_elapsed_interval: bool,
 }
 
@@ -94,7 +98,7 @@ impl Comparison {
             source: 1,
             protocols_expanded: false,
             timeline_expanded: false,
-            timeline_interval: None,
+            timeline_range: None,
             limit_elapsed_interval: false,
         }
     }
@@ -168,11 +172,11 @@ impl Comparison {
     pub(super) fn elapsed_request(
         &self,
         revision: &Arc<()>,
-        index: usize,
+        range: &RangeInclusive<usize>,
     ) -> Option<([PathBuf; 2], Range<i128>, Arc<PacketCaptureComparison>)> {
         if !Arc::ptr_eq(revision, &self.revision)
             || !self.timeline_expanded
-            || self.selected_timeline_interval() != Some(index)
+            || self.selected_timeline_range().as_ref() != Some(range)
         {
             return None;
         }
@@ -181,7 +185,7 @@ impl Comparison {
         timeline.after_origin_unix_ns?;
         Some((
             self.paths.clone(),
-            timeline.offset_interval(index)?,
+            timeline.offset_range(range.clone())?,
             self.model.clone(),
         ))
     }
@@ -189,38 +193,39 @@ impl Comparison {
     pub(super) fn install_elapsed(
         &mut self,
         revision: &Arc<()>,
-        index: usize,
+        range: RangeInclusive<usize>,
         model: Arc<PacketCaptureComparison>,
     ) {
         if Arc::ptr_eq(revision, &self.revision) {
-            self.elapsed_model = Some((index, model));
+            self.elapsed_model = Some((range, model));
             self.apply_filter();
         }
     }
 
-    fn elapsed_scope(&self) -> Option<usize> {
-        if let Some((index, _)) = &self.elapsed_model {
-            return Some(*index);
+    fn elapsed_scope(&self) -> Option<RangeInclusive<usize>> {
+        if let Some((range, _)) = &self.elapsed_model {
+            return Some(range.clone());
         }
         if self.limit_elapsed_interval {
-            self.selected_timeline_interval()
+            self.selected_timeline_range()
         } else {
             None
         }
     }
 
-    fn source_interval(&self, source: usize, elapsed: usize) -> Option<Range<i128>> {
-        if let Some((index, model)) = &self.elapsed_model
-            && *index == elapsed
+    fn source_interval(
+        &self,
+        source: usize,
+        elapsed: RangeInclusive<usize>,
+    ) -> Option<Range<i128>> {
+        if let Some((range, model)) = &self.elapsed_model
+            && *range == elapsed
         {
             let window = model.window.as_ref()?;
             let side = *[&window.before, &window.after].get(source)?;
             return Some(side.start_unix_ns..side.end_unix_ns);
         }
-        self.model
-            .timeline
-            .as_ref()?
-            .source_interval(source, elapsed)
+        self.model.timeline.as_ref()?.source_range(source, elapsed)
     }
 
     pub(super) fn export_model(&self, revision: &Arc<()>) -> Option<Arc<PacketCaptureComparison>> {
@@ -263,29 +268,47 @@ impl Comparison {
                 self.apply_filter();
             }
             Change::LimitElapsedInterval(limit)
-                if !limit || self.selected_timeline_interval().is_some() =>
+                if !limit || self.selected_timeline_range().is_some() =>
             {
                 self.limit_elapsed_interval = limit;
             }
             Change::TimelineInterval(index) if self.timeline_expanded => {
+                let range = self.selected_timeline_range()?;
+                let last = if range.start() == range.end() {
+                    index
+                } else {
+                    index.max(*range.end())
+                };
+                let range = index..=last;
                 if self
                     .model
                     .timeline
                     .as_ref()?
-                    .offset_interval(index)
+                    .offset_range(range.clone())
                     .is_some()
                 {
-                    self.timeline_interval = Some(index);
+                    self.timeline_range = Some(range);
                 }
             }
-            Change::OpenTimelineInterval(side, index)
-                if self.timeline_expanded && self.selected_timeline_interval() == Some(index) =>
+            Change::TimelineEnd { first, last }
+                if self.timeline_expanded && self.selected_timeline_range()?.start() == &first =>
             {
-                let interval = self
+                let range = first..=last;
+                if self
                     .model
                     .timeline
                     .as_ref()?
-                    .occupied_interval(side, index)?;
+                    .offset_range(range.clone())
+                    .is_some()
+                {
+                    self.timeline_range = Some(range);
+                }
+            }
+            Change::OpenTimelineInterval(side, range)
+                if self.timeline_expanded
+                    && self.selected_timeline_range().as_ref() == Some(&range) =>
+            {
+                let interval = self.model.timeline.as_ref()?.occupied_range(side, range)?;
                 return Some((
                     self.paths.get(side)?.clone(),
                     WiresharkFilter::Interval(interval),
@@ -698,8 +721,9 @@ impl Comparison {
                 ));
             }
             let elapsed = self.elapsed_scope();
-            let can_scope =
-                elapsed.is_none_or(|elapsed| self.source_interval(self.source, elapsed).is_some());
+            let can_scope = elapsed
+                .as_ref()
+                .is_none_or(|range| self.source_interval(self.source, range.clone()).is_some());
             if !can_scope {
                 fields.push(text(
                     "no-elapsed-origin",

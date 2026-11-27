@@ -1,6 +1,6 @@
 use super::*;
 use std::{
-    ops::Range,
+    ops::{Range, RangeInclusive},
     path::{Path, PathBuf},
 };
 use w11term::{
@@ -71,7 +71,7 @@ pub enum Outcome {
         baseline: Option<Arc<LocalPacketCapture>>,
         paths: [PathBuf; 2],
     },
-    ComparedElapsed(Arc<()>, usize, Arc<PacketCaptureComparison>),
+    ComparedElapsed(Arc<()>, RangeInclusive<usize>, Arc<PacketCaptureComparison>),
     Wireshark(PathBuf),
     Opened,
 }
@@ -1331,18 +1331,18 @@ impl TerminalApp {
                     );
                 }
             }
-            Action::Comparison(revision, compare::Change::CompareElapsed(index)) => {
+            Action::Comparison(revision, compare::Change::CompareElapsed(range)) => {
                 let Some((paths, interval, model)) = panel
                     .comparison
                     .as_ref()
-                    .and_then(|comparison| comparison.elapsed_request(&revision, index))
+                    .and_then(|comparison| comparison.elapsed_request(&revision, &range))
                 else {
                     return;
                 };
                 let ticket = panel.begin("Comparing the selected elapsed interval…");
                 work(ctx, ticket, move || {
                     let comparison = Arc::new(model.rescan_elapsed(paths, interval)?);
-                    Ok(Some(Outcome::ComparedElapsed(revision, index, comparison)))
+                    Ok(Some(Outcome::ComparedElapsed(revision, range, comparison)))
                 });
             }
             Action::Comparison(revision, change) => {
@@ -1665,9 +1665,9 @@ impl TerminalApp {
                 panel.status = Some(format!("Wireshark executable {}", path.display()));
                 panel.wireshark = Some(path);
             }
-            Ok(Some(Outcome::ComparedElapsed(revision, index, model))) => {
+            Ok(Some(Outcome::ComparedElapsed(revision, range, model))) => {
                 if let Some(comparison) = &mut panel.comparison {
-                    comparison.install_elapsed(&revision, index, model);
+                    comparison.install_elapsed(&revision, range, model);
                 }
             }
             Ok(Some(Outcome::Opened)) => panel.status = Some("Opened capture in Wireshark".into()),
