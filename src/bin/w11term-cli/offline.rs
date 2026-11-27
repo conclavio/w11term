@@ -1,4 +1,4 @@
-use super::{cpu_profile, syscall_capture, triage};
+use super::{cpu_profile, packet_capture, syscall_capture, triage};
 use anyhow::{Context, Result};
 use std::{
     io::{self, Write},
@@ -7,24 +7,27 @@ use std::{
 };
 use w11term::{control::Reply, transcript};
 
-type Compare = fn(&[String], &mut dyn Write) -> Result<()>;
+type OfflineCommand = fn(&[String], &mut dyn Write) -> Result<()>;
 
 pub(super) fn run(args: &[String]) -> Option<ExitCode> {
     let (verb, args) = args.split_first()?;
-    let (help, compare): (&str, Compare) = match verb.as_str() {
+    let (help, command): (&str, OfflineCommand) = match verb.as_str() {
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
         syscall_capture::COMPARE_VERB => (
             syscall_capture::COMPARE_HELP,
             syscall_capture::compare_files,
         ),
         triage::COMPARE_VERB => (triage::COMPARE_HELP, triage::compare_files),
+        packet_capture::INSPECT_VERB => {
+            (packet_capture::INSPECT_HELP, packet_capture::inspect_file)
+        }
         _ => return None,
     };
     if args == ["--help"] || args == ["-h"] {
         println!("{help}");
         return Some(ExitCode::SUCCESS);
     }
-    match compare(args, &mut io::stdout().lock()) {
+    match command(args, &mut io::stdout().lock()) {
         Ok(()) => Some(ExitCode::SUCCESS),
         Err(error) => {
             let reply = Reply::from_result(Err(error));
@@ -47,7 +50,7 @@ pub(super) fn write_report(
         stdout.write_all(b"\n")?;
         stdout.flush()?;
     } else {
-        write(stdout).context("Writing the comparison report")?;
+        write(stdout).context("Writing the offline report")?;
     }
     Ok(())
 }

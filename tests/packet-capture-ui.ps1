@@ -91,6 +91,14 @@ try {
             (Find-Element "Timestamp span 0.500 s${dot}2 of 3 packets timestamped") -and
             (Find-Element "Interfaces 1${dot}Ethernet")
     }
+    $summary = & $Cli inspect-packet-capture $olderCapture | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or !$summary.complete -or $summary.format -cne 'pcapng' -or
+        $summary.file_bytes -ne 140 -or $summary.packets -ne 3 -or $summary.captured_bytes -ne 12 -or
+        $summary.truncated_packets -ne 1 -or $summary.timestamped_packets -ne 2 -or
+        $summary.timestamp_span_ns -cne '500000000' -or $summary.interfaces -ne 1 -or
+        $summary.link_types.Count -ne 1 -or $summary.link_types[0] -ne 1) {
+        throw 'The offline inspection differs from the saved capture panel'
+    }
     Select-Capture $invalidCapture
     $null = Wait-Until 'a non-capture file leaves the previous capture selected' {
         (Find-Element 'Choose a PCAP or PCAPNG capture file') -and (Find-Element "PCAPNG${dot}140 bytes")
@@ -115,6 +123,11 @@ try {
         $open -and $open.Current.IsEnabled -and
             (Find-Element "Partial packet summary${dot}Incomplete or invalid PCAPNG block length") -and
             (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated")
+    }
+    $partial = & $Cli inspect-packet-capture $partialCapture | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $partial.complete -or $partial.packets -ne 3 -or
+        $partial.issue -cne 'Incomplete or invalid PCAPNG block length') {
+        throw 'CLI inspection did not preserve complete records in the partial capture'
     }
     Click 'Return to diagnostics overview'
     Click 'CPU flame graph'

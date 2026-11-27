@@ -1491,6 +1491,14 @@ Choose **Open in Wireshark** after saving. w11term looks in the standard Windows
 
 Choose **Open capture file…** in the same panel to reopen a local PCAP or PCAPNG file from an earlier session. This works without SSH. The panel shows the format, file size, packet count, captured bytes, truncated packets, and interface link types. The timestamp span uses the earliest and latest timestamps and shows how many packets were timestamped. The scan reads record headers and stops after one million records or blocks. A partial summary shows the reason it stopped. **Open in Wireshark** opens the original file for packet analysis. [PCAP format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcap/) · [PCAPNG format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/) · [Link types](https://www.iana.org/assignments/pcap)
 
+Use `inspect-packet-capture` to read the same summary as schema-version-1 JSON without a running w11term instance. The report records the local filename, numeric link types, and the timestamp span in nanoseconds as a decimal string. A missing span is `null`. An incomplete scan returns the verified prefix with `complete: false` and the reason in `issue`. A file with an invalid capture header returns a nonzero exit code. Use `--output-file` to save the report to a new file and get its absolute path in the CLI reply.
+
+```powershell
+$summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
+$summary.packets
+& $ctl inspect-packet-capture '.\loopback.pcap' --output-file '.\capture-summary.json'
+```
+
 Choose **List capture interfaces** to see the devices that tcpdump reports for the selected SSH connection. Selecting a device fills the editable interface field. You can also type a name directly. From the CLI, `w11term-cli [--pid PID] list-packet-interfaces --pane ID` returns device names, details, and the connection generation. [tcpdump device listing](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in)
 
 Use a connected Linux SSH pane and review the interface, literal tcpdump filter, limits, and scratch location. Pass the same capture options and the returned connection generation and review ID to record. The host needs tcpdump, Bash, GNU coreutils, flock, the SSH SFTP subsystem, and permission to capture on the selected interface. [tcpdump manual](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in)

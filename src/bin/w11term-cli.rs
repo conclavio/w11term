@@ -314,7 +314,11 @@ async fn main() -> ExitCode {
         );
         println!("{}", triage::COMPARE_HELP);
         println!("\n{}\n{}", cpu_profile::HELP, cpu_profile::COMPARE_HELP);
-        println!("\n{}", packet_capture::HELP);
+        println!(
+            "\n{}\n{}",
+            packet_capture::HELP,
+            packet_capture::INSPECT_HELP
+        );
         println!(
             "\n{}\n{}",
             syscall_capture::HELP,

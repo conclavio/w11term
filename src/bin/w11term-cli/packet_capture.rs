@@ -1,10 +1,12 @@
-use anyhow::{Context, Result, ensure};
+use super::offline;
+use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::BTreeMap,
+    io::Write,
     path::{self, Path, PathBuf},
 };
 use w11term::control::{PacketCaptureOptions, Reply, Request};
-use w11term::ssh::open_capture_in_wireshark;
+use w11term::ssh::{LocalPacketCapture, open_capture_in_wireshark};
 
 pub(super) const HELP: &str = concat!(
     "w11term-cli [--pid PID] list-packet-interfaces --pane ID\n",
@@ -15,6 +17,34 @@ pub(super) const HELP: &str = concat!(
     "CAPTURE OPTIONS: [--filter EXPR] [--snap-length BYTES] [--seconds N] [--max-mib N] ",
     "[--packet-limit N] [--rotate-files 2..16] [--scratch-directory PATH] [--tmpfs]",
 );
+
+pub(super) const INSPECT_VERB: &str = "inspect-packet-capture";
+pub(super) const INSPECT_HELP: &str =
+    "w11term-cli inspect-packet-capture FILE [--output-file PATH]";
+
+pub(super) fn inspect_file(args: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let mut args = args.iter();
+    let path = args
+        .next()
+        .context("provide the local PCAP or PCAPNG file")?;
+    let mut output_file = None;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--output-file" => {
+                ensure!(output_file.is_none(), "specify --output-file only once");
+                output_file = Some(
+                    args.next()
+                        .context("--output-file requires a value")?
+                        .as_str(),
+                );
+            }
+            _ => bail!("unknown option {flag} for {INSPECT_VERB}"),
+        }
+    }
+    let capture = LocalPacketCapture::open(path::absolute(path)?)
+        .with_context(|| format!("Inspecting packet capture {path}"))?;
+    offline::write_report(stdout, output_file, |output| capture.write_json(output))
+}
 
 pub(super) fn parse(
     verb: &str,

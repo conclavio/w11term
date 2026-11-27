@@ -1,8 +1,11 @@
 use super::classic_little_endian;
 use anyhow::{Context, Result, bail, ensure};
+use serde::Serialize;
 use std::{
+    borrow::Cow,
+    collections::BTreeSet,
     fs::File,
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
 };
 
@@ -16,10 +19,28 @@ pub struct LocalCapture {
     pub summary: Summary,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum Format {
     Pcap,
     PcapNg,
+}
+
+#[derive(Serialize)]
+struct Report<'a> {
+    schema_version: u8,
+    format: &'a Format,
+    file_name: Cow<'a, str>,
+    file_bytes: u64,
+    packets: u32,
+    captured_bytes: u64,
+    truncated_packets: u32,
+    timestamped_packets: u32,
+    timestamp_span_ns: Option<String>,
+    interfaces: u32,
+    link_types: &'a BTreeSet<u16>,
+    complete: bool,
+    issue: Option<&'a str>,
 }
 
 impl LocalCapture {
@@ -45,6 +66,31 @@ impl LocalCapture {
             Format::Pcap => "PCAP",
             Format::PcapNg => "PCAPNG",
         }
+    }
+
+    /// Write the bounded packet summary as a versioned JSON report.
+    pub fn write_json(&self, output: impl Write) -> io::Result<()> {
+        let summary = &self.summary;
+        let report = Report {
+            schema_version: 1,
+            format: &self.format,
+            file_name: self.path.file_name().unwrap_or_default().to_string_lossy(),
+            file_bytes: self.bytes,
+            packets: summary.packets,
+            captured_bytes: summary.captured_bytes,
+            truncated_packets: summary.truncated_packets,
+            timestamped_packets: summary.timestamped_packets,
+            // A decimal string preserves the full span for consumers with 53-bit numbers.
+            timestamp_span_ns: summary.span_ns().map(|span| span.to_string()),
+            interfaces: summary.interfaces,
+            link_types: &summary.link_types,
+            complete: summary.issue.is_none(),
+            issue: summary.issue.as_deref(),
+        };
+        let mut output = BufWriter::new(output);
+        serde_json::to_writer(&mut output, &report).map_err(io::Error::other)?;
+        output.write_all(b"\n")?;
+        output.flush()
     }
 }
 
