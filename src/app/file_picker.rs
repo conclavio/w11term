@@ -24,6 +24,8 @@ pub(super) enum Purpose {
     SshConfig(PathBuf),
     DotfilesBundle(PathBuf),
     ToolBundle(PathBuf),
+    ToolExecutable(PathBuf),
+    SaveToolBundle(PathBuf),
     OpenSshHostList,
     OpenSshGroupDefinition,
     SshIdentity {
@@ -208,6 +210,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::SshConfig(_)
                 | Purpose::DotfilesBundle(_)
                 | Purpose::ToolBundle(_)
+                | Purpose::ToolExecutable(_)
                 | Purpose::OpenSshHostList
                 | Purpose::OpenSshGroupDefinition
                 | Purpose::SshIdentity { .. }
@@ -287,6 +290,23 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     w!("Choose dotfiles bundle")
                 })?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if let Some(folder) = current.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
+            Purpose::ToolExecutable(ref current) | Purpose::SaveToolBundle(ref current) => {
+                if matches!(&purpose, Purpose::SaveToolBundle(_)) {
+                    dialog.SetTitle(w!("Save new SSH tool bundle"))?;
+                    dialog.SetFileName(w!("tools.json"))?;
+                    dialog.SetDefaultExtension(w!("json"))?;
+                    options &= !FOS_OVERWRITEPROMPT;
+                    options |= FOS_NOTESTFILECREATE;
+                } else {
+                    dialog.SetTitle(w!("Choose a Linux executable"))?;
+                    options |= FOS_FILEMUSTEXIST;
+                }
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 if let Some(folder) = current.parent() {
                     local_folder(&dialog, folder);
                 }

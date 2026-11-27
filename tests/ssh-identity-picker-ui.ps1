@@ -304,6 +304,46 @@ try {
         }
         if ((Tool-Check 'netwatch').Current.ToggleState -ne 'Off') { throw 'Reopened profile selected an omitted tool' }
     }
+
+    Click 'Create bundle from local tools'
+    Set-Field 'New bundle name' 'team-tools'
+    Set-Field 'Linux command name' 'operator'
+    $dot = ' ' + [char]0xb7 + ' '
+    foreach ($build in @(@('operator-x64', 'x86-64'), @('operator-arm','ARM64'))) {
+        Click 'Add Linux executable'
+        $picker = Wait-Until 'owned Linux executable picker' { Find-OwnedDialog 'Choose a Linux executable' }
+        Select-DialogItem $picker $build[0]
+        $null = Wait-Until 'accept Linux executable file' { [FixtureDialog]::ClickButton($picker, 1) }
+        $null = Wait-Until "detected $($build[1]) executable" { Find-Element "operator${dot}$($build[1])" }
+    }
+    Click 'Save new tool bundle'
+    $picker = Wait-Until 'owned bundle save dialog' { Find-OwnedDialog 'Save new SSH tool bundle' }
+    $null = Wait-Until 'accept new bundle file' { [FixtureDialog]::ClickButton($picker, 1) }
+    $created = Join-Path $State 'tools.json'
+    $null = Wait-Until 'new manifest selected before review' {
+        $field = Find-Element 'Tool bundle manifest' $edit
+        $field -and [FixtureDialog]::SameFile($created, $field.GetCurrentPattern($value).Current.Value)
+    }
+    $createdBundle = [IO.File]::ReadAllText($created) | ConvertFrom-Json
+    if ($createdBundle.name -cne 'team-tools' -or $createdBundle.tools.name -cne 'operator' -or
+        ($createdBundle.tools.builds.architecture -join ',') -cne 'x86_64,aarch64') {
+        throw 'Created manifest did not contain the named command and both architectures'
+    }
+    foreach ($build in $createdBundle.tools.builds) {
+        $source = if ([IO.Path]::IsPathRooted($build.path)) { $build.path } else { Join-Path $State $build.path }
+        if ((File-Sha256 $source) -cne $build.sha256) {
+            throw 'The saved manifest pin did not match the selected executable'
+        }
+    }
+    Click 'Review tool bundle'
+    $review = 'team-tools ' + [char]0x2192 + " test@example.test:22${dot}/home/test/.local/bin"
+    $null = Wait-Until 'new local bundle was reviewed' { Find-Element $review }
+    Click 'Approve tool sync'
+    Click 'Save profile changes'
+    $null = Wait-Until 'local bundle approval saved to the profile' {
+        $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+        $tools.name -ceq 'team-tools' -and [FixtureDialog]::SameFile($created, $tools.bundle)
+    }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()

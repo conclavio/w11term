@@ -71,7 +71,7 @@ pub(super) fn tool_digest_report(
 
 // Minimal ELF programs for Linux x86-64 and AArch64 that exit with status 0.
 // The optional interpreter segment lets a fixture exercise missing-loader diagnostics.
-fn executable(architecture: UtilityArchitecture, interpreter: Option<&str>) -> Vec<u8> {
+pub(super) fn executable(architecture: UtilityArchitecture, interpreter: Option<&str>) -> Vec<u8> {
     let mut bytes = vec![0u8; 256];
     bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
     bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
@@ -150,6 +150,66 @@ fn preview(builds: Vec<UtilityBuild>) -> Operation {
             }],
         },
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_tool_bundle_pins_both_architectures_for_reviewed_installation() {
+    use UtilityArchitecture::{Aarch64, X86_64};
+    use w11term::sftp::{LocalUtilityBundle, LocalUtilityExecutable};
+
+    let local = tempfile::tempdir().unwrap();
+    let x64 = local.path().join("operator-x64");
+    let arm = local.path().join("operator-arm");
+    let bogus = local.path().join("not-an-elf.exe");
+    fs::write(&x64, executable(X86_64, None)).unwrap();
+    fs::write(&arm, executable(Aarch64, None)).unwrap();
+    fs::write(&bogus, b"MZ invalid").unwrap();
+    assert!(LocalUtilityExecutable::inspect(&bogus).is_err());
+    let x64_build = LocalUtilityExecutable::inspect(&x64).unwrap();
+    let arm_build = LocalUtilityExecutable::inspect(&arm).unwrap();
+    assert_eq!(x64_build.architecture, X86_64);
+    assert_eq!(arm_build.architecture, Aarch64);
+    let mut bundle = LocalUtilityBundle::default();
+    assert!(bundle.add("-invalid", x64_build.clone()).is_err());
+    bundle.add("operator", x64_build.clone()).unwrap();
+    assert!(bundle.add("operator", x64_build).is_err());
+    bundle.add("operator", arm_build).unwrap();
+    let manifest = local.path().join("tools.json");
+    bundle.save(&manifest, "ops", ".local/bin").unwrap();
+    let saved = fs::read(&manifest).unwrap();
+    assert!(bundle.save(&manifest, "other", ".local/bin").is_err());
+    assert_eq!(fs::read(&manifest).unwrap(), saved);
+    let document: Value = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(document["tools"][0]["builds"][0]["path"], "operator-x64");
+
+    let (pane, _, remote, _, server) = fixture(false).await;
+    probe_response(remote.path(), "aarch64", "/", "/usr/bin:/.local/bin");
+    fs::write(remote.path().join("posix-rename-version"), "1").unwrap();
+    let operation = || Operation::PreviewToolBundle {
+        bundle: UtilityBundle::load(&manifest).unwrap(),
+    };
+    let mut changed = executable(Aarch64, None);
+    changed[255] = 1;
+    fs::write(&arm, changed).unwrap();
+    let blocked = guarded_job(&pane, None, operation()).await.unwrap();
+    assert_eq!(blocked["ready"], false);
+    assert!(blocked.to_string().contains("SHA-256 does not match"));
+    let original = executable(Aarch64, None);
+    fs::write(&arm, &original).unwrap();
+    let plan = guarded_job(&pane, None, operation()).await.unwrap();
+    assert_eq!(plan["ready"], true);
+    let installed = guarded_job(&pane, None, apply(operation(), &plan))
+        .await
+        .unwrap();
+    let digest = installed["bundle_sha256"].as_str().unwrap();
+    assert_eq!(
+        fs::read(remote.path().join(format!(
+            ".local/share/w11term/tools/ops/versions/{digest}/operator"
+        )))
+        .unwrap(),
+        original
+    );
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

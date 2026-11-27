@@ -4061,6 +4061,16 @@ fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
         br#"{"profiles":{"fixture":{"host":"example.test","user":"test","auth":"identity","identity":"missing-key-folder/original-key"}}}"#,
     )
     .unwrap();
+    for (name, architecture) in [
+        ("operator-x64", w11term::sftp::UtilityArchitecture::X86_64),
+        ("operator-arm", w11term::sftp::UtilityArchitecture::Aarch64),
+    ] {
+        fs::write(
+            state.path().join(name),
+            super::utilities::executable(architecture, None),
+        )
+        .unwrap();
+    }
     drive_gui("ssh-identity-picker-ui.ps1", state.path());
 }
 

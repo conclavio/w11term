@@ -5,6 +5,7 @@ use std::{collections::BTreeSet, io::Read};
 mod build;
 mod downloads;
 mod install;
+mod local;
 mod login;
 use build::{LibcVersion, Verified};
 pub use downloads::{
@@ -13,6 +14,7 @@ pub use downloads::{
 };
 use install::{InstallPlan, Release, StoredTool};
 pub use install::{InstalledTool, InstalledTools, RetainedToolVersion, ToolBundleVersions};
+pub use local::{LocalUtilityBundle, LocalUtilityExecutable};
 pub(crate) use login::sync_login_tools;
 
 const DEFAULT_BIN: &str = ".local/bin";
@@ -85,6 +87,10 @@ fn valid_bin_directory(directory: &str) -> bool {
         && !directory.starts_with(&format!("{STORE}/"))
 }
 
+fn valid_command_name(name: &str) -> bool {
+    safe_component(name) && !name.starts_with(['.', '-'])
+}
+
 impl UtilityBundle {
     pub fn load(manifest: &Path) -> Result<Self> {
         let manifest = std::path::absolute(manifest)?;
@@ -127,10 +133,7 @@ impl UtilityBundle {
         ensure!((1..=16).contains(&self.tools.len()), "Choose 1 to 16 tools");
         let mut names = BTreeSet::new();
         for tool in &self.tools {
-            ensure!(
-                safe_component(&tool.name) && !tool.name.starts_with(['.', '-']),
-                "Invalid command name"
-            );
+            ensure!(valid_command_name(&tool.name), "Invalid command name");
             ensure!(names.insert(&tool.name), "Duplicate tool {}", tool.name);
             ensure!(
                 (1..=4).contains(&tool.builds.len()),

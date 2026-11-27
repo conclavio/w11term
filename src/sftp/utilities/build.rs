@@ -60,15 +60,24 @@ impl Verified {
         bytes: &[u8],
         sha256: String,
     ) -> Result<Self> {
+        Self::inspect_elf(bytes, sha256, Some(architecture)).map(|(verified, _)| verified)
+    }
+
+    pub(super) fn inspect_elf(
+        bytes: &[u8],
+        sha256: String,
+        expected: Option<UtilityArchitecture>,
+    ) -> Result<(Self, UtilityArchitecture)> {
         let elf = Elf::parse(bytes).context("Reading Linux ELF executable headers")?;
-        let machine = match architecture {
-            UtilityArchitecture::X86_64 => header::EM_X86_64,
-            UtilityArchitecture::Aarch64 => header::EM_AARCH64,
+        let architecture = match elf.header.e_machine {
+            header::EM_X86_64 => UtilityArchitecture::X86_64,
+            header::EM_AARCH64 => UtilityArchitecture::Aarch64,
+            _ => bail!("Choose a Linux x86-64 or ARM64 executable"),
         };
         ensure!(
             elf.is_64
                 && elf.little_endian
-                && elf.header.e_machine == machine
+                && expected.is_none_or(|expected| expected == architecture)
                 && matches!(
                     elf.header.e_ident[header::EI_OSABI],
                     header::ELFOSABI_NONE | header::ELFOSABI_LINUX
@@ -128,17 +137,27 @@ impl Verified {
                 }
             }
         }
-        Ok(Self {
+        let verified = Self {
             sha256,
             bytes: bytes.len() as u64,
             interpreter,
             glibc_minimum,
             libraries: elf.libraries.into_iter().map(str::to_owned).collect(),
-        })
+        };
+        Ok((verified, architecture))
     }
 }
 
 pub(super) fn read_pinned(path: &Path, sha256: &str, remaining: &mut u64) -> Result<Vec<u8>> {
+    let bytes = read_executable(path, remaining)?;
+    ensure!(
+        digest_hex(Sha256::new_with_prefix(&bytes)) == sha256,
+        "SHA-256 does not match the pinned executable"
+    );
+    Ok(bytes)
+}
+
+pub(super) fn read_executable(path: &Path, remaining: &mut u64) -> Result<Vec<u8>> {
     use super::super::upload_directory::{Source, open_source};
 
     let Source::File(file, size) = open_source(path, FILE_READ_DATA, FILE_SHARE_READ)? else {
@@ -155,10 +174,6 @@ pub(super) fn read_pinned(path: &Path, sha256: &str, remaining: &mut u64) -> Res
     ensure!(
         bytes.len() as u64 == size,
         "The Windows file size changed while reading it"
-    );
-    ensure!(
-        digest_hex(Sha256::new_with_prefix(&bytes)) == sha256,
-        "SHA-256 does not match the pinned executable"
     );
     Ok(bytes)
 }

@@ -1331,6 +1331,8 @@ A reviewed manual switch holds the chosen bundle on later logins, including when
 
 In **Settings → Edit profile → SSH tools**, select a preset or pick individual utilities under **Custom tools**. Choose **Use selected tools** for a custom set. The download runs in the background and selects the prepared manifest when it finishes. Review the host and account, approve sync, and save the profile. Each selection and preset revision has its own local manifest, so earlier approvals keep their pins until you select and approve a new version.
 
+Choose **Create bundle from local tools** to build a manifest from raw Linux executables on Windows. Give the bundle and each command a name, then pick the local executable. You can add an x86-64 and an ARM64 build under the same command name. w11term detects the architecture and computes the SHA-256 pin. The launcher directory defaults to `.local/bin` under the remote home. Save to a new manifest file, then review and approve it in the profile. Keep the source executables at their saved locations so installation can verify the pins.
+
 **Linux essentials** includes `rg`, `jq`, `dust`, and `hyperfine`. **Linux admin tools** adds `bandwhich`, `diskwatch`, `mdd` (mddog), `ncdu`, and `netwatch`. The presets and custom selections share the `linux-essentials` bundle name and `.local/bin` launchers for updates and rollback. Profiles that connect to the same account update the same active set. Omitted launchers become dormant and can be restored by rollback. Linux `x86_64` and `aarch64` are supported. Omit `--architecture` to fetch both. Use manual preview and apply for a first transfer that needs more than the login sync deadline.
 
 ```powershell

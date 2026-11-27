@@ -8,6 +8,8 @@ use w11term::{
     },
 };
 
+mod local_bundle;
+
 const TITLE: &str = "SSH tools";
 
 #[derive(Clone, Copy)]
@@ -29,6 +31,7 @@ pub enum Action {
     Tool(&'static str, bool),
     Starter,
     StarterFinished(Arc<()>, Result<String, String>),
+    Local(local_bundle::Action),
     Review,
     Reviewed(Arc<()>, Result<Box<ToolSync>, String>),
     Approve,
@@ -48,6 +51,7 @@ pub(super) struct Editor {
     work: Option<Arc<()>>,
     preset: ToolBundlePreset,
     starter: Option<(Arc<()>, ComponentTask)>,
+    local: Option<local_bundle::Editor>,
     feedback: Option<String>,
 }
 
@@ -143,6 +147,9 @@ impl Editor {
         base: &Path,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
+        if let Some(local) = &self.local {
+            return self.expander(id, local.view(id, ctx), ctx);
+        }
         let send =
             |action: Action| ctx.callback(move |_| Message::ProfileTools(id, action.clone()));
         let field = |which, label: &str, value: &str, hint: &str| {
@@ -207,6 +214,13 @@ impl Editor {
                     .is_enabled(idle)
                     .on_click(send(Action::Browse))
                     .content("Browse for tool bundle"),
+            ),
+            KeyedView::new(
+                "create",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(send(Action::Local(local_bundle::Action::Open)))
+                    .content("Create bundle from local tools"),
             ),
             KeyedView::new(
                 "builtin",
@@ -336,6 +350,14 @@ impl Editor {
                     .text_wrapping(TextWrapping::Wrap),
             ),
         ]);
+        self.expander(
+            id,
+            StackPanel::new().spacing(8.0).keyed_children(fields),
+            ctx,
+        )
+    }
+
+    fn expander(&self, id: TabId, content: View, ctx: &ViewContext<TerminalApp>) -> View {
         Expander::new()
             .automation_name(TITLE)
             .horizontal_alignment(HorizontalAlignment::Stretch)
@@ -345,10 +367,7 @@ impl Editor {
             )
             .slots([
                 SlotView::new(ExpanderSlot::Header, TextBlock::new().text(TITLE)),
-                SlotView::new(
-                    ExpanderSlot::Content,
-                    StackPanel::new().spacing(8.0).keyed_children(fields),
-                ),
+                SlotView::new(ExpanderSlot::Content, content),
             ])
     }
 }
@@ -370,7 +389,17 @@ impl TerminalApp {
         else {
             return;
         };
+        if let Action::Local(action) = action {
+            draft
+                .tool_bundle
+                .edit_local_bundle(id, action, owner, catalog, ctx);
+            return;
+        }
+        if draft.tool_bundle.local.is_some() && !matches!(action, Action::Expanded(_)) {
+            return;
+        }
         match action {
+            Action::Local(_) => unreachable!("local bundle actions handled above"),
             Action::Expanded(expanded) => draft.tool_bundle.expanded = expanded,
             Action::PathMode(Some(index)) if index != draft.tool_bundle.path_mode && index < 3 => {
                 draft.tool_bundle.path_mode = index;
