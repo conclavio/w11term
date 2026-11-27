@@ -4283,6 +4283,11 @@ impl TerminalApp {
             command_reference::SELECTION => {
                 Message::CommandReference(command_reference::Action::Selection(paste))
             }
+            openrouter_assistance::EXPLAIN_VIEWPORT => {
+                paste.map_or(Message::ControlIdle, |origin| {
+                    Message::OpenRouter(openrouter_assistance::Action::ExplainViewport(origin))
+                })
+            }
             label if pane_broadcast::is_label(label) => offered_broadcast
                 .clone()
                 .filter(|action| action.label() == label)
@@ -4746,6 +4751,11 @@ impl TerminalApp {
                 "openrouter-explain",
                 openrouter_assistance::EXPLAIN,
                 self.active_selection(),
+            ),
+            command_menu_item(
+                "openrouter-explain-viewport",
+                openrouter_assistance::EXPLAIN_VIEWPORT,
+                self.openrouter_viewport().is_some(),
             ),
             command_menu_item(
                 "command-reference-selection",

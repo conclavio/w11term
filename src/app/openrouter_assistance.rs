@@ -6,15 +6,18 @@ use std::{
 use w11term::{
     openrouter::{self, Model, Preferences, Reply, Review, Task},
     ssh::TriageReport,
+    terminal::{Snapshot, viewport_text},
 };
 use zeroize::Zeroizing;
 
 pub(super) const LABEL: &str = "OpenRouter assistance";
 pub(super) const EXPLAIN: &str = "Explain selected text with OpenRouter";
+pub(super) const EXPLAIN_VIEWPORT: &str = "Explain visible pane with OpenRouter";
 pub(super) const DRAFT: &str = "Draft a Bash command with OpenRouter";
 
 pub enum Action {
     Show(Task),
+    ExplainViewport(clipboard_paste::Origin),
     Key(TabId, String),
     SaveKey(TabId),
     RemoveKey(TabId),
@@ -31,11 +34,11 @@ pub enum Action {
 }
 
 pub enum Outcome {
-    Loaded(
-        Result<Preferences, String>,
-        Result<bool, String>,
-        Option<String>,
-    ),
+    Prepared {
+        preferences: Option<Result<Preferences, String>>,
+        saved_key: Option<Result<bool, String>>,
+        evidence: Result<String, &'static str>,
+    },
     Key(bool),
     SettingsSaved,
     Models(Vec<Model>),
@@ -45,6 +48,31 @@ pub enum Outcome {
 struct Pending {
     ticket: Arc<()>,
     cancel: Option<Arc<AtomicBool>>,
+}
+
+enum Evidence {
+    Text(String),
+    MissingSelection,
+    Viewport(Arc<Snapshot>),
+}
+
+impl Evidence {
+    fn read(self) -> Result<String, &'static str> {
+        match self {
+            Self::Text(text) => Ok(text),
+            Self::MissingSelection => {
+                Err("Select terminal text or paste an excerpt into the preview.")
+            }
+            Self::Viewport(frame) => {
+                let text = viewport_text(&frame)
+                    .map_err(|_| "The visible pane exceeds the text capture limit. Select an excerpt to explain.")?;
+                if text.is_empty() {
+                    return Err("The visible pane contains no text.");
+                }
+                Ok(text)
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -87,17 +115,12 @@ impl TerminalApp {
     ) {
         self.show_openrouter(
             Task::Triage,
-            Some(triage_preview(report, preview_sample)),
+            Evidence::Text(triage_preview(report, preview_sample)),
             ctx,
         );
     }
 
-    fn show_openrouter(
-        &mut self,
-        task: Task,
-        evidence: Option<String>,
-        ctx: &ComponentContext<Self>,
-    ) {
+    fn show_openrouter(&mut self, task: Task, evidence: Evidence, ctx: &ComponentContext<Self>) {
         self.triage.open = task == Task::Triage;
         self.flame_graph.open = false;
         self.packet_capture.open = false;
@@ -128,30 +151,44 @@ impl TerminalApp {
         page.review = None;
         page.reply = None;
         page.task = Some(task);
-        let missing_selection = task == Task::Explain && evidence.is_none();
-        let evidence = display_safe(&evidence.unwrap_or_default())
-            .replace("\r\n", "\r")
-            .replace('\n', "\r");
-        let clipped = evidence.len() > openrouter::MAX_INPUT;
-        page.evidence = clip(&evidence, openrouter::MAX_INPUT).to_owned();
-        page.status = if missing_selection {
-            Some("Select terminal text or paste an excerpt into the preview.".into())
-        } else if clipped {
-            Some("The preview includes the first 16 KiB of the selected evidence.".into())
-        } else {
-            None
-        };
-        if !page.loaded {
-            let preview_status = page.status.take();
-            let (ticket, _) = page.begin("Loading local OpenRouter settings…", false);
-            run(ctx, id, ticket, move |_| {
-                Ok(Outcome::Loaded(
-                    openrouter::Preferences::load().map_err(|error| format!("{error:#}")),
-                    openrouter::has_key().map_err(|error| format!("{error:#}")),
-                    preview_status,
-                ))
-            });
+        page.evidence.clear();
+        let viewport = matches!(evidence, Evidence::Viewport(_));
+        let load_settings = !page.loaded;
+        if !viewport && !load_settings {
+            page.set_evidence(evidence.read());
+            return;
         }
+        let status = if viewport {
+            "Preparing visible pane text…"
+        } else {
+            "Loading local OpenRouter settings…"
+        };
+        let (ticket, _) = page.begin(status, false);
+        run(ctx, id, ticket, move |_| {
+            Ok(Outcome::Prepared {
+                preferences: load_settings
+                    .then(|| Preferences::load().map_err(|error| format!("{error:#}"))),
+                saved_key: load_settings
+                    .then(|| openrouter::has_key().map_err(|error| format!("{error:#}"))),
+                evidence: evidence.read(),
+            })
+        });
+    }
+
+    pub(super) fn openrouter_viewport(&self) -> Option<(clipboard_paste::Origin, Arc<Snapshot>)> {
+        let Page::Terminal(tab) = &self.tabs.active()?.page else {
+            return None;
+        };
+        let frame = tab.session.frames.load();
+        if tab.browsing_sessions() || tab.device_busy || frame.prompt.is_some() {
+            return None;
+        }
+        let origin = clipboard_paste::Origin {
+            pane: tab.session.pane_id,
+            group: self.tabs.active_group_id()?,
+            connection: frame.connection_generation,
+        };
+        Some((origin, frame))
     }
 
     fn openrouter_page(&mut self, id: TabId) -> Option<&mut PageState> {
@@ -164,11 +201,25 @@ impl TerminalApp {
     pub(super) fn openrouter_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         let id = match &action {
             Action::Show(task) => {
-                let evidence = (*task == Task::Explain)
-                    .then(|| self.paste_origin())
-                    .flatten()
-                    .and_then(|origin| self.pane_selection_text(origin));
+                let evidence = if *task == Task::Explain {
+                    self.paste_origin()
+                        .and_then(|origin| self.pane_selection_text(origin))
+                        .map_or(Evidence::MissingSelection, Evidence::Text)
+                } else {
+                    Evidence::Text(String::new())
+                };
                 self.show_openrouter(*task, evidence, ctx);
+                return;
+            }
+            Action::ExplainViewport(target) => {
+                if let Some((_, frame)) = self
+                    .openrouter_viewport()
+                    .filter(|(origin, _)| origin == target)
+                {
+                    self.show_openrouter(Task::Explain, Evidence::Viewport(frame), ctx);
+                } else {
+                    self.window_error = Some("The focused pane changed. Choose the pane again to review its visible text.".into());
+                }
                 return;
             }
             Action::Ready(id, ..)
@@ -211,6 +262,25 @@ impl TerminalApp {
 }
 
 impl PageState {
+    fn set_evidence(&mut self, evidence: Result<String, &'static str>) {
+        match evidence {
+            Ok(text) => {
+                // CRLF pairs can halve the byte count. Leave enough input to
+                // fill the limit, including one UTF-8 character at the boundary.
+                let prefix = clip(&text, 2 * openrouter::MAX_INPUT + 4);
+                let clipped = prefix.len() < text.len();
+                let text = display_safe(prefix)
+                    .replace("\r\n", "\r")
+                    .replace('\n', "\r");
+                self.status = (clipped || text.len() > openrouter::MAX_INPUT).then(|| {
+                    "The preview includes the first 16 KiB of the selected evidence.".into()
+                });
+                self.evidence = clip(&text, openrouter::MAX_INPUT).to_owned();
+            }
+            Err(error) => self.status = Some(error.into()),
+        }
+    }
+
     fn begin(&mut self, status: &str, cancellable: bool) -> (Arc<()>, Option<Arc<AtomicBool>>) {
         let ticket = Arc::new(());
         let cancel = cancellable.then(|| Arc::new(AtomicBool::new(false)));
@@ -232,16 +302,24 @@ impl PageState {
         }
         self.status = None;
         match result {
-            Ok(Outcome::Loaded(prefs, key, preview_status)) => {
+            Ok(Outcome::Prepared {
+                preferences,
+                saved_key,
+                evidence,
+            }) => {
                 self.loaded = true;
-                self.status = preview_status;
-                match prefs {
-                    Ok(prefs) => self.prefs = prefs,
-                    Err(error) => self.status = Some(error),
+                self.set_evidence(evidence);
+                if let Some(preferences) = preferences {
+                    match preferences {
+                        Ok(prefs) => self.prefs = prefs,
+                        Err(error) => self.status = Some(error),
+                    }
                 }
-                match key {
-                    Ok(saved) => self.saved_key = saved,
-                    Err(error) => self.status = Some(error),
+                if let Some(saved_key) = saved_key {
+                    match saved_key {
+                        Ok(saved) => self.saved_key = saved,
+                        Err(error) => self.status = Some(error),
+                    }
                 }
             }
             Ok(Outcome::Key(saved)) => {

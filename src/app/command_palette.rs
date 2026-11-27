@@ -115,6 +115,7 @@ pub enum CommandId {
     FocusPreviousPane(Option<previous_pane::Target>),
     SaveScrollback(Option<u64>),
     CopyPaneText(Option<u64>),
+    ExplainViewport(Option<clipboard_paste::Origin>),
     PaneImage(Option<u64>, text_export::ImageDestination),
     Recording(Option<recordings::Choice>),
     ClearScrollback(Option<u64>),
@@ -479,6 +480,10 @@ impl TerminalApp {
             if matches!(&row.id, CommandId::Menu(label) if label == text_export::COPY_VIEWPORT_LABEL)
             {
                 row.id = CommandId::CopyPaneText(pane);
+            }
+            if matches!(&row.id, CommandId::Menu(label) if label == openrouter_assistance::EXPLAIN_VIEWPORT)
+            {
+                row.id = CommandId::ExplainViewport(origin);
             }
             if let CommandId::Menu(label) = &row.id
                 && let Some(destination) = text_export::ImageDestination::from_label(label)
@@ -1056,6 +1061,9 @@ impl TerminalApp {
             CommandId::CopyPaneText(pane) => {
                 Message::Export(text_export::Action::CopyPaneText(pane))
             }
+            CommandId::ExplainViewport(origin) => origin.map_or(Message::ControlIdle, |origin| {
+                Message::OpenRouter(openrouter_assistance::Action::ExplainViewport(origin))
+            }),
             CommandId::PaneImage(pane, destination) => {
                 Message::Export(text_export::Action::StartPaneImage(pane, destination))
             }

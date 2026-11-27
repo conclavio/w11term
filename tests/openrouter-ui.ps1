@@ -8,8 +8,7 @@ $value = [System.Windows.Automation.ValuePattern]::Pattern
 $preview = 'OpenRouter request preview'
 $draft = 'Draft a Bash command with OpenRouter'
 $providerKey = 'sk-or-v1-w11term-fixture'
-$profilesJson = '{"profiles":{"PowerShell":{"backend":"local","executable":"powershell.exe","args":["-NoProfile","-NoLogo"]}}}'
-[IO.File]::WriteAllText($profiles, $profilesJson)
+$explain = 'Explain visible pane with OpenRouter'
 
 function Click([string]$Name) {
     Invoke-Button (Wait-Until "enabled '$Name' button" {
@@ -53,7 +52,53 @@ function Confirm-NoRequest([int]$Number) {
     }
 }
 
-$app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', 'PowerShell') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
+function Review-VisibleSshPane {
+    $local = (Sessions | Where-Object label -eq 'Palette PowerShell').id
+    $null = Control @('focus-pane','--pane',"$local")
+    Wait-Focus $local
+    Type-Line "'neighbor-private-' + '42'"
+    Wait-Text $local 'neighbor-private-42'
+    Run-Palette 'Split right with palette-ssh'
+    $ssh = Wait-Until 'SSH split becomes active' {
+        (Sessions | Where-Object { $_.label -eq 'palette-ssh' -and $_.active }).id
+    }
+    Wait-Text $ssh 'ssh-live-tail'
+    if ((Control @('get-text','--pane',"$ssh")).text.Contains('ssh-visible-issue')) {
+        throw 'The SSH fixture issue is still on the live screen'
+    }
+    $document = Wait-Until 'accessible SSH pane' {
+        Find-Element ('Terminal ' + [char]0xb7 + ' palette-ssh') ([System.Windows.Automation.ControlType]::Document)
+    }
+    $scroll = $document.GetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern)
+    $null = Wait-Until 'SSH pane exposes retained history' { $scroll.Current.VerticallyScrollable }
+    $scroll.SetScrollPercent(-1, 50)
+    $range = $document.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+    $null = Wait-Until 'scrolling to the middle shows the earlier SSH text' {
+        $range.GetVisibleRanges()[0].GetText(-1).Contains('ssh-visible-issue')
+    }
+    Run-Palette $explain -Enter
+    $seed = Wait-Until 'snapshot of the scrolled SSH pane is available to edit' {
+        $field = Find-Element $preview $edit
+        if ($field -and $field.Current.IsEnabled) {
+            $text = $field.GetCurrentPattern($value).Current.Value
+            if ($text.Contains('ssh-visible-issue redact-this-fixture')) { $text }
+        }
+    }
+    foreach ($excluded in @('ssh-offscreen-archive','ssh-live-tail','neighbor-private-42')) {
+        if ($seed.Contains($excluded)) { throw "The preview included '$excluded' from outside the focused viewport" }
+    }
+    Confirm-NoRequest 4
+    $edited = $seed.Replace("`r`n", "`r").Replace("`n", "`r").Replace('redact-this-fixture', '[redacted]')
+    Set-Field $preview $edited
+    Click 'Review OpenRouter request'
+    $null = Wait-Until 'the edited viewport is ready for Send' { Find-Element 'Send reviewed request' $button }
+    Confirm-NoRequest 4
+    [IO.File]::WriteAllText((Join-Path $State 'approved-viewport'), $edited.Replace("`r", "`n"))
+    Click 'Send reviewed request'
+    $null = Wait-Until 'reviewed viewport response' { Find-Element 'explained the reviewed viewport' }
+}
+
+$app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', '"Palette PowerShell"', '--cols', '120', '--rows', '24') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
     Run-Palette $draft
@@ -110,8 +155,10 @@ try {
     $null = Wait-Until 'cancelled state is displayed' { Find-Element 'Stopped waiting for OpenRouter.' }
     [IO.File]::WriteAllText((Join-Path $State 'openrouter-cancel-seen'), '')
     $null = Wait-Until 'provider attempted to deliver the late response' {
-        Test-Path -LiteralPath (Join-Path $State 'openrouter-fixture-done')
+        Test-Path -LiteralPath (Join-Path $State 'openrouter-late-sent')
     }
+    if (Find-Element 'late fixture reply') { throw 'Cancellation allowed a late response' }
+    Review-VisibleSshPane
     Click 'Remove OpenRouter key'
     $null = Wait-Until 'saved key is removed' { Find-Element 'Saved OpenRouter API key removed' }
     if ((Find-Element 'late fixture reply') -or (Test-Path -LiteralPath $credential)) {

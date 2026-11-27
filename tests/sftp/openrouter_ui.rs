@@ -1,4 +1,4 @@
-use super::drive_gui;
+use super::{Source, drive_mixed_gui, fixture_connections};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -8,23 +8,40 @@ use std::{
     time::Duration,
 };
 
-#[test]
-#[ignore = "reviews, sends and cancels requests against a local provider in the native UI"]
-fn native_openrouter_requires_an_explicit_review_and_never_submits_the_reply() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews drafts and a scrolled SSH pane against a local provider in the native UI"]
+async fn native_openrouter_requires_an_explicit_review_and_never_submits_the_reply() {
+    let (Source::Ssh(ssh), remote, _, ssh_server) = fixture_connections(false, 1).await else {
+        unreachable!()
+    };
+    let mut history = String::from("ssh-offscreen-archive\r\n");
+    for i in 0..180 {
+        if i == 90 {
+            history.push_str("ssh-visible-issue redact-this-fixture\r\n");
+        } else {
+            history.push_str(&format!("ssh-output-{i:03}\r\n"));
+        }
+    }
+    history.push_str("ssh-live-tail\r\n");
+    fs::write(remote.path().join("copy-history.vt"), history).unwrap();
+    let wire = remote.path().join("keyboard-input.bin");
+    fs::write(&wire, []).unwrap();
     let state = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     fs::write(state.path().join("openrouter-port"), port.to_string()).unwrap();
     let directory = state.path().to_owned();
     let provider = std::thread::spawn(move || serve(listener, &directory));
-    drive_gui("openrouter-ui.ps1", state.path());
+    drive_mixed_gui("openrouter-ui.ps1", &ssh, state.path());
     provider.join().unwrap();
+    assert!(fs::read(wire).unwrap().is_empty());
+    ssh_server.abort();
 }
 
 fn serve(listener: TcpListener, directory: &Path) {
     listener.set_nonblocking(true).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    for index in 0..4 {
+    for index in 0..5 {
         let mut client = loop {
             match listener.accept() {
                 Ok((client, _)) => break client,
@@ -56,14 +73,35 @@ fn serve(listener: TcpListener, directory: &Path) {
                 json!({"data_collection": "deny", "zdr": true})
             );
             assert_eq!(request["messages"][1]["role"], "user");
-            assert_eq!(
-                request["messages"][1]["content"],
-                [
-                    "approved edit\nwith a second line",
-                    "try provider rejection",
-                    "cancel after receipt"
-                ][index - 1]
-            );
+            let text = request["messages"][1]["content"].as_str().unwrap();
+            if index == 4 {
+                let expected = fs::read_to_string(directory.join("approved-viewport")).unwrap();
+                assert_eq!(text, expected);
+                assert!(text.contains("ssh-visible-issue [redacted]"));
+                for excluded in [
+                    "redact-this-fixture",
+                    "ssh-offscreen-archive",
+                    "ssh-live-tail",
+                    "neighbor-private-42",
+                ] {
+                    assert!(!text.contains(excluded));
+                }
+                assert!(
+                    request["messages"][0]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("quoted terminal evidence")
+                );
+            } else {
+                assert_eq!(
+                    text,
+                    [
+                        "approved edit\nwith a second line",
+                        "try provider rejection",
+                        "cancel after receipt"
+                    ][index - 1]
+                );
+            }
             assert!(request.get("tools").is_none());
         }
         fs::write(directory.join(format!("openrouter-request-{index}")), &body).unwrap();
@@ -92,9 +130,13 @@ fn serve(listener: TcpListener, directory: &Path) {
                 "404 Not Found",
                 json!({"error": {"message": "private provider diagnostics"}}),
             ),
-            _ => (
+            3 => (
                 "200 OK",
                 json!({"choices": [{"message": {"content": "late fixture reply"}}]}),
+            ),
+            _ => (
+                "200 OK",
+                json!({"choices": [{"message": {"content": "explained the reviewed viewport"}}]}),
             ),
         };
         let body = serde_json::to_string(&reply).unwrap();
@@ -103,11 +145,12 @@ fn serve(listener: TcpListener, directory: &Path) {
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        if index != 3 {
+        if index == 3 {
+            fs::write(directory.join("openrouter-late-sent"), []).unwrap();
+        } else {
             response.unwrap();
         }
     }
-    fs::write(directory.join("openrouter-fixture-done"), []).unwrap();
 }
 
 fn receive(client: &mut TcpStream) -> (String, String, Vec<u8>) {

@@ -1509,7 +1509,9 @@ The collector uses a sibling SSH channel with a 60-second client deadline and a 
 
 Open **Settings → OpenRouter assistance** to save an API key protected by Windows and enter a model ID. **Refresh model catalog** fetches the public model list. **Save OpenRouter settings** remembers the model and routing preference. Zero Data Retention routing is required by default, and each request asks OpenRouter to exclude providers that collect data. [OpenRouter routing and data collection](https://openrouter.ai/docs/guides/routing/provider-selection) · [Zero Data Retention](https://openrouter.ai/docs/guides/features/zdr)
 
-Open **More → Draft a Bash command with OpenRouter** to describe a task, or select terminal text and choose **Explain selected text with OpenRouter**. In a Linux performance report, **Review report with OpenRouter…** starts with local findings and excerpts from the selected sample. Review and edit the preview, which accepts up to 16 KiB of text. **Review OpenRouter request** shows the destination, model, and privacy policy. **Send reviewed request** submits the displayed text.
+Open **More → Draft a Bash command with OpenRouter** to describe a task, or select terminal text and choose **Explain selected text with OpenRouter**. To capture a pane without selecting text first, focus it and choose **Explain visible pane with OpenRouter** from **More** or the command palette. This snapshots the text rows then on screen, including a scrolled view, with no offscreen history or images. In a Linux performance report, **Review report with OpenRouter…** starts with local findings and excerpts from the selected sample.
+
+Edit the preview to remove any details you want to keep local. The preview accepts up to 16 KiB of text. **Review OpenRouter request** shows the destination, model, and privacy policy. **Send reviewed request** submits the displayed text.
 
 The response appears as selectable text. **Copy response** puts it on the Windows clipboard for manual use. Token usage appears when OpenRouter returns it. **Stop waiting** discards the eventual response in w11term. A request already sent can still finish at OpenRouter.
 
