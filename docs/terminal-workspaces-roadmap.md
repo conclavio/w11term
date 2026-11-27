@@ -20,7 +20,7 @@ The [Windows folder sharing roadmap](#mount-selected-windows-folders-on-a-linux-
 
 The [SSH host groups roadmap](#ssh-host-groups) covers running the same command across live remote shells from a single Windows tab.
 
-The [SSH diagnostics roadmap](#ssh-diagnostics) covers remote packet and syscall capture, Windows analysis, and comparison of working and failing runs.
+The [SSH diagnostics roadmap](#ssh-diagnostics) covers packet capture, syscall tracing, Linux performance triage, and flame graphs. The [LLM assistance roadmap](#llm-assistance) covers reviewing selected terminal evidence and drafting Bash commands.
 
 ## Current capabilities
 
@@ -295,9 +295,33 @@ Add **Diagnostics** for the selected Linux SSH pane. Review the verified host, t
 
 Align the traces by executable and process lineage, then by syscall, resource, and sequence within each process. Map transient PIDs and descriptor numbers to their logical identities. Show added or missing calls, changes in return values or errno, count differences, and the first meaningful divergence. Show timing as elapsed time from run start or a paired event, plus per-call duration deltas. Let users expand uncertain matches and inspect the two original trace lines.
 
-**Ship order.** Start with capture, transfer, cleanup, and Wireshark launch. Add bounded strace capture and offline viewing with handle tracking next. Follow with side-by-side comparison.
+**Packet and syscall ship order.** Start with capture, transfer, cleanup, and Wireshark launch. Add bounded strace capture and offline viewing with handle tracking next. Follow with side-by-side comparison.
 
 **Acceptance.** Capture a known loopback exchange on a Linux fixture and open the verified file in Windows Wireshark. Exercise the RAM budget and disconnect the client mid-capture to verify bounded storage, a stopped job, and cleanup. Trace working and failing runs of the same binary with shifted clocks and different descriptor numbers. Verify the comparison identifies the path of a failed file open, changed result, and relative timing. Include a reused descriptor and a repetitive read loop to check lifecycle tracking and expansion to raw evidence.
+
+### Linux performance triage in 60 seconds
+
+Add **Run 60-second triage** for the selected Linux SSH pane. Capture load and uptime, recent kernel messages, and the CPU, process, memory, disk and network observations from Brendan Gregg and the Netflix Performance Engineering team’s checklist. Run `uptime`, the tail of `dmesg`, interval samples from `vmstat`, per-CPU `mpstat`, `pidstat`, extended `iostat`, a `free` snapshot, both network views from `sar` (`DEV` and `TCP,ETCP`), and a bounded batch-mode `top`. [Linux Performance Analysis in 60,000 Milliseconds](https://www.brendangregg.com/Articles/Netflix_Linux_Perf_Analysis_60s.pdf)
+
+Give the collection a shared remote deadline and limit concurrency and bytes. Align interval samples to the collection window and distinguish since-boot averages from live measurements. Record each command, sample times, exit status, and raw output. Show missing utilities, permission failures, timeouts, and unreadable samples alongside the successful checks. Summarize utilization, saturation, and errors by resource, with a link from each observation to its evidence. Save and reopen the report on Windows. From a busy process, offer to start a targeted CPU profile.
+
+### CPU profiles and flame graphs
+
+Start with a selected PID or a newly launched command and a bounded Linux `perf record` call-stack capture. Let the operator review the target, sampling frequency, call-stack mode, and duration. Check the host’s available perf capabilities and report permission, symbolization, and lost-sample issues. Run `perf script` against the finalized capture on the host, resolve symbols where available, and transfer folded stacks over SFTP. Offer the raw profile as a separately saved artifact. Reuse the diagnostic job’s timeout, storage, and cleanup rules. [CPU Flame Graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html)
+
+Render the folded stacks locally with zoom, symbol search, sample counts, and each frame’s share of samples. Frame width represents sample weight. Keep unresolved frames visible and offer an export for sharing. Ship the triage collector and offline report first, then CPU capture and viewing.
+
+**Acceptance.** Use a Linux fixture with a known CPU hotspot, a missing utility, and a denied kernel-log read. Check that the report distinguishes each outcome and ends within its deadline. Confirm the flame graph finds the hotspot, preserves its callers and counts, and reopens offline on Windows.
+
+## LLM assistance
+
+Add optional Windows-side OpenRouter settings. Store the user’s API key with Windows credential protection, load the model catalog, and let the user choose a model. Show the destination and chosen model before sending, expose available provider privacy controls such as Zero Data Retention routing, and give a clear error when the requested routing policy cannot be met. Show token usage when the service returns it. [OpenRouter model catalog](https://openrouter.ai/docs/api/api-reference/models/get-models) · [OpenRouter data controls](https://openrouter.ai/docs/guides/get-started/sovereign-ai)
+
+- **Explain terminal output.** Start from selected text or the visible pane the user chooses to share. Show an editable preview of the outgoing excerpt and let the user remove secret values or sensitive paths. Keep terminal text and diagnostic artifacts as quoted evidence. Remote output can contain instructions intended for the model, so keep command execution outside the model’s capabilities.
+- **Draft a Bash command.** Accept a description of the task and show the suggested command, its assumptions, and expected effects. Offer copy or insertion into an editable command line. The user decides whether and where to submit it.
+- **Review a performance report.** Send the user-approved summary and excerpts. Ask the model to call out anomalies, link to evidence by command and sample, and identify missing measurements. Keep those comments beside the locally produced report so readers can inspect the supporting numbers.
+
+Ship selection explanation and Bash drafting with a shared request preview, then add optional performance review. Test with a stub provider that captures the exact outbound payload, exercises cancellation and provider errors, and returns shell-looking text. Verify that requests require review and that the response alone never submits a command.
 
 ## Subsequent features for RustMUSH
 
