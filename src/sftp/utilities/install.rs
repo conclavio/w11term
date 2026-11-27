@@ -345,6 +345,89 @@ impl Engine {
         Ok(release.bin_directory)
     }
 
+    pub(in crate::sftp) async fn save_installed_tool_bundle(
+        &self,
+        name: &str,
+        id: &str,
+        directory: &Path,
+        cancel: Option<&TransferCancel>,
+    ) -> Result<PathBuf> {
+        let id = normalize_sha256(id)?;
+        let home = self.dotfile_home().await?;
+        let store = managed_tool_store(&home, name)?;
+        let managed = self
+            .utility_directories(&home, &format!("{STORE}/{name}/versions"))
+            .await?;
+        let selector = self.utility_selector_state(&store, &managed).await?;
+        ensure!(
+            !selector.conflict && selector.version.as_deref() == Some(id.as_str()),
+            "The active tool bundle changed. Refresh bundle versions."
+        );
+        let release = self
+            .utility_release_manifest(&store, name, None, &id)
+            .await?;
+        let directory = std::path::absolute(directory)?;
+        let staging = tokio::task::spawn_blocking(move || -> Result<_> {
+            std::fs::create_dir_all(&directory)?;
+            Ok(tempfile::Builder::new()
+                .prefix("installed-")
+                .tempdir_in(&directory)?)
+        })
+        .await??;
+        let mut bundle = LocalUtilityBundle::default();
+        for (index, tool) in release.tools.iter().enumerate() {
+            let remote = format!("{store}/versions/{id}/{}", tool.name);
+            ensure!(
+                self.tool_file_attrs(&remote).await?.size == Some(tool.bytes),
+                "The installed executable changed at {remote}"
+            );
+            // Numbered filenames also work for Linux command names Windows reserves.
+            let local = staging.path().join(format!("tool-{}.elf", index + 1));
+            let copied = self
+                .get(
+                    remote,
+                    local.clone(),
+                    false,
+                    DownloadChecks {
+                        max_bytes: Some(tool.bytes),
+                        sha256: Some(tool.sha256.clone()),
+                        resume: false,
+                        preserve_mtime: false,
+                    },
+                    None,
+                    cancel,
+                )
+                .await?;
+            ensure!(
+                copied["sha256"] == tool.sha256 && copied["bytes_transferred"] == tool.bytes,
+                "The pinned download for {} did not finish",
+                tool.name
+            );
+            let executable =
+                tokio::task::spawn_blocking(move || LocalUtilityExecutable::inspect(&local))
+                    .await??;
+            ensure!(
+                executable.architecture == release.architecture && executable.sha256 == tool.sha256,
+                "The saved executable did not match the active build for {}",
+                tool.name
+            );
+            bundle.add(&tool.name, executable)?;
+        }
+        self.check_selector(&store, &selector).await?;
+        let manifest = staging.path().join("bundle.json");
+        let (staging, manifest) = tokio::task::spawn_blocking(move || -> Result<_> {
+            bundle.save(&manifest, &release.name, &release.bin_directory)?;
+            Ok((staging, manifest))
+        })
+        .await??;
+        ensure!(
+            !cancel.is_some_and(TransferCancel::is_cancelled),
+            "Saving the tool bundle was cancelled"
+        );
+        let _ = staging.keep();
+        Ok(manifest)
+    }
+
     pub(super) fn utility_review(&self, report: &Value) -> Result<String> {
         let mut digest = Sha256::new_with_prefix(self.dotfiles_review_scope.to_le_bytes());
         digest.update(b"w11term-tools-review-v1\0");

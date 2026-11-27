@@ -433,6 +433,102 @@ fn rollback(id: &str, preview: Option<&Value>) -> Operation {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_tool_bundle_saves_exact_pins_for_profile_reuse() {
+    let (pane, _, root, _, server) = fixture(false).await;
+    let remote = root.path();
+    probe_response(remote, "x86_64", "/", "/usr/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let destination = local.path().join("snapshots");
+    let mut bundle = UtilityBundle {
+        version: 1,
+        name: "portable".into(),
+        bin_directory: ".local/custom-bin".into(),
+        tools: Vec::new(),
+    };
+    let arch = UtilityArchitecture::X86_64;
+    for (index, name) in ["mdd", "rg"].into_iter().enumerate() {
+        let mut bytes = executable(arch, None);
+        bytes.push(index as u8);
+        bundle.tools.push(UtilityTool {
+            name: name.into(),
+            builds: vec![build(local.path(), name, arch, bytes)],
+        });
+    }
+    let preview = || Operation::PreviewToolBundle {
+        bundle: bundle.clone(),
+    };
+    let review = guarded_job(&pane, None, preview()).await.unwrap();
+    let installed = guarded_job(&pane, None, apply(preview(), &review))
+        .await
+        .unwrap();
+    let id = installed["bundle_sha256"].as_str().unwrap();
+    let store = remote.join(".local/share/w11term/tools/portable");
+    let selector = fs::read(store.join("current")).unwrap();
+    let selected_file = store.join(format!("versions/{id}/rg"));
+    let original = fs::read(&selected_file).unwrap();
+    let save = |id: &str| Operation::SaveInstalledToolBundle {
+        name: bundle.name.clone(),
+        bundle_sha256: id.into(),
+        directory: destination.clone(),
+    };
+    let generation = pane.ssh_connection_generation().unwrap();
+    let error = guarded_job(&pane, None, save(id)).await.unwrap_err();
+    assert!(error.contains("original SSH connection"), "{error}");
+    let error = guarded_job(&pane, Some(generation), save(&"0".repeat(64)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("active tool bundle changed"), "{error}");
+    assert!(!destination.exists());
+
+    let mut corrupted = original.clone();
+    *corrupted.last_mut().unwrap() ^= 1;
+    fs::write(&selected_file, corrupted).unwrap();
+    let error = guarded_job(&pane, Some(generation), save(id))
+        .await
+        .unwrap_err();
+    assert!(error.contains("SHA-256 mismatch"), "{error}");
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    fs::write(&selected_file, original).unwrap();
+
+    let saved = guarded_job(&pane, Some(generation), save(id))
+        .await
+        .unwrap();
+    let manifest = std::path::Path::new(saved["manifest"].as_str().unwrap());
+    assert!(manifest.starts_with(&destination));
+    let exported = UtilityBundle::load(manifest).unwrap();
+    assert_eq!(exported.name, bundle.name);
+    assert_eq!(exported.bin_directory, bundle.bin_directory);
+    assert_eq!(exported.tools.len(), bundle.tools.len());
+    for (saved_tool, original_tool) in exported.tools.iter().zip(bundle.tools) {
+        assert_eq!(saved_tool.name, original_tool.name);
+        let [saved_build] = saved_tool.builds.as_slice() else {
+            panic!("expected the single installed architecture");
+        };
+        let original_build = &original_tool.builds[0];
+        assert_eq!(saved_build.architecture, arch);
+        assert_eq!(saved_build.sha256, original_build.sha256);
+        assert!(saved_build.path.starts_with(manifest.parent().unwrap()));
+        assert_eq!(
+            fs::read(&saved_build.path).unwrap(),
+            fs::read(&original_build.path).unwrap()
+        );
+        fs::remove_file(&original_build.path).unwrap();
+    }
+    let restored = guarded_job(
+        &pane,
+        None,
+        Operation::PreviewToolBundle { bundle: exported },
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored["bundle_sha256"], id);
+    assert_eq!(restored["ready"], true);
+    assert_eq!(fs::read(store.join("current")).unwrap(), selector);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn utility_install_uses_a_verified_download_cache_without_network() {
     const CHILD: &str = "W11TERM_UTILITY_CACHE_TEST";
     let Some(state) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {

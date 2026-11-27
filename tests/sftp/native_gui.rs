@@ -2929,6 +2929,31 @@ async fn native_command_reference_follows_powershell_and_ssh() {
     fs::write(state.path().join("ssh-wire"), trace.to_str().unwrap()).unwrap();
     let ssh = super::utilities::reference_tool_profile(source, state.path(), remote.path());
     drive_mixed_gui("command-reference-ui.ps1", &ssh, state.path());
+    let snapshots = fs::read_dir(state.path().join("tool-bundle-snapshots"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let [snapshot] = snapshots.as_slice() else {
+        panic!("expected one saved tool bundle");
+    };
+    let saved = w11term::sftp::UtilityBundle::load(&snapshot.path().join("bundle.json")).unwrap();
+    let original = w11term::sftp::UtilityBundle::load(&state.path().join("fleet.json")).unwrap();
+    assert_eq!(saved.name, original.name);
+    assert_eq!(saved.bin_directory, original.bin_directory);
+    assert_eq!(saved.tools.len(), original.tools.len());
+    for tool in original.tools {
+        let pin = &saved
+            .tools
+            .iter()
+            .find(|saved| saved.name == tool.name)
+            .unwrap()
+            .builds[0];
+        assert_eq!(pin.sha256, tool.builds[0].sha256);
+        assert_eq!(
+            fs::read(&pin.path).unwrap(),
+            fs::read(&tool.builds[0].path).unwrap()
+        );
+    }
     let shell = fs::read_to_string(remote.path().join(".bashrc")).unwrap();
     assert!(shell.starts_with("# preserve my shell changes\n"));
     assert!(shell.ends_with("# trailing user settings\n"));

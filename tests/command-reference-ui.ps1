@@ -3,6 +3,12 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 . (Join-Path $PSScriptRoot 'support/mixed-tab-layout.ps1')
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
+$verifyClipboard = $env:GITHUB_ACTIONS -ceq 'true' -and $env:RUNNER_ENVIRONMENT -ceq 'github-hosted'
+if ($verifyClipboard) {
+    . (Join-Path $PSScriptRoot 'support/clipboard.ps1')
+} else {
+    $env:W11TERM_TEST_COPY_FILE = Join-Path $State 'copied-manifest-path.txt'
+}
 
 $edit = [System.Windows.Automation.ControlType]::Edit
 $combo = [System.Windows.Automation.ControlType]::ComboBox
@@ -244,6 +250,38 @@ try {
     $null = Wait-Until 'rollback restored and pinned the original version' {
         (Find-Element 'Restored tool bundle portable') -and
         [IO.File]::ReadAllText($selectorPath).Contains("./versions/$oldId")
+    }
+    $held = [IO.File]::ReadAllText($selectorPath)
+    $beforeSave = [IO.File]::ReadAllText($profiles)
+    $snapshotRoot = Join-Path $State 'tool-bundle-snapshots'
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot save the active bundle' {
+        $save = Find-Element 'Save pinned bundle on Windows' $button
+        $save -and !$save.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    Click 'Save pinned bundle on Windows'
+    $manifest = Wait-Until 'active bundle saved next to the profile catalog' {
+        if (Find-Element 'Saved pinned tool bundle on Windows') {
+            $paths = @(Get-ChildItem -LiteralPath $snapshotRoot -Filter 'bundle.json' -File -Recurse)
+            if ($paths.Count -eq 1 -and (Find-Element $paths[0].FullName)) { $paths[0].FullName }
+        }
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $beforeSave -or [IO.File]::ReadAllText($selectorPath) -cne $held) {
+        throw 'Saving the bundle changed the profile or resumed automatic updates'
+    }
+    if ($verifyClipboard) {
+        $clipBefore = [FixtureClipboard]::GetClipboardSequenceNumber()
+    }
+    Click 'Copy saved manifest path'
+    $null = Wait-Until 'manifest path copied' {
+        if ($verifyClipboard) {
+            [FixtureClipboard]::ContainsNewText($clipBefore, $manifest)
+        } else {
+            (Read-ClipboardFixture) -ceq $manifest
+        }
     }
     Click 'Review update resumption'
     $null = Wait-Until 'review explains when automatic updates run' {

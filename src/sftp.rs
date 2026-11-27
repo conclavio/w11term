@@ -296,6 +296,12 @@ pub enum Operation {
     InstalledTools,
     ToolBundleVersions,
     #[serde(skip)]
+    SaveInstalledToolBundle {
+        name: String,
+        bundle_sha256: String,
+        directory: PathBuf,
+    },
+    #[serde(skip)]
     ReviewToolPath {
         review: Option<String>,
     },
@@ -890,6 +896,9 @@ pub(crate) async fn run(
                 Operation::ReviewToolPath { .. } | Operation::ReviewInstalledToolPath { .. } => {
                     Some("The PATH review needs its original SSH connection")
                 }
+                Operation::SaveInstalledToolBundle { .. } => {
+                    Some("Saving the tool bundle needs its original SSH connection")
+                }
                 Operation::SaveText { .. } => Some("The editor needs its original SSH connection"),
                 Operation::RenameEntry { .. } | Operation::CheckRenameBatch { .. } => {
                     Some("Missing SSH connection approval; rename was not started")
@@ -1068,6 +1077,9 @@ pub(crate) async fn run(
                 }
                 Operation::ToolBundleVersions => {
                     JobStage::Checking("Tool history lookup did not finish")
+                }
+                Operation::SaveInstalledToolBundle { .. } => {
+                    JobStage::Checking("Saving the installed tool bundle did not finish")
                 }
                 Operation::ReviewToolPath { .. } | Operation::ReviewInstalledToolPath { .. } => {
                     JobStage::Checking(
@@ -1623,6 +1635,16 @@ impl Engine {
             }
             InstalledTools => serde_json::to_value(self.installed_tools(cancel).await?)?,
             ToolBundleVersions => serde_json::to_value(self.tool_bundle_versions(cancel).await?)?,
+            SaveInstalledToolBundle {
+                name,
+                bundle_sha256,
+                directory,
+            } => {
+                let manifest = self
+                    .save_installed_tool_bundle(&name, &bundle_sha256, &directory, cancel)
+                    .await?;
+                json!({ "manifest": manifest })
+            }
             ReviewToolPath { review } => {
                 let settings = approved_tool_path
                     .context("The verified SSH connection has no matching tool PATH approval")?;

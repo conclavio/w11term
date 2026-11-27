@@ -11,6 +11,9 @@ pub enum Action {
     Restore,
     Resume,
     Switched(Arc<()>, Result<SwitchReport, String>),
+    Save,
+    Saved(Arc<()>, Result<SavedBundle, String>),
+    CopyManifest,
     Close,
 }
 
@@ -60,6 +63,11 @@ pub struct SwitchReport {
     bundle_sha256: String,
 }
 
+#[derive(Deserialize)]
+pub struct SavedBundle {
+    manifest: PathBuf,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Work {
     List,
@@ -67,11 +75,12 @@ enum Work {
     ReviewResume,
     Restore,
     Resume,
+    Save,
 }
 
 impl Work {
     fn writes(self) -> bool {
-        matches!(self, Self::Restore | Self::Resume)
+        matches!(self, Self::Restore | Self::Resume | Self::Save)
     }
 }
 
@@ -82,6 +91,7 @@ pub(super) struct Panel {
     review: Option<ReviewedVersion>,
     pending: Option<(Arc<()>, Work)>,
     status: Option<String>,
+    saved: Option<PathBuf>,
 }
 
 fn message(action: Action) -> Message {
@@ -159,6 +169,7 @@ impl Panel {
                 Work::ReviewResume => "Reviewing automatic updates…",
                 Work::Restore => "Restoring reviewed tool bundle…",
                 Work::Resume => "Resuming automatic updates…",
+                Work::Save => "Saving the pinned Linux executables on Windows…",
             })
         } else if !active {
             Some("Return to the original SSH pane or open a new review")
@@ -242,6 +253,25 @@ impl Panel {
             ))
         };
         fields.push(KeyedView::new("actions", actions));
+        if self.selected().is_some_and(|row| row.active) {
+            fields.push(KeyedView::new(
+                "save-pinned-bundle",
+                button("Save pinned bundle on Windows", available, || Action::Save),
+            ));
+        }
+        if let Some(manifest) = &self.saved {
+            fields.push(detail("saved-manifest", manifest.display().to_string()));
+            fields.push(detail(
+                "use-saved-manifest",
+                "Choose this manifest under Edit profile → SSH tools to review it for login sync.",
+            ));
+            fields.push(KeyedView::new(
+                "copy-manifest",
+                button("Copy saved manifest path", !writing, || {
+                    Action::CopyManifest
+                }),
+            ));
+        }
         fields.push(KeyedView::new(
             "back",
             button("Back to tool installer", !writing, || Action::Close),
@@ -352,6 +382,7 @@ impl TerminalApp {
         let current = self
             .reference_tool_target()
             .map(|(pane, session)| (pane, session.input.clone()));
+        let directory = self.store.path().with_file_name("tool-bundle-snapshots");
         let reference = &mut self.command_reference;
         let Some(installer) = &mut reference.tool_install else {
             return;
@@ -380,7 +411,8 @@ impl TerminalApp {
             | Action::Review
             | Action::ReviewResume
             | Action::Restore
-            | Action::Resume => {
+            | Action::Resume
+            | Action::Save => {
                 let Some(input) = input else { return };
                 if history.pending.is_some() {
                     return;
@@ -390,12 +422,23 @@ impl TerminalApp {
                     Action::Review => Work::Review,
                     Action::ReviewResume => Work::ReviewResume,
                     Action::Resume => Work::Resume,
+                    Action::Save => Work::Save,
                     _ => Work::Restore,
                 };
                 let operation = if work == Work::List {
                     history.versions = None;
                     history.selected = None;
+                    history.saved = None;
                     Operation::ToolBundleVersions
+                } else if work == Work::Save {
+                    let Some(row) = history.selected().filter(|row| row.active) else {
+                        return;
+                    };
+                    Operation::SaveInstalledToolBundle {
+                        name: row.bundle.clone(),
+                        bundle_sha256: row.bundle_sha256.clone(),
+                        directory,
+                    }
                 } else {
                     let resume = matches!(work, Work::ReviewResume | Work::Resume);
                     let Some(row) = history
@@ -426,6 +469,9 @@ impl TerminalApp {
                         }
                     }
                 };
+                if work == Work::Save {
+                    history.saved = None;
+                }
                 history.review = None;
                 let ticket = history.begin(work);
                 let rejected = result_message(
@@ -435,12 +481,13 @@ impl TerminalApp {
                 );
                 ctx.spawn_background_with_rejection(
                     move |_| {
-                        let timeout =
-                            Duration::from_secs(if matches!(work, Work::Review | Work::Restore) {
+                        let timeout = Duration::from_secs(
+                            if matches!(work, Work::Review | Work::Restore | Work::Save) {
                                 600
                             } else {
                                 30
-                            });
+                            },
+                        );
                         result_message(
                             ticket,
                             work,
@@ -460,6 +507,7 @@ impl TerminalApp {
                     history.selected = Some(index);
                     history.review = None;
                     history.status = None;
+                    history.saved = None;
                 }
             }
             Action::Listed(ticket, result) if history.finish(&ticket, Work::List) => match result {
@@ -475,6 +523,24 @@ impl TerminalApp {
                 match result {
                     Ok(review) => history.review = Some(review),
                     Err(error) => history.status = Some(error),
+                }
+            }
+            Action::Saved(ticket, result) if history.finish(&ticket, Work::Save) => {
+                history.status = Some(match result {
+                    Ok(saved) => {
+                        history.saved = Some(saved.manifest);
+                        "Saved pinned tool bundle on Windows".into()
+                    }
+                    Err(error) => error,
+                });
+            }
+            Action::CopyManifest if history.pending.is_none() => {
+                if let Some(path) = &history.saved {
+                    history.status =
+                        Some(match w11term::clipboard::write(&path.to_string_lossy()) {
+                            Ok(()) => "Copied the saved manifest path".into(),
+                            Err(error) => format!("Copying the saved manifest path: {error:#}"),
+                        });
                 }
             }
             Action::Switched(ticket, result) => {
@@ -524,5 +590,6 @@ fn result_message(
         Work::Review => Action::Reviewed(ticket, decode(result).map(ReviewedVersion::Rollback)),
         Work::ReviewResume => Action::Reviewed(ticket, decode(result).map(ReviewedVersion::Resume)),
         Work::Restore | Work::Resume => Action::Switched(ticket, decode(result)),
+        Work::Save => Action::Saved(ticket, decode(result)),
     })
 }

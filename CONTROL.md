@@ -1411,6 +1411,8 @@ To undo it, choose **Review PATH removal** and then **Remove reviewed PATH block
 
 Open **Bundle versions** to see the releases still stored under the SSH account, with the active version marked. Choose an earlier release and select **Review rollback** to verify its binaries and see its commands and launcher paths. **Restore reviewed version** switches to that release and pauses automatic updates for the bundle. Launchers for commands absent from the restored release become dormant.
 
+Select the active release and choose **Save pinned bundle on Windows** to use those exact builds in a profile. w11term verifies the executables against the installed release and saves them with a manifest in `tool-bundle-snapshots` beside the profile catalog. The manifest contains the installed architecture. Use **Copy saved manifest path** and choose that file under **Edit profile → SSH tools**, then review, approve, and save the profile. If updates are paused, review and resume them from **Bundle versions** after saving the profile. Keep the manifest and its sibling executables together.
+
 Review the destinations, PATH status, and selected builds. When the report has `ready: true`, pass its `review` token back to the same pane. The commands below use the default JSON response from `w11term-cli`.
 
 ```powershell
