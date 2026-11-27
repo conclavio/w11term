@@ -1,4 +1,4 @@
-use super::{LocalCapture, SourceStamp, ip_protocol_label, summary::Traffic};
+use super::{CaptureExcerptPlan, LocalCapture, SourceStamp, ip_protocol_label, summary::Traffic};
 use crate::prompts::sanitize_single_line;
 use anyhow::{Context, Result, ensure};
 use serde::{Serialize, Serializer};
@@ -146,6 +146,19 @@ impl CaptureComparison {
 
     pub fn compare_elapsed(paths: [PathBuf; 2], offsets: Range<i128>) -> Result<Self> {
         Self::scan_elapsed(paths, offsets, [None; 2])
+    }
+
+    pub fn prepare_excerpt(
+        &self,
+        source: usize,
+        path: PathBuf,
+        bounds: Range<i128>,
+    ) -> Result<CaptureExcerptPlan> {
+        let stamp = *self
+            .source_stamps
+            .get(source)
+            .context("Choose the Before or After capture")?;
+        CaptureExcerptPlan::absolute(path, bounds, stamp)
     }
 
     pub fn rescan_elapsed(&self, paths: [PathBuf; 2], offsets: Range<i128>) -> Result<Self> {

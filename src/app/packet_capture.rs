@@ -7,9 +7,9 @@ use w11term::{
     control::PacketCaptureOptions,
     ssh::{
         CaptureStop, LocalPacketCapture, PacketCapture, PacketCaptureComparison,
-        PacketCaptureInterfaces, PacketCapturePlan, PacketConversationEndpoints, ip_protocol_label,
-        open_capture_in_wireshark, open_capture_interval_in_wireshark,
-        open_capture_pair_in_wireshark,
+        PacketCaptureExcerpt, PacketCaptureExcerptPlan, PacketCaptureInterfaces, PacketCapturePlan,
+        PacketConversationEndpoints, ip_protocol_label, open_capture_in_wireshark,
+        open_capture_interval_in_wireshark, open_capture_pair_in_wireshark,
     },
 };
 
@@ -55,6 +55,7 @@ pub enum Action {
     ChooseWireshark,
     OpenWireshark,
     OpenTimelineInterval(PathBuf),
+    SaveTimelineExcerpt(PathBuf),
     OpenConversation(PathBuf),
     OpenTransportConversation(PathBuf),
     Finished(Arc<()>, Result<Option<Outcome>, String>),
@@ -65,6 +66,7 @@ pub enum Outcome {
     Reviewed(u64, Box<PacketCapturePlan>),
     Destination(PathBuf),
     Saved(PacketCapture),
+    ExcerptSaved(PacketCaptureExcerpt),
     Loaded(Arc<LocalPacketCapture>),
     Compared {
         comparison: Arc<PacketCaptureComparison>,
@@ -618,6 +620,7 @@ impl Panel {
                     let selected_option = occupied.iter().position(|&index| index == selected);
                     let timeline_path = capture.path.clone();
                     let open_path = capture.path.clone();
+                    let excerpt_path = capture.path.clone();
                     let selection = ComboBox::new()
                         .automation_name("Packet timeline intervals")
                         .items_source(labels)
@@ -684,6 +687,9 @@ impl Panel {
                                 Button::new().is_enabled(idle)
                                     .on_click(ctx.callback(move |_| message(Action::OpenTimelineInterval(open_path.clone()))))
                                     .content("Open interval in Wireshark"),
+                                Button::new().is_enabled(idle)
+                                    .on_click(ctx.callback(move |_| message(Action::SaveTimelineExcerpt(excerpt_path.clone()))))
+                                    .content("Save capture excerpt…"),
                             ))),
                         ])));
                 }
@@ -1345,6 +1351,16 @@ impl TerminalApp {
                     Ok(Some(Outcome::ComparedElapsed(revision, range, comparison)))
                 });
             }
+            Action::Comparison(revision, compare::Change::SaveTimelineExcerpt(side, range)) => {
+                let Some((path, bounds, model)) = panel
+                    .comparison
+                    .as_ref()
+                    .and_then(|comparison| comparison.excerpt_request(&revision, side, &range))
+                else {
+                    return;
+                };
+                self.save_capture_excerpt(move || model.prepare_excerpt(side, path, bounds), ctx);
+            }
             Action::Comparison(revision, change) => {
                 if let Some((capture, filter)) = panel
                     .comparison
@@ -1356,6 +1372,24 @@ impl TerminalApp {
             }
             Action::BackToCapture => panel.comparison = None,
             Action::ChooseWireshark => self.choose_capture_file(FileChoice::Wireshark, ctx),
+            Action::SaveTimelineExcerpt(path) => {
+                let Some(LoadedCapture::Local(capture)) = &panel.loaded else {
+                    return;
+                };
+                if !panel.timeline_expanded || capture.path != path {
+                    return;
+                }
+                let Some(bounds) = capture
+                    .summary
+                    .timeline
+                    .as_ref()
+                    .and_then(|timeline| timeline.selected_interval(panel.timeline_interval))
+                else {
+                    return;
+                };
+                let capture = Arc::clone(capture);
+                self.save_capture_excerpt(move || capture.prepare_excerpt(bounds), ctx);
+            }
             Action::OpenWireshark
             | Action::OpenTimelineInterval(..)
             | Action::OpenConversation(_)
@@ -1454,6 +1488,26 @@ impl TerminalApp {
                 }
             }?;
             Ok(Some(Outcome::Opened))
+        });
+    }
+
+    fn save_capture_excerpt(
+        &mut self,
+        prepare: impl FnOnce() -> anyhow::Result<PacketCaptureExcerptPlan> + Send + 'static,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
+            return;
+        };
+        let ticket = self.packet_capture.begin("Saving capture excerpt…");
+        work(ctx, ticket, move || {
+            let plan = prepare()?;
+            let purpose =
+                file_picker::Purpose::SavePacketExcerpt(plan.source().to_owned(), plan.extension());
+            let Some(file) = file_picker::pick(owner, purpose)? else {
+                return Ok(None);
+            };
+            Ok(Some(Outcome::ExcerptSaved(plan.save(file.path)?)))
         });
     }
 
@@ -1641,6 +1695,23 @@ impl TerminalApp {
                 self.remember_diagnostic(
                     w11term::diagnostic_history::Kind::PacketCapture,
                     [path],
+                    ctx,
+                );
+            }
+            Ok(Some(Outcome::ExcerptSaved(excerpt))) => {
+                let unit = if excerpt.packets == 1 {
+                    "packet"
+                } else {
+                    "packets"
+                };
+                panel.status = Some(format!(
+                    "Saved capture excerpt · {} {unit} · {}",
+                    excerpt.packets,
+                    excerpt.path.display()
+                ));
+                self.remember_diagnostic(
+                    w11term::diagnostic_history::Kind::PacketCapture,
+                    [excerpt.path],
                     ctx,
                 );
             }

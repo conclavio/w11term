@@ -52,6 +52,7 @@ pub enum Change {
         last: usize,
     },
     OpenTimelineInterval(usize, RangeInclusive<usize>),
+    SaveTimelineExcerpt(usize, RangeInclusive<usize>),
     CompareElapsed(RangeInclusive<usize>),
     CompareWholeCaptures,
     LimitElapsedInterval(bool),
@@ -188,6 +189,26 @@ impl Comparison {
             timeline.offset_range(range.clone())?,
             self.model.clone(),
         ))
+    }
+
+    pub(super) fn excerpt_request(
+        &self,
+        revision: &Arc<()>,
+        side: usize,
+        range: &RangeInclusive<usize>,
+    ) -> Option<(PathBuf, Range<i128>, Arc<PacketCaptureComparison>)> {
+        if !Arc::ptr_eq(revision, &self.revision)
+            || !self.timeline_expanded
+            || self.selected_timeline_range().as_ref() != Some(range)
+        {
+            return None;
+        }
+        let bounds = self
+            .model
+            .timeline
+            .as_ref()?
+            .occupied_range(side, range.clone())?;
+        Some((self.paths.get(side)?.clone(), bounds, self.model.clone()))
     }
 
     pub(super) fn install_elapsed(

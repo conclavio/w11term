@@ -9,7 +9,7 @@ use std::{
 
 mod conversations;
 mod ip;
-mod pcapng;
+pub(super) mod pcapng;
 mod protocols;
 mod timeline;
 mod transport;
@@ -151,11 +151,6 @@ impl Summary {
             stats: PacketStats::default(),
             capture_statistics: None,
         });
-        let fraction_limit = if format.nanoseconds {
-            1_000_000_000
-        } else {
-            1_000_000
-        };
         let mut remaining = bytes - 24;
         let mut prefix = [0; ip::PREFIX_BYTES];
         let mut records = 0;
@@ -164,11 +159,7 @@ impl Summary {
             let ([seconds, fraction, captured, original], kept) =
                 format.read_packet(file, &mut remaining, &mut prefix)?;
             records += 1;
-            let timestamp = (fraction < fraction_limit).then(|| {
-                i128::from(seconds) * i128::from(NANOS_PER_SECOND)
-                    + i128::from(fraction)
-                        * i128::from(NANOS_PER_SECOND / u64::from(fraction_limit))
-            });
+            let timestamp = format.timestamp_ns(seconds, fraction);
             self.packet(
                 0,
                 captured,
@@ -245,7 +236,7 @@ impl PacketStats {
     }
 }
 
-fn check_record_limit(records: u32) -> Result<()> {
+pub(super) fn check_record_limit(records: u32) -> Result<()> {
     ensure!(
         records < MAX_RECORDS,
         "Reached the scan limit of {MAX_RECORDS} records or blocks"

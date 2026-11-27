@@ -25,6 +25,22 @@ fn compare(directory: &Path, before: &str, after: &str, options: &[&str]) -> Out
         .unwrap()
 }
 
+fn clip(directory: &Path, input: &str, elapsed: &str, destination: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+        .current_dir(directory)
+        .env_remove("LOCALAPPDATA")
+        .args([
+            "clip-packet-capture",
+            input,
+            "--elapsed-ns",
+            elapsed,
+            "--output-file",
+            destination,
+        ])
+        .output()
+        .unwrap()
+}
+
 fn raw_ip_capture(pairs: impl IntoIterator<Item = (u32, u32)>) -> Vec<u8> {
     raw_capture(pairs.into_iter().map(|(a, b)| {
         let mut packet = [0_u8; 20];
@@ -190,6 +206,43 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
     assert!(!collision.status.success());
     assert!(collision.stdout.is_empty());
     assert_eq!(fs::read(root.join(filename)).unwrap(), output.stdout);
+}
+
+#[test]
+fn saves_exact_classic_records_inside_the_elapsed_bounds_without_replacing_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let source = classic_capture();
+    fs::write(root.join("original.pcap"), &source).unwrap();
+    let output = clip(
+        root,
+        "original.pcap",
+        "1250000000:1250000001",
+        "excerpt.pcap",
+    );
+    assert!(output.status.success(), "{output:?}");
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["result"]["packets"], 1);
+    let expected = [&source[..24], &source[44..]].concat();
+    assert_eq!(fs::read(root.join("excerpt.pcap")).unwrap(), expected);
+    let output = inspect(root, "excerpt.pcap", &[]);
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["complete"], true);
+    assert_eq!(report["truncated_packets"], 1);
+    assert_eq!(report["captured_bytes"], 2);
+
+    let duplicate = clip(root, "original.pcap", "0:1", "excerpt.pcap");
+    assert!(!duplicate.status.success());
+    assert_eq!(fs::read(root.join("excerpt.pcap")).unwrap(), expected);
+    let empty = clip(root, "original.pcap", "1:1250000000", "empty.pcap");
+    assert!(!empty.status.success());
+    assert!(!root.join("empty.pcap").exists());
+    fs::write(root.join("partial.pcap"), &source[..source.len() - 1]).unwrap();
+    let partial = clip(root, "partial.pcap", "0:1", "failed.pcap");
+    assert!(!partial.status.success());
+    assert!(!root.join("failed.pcap").exists());
+    assert_eq!(fs::read(root.join("original.pcap")).unwrap(), source);
 }
 
 #[test]

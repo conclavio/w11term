@@ -200,6 +200,15 @@ function Save-PacketComparison([string]$Path, [switch]$Json) {
     $null = Wait-Until 'save the packet comparison report' { [FixtureDialog]::ClickButton($dialog, 1) }
 }
 
+function Save-CaptureExcerpt([string]$Label, [string]$Path) {
+    Click $Label
+    $dialog = Wait-Until 'owned capture excerpt save dialog' { Find-OwnedDialog 'Save capture excerpt' }
+    $suggestion = 'capture-excerpt' + [IO.Path]::GetExtension($Path)
+    $null = Wait-Until 'enter the capture excerpt path' { [FixtureDialog]::SetFilename($dialog, $Path, $suggestion) }
+    $null = Wait-Until 'save the capture excerpt' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the capture excerpt is published' { [IO.File]::Exists($Path) }
+}
+
 function Open-PacketSection([string]$Id) {
     $expander = Wait-Until "the capture exposes '$Id'" {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
@@ -339,6 +348,16 @@ try {
         $displayFilter = $olderCapture + '.filter'
         [IO.File]::Exists($displayFilter) -and [IO.File]::ReadAllText($displayFilter) -ceq
             'frame.time >= "1970-01-01T00:00:01.499136000Z" && frame.time < "1970-01-01T00:00:01.507328000Z"'
+    }
+    $excerpt = Join-Path $State 'selected wireless interval.pcapng'
+    Save-CaptureExcerpt ('Save capture excerpt' + [char]0x2026) $excerpt
+    $excerptReport = & $Cli inspect-packet-capture $excerpt | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or !$excerptReport.complete -or $excerptReport.packets -ne 1 -or
+        $excerptReport.captured_bytes -ne 4 -or $excerptReport.timeline.start_unix_ns -cne '1500000000' -or
+        $excerptReport.interfaces -ne 2 -or $excerptReport.interface_details[1].name -cne 'wireless' -or
+        $null -ne $excerptReport.interface_details[0].capture_statistics -or
+        $null -ne $excerptReport.interface_details[1].capture_statistics) {
+        throw 'The PCAPNG excerpt did not preserve the selected packet and its interface'
     }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Click 'Open in Wireshark'
@@ -582,6 +601,14 @@ try {
         $filterPath = $conversationCapture + '.filter'
         [IO.File]::ReadAllText($filterPath) -ceq
             'frame.time >= "1970-01-01T00:00:01.786432000Z" && frame.time < "1970-01-01T00:00:04.145728000Z"'
+    }
+    $beforeExcerpt = Join-Path $State 'before range.pcap'
+    Save-CaptureExcerpt ('Save Before excerpt' + [char]0x2026) $beforeExcerpt
+    $cliExcerpt = Join-Path $State 'before range cli.pcap'
+    $null = & $Cli clip-packet-capture $conversationCapture --elapsed-ns '786432000:3145728000' --output-file $cliExcerpt
+    if ($LASTEXITCODE -ne 0 -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($beforeExcerpt)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliExcerpt))) {
+        throw 'The saved Before excerpt differs from the CLI'
     }
     Click 'Compare selected interval'
     $null = Wait-Until 'the report compares the complete selected range' {

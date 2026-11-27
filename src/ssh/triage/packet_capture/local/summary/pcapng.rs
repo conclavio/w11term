@@ -3,7 +3,13 @@ use super::{
     PacketStats, Summary, check_record_limit, ip,
 };
 use anyhow::{Context, Result, bail, ensure};
-use std::io::{Read, Seek};
+use std::{
+    io::{Read, Seek},
+    ops::Range,
+};
+
+mod excerpt;
+pub(in crate::ssh::triage::packet_capture::local) use excerpt::write_excerpt;
 
 const SECTION: [u8; 4] = [0x0a, 0x0d, 0x0d, 0x0a];
 const MAX_INTERFACES: usize = 4096;
@@ -47,12 +53,14 @@ impl Order {
     }
 }
 
+#[derive(Clone)]
 struct Interface {
     link_type: u16,
     snap: u32,
     name: Option<String>,
     resolution: u8,
     offset_seconds: i64,
+    fcs_length: Option<u8>,
 }
 
 impl Interface {
@@ -78,6 +86,7 @@ enum Entry {
         captured: u32,
         original: u32,
         timestamp: Option<i128>,
+        ticks: Option<u64>,
         decoded: Option<ip::Packet>,
     },
     Statistics {
@@ -90,14 +99,74 @@ enum Entry {
 pub(super) fn scan(
     summary: &mut Summary,
     file: &mut (impl Read + Seek),
-    mut remaining: u64,
+    bytes: u64,
     conversations: &mut ConversationScans,
 ) -> Result<()> {
-    let mut order = None;
-    let mut interfaces = Vec::new();
-    let mut blocks = 0;
     let mut section_number = 0;
     let mut section_start = 0;
+    walk(file, bytes, |_, _, entry| {
+        match entry {
+            Entry::Section(_) => {
+                section_number += 1;
+                section_start = summary.interfaces.len();
+            }
+            Entry::Interface(interface) => {
+                let interface_id = (summary.interfaces.len() - section_start) as u32;
+                summary.interface(InterfaceSummary {
+                    section: Some(section_number),
+                    interface_id,
+                    link_type: interface.link_type,
+                    snap_length: (interface.snap != 0).then_some(interface.snap),
+                    name: interface.name,
+                    stats: PacketStats::default(),
+                    capture_statistics: None,
+                });
+            }
+            Entry::Packet {
+                interface,
+                captured,
+                original,
+                timestamp,
+                decoded,
+                ..
+            } => {
+                summary.packet(
+                    section_start + interface,
+                    captured,
+                    original,
+                    timestamp,
+                    decoded,
+                    conversations,
+                );
+            }
+            Entry::Statistics {
+                interface,
+                snapshot,
+            } => {
+                let latest = &mut summary.interfaces[section_start + interface].capture_statistics;
+                if latest
+                    .as_ref()
+                    .is_none_or(|current| snapshot.ticks >= current.ticks)
+                {
+                    *latest = Some(snapshot);
+                }
+            }
+            Entry::Other => (),
+        }
+        Ok(())
+    })
+}
+
+fn walk<R: Read + Seek>(
+    file: &mut R,
+    bytes: u64,
+    mut visit: impl FnMut(&mut R, Range<u64>, Entry) -> Result<()>,
+) -> Result<()> {
+    let mut remaining = bytes;
+    let mut order = None;
+    let mut interfaces = Vec::new();
+    let mut interfaces_total = 0;
+    let mut blocks = 0;
     while remaining > 0 {
         check_record_limit(blocks)?;
         ensure!(remaining >= 12, "Incomplete PCAPNG block header");
@@ -137,7 +206,7 @@ pub(super) fn scan(
             match endian.u32(kind) {
                 1 => {
                     ensure!(
-                        summary.interfaces.len() < MAX_INTERFACES,
+                        interfaces_total < MAX_INTERFACES,
                         "Reached the PCAPNG scan limit of {MAX_INTERFACES} interfaces"
                     );
                     Entry::Interface(block.interface()?)
@@ -150,55 +219,19 @@ pub(super) fn scan(
             }
         };
         block.finish(size)?;
-        match entry {
+        match &entry {
             Entry::Section(endian) => {
-                order = Some(endian);
+                order = Some(*endian);
                 interfaces.clear();
-                section_number += 1;
-                section_start = summary.interfaces.len();
             }
-            Entry::Interface(mut interface) => {
-                summary.interface(InterfaceSummary {
-                    section: Some(section_number),
-                    interface_id: interfaces.len() as u32,
-                    link_type: interface.link_type,
-                    snap_length: (interface.snap != 0).then_some(interface.snap),
-                    name: interface.name.take(),
-                    stats: PacketStats::default(),
-                    capture_statistics: None,
-                });
-                interfaces.push(interface);
+            Entry::Interface(interface) => {
+                interfaces_total += 1;
+                interfaces.push(interface.clone());
             }
-            Entry::Packet {
-                interface,
-                captured,
-                original,
-                timestamp,
-                decoded,
-            } => {
-                summary.packet(
-                    section_start + interface,
-                    captured,
-                    original,
-                    timestamp,
-                    decoded,
-                    conversations,
-                );
-            }
-            Entry::Statistics {
-                interface,
-                snapshot,
-            } => {
-                let latest = &mut summary.interfaces[section_start + interface].capture_statistics;
-                if latest
-                    .as_ref()
-                    .is_none_or(|current| snapshot.ticks >= current.ticks)
-                {
-                    *latest = Some(snapshot);
-                }
-            }
-            Entry::Other => (),
+            _ => (),
         }
+        let start = bytes - remaining;
+        visit(file, start..start + total, entry)?;
         remaining -= total;
         blocks += 1;
     }
@@ -279,6 +312,7 @@ impl<T: Read + Seek> Block<'_, T> {
             name: None,
             resolution: 6,
             offset_seconds: 0,
+            fcs_length: None,
         };
         ensure!(
             self.remaining <= MAX_OPTIONS_BYTES,
@@ -289,6 +323,10 @@ impl<T: Read + Seek> Block<'_, T> {
                 (2, _) if interface.name.is_none() => interface.name = self.interface_name(size)?,
                 (9, 1) => {
                     interface.resolution = self.read::<1>()?[0];
+                    self.skip(3)?;
+                }
+                (13, 1) => {
+                    interface.fcs_length = Some(self.read::<1>()?[0]);
                     self.skip(3)?;
                 }
                 (14, 8) => interface.offset_seconds = self.order.u64(self.read()?) as i64,
@@ -386,6 +424,7 @@ impl<T: Read + Seek> Block<'_, T> {
             captured,
             original,
             timestamp: Some(interface.timestamp_ns(ticks)),
+            ticks: Some(ticks),
             decoded: self.decode_ip(interface.link_type, captured)?,
         })
     }
@@ -409,6 +448,7 @@ impl<T: Read + Seek> Block<'_, T> {
             captured,
             original,
             timestamp: None,
+            ticks: None,
             decoded: self.decode_ip(interface.link_type, captured)?,
         })
     }

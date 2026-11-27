@@ -70,6 +70,7 @@ pub(super) enum Purpose {
     OpenPacketCapture(PathBuf),
     ComparePacketCapture(PathBuf),
     SavePacketCapture(PathBuf),
+    SavePacketExcerpt(PathBuf, &'static str),
     WiresharkExecutable(PathBuf),
     OpenSyscallTrace(PathBuf),
     SaveSyscallTrace(PathBuf),
@@ -402,6 +403,37 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     }])?;
                     options |= FOS_FILEMUSTEXIST;
                 }
+                if let Some(folder) = path.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
+            Purpose::SavePacketExcerpt(path, extension) => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                let (name, pattern, suffix, filename) = if extension == "pcapng" {
+                    (
+                        w!("PCAPNG capture"),
+                        w!("*.pcapng"),
+                        w!("pcapng"),
+                        w!("capture-excerpt.pcapng"),
+                    )
+                } else {
+                    (
+                        w!("PCAP capture"),
+                        w!("*.pcap"),
+                        w!("pcap"),
+                        w!("capture-excerpt.pcap"),
+                    )
+                };
+                dialog.SetTitle(w!("Save capture excerpt"))?;
+                dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                    pszName: name,
+                    pszSpec: pattern,
+                }])?;
+                dialog.SetDefaultExtension(suffix)?;
+                dialog.SetFileName(filename)?;
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT | FOS_NOTESTFILECREATE;
+                options &= !FOS_OVERWRITEPROMPT;
                 if let Some(folder) = path.parent() {
                     local_folder(&dialog, folder);
                 }

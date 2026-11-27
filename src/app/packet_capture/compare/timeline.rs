@@ -208,6 +208,20 @@ impl Comparison {
                         }))
                         .content(format!("Open {label} interval in Wireshark")),
                 ));
+                let revision = Arc::clone(&self.revision);
+                let range = selected.clone();
+                fields.push(KeyedView::new(
+                    format!("save-{side}"),
+                    Button::new()
+                        .is_enabled(idle && has_packets)
+                        .on_click(ctx.callback(move |_| {
+                            message(Action::Comparison(
+                                revision.clone(),
+                                Change::SaveTimelineExcerpt(side, range.clone()),
+                            ))
+                        }))
+                        .content(format!("Save {label} excerpt…")),
+                ));
             }
         }
         let revision = Arc::clone(&self.revision);

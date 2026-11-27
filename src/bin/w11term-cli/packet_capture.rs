@@ -7,7 +7,10 @@ use std::{
     path::{self, Path, PathBuf},
 };
 use w11term::control::{PacketCaptureOptions, Reply, Request};
-use w11term::ssh::{LocalPacketCapture, PacketCaptureComparison, open_capture_in_wireshark};
+use w11term::ssh::{
+    LocalPacketCapture, PacketCaptureComparison, PacketCaptureExcerptPlan,
+    open_capture_in_wireshark,
+};
 
 pub(super) const HELP: &str = concat!(
     "w11term-cli [--pid PID] list-packet-interfaces --pane ID\n",
@@ -27,6 +30,9 @@ pub(super) const COMPARE_HELP: &str = concat!(
     "w11term-cli compare-packet-captures BEFORE AFTER [--elapsed-ns START:END] ",
     "[--format json|text] [--output-file PATH]",
 );
+pub(super) const CLIP_VERB: &str = "clip-packet-capture";
+pub(super) const CLIP_HELP: &str =
+    "w11term-cli clip-packet-capture FILE --elapsed-ns START:END --output-file PATH";
 
 pub(super) fn inspect_file(args: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut args = args.iter();
@@ -71,6 +77,25 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
     })
 }
 
+pub(super) fn clip_file(args: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let mut args = args.iter();
+    let input = args.next().context("provide the source capture file")?;
+    let options = report_options(CLIP_VERB, args)?;
+    let bounds = parse_elapsed(
+        options
+            .elapsed_ns
+            .context("provide --elapsed-ns START:END")?,
+    )?;
+    let output = options.output_file.context("provide --output-file PATH")?;
+    let excerpt = PacketCaptureExcerptPlan::elapsed(path::absolute(input)?, bounds)?
+        .save(path::absolute(output)?)?;
+    let reply = Reply::from_result(Ok(serde_json::to_value(excerpt)?));
+    serde_json::to_writer(&mut *stdout, &reply)?;
+    writeln!(stdout)?;
+    stdout.flush()?;
+    Ok(())
+}
+
 fn parse_elapsed(value: &str) -> Result<Range<i128>> {
     let (start, end) = value
         .split_once(':')
@@ -96,7 +121,7 @@ fn report_options<'a>(
     while let Some(flag) = args.next() {
         let target = match flag.as_str() {
             "--format" if verb == COMPARE_VERB => &mut options.format,
-            "--elapsed-ns" if verb == COMPARE_VERB => &mut options.elapsed_ns,
+            "--elapsed-ns" if matches!(verb, COMPARE_VERB | CLIP_VERB) => &mut options.elapsed_ns,
             "--output-file" => &mut options.output_file,
             _ => bail!("unknown option {flag} for {verb}"),
         };

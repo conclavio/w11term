@@ -26,7 +26,8 @@ pub(crate) const CONTROL_SECONDS: u64 = 155;
 mod local;
 mod ring;
 pub use local::{
-    CaptureComparison, ConversationChange, ConversationEndpoints, LocalCapture, ip_protocol_label,
+    CaptureComparison, CaptureExcerpt, CaptureExcerptPlan, ConversationChange,
+    ConversationEndpoints, LocalCapture, ip_protocol_label,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -885,6 +886,18 @@ impl ClassicPcap {
         file.seek_relative(i64::from(caplen) - kept as i64)?;
         *remaining -= 16 + u64::from(caplen);
         Ok((fields, kept))
+    }
+
+    fn timestamp_ns(&self, seconds: u32, fraction: u32) -> Option<i128> {
+        let limit = if self.nanoseconds {
+            1_000_000_000
+        } else {
+            1_000_000
+        };
+        (fraction < limit).then(|| {
+            i128::from(seconds) * 1_000_000_000
+                + i128::from(fraction) * (1_000_000_000 / i128::from(limit))
+        })
     }
 }
 

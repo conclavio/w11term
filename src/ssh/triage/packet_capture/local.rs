@@ -12,8 +12,10 @@ use std::{
 };
 
 mod compare;
+mod excerpt;
 mod summary;
 pub use compare::{CaptureComparison, ConversationChange, ConversationEndpoints};
+pub use excerpt::{CaptureExcerpt, CaptureExcerptPlan};
 pub use summary::ip_protocol_label;
 use summary::{
     Bucket, CaptureCounters, Conversations, IpProtocols, PacketStats, Summary,
