@@ -240,30 +240,33 @@ function Open-PacketSection([string]$Id) {
 }
 
 function Wait-CaptureCombo([string]$Name) {
-    Wait-Until "enabled capture dropdown '$Name'" {
+    $search = @{ scroll = $null }
+    Wait-Until "visible capture dropdown '$Name'" {
         $item = Find-Element $Name ([System.Windows.Automation.ControlType]::ComboBox)
-        if ($item -and $item.Current.IsEnabled) { $item }
+        if ($item -and $item.Current.IsEnabled) {
+            if (!$item.Current.IsOffscreen) { return $item }
+            Move-NativeControlIntoView $item $search
+        }
     }
+}
+
+function Select-CaptureComboItem([string]$Combo, [string]$Name) {
+    $dropdown = (Wait-CaptureCombo $Combo).GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    $item = Wait-Until "'$Name' is selectable in '$Combo'" {
+        if ($dropdown.Current.ExpandCollapseState -eq 'Collapsed') {
+            $dropdown.Expand()
+        }
+        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
 }
 
 function Select-ComparisonConversationType([string]$Name) {
-    $type = Wait-CaptureCombo 'Conversation type'
-    $type.SetFocus()
-    $type.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $item = Wait-Until "conversation type '$Name' is selectable" {
-        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem)
-    }
-    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Select-CaptureComboItem 'Conversation type' $Name
 }
 
 function Select-ComparisonCaptureSide([string]$Name) {
-    $source = Wait-CaptureCombo 'Capture to open in Wireshark'
-    $source.SetFocus()
-    $source.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $item = Wait-Until "capture side '$Name' is selectable" {
-        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem)
-    }
-    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Select-CaptureComboItem 'Capture to open in Wireshark' $Name
 }
 
 function Udp-PortFilter([int]$Port) {
@@ -767,6 +770,16 @@ try {
         (Find-Element "RST${dot}Before 1${dot}After 0") -and
         (Find-Element 'TCP flag deltas unavailable for this coverage')
     }
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+    $bounds = $root.Current.BoundingRectangle
+    $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
+    $scale = [FixtureMessages]::GetDpiForWindow($window) / 96.0
+    $resize.Resize($bounds.Width, [Math]::Round(280 * $scale))
+    $scroll = Wait-Until 'the comparison summary can scroll' {
+        $combo = Find-Element 'Conversation type' ([System.Windows.Automation.ControlType]::ComboBox)
+        if ($combo) { Find-NativeVerticalScroll $combo }
+    }
+    $scroll.SetScrollPercent(-1, 100)
     Select-ComparisonConversationType 'TCP and UDP ports'
     $null = Wait-Until 'the transport comparison reports both pairs and their coverage' {
         (Find-Element 'TCP and UDP conversation changes 2') -and
@@ -774,6 +787,7 @@ try {
         (Find-Element "Before${dot}Left to right 3 packets, 120 bytes${dot}Right to left 1 packets, 40 bytes") -and
         (Find-Element "Change${dot}Unavailable")
     }
+    $resize.Resize($bounds.Width, $bounds.Height)
     $row = Wait-Until 'the compared TCP pair can be selected' {
         Find-Element "TCP${dot}192.0.2.1:49152 $bothDirections 192.0.2.2:443" ([System.Windows.Automation.ControlType]::ListItem)
     }

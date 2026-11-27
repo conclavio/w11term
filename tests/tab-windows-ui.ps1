@@ -580,7 +580,8 @@ function Test-ManageWorkspace {
     if (!$claim -or $claim.workspace -cne $originalClaim.workspace) {
         throw 'Renaming changed the identity of the live workspace'
     }
-    Invoke-Button (Find-Here $manager "Switch to workspace $managedName")
+    Use-Window $manager
+    Invoke-WorkspaceButton $manager "Switch to workspace $managedName"
     Expect-Focus $origin $ssh.id 'Switching by the new name returns to the original SSH pane'
     if ([TabFixtureWindows]::OwnedBy($app.Id).Count -ne 2 -or @((Control @('list')).sessions).Count -ne 4) {
         throw 'Switching after rename reopened panes'
