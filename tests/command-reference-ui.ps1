@@ -163,7 +163,7 @@ try {
         Find-Element 'Managed PATH repaired for new shells'
     }
     Click 'Browse for tool bundle'
-    $manifestDialog = Wait-Until 'owned tool manifest picker' { Find-OwnedDialog 'Choose SSH tool bundle' }
+    $manifestDialog = Wait-OwnedDialog 'Choose SSH tool bundle'
     $manifestPath = Join-Path $State 'Tool review.json'
     $null = Wait-Until 'enter the full update manifest path' { [FixtureDialog]::SetFilename($manifestDialog, $manifestPath, '') }
     $null = Wait-Until 'select the update manifest' { [FixtureDialog]::ClickButton($manifestDialog, 1) }
