@@ -41,6 +41,9 @@ public static class Viewer {
         if (args.Length == 2 && args[0] == "-r" && File.Exists(args[1])) {
             File.WriteAllText(args[1] + ".opened", args[0]);
         }
+        if (args.Length == 4 && args[0] == "-r" && args[2] == "-Y" && File.Exists(args[1])) {
+            File.WriteAllText(args[1] + ".filter", args[3]);
+        }
     }
 }
 '@
@@ -81,6 +84,17 @@ function Select-Viewer {
     $null = Wait-Until 'viewer picker closed' { !(Find-OwnedDialog 'Choose Wireshark executable') }
 }
 
+function Open-PacketTimeline {
+    $expander = Wait-Until 'the capture exposes a timeline expander' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $condition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'packet-timeline')
+        $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    }
+    $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $expander
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -101,13 +115,7 @@ try {
             (Find-Element "Reported${dot}Received 12") -and
             (Find-Element "Reported${dot}Interface drops 1")
     }
-    $expander = Wait-Until 'the capture exposes a timeline expander' {
-        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
-        $condition = [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'packet-timeline')
-        $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-    }
-    $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $expander = Open-PacketTimeline
     $null = Wait-Until 'the timeline chart and its earliest peak are visible' {
         (Find-Element 'Packet timeline chart' -Visible) -and
             (Find-Element 'Bucket width 0.008192 s' -Visible) -and
@@ -163,6 +171,22 @@ try {
     }
     Select-Viewer
     if ([IO.File]::Exists($olderCapture + '.opened')) { throw 'Selecting the local file launched Wireshark' }
+    $expander = Open-PacketTimeline
+    $intervals = Wait-Until 'the packet timeline can select populated intervals' {
+        Find-Element 'Packet timeline intervals' ([System.Windows.Automation.ControlType]::ComboBox)
+    }
+    $intervals.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $interval = Wait-Until 'the second populated interval is available' {
+        Find-Element "+0.499712 s${dot}1 packet" ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    }
+    $interval.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Click 'Open interval in Wireshark'
+    $null = Wait-Until 'the original capture and exact UTC interval reach Wireshark' {
+        $displayFilter = $olderCapture + '.filter'
+        [IO.File]::Exists($displayFilter) -and [IO.File]::ReadAllText($displayFilter) -ceq
+            'frame.time >= "1970-01-01T00:00:01.499136000Z" && frame.time < "1970-01-01T00:00:01.507328000Z"'
+    }
+    $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Click 'Open in Wireshark'
     $null = Wait-Until 'the local capture reaches Wireshark without an SSH pane' {
         $opened = $olderCapture + '.opened'

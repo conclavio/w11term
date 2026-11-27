@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::{collections::BTreeMap, mem};
+use std::{collections::BTreeMap, mem, ops::Range};
 
 const MIN_BUCKET_NS: i128 = 1_000;
 const MAX_BUCKETS: i128 = 64;
@@ -63,6 +63,14 @@ impl Timeline {
         self.width as u128
     }
 
+    pub fn occupied_interval(&self, bucket: usize) -> Option<Range<i128>> {
+        let (&first, _) = self.bins.first_key_value()?;
+        let index = first.checked_add(i128::try_from(bucket).ok()?)?;
+        self.bins.get(&index)?;
+        let start = index * self.width;
+        Some(start..start + self.width)
+    }
+
     pub fn buckets(&self) -> impl Iterator<Item = Bucket> + '_ {
         let first = self.bins.first_key_value().map_or(0, |(&index, _)| index);
         let last = self.bins.last_key_value().map_or(-1, |(&index, _)| index);
@@ -98,5 +106,9 @@ mod tests {
                 .sum::<u64>(),
             17
         );
+        assert_eq!(timeline.occupied_interval(32), Some(-4_000..0));
+        assert_eq!(timeline.occupied_interval(33), None);
+        assert_eq!(timeline.occupied_interval(34), Some(4_000..8_000));
+        assert_eq!(timeline.occupied_interval(35), None);
     }
 }

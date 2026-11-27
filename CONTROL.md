@@ -1499,6 +1499,8 @@ If a PCAPNG file records interface statistics, the panel shows the newest timest
 
 Expand **Packet timeline** to see packet activity across the whole capture, with the peak bucket and its captured bytes. The timeline uses up to 64 equal-width buckets of at least one microsecond, including empty intervals, and counts packets that have usable timestamps. The JSON `timeline` object gives the start and bucket width as decimal nanosecond strings, followed by packet and byte counts for each bucket. Bucket intervals include their start and exclude their end. A capture without usable timestamps has a `null` timeline. The timeline covers the scanned prefix when the report is partial.
 
+Select a populated interval, then choose **Open interval in Wireshark** to open the original capture with a UTC display filter for that interval. The selector starts at the peak bucket. **Open in Wireshark** opens the full capture. [Wireshark display filters](https://www.wireshark.org/docs/man-pages/wireshark-filter.html)
+
 ```powershell
 $summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
 $summary.packets

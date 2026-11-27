@@ -4,7 +4,7 @@ use w11term::{
     control::PacketCaptureOptions,
     ssh::{
         CaptureStop, LocalPacketCapture, PacketCapture, PacketCaptureInterfaces, PacketCapturePlan,
-        open_capture_in_wireshark,
+        open_capture_in_wireshark, open_capture_interval_in_wireshark,
     },
 };
 
@@ -30,6 +30,7 @@ pub enum Action {
     SelectInterface(flame_graph::Connection, String),
     SelectSavedInterface(PathBuf, usize),
     TimelineExpanded(bool),
+    SelectTimelineInterval(PathBuf, usize),
     Tmpfs(bool),
     Review,
     Save,
@@ -37,6 +38,7 @@ pub enum Action {
     OpenCaptureFile(Option<PathBuf>),
     ChooseWireshark,
     OpenWireshark,
+    OpenTimelineInterval(PathBuf, usize),
     Finished(Arc<()>, Result<Option<Outcome>, String>),
 }
 
@@ -175,6 +177,7 @@ pub(super) struct Panel {
     loaded: Option<LoadedCapture>,
     saved_interface: usize,
     timeline_expanded: bool,
+    timeline_interval: Option<usize>,
     wireshark: Option<PathBuf>,
     pub(super) pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
@@ -498,13 +501,60 @@ impl Panel {
             }
             if let Some(timeline) = &summary.timeline {
                 let buckets: Vec<_> = timeline.buckets().collect();
-                if let Some((index, peak)) = buckets
+                if let Some((peak_index, peak)) = buckets
                     .iter()
                     .enumerate()
                     .max_by_key(|(index, bucket)| (bucket.packets, std::cmp::Reverse(*index)))
                 {
                     const CHART_HEIGHT: f64 = 56.0;
                     let width = timeline.bucket_width_ns();
+                    let selected = self
+                        .timeline_interval
+                        .filter(|&index| {
+                            buckets.get(index).is_some_and(|bucket| bucket.packets != 0)
+                        })
+                        .unwrap_or(peak_index);
+                    let occupied: Vec<_> = buckets
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, bucket)| bucket.packets != 0)
+                        .map(|(index, _)| index)
+                        .collect();
+                    let labels = occupied
+                        .iter()
+                        .map(|&index| {
+                            let bucket = &buckets[index];
+                            let unit = if bucket.packets == 1 {
+                                "packet"
+                            } else {
+                                "packets"
+                            };
+                            format!(
+                                "+{} s · {} {unit}",
+                                seconds_text(width * index as u128),
+                                bucket.packets
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let selected_option = occupied.iter().position(|&index| index == selected);
+                    let timeline_path = capture.path.clone();
+                    let open_path = capture.path.clone();
+                    let selection = ComboBox::new()
+                        .automation_name("Packet timeline intervals")
+                        .items_source(labels)
+                        .selected_index(selected_option)
+                        .is_enabled(idle)
+                        .on_selection_changed(ctx.callback(move |option: Option<usize>| {
+                            option.and_then(|index| occupied.get(index)).map_or(
+                                Message::ControlIdle,
+                                |&index| {
+                                    message(Action::SelectTimelineInterval(
+                                        timeline_path.clone(),
+                                        index,
+                                    ))
+                                },
+                            )
+                        }));
                     let bars = Grid::new()
                         .columns((0..buckets.len()).map(|_| GridLength::Star(1.0)))
                         .column_spacing(1.0)
@@ -525,7 +575,11 @@ impl Panel {
                                                     * CHART_HEIGHT)
                                                     .max(1.0),
                                             )
-                                            .background(Color::rgb(96, 165, 230)),
+                                            .background(if column == selected {
+                                                Color::rgb(161, 205, 246)
+                                            } else {
+                                                Color::rgb(96, 165, 230)
+                                            }),
                                     )
                                 }),
                         );
@@ -545,8 +599,12 @@ impl Panel {
                                 Border::new().height(CHART_HEIGHT).background(Color::rgb(44, 44, 48))
                                     .automation_name("Packet timeline chart").content(bars),
                                 TextBlock::new().text(format!("Peak {} {unit} · {} bytes · +{} s from timeline start",
-                                    peak.packets, peak.captured_bytes, seconds_text(width * index as u128)))
+                                    peak.packets, peak.captured_bytes, seconds_text(width * peak_index as u128)))
                                     .text_wrapping(TextWrapping::Wrap),
+                                selection,
+                                Button::new().is_enabled(idle)
+                                    .on_click(ctx.callback(move |_| message(Action::OpenTimelineInterval(open_path.clone(), peak_index))))
+                                    .content("Open interval in Wireshark"),
                             ))),
                         ])));
                 }
@@ -823,6 +881,19 @@ impl TerminalApp {
                 }
             }
             Action::TimelineExpanded(expanded) => panel.timeline_expanded = expanded,
+            Action::SelectTimelineInterval(path, index) => {
+                if let Some(LoadedCapture::Local(capture)) = &panel.loaded
+                    && capture.path == path
+                    && capture
+                        .summary
+                        .timeline
+                        .as_ref()
+                        .and_then(|timeline| timeline.occupied_interval(index))
+                        .is_some()
+                {
+                    panel.timeline_interval = Some(index);
+                }
+            }
             Action::Review => self.review_packet_capture(ctx),
             Action::Save => self.choose_capture_file(FileChoice::Save, ctx),
             Action::OpenCaptureFile(None) => self.choose_capture_file(FileChoice::Capture, ctx),
@@ -835,8 +906,24 @@ impl TerminalApp {
                 });
             }
             Action::ChooseWireshark => self.choose_capture_file(FileChoice::Wireshark, ctx),
-            Action::OpenWireshark => {
+            Action::OpenWireshark | Action::OpenTimelineInterval(..) => {
                 let Some(capture) = &panel.loaded else { return };
+                let interval = if let Action::OpenTimelineInterval(path, peak_index) = action {
+                    let LoadedCapture::Local(local) = capture else {
+                        return;
+                    };
+                    if !panel.timeline_expanded || local.path != path {
+                        return;
+                    }
+                    let Some(interval) = local.summary.timeline.as_ref().and_then(|timeline| {
+                        timeline.occupied_interval(panel.timeline_interval.unwrap_or(peak_index))
+                    }) else {
+                        return;
+                    };
+                    Some(interval)
+                } else {
+                    None
+                };
                 let capture = capture.path().to_owned();
                 let configured = panel.wireshark.clone();
                 let ticket = panel.begin("Opening Wireshark…");
@@ -844,7 +931,11 @@ impl TerminalApp {
                     let executable = configured.or_else(default_wireshark).context(
                         "Wireshark was not found. Choose its executable to open the capture.",
                     )?;
-                    open_capture_in_wireshark(&capture, &executable)?;
+                    if let Some(interval) = interval {
+                        open_capture_interval_in_wireshark(&capture, &executable, interval)?;
+                    } else {
+                        open_capture_in_wireshark(&capture, &executable)?;
+                    }
                     Ok(Some(Outcome::Opened))
                 });
             }
@@ -1016,6 +1107,7 @@ impl TerminalApp {
                 panel.loaded = Some(LoadedCapture::Local(*capture));
                 panel.saved_interface = 0;
                 panel.timeline_expanded = false;
+                panel.timeline_interval = None;
                 panel.activity = None;
                 self.remember_diagnostic(
                     w11term::diagnostic_history::Kind::PacketCapture,

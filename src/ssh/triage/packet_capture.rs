@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     io::{BufReader, Read, Seek},
+    ops::Range,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -426,6 +427,41 @@ fn check_before_launch(stop: &CaptureStop) -> Result<()> {
 }
 
 pub fn open_capture_in_wireshark(path: &Path, executable: &Path) -> Result<u32> {
+    launch_wireshark(path, executable, None)
+}
+
+pub fn open_capture_interval_in_wireshark(
+    path: &Path,
+    executable: &Path,
+    interval: Range<i128>,
+) -> Result<u32> {
+    let filter = wireshark_interval_filter(interval)?;
+    launch_wireshark(path, executable, Some(&filter))
+}
+
+fn wireshark_interval_filter(interval: Range<i128>) -> Result<String> {
+    use chrono::{DateTime, Datelike, SecondsFormat};
+    ensure!(
+        interval.start < interval.end,
+        "Choose a nonempty capture interval"
+    );
+    let utc = |timestamp: i128| -> Result<String> {
+        let seconds = i64::try_from(timestamp.div_euclid(1_000_000_000)).ok();
+        let nanos = timestamp.rem_euclid(1_000_000_000) as u32;
+        let time = seconds
+            .and_then(|seconds| DateTime::from_timestamp(seconds, nanos))
+            .filter(|time| (1..=9999).contains(&time.year()))
+            .context("The selected interval is outside Wireshark's calendar range")?;
+        Ok(time.to_rfc3339_opts(SecondsFormat::Nanos, true))
+    };
+    Ok(format!(
+        "frame.time >= \"{}\" && frame.time < \"{}\"",
+        utc(interval.start)?,
+        utc(interval.end)?,
+    ))
+}
+
+fn launch_wireshark(path: &Path, executable: &Path, filter: Option<&str>) -> Result<u32> {
     ensure!(
         executable.is_absolute()
             && executable
@@ -443,11 +479,12 @@ pub fn open_capture_in_wireshark(path: &Path, executable: &Path) -> Result<u32> 
         path.is_absolute() && path.is_file(),
         "The saved capture file is unavailable"
     );
-    Ok(std::process::Command::new(executable)
-        .arg("-r")
-        .arg(path)
-        .spawn()?
-        .id())
+    let mut command = std::process::Command::new(executable);
+    command.arg("-r").arg(path);
+    if let Some(filter) = filter {
+        command.arg("-Y").arg(filter);
+    }
+    Ok(command.spawn()?.id())
 }
 
 fn command(
@@ -717,6 +754,17 @@ impl ClassicPcap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wireshark_interval_filters_keep_exact_utc_bounds_and_cross_the_epoch() {
+        let filter = wireshark_interval_filter(-1..1_000_000_001).unwrap();
+        assert_eq!(
+            filter,
+            "frame.time >= \"1969-12-31T23:59:59.999999999Z\" && frame.time < \"1970-01-01T00:00:01.000000001Z\""
+        );
+        assert!(wireshark_interval_filter(0..0).is_err());
+        assert!(wireshark_interval_filter(0..i128::MAX).is_err());
+    }
 
     #[test]
     fn interface_list_preserves_literal_names_and_skips_unselectable_entries() {
