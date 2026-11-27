@@ -263,11 +263,20 @@ try {
     $null = Control @('focus-pane','--pane',"$remotePane")
     Wait-Focus $remotePane
     Click 'Save pinned bundle on Windows'
-    $manifest = Wait-Until 'active bundle saved next to the profile catalog' {
-        if (Find-Element 'Saved pinned tool bundle on Windows') {
-            $paths = @(Get-ChildItem -LiteralPath $snapshotRoot -Filter 'bundle.json' -File -Recurse)
-            if ($paths.Count -eq 1 -and (Find-Element $paths[0].FullName)) { $paths[0].FullName }
+    $observed = @{ ManifestCount = 0; CopyEnabled = $false }
+    try {
+        $manifest = Wait-Until 'saved snapshot and its enabled copy action' {
+            $copy = Find-Element 'Copy saved manifest path' $button
+            $observed.CopyEnabled = $copy -and $copy.Current.IsEnabled
+            if ([IO.Directory]::Exists($snapshotRoot)) {
+                $paths = @(Get-ChildItem -LiteralPath $snapshotRoot -Filter 'bundle.json' -File -Recurse)
+                $observed.ManifestCount = $paths.Count
+                if ($paths.Count -eq 1 -and $observed.CopyEnabled) { $paths[0].FullName }
+            }
         }
+    } catch {
+        $labels = (Get-NativeTextLabels) -join ' | '
+        throw "$_ Snapshot root [$snapshotRoot], manifests $($observed.ManifestCount), copy enabled $($observed.CopyEnabled). Visible text: $labels"
     }
     if ([IO.File]::ReadAllText($profiles) -cne $beforeSave -or [IO.File]::ReadAllText($selectorPath) -cne $held) {
         throw 'Saving the bundle changed the profile or resumed automatic updates'
@@ -277,11 +286,12 @@ try {
     }
     Click 'Copy saved manifest path'
     $null = Wait-Until 'manifest path copied' {
-        if ($verifyClipboard) {
-            [FixtureClipboard]::ContainsNewText($clipBefore, $manifest)
+        $copied = if ($verifyClipboard) {
+            [FixtureClipboard]::ReadNewText($clipBefore)
         } else {
-            (Read-ClipboardFixture) -ceq $manifest
+            Read-ClipboardFixture
         }
+        $copied -and [FixtureDialog]::SameFile($manifest, $copied)
     }
     Click 'Review update resumption'
     $null = Wait-Until 'review explains when automatic updates run' {
@@ -309,7 +319,7 @@ try {
         $fingerprintField = Find-Element 'Tool bundle host-key fingerprint' $edit
         $approve = Find-Element 'Approve tool sync' $button
         $bundleField -and $homeField -and $fingerprintField -and $approve -and $approve.Current.IsEnabled -and
-            $bundleField.GetCurrentPattern($value).Current.Value -ceq $manifest -and
+            [FixtureDialog]::SameFile($manifest, $bundleField.GetCurrentPattern($value).Current.Value) -and
             $homeField.GetCurrentPattern($value).Current.Value -ceq '/' -and
             $fingerprintField.GetCurrentPattern($value).Current.Value -ceq $originalProfile.host_key
     }
@@ -320,7 +330,7 @@ try {
     Click 'Save profile changes'
     $null = Wait-Until 'snapshot becomes the saved profile bundle and retains the PATH preference' {
         $scope = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.tool_bundle
-        $scope.bundle -ceq $manifest -and $scope.name -ceq 'portable' -and $scope.home -ceq '/' -and
+        [FixtureDialog]::SameFile($manifest, $scope.bundle) -and $scope.name -ceq 'portable' -and $scope.home -ceq '/' -and
             $scope.fingerprint -ceq $originalProfile.host_key -and $scope.add_to_path.shell -ceq 'bash'
     }
     $null = Control @('focus-pane','--pane',"$remotePane")
