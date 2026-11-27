@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     io::{BufReader, Read, Seek},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     ops::Range,
     path::{Path, PathBuf},
     time::Duration,
@@ -461,6 +461,17 @@ pub fn open_capture_conversation_interval_in_wireshark(
     launch_wireshark(path, executable, Some(&filter))
 }
 
+pub fn open_capture_transport_in_wireshark(
+    path: &Path,
+    executable: &Path,
+    protocol: u8,
+    a: SocketAddr,
+    b: SocketAddr,
+) -> Result<u32> {
+    let filter = wireshark_transport_filter(protocol, a, b)?;
+    launch_wireshark(path, executable, Some(&filter))
+}
+
 fn wireshark_conversation_interval_filter(
     a: IpAddr,
     b: IpAddr,
@@ -471,17 +482,57 @@ fn wireshark_conversation_interval_filter(
     Ok(format!("({conversation}) && ({interval})"))
 }
 
-fn wireshark_conversation_filter(a: IpAddr, b: IpAddr) -> Result<String> {
-    let protocol = match (a, b) {
+// Wireshark numbers layers separately for IPv4 and IPv6. The prefix consumes
+// the link-layer tokens without permitting any earlier IP header.
+const OUTER_IP_PATTERN: &str = "^(?:(?!ip:|ipv6:)[^:]+:)*";
+
+fn wireshark_ip_field(a: IpAddr, b: IpAddr) -> Result<&'static str> {
+    Ok(match (a, b) {
         (IpAddr::V4(_), IpAddr::V4(_)) => "ip",
         (IpAddr::V6(_), IpAddr::V6(_)) => "ipv6",
         _ => bail!("Choose two addresses from the same IP version"),
-    };
-    // Layers are numbered separately for IPv4 and IPv6. Require this IP
-    // version to appear first so IP-in-IP uses the same addresses as the summary.
-    let outer = format!(r#"frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*{protocol}(?::|$)""#);
+    })
+}
+
+fn wireshark_conversation_filter(a: IpAddr, b: IpAddr) -> Result<String> {
+    let protocol = wireshark_ip_field(a, b)?;
+    let outer = format!(r#"frame.protocols matches "{OUTER_IP_PATTERN}{protocol}(?::|$)""#);
     let direction =
         |source, dest| format!("{protocol}.src#1 == {source} && {protocol}.dst#1 == {dest}");
+    let forward = direction(a, b);
+    if a == b {
+        return Ok(format!("{outer} && {forward}"));
+    }
+    let reverse = direction(b, a);
+    Ok(format!("{outer} && (({forward}) || ({reverse}))"))
+}
+
+fn wireshark_transport_filter(protocol: u8, a: SocketAddr, b: SocketAddr) -> Result<String> {
+    let transport = match protocol {
+        6 => "tcp",
+        17 => "udp",
+        _ => bail!("Choose a TCP or UDP conversation"),
+    };
+    let ip = wireshark_ip_field(a.ip(), b.ip())?;
+    // Allow the IPv6 extensions supported by the summary between IP and
+    // transport. A tunnel or an ICMP quote would introduce other tokens.
+    let extensions = if ip == "ipv6" {
+        "(?:ipv6[.](?:hopopts|routing|fraghdr|dstopts):|ah:)*"
+    } else {
+        ""
+    };
+    let outer = format!(
+        r#"frame.protocols matches "{OUTER_IP_PATTERN}{ip}:{extensions}{transport}(?::|$)""#
+    );
+    let direction = |src: SocketAddr, dst: SocketAddr| {
+        format!(
+            "{ip}.src#1 == {} && {transport}.srcport#1 == {} && {ip}.dst#1 == {} && {transport}.dstport#1 == {}",
+            src.ip(),
+            src.port(),
+            dst.ip(),
+            dst.port()
+        )
+    };
     let forward = direction(a, b);
     if a == b {
         return Ok(format!("{outer} && {forward}"));
@@ -812,6 +863,30 @@ impl ClassicPcap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wireshark_transport_filter_preserves_the_port_of_each_endpoint_and_outer_layer() {
+        let a = "192.0.2.1:49152".parse().unwrap();
+        let b = "192.0.2.2:443".parse().unwrap();
+        assert_eq!(
+            wireshark_transport_filter(6, a, b).unwrap(),
+            concat!(
+                r#"frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip:tcp(?::|$)" && "#,
+                "((ip.src#1 == 192.0.2.1 && tcp.srcport#1 == 49152 && ip.dst#1 == 192.0.2.2 && tcp.dstport#1 == 443) || ",
+                "(ip.src#1 == 192.0.2.2 && tcp.srcport#1 == 443 && ip.dst#1 == 192.0.2.1 && tcp.dstport#1 == 49152))"
+            )
+        );
+        let v6 = "[2001:db8::1]:5353".parse().unwrap();
+        assert_eq!(
+            wireshark_transport_filter(17, v6, v6).unwrap(),
+            concat!(
+                r#"frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ipv6:(?:ipv6[.](?:hopopts|routing|fraghdr|dstopts):|ah:)*udp(?::|$)" && "#,
+                "ipv6.src#1 == 2001:db8::1 && udp.srcport#1 == 5353 && ipv6.dst#1 == 2001:db8::1 && udp.dstport#1 == 5353"
+            )
+        );
+        assert!(wireshark_transport_filter(17, a, v6).is_err());
+        assert!(wireshark_transport_filter(58, a, b).is_err());
+    }
 
     #[test]
     fn wireshark_conversation_filter_matches_both_directions_at_the_outer_ip_layer() {

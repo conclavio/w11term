@@ -483,6 +483,25 @@ try {
         $udp.a_to_b.captured_bytes -ne 28 -or $udp.b_to_a.packets -ne 0) {
         throw 'The CLI transport report differs from the capture panel'
     }
+    $null = Wait-Until 'launching a transport pair requires a selection' {
+        $open = Find-Element 'Open port pair in Wireshark' $button
+        $open -and !$open.Current.IsEnabled
+    }
+    $transportFilterPath = $protocolCapture + '.filter'
+    foreach ($kind in @('TCP', 'UDP')) {
+        $protocolField = $kind.ToLowerInvariant()
+        $expected = ('frame.protocols matches "^(?:(?!ip:|ipv6:)[^:]+:)*ip:{0}(?::|$)" && ' +
+            '((ip.src#1 == 192.0.2.1 && {0}.srcport#1 == 49152 && ip.dst#1 == 192.0.2.2 && {0}.dstport#1 == 443) || ' +
+            '(ip.src#1 == 192.0.2.2 && {0}.srcport#1 == 443 && ip.dst#1 == 192.0.2.1 && {0}.dstport#1 == 49152))') -f $protocolField
+        $row = Wait-Until "the $kind port pair can be selected" {
+            Find-Element "$kind${dot}192.0.2.1:49152 $bothDirections 192.0.2.2:443" ([System.Windows.Automation.ControlType]::ListItem)
+        }
+        $row.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+        Click 'Open port pair in Wireshark'
+        $null = Wait-Until "Wireshark receives the original file and exact $kind port filter" {
+            [IO.File]::Exists($transportFilterPath) -and [IO.File]::ReadAllText($transportFilterPath) -ceq $expected
+        }
+    }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Select-Capture $olderCapture $compareCaptureLabel 'Choose after packet capture'
     $expander = Open-PacketSection 'comparison-ip-protocols'

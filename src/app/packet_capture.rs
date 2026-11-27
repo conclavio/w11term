@@ -1,6 +1,6 @@
 use super::*;
 use std::{
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -11,6 +11,7 @@ use w11term::{
         PacketCaptureInterfaces, PacketCapturePlan, ip_protocol_label,
         open_capture_conversation_in_wireshark, open_capture_conversation_interval_in_wireshark,
         open_capture_in_wireshark, open_capture_interval_in_wireshark,
+        open_capture_transport_in_wireshark,
     },
 };
 
@@ -42,6 +43,7 @@ pub enum Action {
     ProtocolsExpanded(bool),
     ConversationsExpanded(bool),
     TransportConversationsExpanded(bool),
+    SelectTransportConversation(PathBuf, Option<usize>),
     SelectConversation(PathBuf, Option<usize>),
     LimitConversationInterval(PathBuf, bool),
     Tmpfs(bool),
@@ -56,6 +58,7 @@ pub enum Action {
     OpenWireshark,
     OpenTimelineInterval(PathBuf),
     OpenConversation(PathBuf),
+    OpenTransportConversation(PathBuf),
     Finished(Arc<()>, Result<Option<Outcome>, String>),
 }
 
@@ -85,6 +88,7 @@ enum FileChoice {
 enum WiresharkFilter {
     Interval(Range<i128>),
     Conversation(IpAddr, IpAddr, Option<Range<i128>>),
+    Transport(u8, SocketAddr, SocketAddr),
 }
 
 enum LoadedCapture {
@@ -210,6 +214,7 @@ pub(super) struct Panel {
     protocols_expanded: bool,
     conversations_expanded: bool,
     transport_conversations_expanded: bool,
+    selected_transport_conversation: Option<usize>,
     selected_conversation: Option<usize>,
     limit_conversation_interval: bool,
     wireshark: Option<PathBuf>,
@@ -258,6 +263,7 @@ impl Panel {
         self.protocols_expanded = false;
         self.conversations_expanded = false;
         self.transport_conversations_expanded = false;
+        self.selected_transport_conversation = None;
         self.selected_conversation = None;
         self.limit_conversation_interval = false;
         self.activity = None;
@@ -861,22 +867,52 @@ impl Panel {
                             format!("Transport pair limit reached · {} packets omitted from the ranking", transport.untracked_packets),
                         ));
                     }
-                    rows.extend(transport.top.iter().map(|pair| {
-                        let label = format!("{} · {} ↔ {}", ip_protocol_label(pair.protocol), pair.a, pair.b);
-                        let total = pair.total();
-                        KeyedView::new(
-                            label.clone(),
-                            StackPanel::new().spacing(3.0).keyed_children([
-                                text("endpoints", label),
-                                text("totals", format!("Packets {} · Captured bytes {}", total.packets, total.captured_bytes)),
-                                text("directions", format!(
-                                    "Left to right {} packets, {} bytes · Right to left {} packets, {} bytes",
-                                    pair.a_to_b.packets, pair.a_to_b.captured_bytes,
-                                    pair.b_to_a.packets, pair.b_to_a.captured_bytes,
-                                )),
-                            ]),
-                        )
-                    }));
+                    if !transport.top.is_empty() {
+                        let select_path = capture.path.clone();
+                        let open_path = capture.path.clone();
+                        rows.extend([
+                            KeyedView::new(
+                                "transport-pairs",
+                                ListView::new()
+                                    .automation_name("TCP and UDP port pairs by captured bytes")
+                                    .max_height(280.0)
+                                    .selected_index(self.selected_transport_conversation)
+                                    .on_selection_changed(ctx.callback(move |index| {
+                                        message(Action::SelectTransportConversation(select_path.clone(), index))
+                                    }))
+                                    .collection_slot(
+                                        ListViewSlot::Items,
+                                        transport.top.iter().map(|pair| {
+                                            let label = format!("{} · {} ↔ {}", ip_protocol_label(pair.protocol), pair.a, pair.b);
+                                            let total = pair.total();
+                                            KeyedView::new(
+                                                label.as_str(),
+                                                ListViewItem::new().automation_name(&label).content(
+                                                    StackPanel::new().spacing(3.0).keyed_children([
+                                                        text("endpoints", label.clone()),
+                                                        text("totals", format!("Packets {} · Captured bytes {}", total.packets, total.captured_bytes)),
+                                                        text("directions", format!(
+                                                            "Left to right {} packets, {} bytes · Right to left {} packets, {} bytes",
+                                                            pair.a_to_b.packets, pair.a_to_b.captured_bytes,
+                                                            pair.b_to_a.packets, pair.b_to_a.captured_bytes,
+                                                        )),
+                                                    ]),
+                                                ),
+                                            )
+                                        }),
+                                    ),
+                            ),
+                            KeyedView::new(
+                                "open-transport-pair",
+                                Button::new()
+                                    .is_enabled(idle && self.selected_transport_conversation.is_some())
+                                    .on_click(ctx.callback(move |_| {
+                                        message(Action::OpenTransportConversation(open_path.clone()))
+                                    }))
+                                    .content("Open port pair in Wireshark"),
+                            ),
+                        ]);
+                    }
                 }
                 files.push(KeyedView::new(
                     "local-transport",
@@ -1155,6 +1191,7 @@ impl TerminalApp {
                                 | Action::ProtocolsExpanded(_)
                                 | Action::ConversationsExpanded(_)
                                 | Action::TransportConversationsExpanded(_)
+                                | Action::SelectTransportConversation(..)
                                 | Action::Comparison(_, compare::Change::Pair { .. })
                                 | Action::Comparison(_, compare::Change::ProtocolsExpanded(_))
                         )) =>
@@ -1216,6 +1253,14 @@ impl TerminalApp {
             Action::ConversationsExpanded(expanded) => panel.conversations_expanded = expanded,
             Action::TransportConversationsExpanded(expanded) => {
                 panel.transport_conversations_expanded = expanded;
+            }
+            Action::SelectTransportConversation(path, index) => {
+                if let Some(LoadedCapture::Local(capture)) = &panel.loaded
+                    && capture.path == path
+                {
+                    panel.selected_transport_conversation = index
+                        .filter(|&index| index < capture.summary.transport_conversations.top.len());
+                }
             }
             Action::SelectConversation(path, index) => {
                 if let Some(LoadedCapture::Local(capture)) = &panel.loaded
@@ -1291,7 +1336,8 @@ impl TerminalApp {
             Action::ChooseWireshark => self.choose_capture_file(FileChoice::Wireshark, ctx),
             Action::OpenWireshark
             | Action::OpenTimelineInterval(..)
-            | Action::OpenConversation(_) => {
+            | Action::OpenConversation(_)
+            | Action::OpenTransportConversation(_) => {
                 let Some(capture) = &panel.loaded else { return };
                 let filter = match (action, capture) {
                     (Action::OpenWireshark, _) => None,
@@ -1327,6 +1373,17 @@ impl TerminalApp {
                             None
                         };
                         Some(WiresharkFilter::Conversation(pair.a, pair.b, interval))
+                    }
+                    (Action::OpenTransportConversation(path), LoadedCapture::Local(local))
+                        if panel.transport_conversations_expanded && local.path == path =>
+                    {
+                        let Some(pair) = panel
+                            .selected_transport_conversation
+                            .and_then(|index| local.summary.transport_conversations.top.get(index))
+                        else {
+                            return;
+                        };
+                        Some(WiresharkFilter::Transport(pair.protocol, pair.a, pair.b))
                     }
                     _ => return,
                 };
@@ -1365,6 +1422,9 @@ impl TerminalApp {
                         b,
                         interval,
                     )
+                }
+                Some(WiresharkFilter::Transport(protocol, a, b)) => {
+                    open_capture_transport_in_wireshark(&capture, &executable, protocol, a, b)
                 }
             }?;
             Ok(Some(Outcome::Opened))
