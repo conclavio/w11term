@@ -6,12 +6,15 @@ use std::{
     collections::BTreeMap,
     io::{BufWriter, Write},
     num::NonZeroU32,
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 const SUPERVISOR: &str = include_str!("cpu-profile-supervisor.sh");
-const WORKER: &str = include_str!("cpu-profile-worker.sh");
+const WORKER: &str = concat!(
+    include_str!("cpu-perf-data.sh"),
+    include_str!("cpu-profile-worker.sh")
+);
 const MAX_SECONDS: u8 = 30;
 const RECORD_KIB: usize = 32 * 1024;
 const STACKS_KIB: usize = 4 * 1024;
@@ -21,7 +24,10 @@ const SSH_MARGIN_SECONDS: u64 = 6;
 const PROBE_SECONDS: u64 = 4;
 const END_MARKER: &[u8] = b"\nw11term-cpu-profile-end\n";
 pub(crate) mod launch;
+mod raw;
 pub use launch::CpuWorkloadOutcome;
+pub use raw::PerfDataArtifact;
+pub const PERF_DATA_TRANSFER_SECONDS: u64 = 60;
 pub(crate) const CONTROL_TIMEOUT_SECONDS: u64 =
     MAX_SECONDS as u64 + EXTRA_WORK_SECONDS + SSH_MARGIN_SECONDS + 20;
 
@@ -110,6 +116,15 @@ impl Target {
         plan: &CpuProfilePlan,
         path: &Path,
     ) -> Result<CpuProfileSummary> {
+        self.save_cpu_profile_artifacts_blocking(plan, path, None)
+    }
+
+    pub fn save_cpu_profile_artifacts_blocking(
+        self,
+        plan: &CpuProfilePlan,
+        path: &Path,
+        perf_data: Option<&Path>,
+    ) -> Result<CpuProfileSummary> {
         let (host, user, port, fingerprint) = self.link.verified_endpoint();
         ensure!(
             plan.connection_generation == self.generation
@@ -122,9 +137,13 @@ impl Target {
                     ),
             "The reviewed SSH connection changed. Review the process again."
         );
-        Folded::check_destination(path)?;
+        Recording::check_destinations(path, perf_data)?;
         crate::ssh::NETWORK
-            .block_on(self.capture_cpu_profile(plan.options, plan.process_start_ticks))?
+            .block_on(self.capture_cpu_profile(
+                plan.options,
+                plan.process_start_ticks,
+                perf_data.map(Path::to_owned),
+            ))?
             .save(path)
     }
 
@@ -136,7 +155,7 @@ impl Target {
         let (bytes, _) = self
             .run_diagnostic(
                 "Linux CPU profile preview",
-                command(options, None),
+                command(options, None, false),
                 Duration::from_secs(PROBE_SECONDS + SSH_MARGIN_SECONDS),
                 PROCESS_WIRE_BYTES,
             )
@@ -167,14 +186,18 @@ impl Target {
         mut self,
         options: CpuProfileOptions,
         expected_ticks: u64,
-    ) -> Result<Folded> {
+        perf_data: Option<PathBuf>,
+    ) -> Result<Recording> {
         let options = options.validate()?;
-        let (bytes, stderr) = self
-            .run_diagnostic(
+        let raw = perf_data.is_some();
+        let deadline = options.worker_seconds() + transfer_seconds(raw);
+        let (bytes, stderr, perf_data) = self
+            .read_profile_output(
                 "Linux CPU profile",
-                command(options, Some(expected_ticks)),
-                Duration::from_secs(options.worker_seconds() + SSH_MARGIN_SECONDS),
+                command(options, Some(expected_ticks), raw),
+                Duration::from_secs(deadline + SSH_MARGIN_SECONDS),
                 STACKS_KIB * 1024 + PROCESS_WIRE_BYTES + END_MARKER.len(),
+                perf_data,
             )
             .await?;
         let (ticks, name, remainder) = process_header(&bytes)?;
@@ -191,7 +214,7 @@ impl Target {
             .map(crate::events::display_field)
             .filter(|line| !line.is_empty())
             .collect();
-        let mut folded = fold(&String::from_utf8_lossy(samples), options.target_pid, &name)
+        let folded = fold(&String::from_utf8_lossy(samples), options.target_pid, &name)
             .with_context(|| {
                 let message = crate::events::display_field(&stderr);
                 if message.is_empty() {
@@ -199,16 +222,27 @@ impl Target {
                 } else {
                     format!("Reading perf script samples ({message})")
                 }
-            })?;
-        folded.summary.diagnostics = diagnostics;
-        Ok(folded)
+            })
+            .map(|mut folded| {
+                folded.summary.diagnostics = diagnostics;
+                folded
+            });
+        Ok(Recording { folded, perf_data })
     }
 }
 
-fn command(options: CpuProfileOptions, expected_ticks: Option<u64>) -> String {
-    let (mode, deadline) = match expected_ticks {
-        Some(_) => ("capture", options.worker_seconds()),
-        None => ("inspect", PROBE_SECONDS),
+fn transfer_seconds(raw: bool) -> u64 {
+    u64::from(raw) * PERF_DATA_TRANSFER_SECONDS
+}
+
+fn command(options: CpuProfileOptions, expected_ticks: Option<u64>, raw: bool) -> String {
+    let (mode, deadline) = match (expected_ticks, raw) {
+        (Some(_), true) => (
+            "capture-raw",
+            options.worker_seconds() + PERF_DATA_TRANSFER_SECONDS,
+        ),
+        (Some(_), false) => ("capture", options.worker_seconds()),
+        (None, _) => ("inspect", PROBE_SECONDS),
     };
     format!(
         "/bin/sh -c {} w11term-cpu-profile {} {deadline} {mode} {} {} {} {} {} {RECORD_KIB} {STACKS_KIB}",
@@ -261,6 +295,52 @@ pub struct CpuProfileSummary {
     pub diagnostics: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workload: Option<CpuWorkloadOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perf_data: Option<PerfDataArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perf_data_warning: Option<String>,
+}
+
+pub(crate) struct Recording {
+    folded: Result<Folded>,
+    perf_data: Option<raw::Staged>,
+}
+
+impl Recording {
+    pub(crate) fn check_destinations(folded: &Path, perf_data: Option<&Path>) -> Result<()> {
+        if let Some(perf_data) = perf_data {
+            raw::distinct_destinations(folded, perf_data)
+        } else {
+            Folded::check_destination(folded).map(|_| ())
+        }
+    }
+
+    pub(crate) fn save(self, path: &Path) -> Result<CpuProfileSummary> {
+        let folded = self.folded.and_then(|folded| folded.save(path));
+        let Some(raw) = self.perf_data else {
+            return folded;
+        };
+        match (folded, raw.save()) {
+            (Ok(mut summary), Ok(raw)) => {
+                summary.perf_data = Some(raw);
+                Ok(summary)
+            }
+            (Ok(mut summary), Err(error)) => {
+                summary.perf_data_warning =
+                    Some(format!("Raw perf recording could not be saved. {error:#}"));
+                Ok(summary)
+            }
+            (Err(error), Ok(raw)) => Err(error).with_context(|| {
+                format!(
+                    "Raw perf recording saved to {}. The folded profile could not be saved",
+                    raw.path.display()
+                )
+            }),
+            (Err(error), Err(raw_error)) => Err(error).context(format!(
+                "Raw perf recording could not be saved. {raw_error:#}"
+            )),
+        }
+    }
 }
 
 impl Folded {

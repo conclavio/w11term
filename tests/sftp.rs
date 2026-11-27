@@ -31,6 +31,20 @@ struct Peer {
     reject: bool,
 }
 
+const PERF_DATA_FIXTURE: &[u8] = b"PERFILE2\0\xff\r\nraw perf fixture\0";
+
+fn perf_data_header() -> String {
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(PERF_DATA_FIXTURE)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(
+        "w11term-perf-data-v1\t{}\t{digest}\n",
+        PERF_DATA_FIXTURE.len()
+    )
+}
+
 fn set_fixture_modified(path: &std::path::Path, seconds: u64) -> std::time::SystemTime {
     use std::os::windows::fs::OpenOptionsExt;
     use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES};
@@ -273,6 +287,10 @@ impl server::Handler for Peer {
             s.channel_success(c)?;
             if command.ends_with(&launch) {
                 fs::write(self.root.join("profile-launched"), [])?;
+                if command.contains(" 74 launch-raw ") {
+                    s.data(c, perf_data_header().into_bytes())?;
+                    s.data(c, PERF_DATA_FIXTURE.to_vec())?;
+                }
                 reply.push_str(concat!(
                     "timeout\n",
                     "42 20.0: cpu-clock:u: ab main (/tmp/work space/cpu worker)\n",
@@ -311,8 +329,8 @@ impl server::Handler for Peer {
                     s.exit_status_request(c, 0)?;
                 }
                 [
-                    "14",
-                    "capture",
+                    "14" | "74",
+                    "capture" | "capture-raw",
                     "42",
                     "800",
                     "2",
@@ -323,6 +341,12 @@ impl server::Handler for Peer {
                 ] => {
                     let response = fs::read(self.root.join("profile-response"))?;
                     fs::write(self.root.join("profile-captured"), [])?;
+                    if args[1] == "capture-raw" {
+                        s.data(c, perf_data_header().into_bytes())?;
+                        for chunk in PERF_DATA_FIXTURE.chunks(7) {
+                            s.data(c, chunk.to_vec())?;
+                        }
+                    }
                     s.data(c, response)?;
                     s.extended_data(c, 1, b"Processed 3 events and lost 1 chunks!\n".to_vec())?;
                     s.exit_status_request(c, 0)?;
@@ -1982,6 +2006,92 @@ const TRIAGE_RESPONSE: &str = concat!(
 );
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cpu_profile_raw_export_keeps_valid_recording_when_folding_fails() {
+    let (pane, _, remote, opens, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let profile = remote.path().join("profile-response");
+    let capture: control::CapturePng = Arc::new(|_, _, _| unreachable!("no screen capture"));
+    let registry = registry(&pane);
+    let options = control::CpuProfileOptions {
+        target_pid: 42.try_into().unwrap(),
+        seconds: 2,
+        frequency: 99,
+        call_graph: control::CpuCallGraph::Fp,
+    };
+    let preview = registry
+        .execute(
+            Request::PreviewCpuProfile { pane: 1, options },
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+    let plan = &preview["plan"];
+    let request = |name, perf_data_file| Request::CaptureCpuProfile {
+        pane: 1,
+        options,
+        connection_generation: plan["connection_generation"]
+            .as_u64()
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        process_start_ticks: plan["process_start_ticks"].as_u64().unwrap(),
+        output_file: local.path().join(name),
+        perf_data_file: Some(perf_data_file),
+    };
+    let before = opens.load(Ordering::SeqCst);
+    let same = registry
+        .execute(
+            request("run.folded", local.path().join("RUN.FOLDED")),
+            capture.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{same:#}").contains("different destinations"));
+    assert_eq!(opens.load(Ordering::SeqCst), before);
+
+    let preserved = local.path().join("preserved.perf.data");
+    fs::write(
+        &profile,
+        "w11term-cpu-profile-v1\t800\td29ya2Vy\n\nw11term-cpu-profile-end\n",
+    )
+    .unwrap();
+    let error = registry
+        .execute(request("empty.folded", preserved.clone()), capture.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Raw perf recording saved"));
+    assert!(!local.path().join("empty.folded").exists());
+    assert_eq!(fs::read(preserved).unwrap(), PERF_DATA_FIXTURE);
+
+    let raw = local.path().join("run.perf.data");
+    fs::write(&profile, "w11term-cpu-profile-v1\t800\td29ya2Vy\n 42 22.01: cpu-clock:u: ab hot_loop (worker)\n\nw11term-cpu-profile-end\n").unwrap();
+    let captured = registry
+        .execute(request("run.folded", raw.clone()), capture.clone())
+        .await
+        .unwrap();
+    assert_eq!(captured["summary"]["perf_data"]["path"], json!(raw));
+    assert_eq!(
+        captured["summary"]["perf_data"]["bytes"],
+        PERF_DATA_FIXTURE.len()
+    );
+    assert_eq!(fs::read(&raw).unwrap(), PERF_DATA_FIXTURE);
+    assert_eq!(
+        fs::read_to_string(local.path().join("run.folded")).unwrap(),
+        "worker;hot_loop 1\n"
+    );
+    let before = opens.load(Ordering::SeqCst);
+    assert!(
+        registry
+            .execute(request("new.folded", raw.clone()), capture)
+            .await
+            .is_err()
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), before);
+    assert_eq!(fs::read(raw).unwrap(), PERF_DATA_FIXTURE);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cpu_profile_reuses_the_verified_ssh_transport_and_saves_only_complete_stacks() {
     let (pane, _, remote, opens, server) = fixture(false).await;
     let local = tempfile::tempdir().unwrap();
@@ -2014,6 +2124,7 @@ async fn cpu_profile_reuses_the_verified_ssh_transport_and_saves_only_complete_s
         connection_generation: generation.try_into().unwrap(),
         process_start_ticks,
         output_file: destination.clone(),
+        perf_data_file: None,
     };
     let prior = opens.load(Ordering::SeqCst);
     assert!(

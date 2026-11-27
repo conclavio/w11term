@@ -100,7 +100,7 @@ pub fn normalize_sha256(value: &str) -> Result<String> {
     Ok(value.to_ascii_lowercase())
 }
 
-fn digest_hex(digest: Sha256) -> String {
+pub(crate) fn digest_hex(digest: Sha256) -> String {
     digest
         .finalize()
         .iter()

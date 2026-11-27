@@ -71,6 +71,8 @@ pub enum Request {
         connection_generation: std::num::NonZeroU64,
         process_start_ticks: u64,
         output_file: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        perf_data_file: Option<PathBuf>,
     },
     Record {
         pane: u64,
@@ -1435,6 +1437,7 @@ impl Registry {
                 connection_generation,
                 process_start_ticks,
                 output_file,
+                perf_data_file,
             } => {
                 self.capture_cpu_profile(
                     pane,
@@ -1442,6 +1445,7 @@ impl Registry {
                     connection_generation,
                     process_start_ticks,
                     output_file,
+                    perf_data_file,
                 )
                 .await
             }
@@ -2701,6 +2705,13 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
     tokio::time::timeout(
         Duration::from_secs(match request {
             Request::LinuxTriage { .. } => crate::ssh::triage::DEADLINE.as_secs() + 20,
+            Request::CaptureCpuProfile {
+                perf_data_file: Some(_),
+                ..
+            } => {
+                crate::ssh::triage::cpu_profile::CONTROL_TIMEOUT_SECONDS
+                    + crate::ssh::PERF_DATA_TRANSFER_SECONDS
+            }
             Request::PreviewCpuProfile { .. } | Request::CaptureCpuProfile { .. } => {
                 crate::ssh::triage::cpu_profile::CONTROL_TIMEOUT_SECONDS
             }

@@ -333,6 +333,15 @@ impl Panel {
             ));
         }
         if let Some(capture) = &loaded.capture {
+            if let Some(raw) = &capture.perf_data {
+                fields.push(text(
+                    "raw-recording",
+                    format!("Raw perf recording saved to {}", raw.path.display()),
+                ));
+            }
+            if let Some(warning) = &capture.perf_data_warning {
+                fields.push(text("raw-recording-warning", warning));
+            }
             if let Some(outcome) = &capture.workload {
                 fields.push(text("workload-outcome", outcome.to_string()));
             }

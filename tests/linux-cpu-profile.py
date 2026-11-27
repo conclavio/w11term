@@ -8,10 +8,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from perf_data_fixture import split_perf_data
 
 
 SUPERVISOR = Path("src/ssh/triage/cpu-profile-supervisor.sh").read_text()
-WORKER = Path("src/ssh/triage/cpu-profile-worker.sh").read_text()
+WORKER = (Path("src/ssh/triage/cpu-perf-data.sh").read_text()
+          + Path("src/ssh/triage/cpu-profile-worker.sh").read_text())
 PERF = """#!/usr/bin/env python3
 import os
 import sys
@@ -107,6 +109,14 @@ def fixture_tests():
         assert b"lost 1 chunks" in capture.stderr
         assert not Path(recorded_directory.read_text()).exists()
 
+        raw_only = run(scenario="large-stacks", mode="capture-raw", start=start)
+        assert raw_only.returncode == 0, raw_only.stderr
+        recording, text = split_perf_data(raw_only.stdout)
+        assert recording == b"perf-data"
+        assert text == preview.stdout + b"\nw11term-cpu-profile-end\n"
+        assert b"stack output limit" in raw_only.stderr or b"stacks reached" in raw_only.stderr
+        assert not Path(recorded_directory.read_text()).exists()
+
         for scenario, expected, deadline in [
             ("deny", b"No permission to enable", "6"),
             ("large-record", b"limit", "6"),
@@ -139,16 +149,24 @@ int main(void) { hot_loop(); return 0; }
                 ticks = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
                 profile = subprocess.run(
                     ["/bin/sh", "-c", SUPERVISOR, "w11term-cpu-profile", WORKER, "10",
-                     "capture", pid, ticks, "2", "99", "fp", "32768", "4096"],
+                     "capture-raw", pid, ticks, "2", "99", "fp", "32768", "4096"],
                     capture_output=True,
                     timeout=14,
                 )
                 assert profile.returncode == 0, profile.stderr
+                recording, stacks = split_perf_data(profile.stdout)
                 assert re.search(rb"(?m)^\s*" + pid.encode() + rb" +\d+\.\d+: +cpu-clock(?::u)?:",
-                                 profile.stdout), profile.stdout[:2000]
-                assert b" hot_loop " in profile.stdout, profile.stdout[:2000]
-                assert profile.stdout.endswith(b"\nw11term-cpu-profile-end\n")
-                print("Live perf smoke resolved the hotspot.")
+                                 stacks), stacks[:2000]
+                assert b" hot_loop " in stacks, stacks[:2000]
+                assert stacks.endswith(b"\nw11term-cpu-profile-end\n")
+                raw_file = Path(root) / "captured.perf.data"
+                raw_file.write_bytes(recording)
+                reopened = subprocess.run(
+                    ["perf", "report", "--stdio", "-i", raw_file],
+                    capture_output=True, check=True, timeout=10,
+                )
+                assert b"hot_loop" in reopened.stdout, reopened.stdout[:2000]
+                print("Live perf report reopened the raw recording and resolved the hotspot.")
             finally:
                 hot.terminate()
 

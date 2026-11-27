@@ -8,10 +8,11 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from perf_data_fixture import split_perf_data
 
 SCRIPTS = Path("src/ssh/triage")
 SUPERVISOR = (SCRIPTS / "cpu-profile-supervisor.sh").read_text()
-WORKER = (SCRIPTS / "cpu-launch-worker.sh").read_text()
+WORKER = (SCRIPTS / "cpu-perf-data.sh").read_text() + (SCRIPTS / "cpu-launch-worker.sh").read_text()
 RUNNER = (SCRIPTS / "cpu-launch-command.sh").read_text()
 PERF = """#!/usr/bin/env python3
 import os
@@ -138,15 +139,23 @@ int main(void) { launched_hotspot(); return 0; }
         assert preview.returncode == 0, preview.stderr
         reviewed, _ = paths(preview.stdout)
         capture = subprocess.run(
-            arguments(SUPERVISOR, "launch", root, "./hotspot", reviewed, [], "32768", "4096"),
+            arguments(SUPERVISOR, "launch-raw", root, "./hotspot", reviewed, [], "32768", "4096"),
             capture_output=True, timeout=14,
         )
         assert capture.returncode == 0, capture.stderr
-        actual, stacks = paths(capture.stdout)
+        recording, text = split_perf_data(capture.stdout)
+        actual, stacks = paths(text)
         assert actual == reviewed and stacks.startswith(b"timeout\n")
         assert b" launched_hotspot " in stacks, stacks[:2048]
         assert stacks.endswith(b"\nw11term-cpu-profile-end\n")
-        print("Live perf resolved a launched hotspot and saved samples at the time limit.")
+        raw_file = root / "launched.perf.data"
+        raw_file.write_bytes(recording)
+        reopened = subprocess.run(
+            ["perf", "report", "--stdio", "-i", raw_file],
+            capture_output=True, check=True, timeout=10,
+        )
+        assert b"launched_hotspot" in reopened.stdout, reopened.stdout[:2000]
+        print("Live perf report reopened the raw launch recording after the time limit.")
 
 
 if __name__ == "__main__":

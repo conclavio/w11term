@@ -1,13 +1,20 @@
 use super::{
-    CpuCallGraph, CpuProfileSummary, END_MARKER, EXTRA_WORK_SECONDS, Folded, PROBE_SECONDS,
-    RECORD_KIB, SSH_MARGIN_SECONDS, STACKS_KIB, SUPERVISOR, Target, fold, quote, validate_sampling,
+    CpuCallGraph, CpuProfileSummary, END_MARKER, EXTRA_WORK_SECONDS, PROBE_SECONDS, RECORD_KIB,
+    Recording, SSH_MARGIN_SECONDS, STACKS_KIB, SUPERVISOR, Target, fold, quote, transfer_seconds,
+    validate_sampling,
 };
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
-const WORKER: &str = include_str!("../cpu-launch-worker.sh");
+const WORKER: &str = concat!(
+    include_str!("../cpu-perf-data.sh"),
+    include_str!("../cpu-launch-worker.sh")
+);
 const RUNNER: &str = include_str!("../cpu-launch-command.sh");
 const REVIEW_BYTES: usize = 16 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
@@ -96,6 +103,15 @@ impl Target {
         plan: &CpuLaunchPlan,
         path: &Path,
     ) -> Result<CpuProfileSummary> {
+        self.save_cpu_launch_artifacts_blocking(plan, path, None)
+    }
+
+    pub fn save_cpu_launch_artifacts_blocking(
+        self,
+        plan: &CpuLaunchPlan,
+        path: &Path,
+        perf_data: Option<&Path>,
+    ) -> Result<CpuProfileSummary> {
         let (host, user, port, fingerprint) = self.link.verified_endpoint();
         ensure!(
             plan.connection_generation == self.generation
@@ -108,9 +124,9 @@ impl Target {
                     ),
             "The reviewed SSH connection changed. Review the command again."
         );
-        Folded::check_destination(path)?;
+        Recording::check_destinations(path, perf_data)?;
         crate::ssh::NETWORK
-            .block_on(self.capture_cpu_launch(plan))?
+            .block_on(self.capture_cpu_launch(plan, perf_data.map(Path::to_owned)))?
             .save(path)
     }
 
@@ -118,7 +134,7 @@ impl Target {
         let (stdout, _) = self
             .run_diagnostic(
                 "Linux command profile review",
-                command(&options, None)?,
+                command(&options, None, false)?,
                 Duration::from_secs(PROBE_SECONDS + SSH_MARGIN_SECONDS),
                 REVIEW_BYTES,
             )
@@ -141,13 +157,21 @@ impl Target {
         })
     }
 
-    async fn capture_cpu_launch(mut self, plan: &CpuLaunchPlan) -> Result<Folded> {
-        let (stdout, stderr) = self
-            .run_diagnostic(
+    async fn capture_cpu_launch(
+        mut self,
+        plan: &CpuLaunchPlan,
+        perf_data: Option<PathBuf>,
+    ) -> Result<Recording> {
+        let raw = perf_data.is_some();
+        let (stdout, stderr, perf_data) = self
+            .read_profile_output(
                 "Linux command CPU profile",
-                command(&plan.options, Some(plan))?,
-                Duration::from_secs(plan.options.worker_seconds() + SSH_MARGIN_SECONDS),
+                command(&plan.options, Some(plan), raw)?,
+                Duration::from_secs(
+                    plan.options.worker_seconds() + transfer_seconds(raw) + SSH_MARGIN_SECONDS,
+                ),
                 STACKS_KIB * 1024 + REVIEW_BYTES + END_MARKER.len(),
+                perf_data,
             )
             .await?;
         let (directory, program, remainder) = command_header(&stdout)?;
@@ -165,28 +189,32 @@ impl Target {
             .filter(|name| !name.is_empty())
             .unwrap_or(&program);
         let stderr = String::from_utf8_lossy(&stderr);
-        let mut folded = fold(&String::from_utf8_lossy(stacks), None, root).with_context(|| {
-            let diagnostics = crate::events::display_field(&stderr);
-            format!("{outcome}. Reading perf script samples. {diagnostics}")
-                .trim_end()
-                .to_owned()
-        })?;
-        folded.summary.workload = Some(outcome);
-        folded.summary.diagnostics = stderr
-            .lines()
-            .map(crate::events::display_field)
-            .filter(|line| !line.is_empty())
-            .collect();
-        Ok(folded)
+        let folded = fold(&String::from_utf8_lossy(stacks), None, root)
+            .with_context(|| {
+                let diagnostics = crate::events::display_field(&stderr);
+                format!("{outcome}. Reading perf script samples. {diagnostics}")
+                    .trim_end()
+                    .to_owned()
+            })
+            .map(|mut folded| {
+                folded.summary.workload = Some(outcome);
+                folded.summary.diagnostics = stderr
+                    .lines()
+                    .map(crate::events::display_field)
+                    .filter(|line| !line.is_empty())
+                    .collect();
+                folded
+            });
+        Ok(Recording { folded, perf_data })
     }
 }
 
-fn command(options: &CpuLaunchOptions, plan: Option<&CpuLaunchPlan>) -> Result<String> {
+fn command(options: &CpuLaunchOptions, plan: Option<&CpuLaunchPlan>, raw: bool) -> Result<String> {
     options.validate()?;
     let (mode, deadline, directory, program) = match plan {
         Some(plan) => (
-            "launch",
-            options.worker_seconds(),
+            if raw { "launch-raw" } else { "launch" },
+            options.worker_seconds() + transfer_seconds(raw),
             plan.directory.as_str(),
             plan.program.as_str(),
         ),
@@ -270,13 +298,13 @@ mod tests {
             frequency: 99,
             call_graph: CpuCallGraph::Fp,
         };
-        let line = command(&options, None).unwrap();
+        let line = command(&options, None, false).unwrap();
         assert!(line.ends_with("'quote'\\''and $text' '' '-Fliteral'"));
         options.directory = "relative".into();
-        assert!(command(&options, None).is_err());
+        assert!(command(&options, None, false).is_err());
         options.directory.clear();
         options.arguments.push("bad\0arg".into());
-        assert!(command(&options, None).is_err());
+        assert!(command(&options, None, false).is_err());
     }
 
     #[test]

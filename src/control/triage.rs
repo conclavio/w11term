@@ -1,5 +1,5 @@
 use super::*;
-use crate::ssh::{TriageReport, TriageTarget, triage::cpu_profile::Folded};
+use crate::ssh::{TriageReport, TriageTarget, triage::cpu_profile::Recording};
 use std::num::NonZeroU64;
 
 impl Registry {
@@ -46,11 +46,12 @@ impl Registry {
         generation: NonZeroU64,
         process_start_ticks: u64,
         path: PathBuf,
+        perf_data_file: Option<PathBuf>,
     ) -> Result<Value> {
-        Folded::check_destination(&path)?;
+        Recording::check_destinations(&path, perf_data_file.as_deref())?;
         let target = self.diagnostic_target(pane, Some(generation)).await?;
         let profile = target
-            .capture_cpu_profile(options, process_start_ticks)
+            .capture_cpu_profile(options, process_start_ticks, perf_data_file)
             .await?;
         let (path, summary) = tokio::task::spawn_blocking(move || -> Result<_> {
             let summary = profile.save(&path)?;

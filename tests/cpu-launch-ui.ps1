@@ -5,6 +5,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $folded = Join-Path $State 'launched workload.folded'
+$raw = [IO.Path]::ChangeExtension($folded, 'perf.data')
 $marker = [IO.File]::ReadAllText((Join-Path $State 'launch-marker'))
 $wire = [IO.File]::ReadAllText((Join-Path $State 'launch-wire'))
 $comboType = [System.Windows.Automation.ControlType]::ComboBox
@@ -73,6 +74,13 @@ try {
         throw "$_ Visible controls: $($names -join ' | '). Wire suffix: $wireSuffix"
     }
     if ([IO.File]::Exists($marker)) { throw 'Review started the workload' }
+    $rawOption = Wait-Until 'raw perf recording option' {
+        Find-Element 'Keep raw perf recording' ([System.Windows.Automation.ControlType]::CheckBox)
+    }
+    $rawOption.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
+    $null = Wait-Until 'raw perf recording transfer acknowledged' {
+        Find-Element 'Saves a .perf.data file next to the folded profile. The transfer can take up to 60 additional seconds.'
+    }
     Click-LaunchButton 'Record CPU profile'
     $dialog = Wait-Until 'owned CPU profile destination dialog' { Find-OwnedDialog 'Save CPU profile' }
     $null = Wait-Until 'enter a destination for folded samples' {
@@ -82,12 +90,17 @@ try {
     $null = Wait-Until 'confirm recording destination' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'timeout profile was saved and opened' {
         (Find-Element 'Captured CPU profile') -and
-        (Find-Element 'Command reached its time limit') -and (Find-Element '2 samples')
+        (Find-Element 'Command reached its time limit') -and (Find-Element '2 samples') -and
+        (Find-Element "Raw perf recording saved to $raw")
     }
     $lines = [IO.File]::ReadAllLines($folded)
     if (($lines -join '|') -cne 'cpu worker;child 1|cpu worker;main 1') {
         throw "The folded profile did not contain the parent and child samples: $lines"
     }
+    $actual = [IO.File]::ReadAllBytes($raw)
+    $expected = [Text.Encoding]::ASCII.GetBytes('PERFILE2') +
+        [byte[]]@(0,255,13,10) + [Text.Encoding]::ASCII.GetBytes('raw perf fixture') + [byte]0
+    if (($actual -join ',') -cne ($expected -join ',')) { throw 'The raw perf recording was not preserved byte for byte' }
 } finally {
     Close-FixtureApp $app
 }

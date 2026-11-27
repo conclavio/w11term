@@ -18,6 +18,7 @@ pub enum Action {
     Edit(Field, String),
     Mode(usize),
     TargetMode(usize),
+    KeepRaw(bool),
     Review,
     Record,
 }
@@ -63,6 +64,7 @@ pub(super) struct Form {
     seconds: String,
     frequency: String,
     mode: CpuCallGraph,
+    keep_raw: bool,
     source: Option<Connection>,
     pub review: Option<Review>,
 }
@@ -74,6 +76,7 @@ impl Form {
             seconds: CpuProfileOptions::DEFAULT_SECONDS.to_string(),
             frequency: CpuProfileOptions::DEFAULT_FREQUENCY.to_string(),
             mode: CpuCallGraph::Fp,
+            keep_raw: false,
             source: None,
             review: None,
         }
@@ -265,13 +268,31 @@ impl Form {
         if let Some(review) = &self.review {
             let ready = Some(review.connection) == active;
             review.plan.describe(&mut fields);
-            fields.extend([KeyedView::new(
-                "record",
-                Button::new()
-                    .is_enabled(idle && ready)
-                    .on_click(ctx.callback(|_| send(Action::Record)))
-                    .content("Record CPU profile"),
-            )]);
+            fields.extend([
+                KeyedView::new(
+                    "keep-raw",
+                    CheckBox::new()
+                        .is_enabled(idle)
+                        .is_checked(self.keep_raw)
+                        .on_is_checked_changed(
+                            ctx.callback(|checked| send(Action::KeepRaw(checked))),
+                        )
+                        .content("Keep raw perf recording"),
+                ),
+                KeyedView::new(
+                    "record",
+                    Button::new()
+                        .is_enabled(idle && ready)
+                        .on_click(ctx.callback(|_| send(Action::Record)))
+                        .content("Record CPU profile"),
+                ),
+            ]);
+            if self.keep_raw {
+                fields.push(text("raw-destination", format!(
+                    "Saves a .perf.data file next to the folded profile. The transfer can take up to {} additional seconds.",
+                    w11term::ssh::PERF_DATA_TRANSFER_SECONDS,
+                )));
+            }
             if !ready {
                 fields.push(text(
                     "review-stale",
@@ -437,6 +458,11 @@ impl TerminalApp {
                     self.flame_graph.status = None;
                 }
             }
+            Action::KeepRaw(checked) => {
+                if let Some(form) = &mut self.flame_graph.capture {
+                    form.keep_raw = checked;
+                }
+            }
             Action::Mode(index) => {
                 if let Some(form) = &mut self.flame_graph.capture
                     && index != usize::from(matches!(form.mode, CpuCallGraph::Dwarf))
@@ -502,11 +528,11 @@ impl TerminalApp {
     }
 
     fn record_cpu_capture(&mut self, ctx: &ComponentContext<Self>) {
-        let Some(review) = self
+        let Some((review, keep_raw)) = self
             .flame_graph
             .capture
             .as_ref()
-            .and_then(|form| form.review.clone())
+            .and_then(|form| form.review.clone().map(|review| (review, form.keep_raw)))
         else {
             return;
         };
@@ -548,12 +574,19 @@ impl TerminalApp {
                     if scope.is_cancelled() {
                         return Ok(None);
                     }
-                    let summary = match &review.plan {
-                        ReviewedTarget::Process(plan) => {
+                    let raw_path = keep_raw.then(|| file.path.with_extension("perf.data"));
+                    let summary = match (&review.plan, raw_path.as_deref()) {
+                        (ReviewedTarget::Process(plan), None) => {
                             target.save_cpu_profile_blocking(plan, &file.path)?
                         }
-                        ReviewedTarget::Command(plan) => {
+                        (ReviewedTarget::Command(plan), None) => {
                             target.save_cpu_launch_blocking(plan, &file.path)?
+                        }
+                        (ReviewedTarget::Process(plan), raw @ Some(_)) => {
+                            target.save_cpu_profile_artifacts_blocking(plan, &file.path, raw)?
+                        }
+                        (ReviewedTarget::Command(plan), raw @ Some(_)) => {
+                            target.save_cpu_launch_artifacts_blocking(plan, &file.path, raw)?
                         }
                     };
                     let profile = Profile::open(&file.path).with_context(|| {

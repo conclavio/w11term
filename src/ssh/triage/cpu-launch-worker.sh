@@ -67,14 +67,25 @@ fi
 [[ $record_status == 0 && -s "$work/perf.data" && -s "$work/outcome" ]] \
     || fail 'perf record did not produce a complete command profile. Check the perf diagnostics above.'
 
+stack_error=
 if ! (
     ulimit -f "$stacks_kib" && ulimit -c 0 || exit 2
     exec perf script -i "$work/perf.data" -F pid,time,event,ip,sym,dso
 ) > "$work/stacks"; then
-    fail 'perf script failed or reached the stack output limit.'
+    stack_error='perf script failed or reached the stack output limit.'
+elif [[ $(wc -c < "$work/stacks") -ge $((stacks_kib * 1024)) ]]; then
+    stack_error='The perf stacks reached their file size limit.'
 fi
-[[ $(wc -c < "$work/stacks") -lt $((stacks_kib * 1024)) ]] \
-    || fail 'The perf stacks reached their file size limit.'
+if [[ $mode == launch-raw ]]; then
+    emit_perf_data "$work/perf.data"
+elif [[ -n $stack_error ]]; then
+    fail "$stack_error"
+fi
 emit_command
-cat -- "$work/outcome" "$work/stacks"
+cat -- "$work/outcome"
+if [[ -z $stack_error ]]; then
+    cat -- "$work/stacks"
+else
+    printf '%s\n' "$stack_error" >&2
+fi
 printf '\nw11term-cpu-profile-end\n'

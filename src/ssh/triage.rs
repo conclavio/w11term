@@ -110,10 +110,25 @@ impl Target {
         deadline: Duration,
         stdout_limit: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut stdout = Vec::new();
+        let stderr = self
+            .run_diagnostic_to(operation, command, deadline, stdout_limit, &mut stdout)
+            .await?;
+        Ok((stdout, stderr))
+    }
+
+    async fn run_diagnostic_to(
+        &mut self,
+        operation: &str,
+        command: String,
+        deadline: Duration,
+        stdout_limit: usize,
+        stdout: &mut impl DiagnosticStdout,
+    ) -> Result<Vec<u8>> {
         let _busy = self.link.try_lock_diagnostic()?;
         let request = tokio::time::timeout(
             deadline,
-            read_diagnostic(&self.link, operation, command, stdout_limit),
+            read_diagnostic(&self.link, operation, command, stdout_limit, stdout),
         );
         tokio::select! {
             biased;
@@ -122,6 +137,17 @@ impl Target {
                 format!("{operation} exceeded its {}-second deadline", deadline.as_secs())
             })?,
         }
+    }
+}
+
+trait DiagnosticStdout: Send {
+    fn write(&mut self, bytes: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send;
+}
+
+impl DiagnosticStdout for Vec<u8> {
+    async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.extend_from_slice(bytes);
+        Ok(())
     }
 }
 
@@ -250,7 +276,8 @@ async fn read_diagnostic(
     operation: &str,
     command: String,
     stdout_limit: usize,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+    stdout: &mut impl DiagnosticStdout,
+) -> Result<Vec<u8>> {
     let mut channel = PendingChannel(Some(
         link.handle()
             .channel_open_session()
@@ -259,18 +286,19 @@ async fn read_diagnostic(
     ));
     let channel = channel.0.as_mut().expect("opened channel");
     channel.exec(true, command).await?;
-    let mut stdout = Vec::new();
+    let mut received = 0;
     let mut stderr = Vec::new();
     let mut result = None;
     let mut eof = false;
     while let Some(message) = channel.wait().await {
         match message {
             ChannelMsg::Data { data } => {
+                received += data.len();
                 ensure!(
-                    stdout.len() + data.len() <= stdout_limit,
+                    received <= stdout_limit,
                     "Remote {operation} output exceeds its byte limit"
                 );
-                stdout.extend_from_slice(&data);
+                stdout.write(&data).await?;
             }
             ChannelMsg::ExtendedData { data, .. } => {
                 ensure!(
@@ -296,7 +324,7 @@ async fn read_diagnostic(
         "Remote {operation} failed ({result:?}): {}",
         crate::events::display_field(&String::from_utf8_lossy(&stderr))
     );
-    Ok((stdout, stderr))
+    Ok(stderr)
 }
 
 struct PendingChannel(Option<Channel<client::Msg>>);

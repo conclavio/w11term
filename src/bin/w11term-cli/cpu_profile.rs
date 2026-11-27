@@ -7,7 +7,7 @@ pub(super) const HELP: &str = concat!(
     "[--seconds N] [--frequency HZ] [--call-graph fp|dwarf]\n",
     "w11term-cli [--pid PID] capture-cpu-profile --pane ID --target-pid PID ",
     "[--seconds N] [--frequency HZ] [--call-graph fp|dwarf] ",
-    "--connection-generation N --process-start-ticks N --output-file PATH",
+    "--connection-generation N --process-start-ticks N --output-file PATH [--perf-data PATH]",
 );
 
 pub(super) fn parse(
@@ -23,7 +23,10 @@ pub(super) fn parse(
         ) || (verb == "capture-cpu-profile"
             && matches!(
                 flag.as_str(),
-                "--connection-generation" | "--process-start-ticks" | "--output-file"
+                "--connection-generation"
+                    | "--process-start-ticks"
+                    | "--output-file"
+                    | "--perf-data"
             ));
         ensure!(allowed, "unknown option {flag} for {verb}");
         let value = args
@@ -93,6 +96,10 @@ pub(super) fn parse(
                 .remove("--output-file")
                 .context("provide --output-file for the folded CPU profile")?,
         )?,
+        perf_data_file: flags
+            .remove("--perf-data")
+            .map(path::absolute)
+            .transpose()?,
     })
 }
 
@@ -102,6 +109,33 @@ mod tests {
 
     fn invoke(verb: &str, args: &[&str]) -> Result<Request> {
         parse(verb, args.iter().map(|arg| arg.to_string()), Some(7))
+    }
+
+    #[test]
+    fn perf_data_is_opt_in_and_the_capture_path_is_absolute() {
+        let args = [
+            "--target-pid",
+            "54",
+            "--connection-generation",
+            "9",
+            "--process-start-ticks",
+            "800",
+            "--output-file",
+            "stacks.folded",
+        ];
+        let original = invoke("capture-cpu-profile", &args).unwrap();
+        let json = serde_json::to_value(original).unwrap();
+        assert!(json.get("perf_data_file").is_none());
+        let raw = [args.as_slice(), &["--perf-data", "raw.perf.data"]].concat();
+        assert!(matches!(invoke("capture-cpu-profile", &raw).unwrap(),
+            Request::CaptureCpuProfile { perf_data_file: Some(path), .. } if path.is_absolute()));
+        assert!(
+            invoke(
+                "preview-cpu-profile",
+                &["--target-pid", "54", "--perf-data", "raw.perf.data"]
+            )
+            .is_err()
+        );
     }
 
     #[test]

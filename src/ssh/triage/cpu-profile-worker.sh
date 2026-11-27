@@ -58,14 +58,24 @@ fi
 read_process
 [[ $started == "$expected" ]] || fail 'The target PID changed during the profile.'
 
+stack_error=
 if ! (
     ulimit -f "$stacks_kib" || exit 2
     exec perf script -i "$work/perf.data" --pid "$pid" -F pid,time,event,ip,sym,dso
 ) > "$work/stacks"; then
-    fail 'perf script failed or reached the stack output limit.'
+    stack_error='perf script failed or reached the stack output limit.'
+elif [[ $(wc -c < "$work/stacks") -ge $((stacks_kib * 1024)) ]]; then
+    stack_error='The perf stacks reached their file size limit.'
 fi
-[[ $(wc -c < "$work/stacks") -lt $((stacks_kib * 1024)) ]] \
-    || fail 'The perf stacks reached their file size limit.'
+if [[ $mode == capture-raw ]]; then
+    emit_perf_data "$work/perf.data"
+elif [[ -n $stack_error ]]; then
+    fail "$stack_error"
+fi
 emit_process
-cat -- "$work/stacks"
+if [[ -z $stack_error ]]; then
+    cat -- "$work/stacks"
+else
+    printf '%s\n' "$stack_error" >&2
+fi
 printf '\nw11term-cpu-profile-end\n'
