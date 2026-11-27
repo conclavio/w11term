@@ -235,6 +235,10 @@ pub enum Operation {
     Info,
     InstalledTools,
     ToolBundleVersions,
+    #[serde(skip)]
+    ReviewToolPath {
+        review: Option<String>,
+    },
     PreviewToolBundle {
         bundle: UtilityBundle,
     },
@@ -783,6 +787,7 @@ impl Drop for PendingReply {
 pub(crate) async fn run(
     session: Arc<russh::client::Handle<crate::ssh::Handler>>,
     generation: u64,
+    approved_tool_path: Option<crate::options::ToolSync>,
     mut jobs: mpsc::Receiver<Job>,
     mut cleanup: mpsc::UnboundedReceiver<Job>,
 ) {
@@ -804,6 +809,9 @@ pub(crate) async fn run(
         } = job;
         if expected_generation.is_none() {
             let missing = match operation {
+                Operation::ReviewToolPath { .. } => {
+                    Some("The PATH review needs its original SSH connection")
+                }
                 Operation::SaveText { .. } => Some("The editor needs its original SSH connection"),
                 Operation::RenameEntry { .. } | Operation::CheckRenameBatch { .. } => {
                     Some("Missing SSH connection approval; rename was not started")
@@ -979,6 +987,9 @@ pub(crate) async fn run(
                 Operation::ToolBundleVersions => {
                     JobStage::Checking("Tool history lookup did not finish")
                 }
+                Operation::ReviewToolPath { .. } => JobStage::Checking(
+                    "Tool PATH review did not finish. Review the startup files again.",
+                ),
                 Operation::ApplyToolBundle { .. } | Operation::RollbackToolBundle { .. } => {
                     JobStage::Checking("Tool bundle review did not finish")
                 }
@@ -1049,6 +1060,7 @@ pub(crate) async fn run(
                 .unwrap()
                 .execute(
                     &session,
+                    approved_tool_path.as_ref(),
                     operation,
                     progress.as_ref(),
                     cancel.as_ref(),
@@ -1496,6 +1508,7 @@ impl Engine {
     async fn execute(
         &mut self,
         session: &russh::client::Handle<crate::ssh::Handler>,
+        approved_tool_path: Option<&crate::options::ToolSync>,
         op: Operation,
         job_progress: Option<&JobProgress>,
         cancel: Option<&TransferCancel>,
@@ -1523,6 +1536,12 @@ impl Engine {
             }
             InstalledTools => serde_json::to_value(self.installed_tools(cancel).await?)?,
             ToolBundleVersions => serde_json::to_value(self.tool_bundle_versions(cancel).await?)?,
+            ReviewToolPath { review } => {
+                let settings = approved_tool_path
+                    .context("The verified SSH connection has no matching tool PATH approval")?;
+                self.review_tool_path(session, settings, review.as_deref(), stage)
+                    .await?
+            }
             PreviewToolBundle { bundle } => self.preview_utility_bundle(session, bundle).await?,
             ApplyToolBundle { bundle, review } => {
                 self.apply_utility_bundle(session, bundle, &review, stage)

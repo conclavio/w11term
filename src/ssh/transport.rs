@@ -1735,9 +1735,19 @@ async fn run_channel(
     let (sftp_tx, sftp_rx) = mpsc::channel(8);
     let (cleanup_tx, cleanup_rx) = mpsc::unbounded_channel();
     let mut children = tokio::task::JoinSet::new();
+    let approved_tool_path = options
+        .tool_bundle
+        .as_deref()
+        .filter(|settings| {
+            sync_allowed
+                && settings.add_to_path.is_some()
+                && settings.approves(shell.link.verified_endpoint())
+        })
+        .cloned();
     children.spawn(crate::sftp::run(
         shell.link.handle(),
         generation,
+        approved_tool_path,
         sftp_rx,
         cleanup_rx,
     ));
@@ -2005,6 +2015,7 @@ async fn run_herdr_channel(
     jobs.spawn(crate::sftp::run(
         link.handle(),
         generation,
+        None,
         sftp_rx,
         cleanup_rx,
     ));

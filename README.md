@@ -73,6 +73,8 @@ In a connected SSH pane, **Installed SSH tools** lists active commands from w11t
 
 Use **Settings → Edit profile → SSH tools** to sync an approved bundle of Linux utilities before login or reconnect. The profile can append its launcher directory to Bash or Zsh's `PATH`. The control CLI can preview, install, and roll back bundles on an existing SSH connection. [SSH tool bundle setup](CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
 
+If a managed PATH edit is skipped at login, **Install SSH tools → Review PATH repair** shows the proposed startup-file changes before you apply them on the connected pane. The repaired PATH takes effect in new shells. [SSH tool bundle setup](CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
+
 Choose **Linux essentials** in the profile editor to prepare `rg`, `jq`, `dust`, and `hyperfine` for Linux x86-64 and ARM64. **Linux admin tools** adds `bandwhich`, `diskwatch`, `mdd` (mddog), `ncdu`, and `netwatch`. Use **Custom tools** to select just the commands a profile needs. All built-in selections share the same managed bundle and rollback history. [Download a pinned SSH tool bundle](CONTROL.md#download-a-pinned-ssh-tool-bundle)
 
 Use **Create bundle from local tools** to package your own Linux executables. w11term detects x86-64 and ARM64, pins each file by SHA-256, and selects the saved manifest for profile review. **Revise selected tool bundle** opens a saved manifest and saves your changes as a new file for review. [SSH tool bundle setup](CONTROL.md#sync-a-tool-bundle-on-ssh-connect)

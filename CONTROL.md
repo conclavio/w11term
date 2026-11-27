@@ -1434,6 +1434,8 @@ On an ordinary SSH connect or reconnect, w11term checks the verified endpoint an
 
 **More → Command reference** shows the last login sync for the selected SSH connection. Open **Install SSH tools** for the PATH result and any error detail. Manual installs and rollbacks show their own results in the installer and version history.
 
+When the login PATH update is skipped, **Review PATH repair** checks the approved startup files over the current SSH connection. The review shows each file and the current and proposed text for any managed block it would replace. **Apply reviewed PATH repair** validates the review and writes the changes for new shells. Replacement requires one complete marker pair and preserves the text around it. Duplicate or incomplete marker pairs require manual correction.
+
 A manual rollback pauses automatic bundle updates. Preview and apply the desired bundle manually to resume syncing. **Disable tool sync** stops automatic updates from that profile.
 
 ### Run SFTP operations

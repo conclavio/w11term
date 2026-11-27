@@ -2567,11 +2567,11 @@ async fn native_command_reference_follows_powershell_and_ssh() {
     fs::write(state.path().join("ssh-wire"), trace.to_str().unwrap()).unwrap();
     let ssh = super::utilities::reference_tool_profile(source, state.path(), remote.path());
     drive_mixed_gui("command-reference-ui.ps1", &ssh, state.path());
-    assert!(
-        fs::read_to_string(remote.path().join(".bashrc"))
-            .unwrap()
-            .contains("# preserve my shell changes")
-    );
+    let shell = fs::read_to_string(remote.path().join(".bashrc")).unwrap();
+    assert!(shell.starts_with("# preserve my shell changes\n"));
+    assert!(shell.ends_with("# trailing user settings\n"));
+    assert!(shell.contains("export PATH"));
+    assert!(!shell.contains("# edited managed block"));
     assert!(
         fs::read_to_string(remote.path().join(".local/bin/netwatch"))
             .unwrap()

@@ -892,7 +892,7 @@ pub(super) fn reference_tool_profile(
     .unwrap();
     let path_marker = tool_sha256(b".local/bin");
     fs::write(remote.join(".bashrc"), format!(
-        "# >>> w11term tool PATH {path_marker} >>>\n# preserve my shell changes\n# <<< w11term tool PATH {path_marker} <<<\n"
+        "# preserve my shell changes\n# >>> w11term tool PATH {path_marker} >>>\n# edited managed block\n# <<< w11term tool PATH {path_marker} <<<\n# trailing user settings\n"
     )).unwrap();
     approved_login(source, local)
 }
@@ -1053,6 +1053,13 @@ async fn tool_sync_skips_scope_changes_and_preserves_edited_startup_hooks() {
     wrong.tool_bundle.as_mut().unwrap().fingerprint = "SHA256:unapproved".into();
     let wrong = connect_tools(&wrong);
     wait_tool_login(&wrong, 1, "skipped", None).await;
+    let repair = |review| Operation::ReviewToolPath { review };
+    assert!(
+        guarded_job(&wrong, Some(1), repair(None))
+            .await
+            .unwrap_err()
+            .contains("no matching tool PATH approval")
+    );
     assert!(
         !root.join("utility-probe-command").exists(),
         "scope mismatch must stop before probing"
@@ -1067,9 +1074,8 @@ async fn tool_sync_skips_scope_changes_and_preserves_edited_startup_hooks() {
     let pane = connect_tools(&options);
     wait_tool_login(&pane, 1, "updated", Some("updated")).await;
     let path = root.join(".bashrc");
-    let changed = fs::read_to_string(&path)
-        .unwrap()
-        .replace("export PATH", "export PATH # user edit");
+    let original = fs::read_to_string(&path).unwrap();
+    let changed = original.replace("export PATH", "export PATH # user edit");
     fs::write(&path, &changed).unwrap();
     fs::write(root.join("utility-digest-mode"), "valid").unwrap();
     let trace = root.join("transfer-trace");
@@ -1080,7 +1086,54 @@ async fn tool_sync_skips_scope_changes_and_preserves_edited_startup_hooks() {
         !sftp_opened_tool(&trace),
         "repeat login should keep the bytes on the remote host"
     );
-    assert_eq!(fs::read_to_string(path).unwrap(), changed);
+    assert_eq!(fs::read_to_string(&path).unwrap(), changed);
+
+    let review = guarded_job(&pane, Some(1), repair(None)).await.unwrap();
+    assert_eq!(review["ready"], true);
+    assert_eq!(review["files"][1]["action"], "replace-hook");
+    assert!(
+        review["files"][1]["replaced_hook"]
+            .as_str()
+            .unwrap()
+            .contains("# user edit")
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), changed);
+    let token = |report: &Value| Some(report["review"].as_str().unwrap().to_owned());
+    let concurrent_edit = format!("# outside the managed block\n{changed}");
+    fs::write(&path, &concurrent_edit).unwrap();
+    let stale = guarded_job(&pane, Some(1), repair(token(&review)))
+        .await
+        .unwrap_err();
+    assert!(stale.contains("review is stale"), "{stale}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), concurrent_edit);
+
+    let duplicate = format!("{concurrent_edit}{changed}");
+    fs::write(&path, &duplicate).unwrap();
+    let blocked = guarded_job(&pane, Some(1), repair(None)).await.unwrap();
+    assert_eq!(blocked["ready"], false);
+    assert!(blocked.get("review").is_none());
+    assert_eq!(blocked["files"][1]["action"], "hook-conflict");
+    assert_eq!(fs::read_to_string(&path).unwrap(), duplicate);
+
+    fs::write(&path, &concurrent_edit).unwrap();
+    let review = guarded_job(&pane, Some(1), repair(None)).await.unwrap();
+    let applied = guarded_job(&pane, Some(1), repair(token(&review)))
+        .await
+        .unwrap();
+    assert_eq!(applied["changed"], true);
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        format!("# outside the managed block\n{original}")
+    );
+    let current = guarded_job(&pane, Some(1), repair(None)).await.unwrap();
+    assert_eq!(current["ready"], false);
+    assert!(
+        current["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["action"] == "unchanged")
+    );
 
     let zdotdir = root.join("config/zsh");
     fs::create_dir_all(&zdotdir).unwrap();

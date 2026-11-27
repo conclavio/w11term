@@ -129,6 +129,22 @@ try {
         (Find-Element $loginSummary) -and (Find-Element 'Managed PATH skipped') -and
             (Find-Element 'Resolve the managed PATH conflict at /.bashrc')
     }
+    Click 'Review PATH repair'
+    $null = Wait-Until 'reviewed repair identifies the edited startup block' {
+        (Find-Element "Replace managed block in${dot}/.bashrc") -and
+            (Find-Element 'The repaired PATH applies to new shells.')
+    }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot apply the PATH repair' {
+        !(Find-Element 'Apply reviewed PATH repair' $button)
+    }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    Click 'Apply reviewed PATH repair'
+    $null = Wait-Until 'PATH repair completed without reconnecting' {
+        Find-Element 'Managed PATH repaired for new shells'
+    }
     Click 'Browse for tool bundle'
     $manifestDialog = Wait-Until 'owned tool manifest picker' { Find-OwnedDialog 'Choose SSH tool bundle' }
     Select-DialogItem $manifestDialog 'Tool review.json'

@@ -1,5 +1,7 @@
 use super::*;
 
+mod tool_path;
+
 const DIRECTORY: &str = ".config/w11term/dotfiles";
 const PARENTS: [&str; 3] = [".config", ".config/w11term", DIRECTORY];
 const DISABLED: &str = "disabled\n";
@@ -194,6 +196,7 @@ struct Edit {
     before: Option<String>,
     after: Option<String>,
     hook: Option<String>,
+    replaced_hook: Option<String>,
 }
 
 impl Edit {
@@ -209,6 +212,7 @@ impl Edit {
             before,
             after,
             hook: None,
+            replaced_hook: None,
         }
     }
 
@@ -230,6 +234,9 @@ impl Edit {
         });
         if let Some(hook) = &self.hook {
             report["hook"] = json!(hook);
+        }
+        if let Some(replaced) = &self.replaced_hook {
+            report["replaced_hook"] = json!(replaced);
         }
         report
     }
@@ -715,52 +722,6 @@ impl Engine {
         let rc = startup(&format!(".{}rc", shell.name()));
         let rc_original = self.dotfile_text(&rc).await?;
         Ok([(login, login_original), (rc, rc_original)])
-    }
-
-    pub(super) async fn sync_tool_path(
-        &self,
-        home: &str,
-        bin: &str,
-        settings: &crate::options::ToolPath,
-    ) -> Result<bool> {
-        let zdotdir = settings.zdotdir.as_deref();
-        validate_zdotdir(settings.shell, zdotdir)?;
-        // The caller validates the relative bin path against the manifest grammar.
-        let id = digest_hex(Sha256::new_with_prefix(bin.as_bytes()));
-        let hook = format!(
-            "# >>> w11term tool PATH {id} >>>\n\
-             case \":${{PATH-}}:\" in\n\
-             *\":$HOME/{bin}:\"*) ;;\n\
-             *) PATH=\"${{PATH:+$PATH:}}$HOME/{bin}\"; export PATH ;;\n\
-             esac\n\
-             # <<< w11term tool PATH {id} <<<\n"
-        );
-        let edits = self
-            .startup_files(home, settings.shell, zdotdir)
-            .await?
-            .map(|(path, original)| hook_change(path, original, hook.clone()));
-        let atomic = self.extension(editor::POSIX_RENAME, "1").is_ok();
-        for edit in &edits {
-            ensure!(
-                edit.after.is_some(),
-                "Resolve the managed PATH conflict at {}",
-                edit.path
-            );
-            ensure!(
-                !edit.changed() || edit.before.is_none() || atomic,
-                "The server cannot atomically replace {}",
-                edit.path
-            );
-        }
-        let mut stage = JobStage::Checking("Updating managed tool PATH");
-        let mut changed = false;
-        for edit in &edits {
-            if edit.changed() {
-                self.write_dotfile(edit, &mut stage).await?;
-                changed = true;
-            }
-        }
-        Ok(changed)
     }
 
     async fn dotfile_selector(

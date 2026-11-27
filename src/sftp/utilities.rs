@@ -12,6 +12,7 @@ pub use downloads::{
     ToolBundlePreset, UtilityDownload, builtin_tool_names, export_builtin_tool_bundle,
     fetch_tool_bundle, prepare_builtin_tool_bundle,
 };
+pub(super) use install::with_lock;
 use install::{InstallPlan, Release, StoredTool};
 pub use install::{InstalledTool, InstalledTools, RetainedToolVersion, ToolBundleVersions};
 pub use local::{LocalUtilityBundle, LocalUtilityExecutable};
@@ -79,7 +80,7 @@ fn safe_component(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
 }
 
-fn valid_bin_directory(directory: &str) -> bool {
+pub(super) fn valid_bin_directory(directory: &str) -> bool {
     directory.len() <= 192
         && directory.split('/').all(safe_component)
         && directory.split('/').count() <= 8

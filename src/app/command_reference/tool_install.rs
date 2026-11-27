@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use w11term::sftp::UtilityBundle;
 
 mod history;
+mod path_repair;
 
 pub enum Action {
     Open(ToolPane),
@@ -14,6 +15,7 @@ pub enum Action {
     Apply,
     Applied(Arc<()>, Result<Installation, String>),
     History(history::Action),
+    Path(path_repair::Action),
     Close,
 }
 
@@ -77,6 +79,14 @@ enum Work {
     Browse,
     Preview,
     Apply,
+    PathReview,
+    PathApply,
+}
+
+impl Work {
+    fn writing(self) -> bool {
+        matches!(self, Self::Apply | Self::PathApply)
+    }
 }
 
 pub(super) struct Installer {
@@ -87,6 +97,7 @@ pub(super) struct Installer {
     pending: Option<(Arc<()>, Work)>,
     status: Option<String>,
     history: Option<history::Panel>,
+    path_review: Option<Box<path_repair::Review>>,
 }
 
 fn message(action: Action) -> Message {
@@ -125,7 +136,7 @@ impl Installer {
         let applying = self
             .pending
             .as_ref()
-            .is_some_and(|(_, kind)| *kind == Work::Apply);
+            .is_some_and(|(_, kind)| kind.writing());
         let button = |label: &str, enabled, action: fn() -> Action| {
             Button::new()
                 .is_enabled(enabled)
@@ -172,6 +183,29 @@ impl Installer {
                         .text_wrapping(TextWrapping::Wrap),
                 ));
             }
+            if report.path == Some(ToolPathSyncStatus::Skipped) {
+                fields.push(KeyedView::new(
+                    "review-path",
+                    button("Review PATH repair", available, || {
+                        Action::Path(path_repair::Action::Preview)
+                    }),
+                ));
+            }
+        }
+        if active == Some(self.target)
+            && let Some(review) = &self.path_review
+        {
+            review.describe(&mut fields);
+            if review.ready {
+                fields.push(KeyedView::new(
+                    "apply-path",
+                    button(
+                        "Apply reviewed PATH repair",
+                        available && review.review.is_some(),
+                        || Action::Path(path_repair::Action::Apply),
+                    ),
+                ));
+            }
         }
         fields.extend([
             KeyedView::new(
@@ -206,6 +240,8 @@ impl Installer {
                 Work::Browse => "Choosing a manifest…",
                 Work::Preview => "Reviewing tool bundle…",
                 Work::Apply => "Installing reviewed tool bundle…",
+                Work::PathReview => "Reviewing tool PATH…",
+                Work::PathApply => "Updating shell startup files…",
             })
         } else if active != Some(self.target) {
             Some("Return to the original SSH pane or open a new review")
@@ -318,6 +354,10 @@ impl TerminalApp {
             self.tool_bundle_history(action, ctx);
             return;
         }
+        if let Action::Path(action) = action {
+            self.repair_tool_path(action, ctx);
+            return;
+        }
         let current = self
             .reference_tool_target()
             .map(|(target, session)| (target, session.input.clone()));
@@ -345,6 +385,7 @@ impl TerminalApp {
                 pending: None,
                 status: None,
                 history: None,
+                path_review: None,
             });
             return;
         }
@@ -362,11 +403,12 @@ impl TerminalApp {
         match action {
             Action::Open(_) => unreachable!("opening handled above"),
             Action::History(_) => unreachable!("history handled above"),
+            Action::Path(_) => unreachable!("PATH repair handled above"),
             Action::Close => {
                 if !installer
                     .pending
                     .as_ref()
-                    .is_some_and(|(_, work)| *work == Work::Apply)
+                    .is_some_and(|(_, work)| work.writing())
                 {
                     panel.tool_install = None;
                     panel.focus = panel.focus.wrapping_add(1);

@@ -861,7 +861,7 @@ fn quote_sh(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub(super) async fn with_lock<T>(
+pub(in crate::sftp) async fn with_lock<T>(
     session: &Ssh,
     directory: &str,
     work: impl Future<Output = Result<T>>,
