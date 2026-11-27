@@ -1107,10 +1107,16 @@ impl Source {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiagnosticLaunch {
+    Open(Artifact),
+    Compare { before: Artifact, after: Artifact },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     pub source: Source,
-    pub diagnostic: Option<Artifact>,
+    pub diagnostic: Option<DiagnosticLaunch>,
     pub workspace: Option<String>,
     pub switch_workspace: bool,
     pub expected_workspace_key: Option<String>,
@@ -1132,6 +1138,7 @@ impl Options {
         let mut args = args.into_iter();
         let mut source = Source::Demo;
         let mut diagnostic = None;
+        let mut comparison_paths = Vec::new();
         let mut profile = None;
         let mut workspace_name = None;
         let mut switch_workspace = false;
@@ -1173,11 +1180,7 @@ impl Options {
                     "Too many {arg} paths (maximum {})",
                     kind.max_paths()
                 );
-                let path = value(&mut args, &arg)?;
-                artifact.paths.push(
-                    std::path::absolute(Path::new(&path))
-                        .with_context(|| format!("Resolving the {arg} file path"))?,
-                );
+                artifact.paths.push(diagnostic_path(&mut args, &arg)?);
                 continue;
             }
             explicit_source |= matches!(
@@ -1187,7 +1190,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term --open-cpu-profile PATH\n  w11term --open-triage-report PATH\n  w11term --open-packet-capture PATH\n  w11term --open-syscall-trace PATH [--open-syscall-trace PATH ...]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive] [--certificate FILE]\n      [--host-key SHA256:...] [--host-key-alias NAME] [--agent-pipe PIPE]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
+                        "w11term — Rust / Reactor SSH terminal prototype\n\n  w11term [--demo]\n  w11term --profile root|play-6789|play-6792 [--cols 170 --rows 48]\n  w11term --profile root --tab play-6789 --tab play-6792\n  w11term --list-profiles [--profiles profiles.json]\n  w11term --workspace NAME [--profiles profiles.json]\n  w11term --switch-workspace NAME [--profiles profiles.json]\n  w11term --replay capture.vt\n  w11term --replay-timed capture.vt [--paused]\n  w11term --open-cpu-profile PATH [--compare-with PATH]\n  w11term --open-triage-report PATH [--compare-with PATH]\n  w11term --open-packet-capture PATH\n  w11term --open-syscall-trace PATH [--open-syscall-trace PATH ...] [--compare-with PATH ...]\n  w11term ssh user@host[:port] [--port 22] [--identity KEY | --agent-key SHA256:... | --auth none|agent|password|keyboard-interactive] [--certificate FILE]\n      [--host-key SHA256:...] [--host-key-alias NAME] [--agent-pipe PIPE]\n  w11term --benchmark\n  w11term --smoke-seconds 5\n\nAutomation: w11term-cli --help (named pipe, JSON replies, no focus changes).\nProfiles load from %LOCALAPPDATA%\\w11term\\profiles.json, or --profiles PATH.\nRelative identity and certificate paths in profiles resolve beside that file.\nSSH verifies OpenSSH known_hosts, or an explicitly supplied fingerprint.\nSSH destinations also accept ssh://user@host[:port] and bracketed IPv6.\nAuthentication defaults to the Windows OpenSSH agent; --auth none sends no key.\nCtrl+Shift+V: paste; Shift+PageUp/PageDown: scrollback; F5: reload demo."
                     );
                     return Ok(None);
                 }
@@ -1202,6 +1205,13 @@ impl Options {
                 "--replay-timed" => {
                     source = Source::TimedReplay(value(&mut args, &arg)?.into());
                     profile = None;
+                }
+                "--compare-with" => {
+                    ensure!(
+                        comparison_paths.len() < DiagnosticKind::SyscallTrace.max_paths(),
+                        "Too many --compare-with paths"
+                    );
+                    comparison_paths.push(diagnostic_path(&mut args, &arg)?);
                 }
                 "--profile" => profile = Some(value(&mut args, &arg)?),
                 "--workspace" | "--switch-workspace" => {
@@ -1274,6 +1284,28 @@ impl Options {
                 _ => bail!("unknown argument: {arg}; use --help"),
             }
         }
+        let diagnostic = if comparison_paths.is_empty() {
+            diagnostic.map(DiagnosticLaunch::Open)
+        } else {
+            let before = diagnostic
+                .context("--compare-with requires a saved baseline from an --open-* option")?;
+            let kind = before.kind;
+            ensure!(
+                kind != DiagnosticKind::PacketCapture,
+                "Packet captures cannot be compared in w11term"
+            );
+            ensure!(
+                comparison_paths.len() <= kind.max_paths(),
+                "Use one --compare-with file for this diagnostic"
+            );
+            Some(DiagnosticLaunch::Compare {
+                before,
+                after: Artifact {
+                    kind,
+                    paths: comparison_paths,
+                },
+            })
+        };
         ensure!(
             diagnostic.is_none()
                 || !(explicit_source || workspace_name.is_some() || list_profiles || benchmark),
@@ -1453,6 +1485,12 @@ impl Options {
             rows,
         }))
     }
+}
+
+fn diagnostic_path(args: &mut impl Iterator<Item = String>, option: &str) -> Result<PathBuf> {
+    let path = value(args, option)?;
+    std::path::absolute(Path::new(&path))
+        .with_context(|| format!("Resolving the {option} file path"))
 }
 
 fn value(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String> {
@@ -1930,7 +1968,9 @@ mod tests {
             let launch = parse(&[option, "saved diagnostic.42"]);
             assert_eq!(launch.initial_profile, None);
             assert_eq!(launch.source, Source::Demo);
-            let artifact = launch.diagnostic.unwrap();
+            let Some(DiagnosticLaunch::Open(artifact)) = launch.diagnostic else {
+                panic!("Expected to open {kind:?}");
+            };
             assert_eq!(artifact.kind, kind);
             assert_eq!(
                 artifact.paths,
@@ -1959,14 +1999,12 @@ mod tests {
                     .map(str::to_owned),
             )
         };
-        let paths = parse(&[flag, "run.98", flag, "run.32"])
-            .unwrap()
-            .unwrap()
-            .diagnostic
-            .unwrap()
-            .paths;
+        let launch = parse(&[flag, "run.98", flag, "run.32"]).unwrap().unwrap();
+        let Some(DiagnosticLaunch::Open(artifact)) = launch.diagnostic else {
+            panic!("Expected a saved trace")
+        };
         assert_eq!(
-            paths,
+            artifact.paths,
             ["run.98", "run.32"].map(|path| std::path::absolute(path).unwrap())
         );
         for args in [
@@ -1990,6 +2028,62 @@ mod tests {
             assert!(parse(args).is_err(), "{args:?}");
         }
         let oversized = [flag, "run.32"].repeat(DiagnosticKind::SyscallTrace.max_paths() + 1);
+        assert!(parse(&oversized).is_err());
+    }
+
+    #[test]
+    fn diagnostic_comparisons_preserve_each_side_and_require_compatible_inputs() {
+        let open = "--open-syscall-trace";
+        let compare = "--compare-with";
+        let parse = |args: &[&str]| {
+            Options::parse_from(
+                ["--profiles", "profiles.json"]
+                    .into_iter()
+                    .chain(args.iter().copied())
+                    .map(str::to_owned),
+            )
+        };
+        let launch = parse(&[
+            compare, "fail.79", open, "work.42", open, "work.41", compare, "fail.78",
+        ])
+        .unwrap()
+        .unwrap();
+        let Some(DiagnosticLaunch::Compare { before, after }) = launch.diagnostic else {
+            panic!("Expected a saved comparison");
+        };
+        assert_eq!(before.kind, DiagnosticKind::SyscallTrace);
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(
+            before.paths,
+            ["work.42", "work.41"].map(|p| std::path::absolute(p).unwrap())
+        );
+        assert_eq!(
+            after.paths,
+            ["fail.79", "fail.78"].map(|p| std::path::absolute(p).unwrap())
+        );
+        for args in [
+            &[compare, "after.folded"][..],
+            &["--open-cpu-profile", "before.folded", compare],
+            &[
+                "--open-packet-capture",
+                "before.pcap",
+                compare,
+                "after.pcap",
+            ],
+            &[
+                "--open-triage-report",
+                "before.json",
+                compare,
+                "after.json",
+                compare,
+                "extra.json",
+            ],
+            &[open, "work.42", compare, "fail.78", "--profile", "Remote"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+        let mut oversized = vec![open, "work.42"];
+        oversized.extend([compare, "fail.78"].repeat(DiagnosticKind::SyscallTrace.max_paths() + 1));
         assert!(parse(&oversized).is_err());
     }
 

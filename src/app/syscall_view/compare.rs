@@ -57,7 +57,7 @@ enum Input {
 }
 
 impl TerminalApp {
-    pub(in crate::app) fn compare_recent_syscall_traces(
+    pub(in crate::app) fn compare_saved_syscall_traces(
         &mut self,
         before: Vec<PathBuf>,
         after: Vec<PathBuf>,
@@ -76,9 +76,12 @@ impl TerminalApp {
                 {
                     match result {
                         Ok(Some(comparison)) => {
-                            if page.loaded.is_none() {
+                            let before = if page.loaded.is_none() {
                                 page.load(comparison.traces()[0].clone());
-                            }
+                                Some(comparison.traces()[0].paths())
+                            } else {
+                                None
+                            };
                             let paths = comparison.traces()[1].paths();
                             let state = &mut page.comparison;
                             *state = ViewState {
@@ -87,6 +90,13 @@ impl TerminalApp {
                                 ..Default::default()
                             };
                             state.filter(false);
+                            if let Some(before) = before {
+                                self.remember_diagnostic(
+                                    w11term::diagnostic_history::Kind::SyscallTrace,
+                                    before,
+                                    ctx,
+                                );
+                            }
                             self.remember_diagnostic(
                                 w11term::diagnostic_history::Kind::SyscallTrace,
                                 paths,

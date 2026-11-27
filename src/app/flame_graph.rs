@@ -415,7 +415,7 @@ fn profile_outcome(summary: &CpuProfileSummary) -> Option<String> {
 }
 
 impl TerminalApp {
-    pub(super) fn compare_recent_profiles(
+    pub(super) fn compare_saved_profiles(
         &mut self,
         before: PathBuf,
         after: PathBuf,
@@ -648,14 +648,20 @@ impl TerminalApp {
                         view,
                         install_baseline,
                     })) => {
-                        if install_baseline {
+                        let before = if install_baseline {
                             let (profile, path) = view.before_source();
                             panel.activity = None;
                             panel.capture = None;
-                            panel.load(profile, path, None);
-                        }
+                            panel.load(profile, path.clone(), None);
+                            Some(path)
+                        } else {
+                            None
+                        };
                         let path = view.after_path().to_owned();
                         panel.comparison = Some(*view);
+                        if let Some(before) = before {
+                            self.remember_diagnostic(ArtifactKind::CpuProfile, [before], ctx);
+                        }
                         self.remember_diagnostic(ArtifactKind::CpuProfile, [path], ctx);
                     }
                     Ok(Some(Outcome::ComparisonFiltered(results))) => {

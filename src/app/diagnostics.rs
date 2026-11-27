@@ -482,7 +482,7 @@ impl TerminalApp {
         });
     }
 
-    fn compare_saved_diagnostics(
+    pub(super) fn compare_saved_diagnostics(
         &mut self,
         before: &Artifact,
         after: &Artifact,
@@ -490,13 +490,13 @@ impl TerminalApp {
     ) {
         let started = match (before.kind, before.paths.as_slice(), after.paths.as_slice()) {
             (Kind::TriageReport, [before], [after]) => {
-                self.compare_recent_triage_reports(before.clone(), after.clone(), ctx)
+                self.compare_saved_triage_reports(before.clone(), after.clone(), ctx)
             }
             (Kind::CpuProfile, [before], [after]) => {
-                self.compare_recent_profiles(before.clone(), after.clone(), ctx)
+                self.compare_saved_profiles(before.clone(), after.clone(), ctx)
             }
             (Kind::SyscallTrace, before, after) => {
-                self.compare_recent_syscall_traces(before.to_vec(), after.to_vec(), ctx);
+                self.compare_saved_syscall_traces(before.to_vec(), after.to_vec(), ctx);
                 true
             }
             _ => return,

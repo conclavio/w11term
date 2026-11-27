@@ -1462,6 +1462,14 @@ Use `w11term.exe` to launch directly into the corresponding offline viewer. Path
 .\w11term.exe --open-syscall-trace '.\run.321' --open-syscall-trace '.\run.322'
 ```
 
+To start in the comparison view, supply the Before or Working files with the `--open-*` option and the After or Failing files with `--compare-with`. For split syscall traces, repeat the option for each side independently. The viewer adds both sources to recent diagnostics. Use the comparison's **Back to flame graph**, **Back to report**, or **Back to working trace** button to return to the baseline.
+
+```powershell
+.\w11term.exe --open-cpu-profile '.\before.folded' --compare-with '.\after.folded'
+.\w11term.exe --open-triage-report '.\before.json' --compare-with '.\after.json'
+.\w11term.exe --open-syscall-trace '.\working.321' --open-syscall-trace '.\working.322' --compare-with '.\failing.411' --compare-with '.\failing.412'
+```
+
 **Activity** shows jobs started from the app in this window, with the original SSH endpoint, current state, and the latest result still available in each tool. Packet and syscall captures report their stop reason and saved path. Select an activity to return to the running job or its result even after switching panes. Linux performance triage shows the live count of checks that have finished, including checks that returned an error. **Stop and keep report** ends the collection early. The report retains collected output, labels unfinished checks as incomplete, and records that you stopped the collection.
 
 ### Capture Linux packets and open Wireshark

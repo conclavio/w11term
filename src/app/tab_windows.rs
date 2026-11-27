@@ -3,7 +3,7 @@ use std::{
     rc::Weak,
     sync::atomic::{AtomicU64, Ordering},
 };
-use w11term::options::Options;
+use w11term::options::{DiagnosticLaunch, Options};
 use w11term::tabs::TabTitle;
 use w11term::{control::PaneTransfer, tabs::DetachedPane};
 use windows::Win32::{
@@ -624,8 +624,14 @@ impl TerminalApp {
                     } else if !self.window_restored {
                         self.restore_window();
                     }
-                    if let Some(artifact) = self.window_launch.diagnostic.take() {
-                        self.open_diagnostic_artifact(&artifact, ctx);
+                    match self.window_launch.diagnostic.take() {
+                        Some(DiagnosticLaunch::Open(artifact)) => {
+                            self.open_diagnostic_artifact(&artifact, ctx)
+                        }
+                        Some(DiagnosticLaunch::Compare { before, after }) => {
+                            self.compare_saved_diagnostics(&before, &after, ctx)
+                        }
+                        None => (),
                     }
                 }
                 Err(error) => {
