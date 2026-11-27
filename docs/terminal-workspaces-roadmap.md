@@ -281,6 +281,8 @@ Add a native **SSH host group** tab. Start with live SSH panes across the curren
 
 Open **More → Diagnostics** to choose a tool or see the connected endpoint in **Diagnostics overview**. Review the verified host, target interface or binary, output destination, duration, and size limit before starting. Run the tool over a sibling channel on the pane's existing authenticated transport. Send progress and the stop reason to the Windows UI, and transfer finalized artifacts through SFTP. A server-side deadline and cleanup lease bound the job even if Windows disconnects.
 
+The overview's **Activity** list follows jobs started from the app in the current window. It keeps their original SSH endpoint visible when the active pane changes, and each entry opens that tool or the original syscall viewer tab. A finished capture includes its local artifact path and stop reason when available.
+
 ### Packet capture and Wireshark
 
 - Choose an interface, an optional capture filter, and a snap length. Review the effective `tcpdump -i IFACE -nn -p -s SNAPLEN -w -` arguments and packet limit before starting. For rolling capture, use the stdout stream and place complete pcap records into a bounded set of private files so the capture keeps tcpdump’s existing privilege handling. Rotate before a record exceeds a file’s budget. Show the number of overwritten files and save the retained packets in capture order. Stop cleanly so tcpdump can flush its output and report packet drops. [tcpdump manual](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in) · [Rolling capture controls](../CONTROL.md#capture-linux-packets-and-open-wireshark)

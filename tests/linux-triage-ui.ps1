@@ -70,6 +70,11 @@ try {
     Wait-Focus $remote
     Click 'Run triage'
     $null = Wait-Until 'collection summary' { Find-Element '7 of 10 checks complete' }
+    Click 'Return to diagnostics overview'
+    $null = Wait-Until 'overview shows the completed performance report' {
+        Find-Element 'Collected Linux performance report'
+    }
+    Click 'Open Linux performance triage activity'
     Show-CpuEvidence
     Show-KernelCheck
     Click 'Save report'

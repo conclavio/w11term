@@ -45,6 +45,7 @@ function Find-TraceText([string]$Prefix) {
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
+    $local = (Sessions | Where-Object label -eq 'Palette PowerShell').id
     $remote = (Control @('open','--profile','palette-ssh','--activate')).pane
     Wait-Focus $remote
     $null = Control @('wait-ssh-connected','--pane',"$remote",'--timeout','15')
@@ -76,6 +77,13 @@ try {
     $null = Wait-Until 'enter the trace output path' { [FixtureDialog]::SetFilename($dialog, $destination, 'syscall-trace.strace') }
     $null = Wait-Until 'confirm the trace output path' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'remote trace worker started' { [IO.File]::Exists($started) }
+    $null = Control @('focus-pane','--pane',"$local")
+    Wait-Focus $local
+    Run-Palette 'Diagnostics overview'
+    $null = Wait-Until 'running syscall capture is visible from PowerShell' {
+        (Find-Element 'Open Syscall capture activity' $button) -and (Find-Element 'Running')
+    }
+    Click 'Open Syscall capture activity'
     Click 'Stop syscall capture'
     $null = Wait-Until 'verified stopped trace is displayed in the viewer' {
         if (![IO.File]::Exists($destination)) { return }
@@ -84,6 +92,14 @@ try {
         $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
         $original = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $rawId)
         $original -and $original.Current.Name.Contains('ENOENT')
+    }
+    $null = Control @('focus-pane','--pane',"$local")
+    Wait-Focus $local
+    Run-Palette 'Diagnostics overview'
+    $null = Wait-Until 'overview shows the saved trace and original stop reason' {
+        $summary = Find-TraceText 'Saved syscall trace'
+        $summary -and $summary.Current.Name.Contains('Stopped by request') -and
+            $summary.Current.Name.EndsWith($destination)
     }
 } finally {
     Close-FixtureApp $app

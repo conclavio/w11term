@@ -1449,6 +1449,8 @@ Open **More → Diagnostics → Diagnostics overview** or search for **Diagnosti
 
 Use **Back** in the triage, flame graph, or packet capture panel to return to the overview. Open saved reports, folded stacks, and syscall traces even when you have no active SSH connection. Each live capture still has its own target review and start action.
 
+**Activity** shows jobs started from the app in this window, with the original SSH endpoint, current state, and the latest result still available in each tool. Packet and syscall captures report their stop reason and saved path. Select an activity to return to the running job or its result even after switching panes.
+
 ### Capture Linux packets and open Wireshark
 
 In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → Packet capture** or search for it in the command palette. Choose the interface, optional BPF filter, snap length, duration, and byte budget. Turn on **Use RAM-backed scratch storage** to require tmpfs. **Review packet capture** shows the verified host, effective packet limit, scratch location, and tcpdump arguments. **Capture and save…** starts the capture after you choose a new Windows file. **Stop and save** asks the running tcpdump to finish writing its capture, then transfers the verified file. The result reports why the capture ended and how many packets the kernel dropped when tcpdump reports that count.

@@ -15,6 +15,70 @@ pub enum Action {
     Close,
 }
 
+pub(super) struct Activity {
+    endpoint: String,
+    state: ActivityState,
+}
+
+enum ActivityState {
+    Running { ticket: Arc<()>, stopping: bool },
+    Finished(String),
+}
+
+impl Activity {
+    pub(super) fn start(ticket: &Arc<()>, user: &str, host: &str, port: u16) -> Self {
+        Self {
+            endpoint: ssh_endpoint(user, host, port),
+            state: ActivityState::Running {
+                ticket: ticket.clone(),
+                stopping: false,
+            },
+        }
+    }
+
+    pub(super) fn stopping(&mut self) {
+        if let ActivityState::Running { stopping, .. } = &mut self.state {
+            *stopping = true;
+        }
+    }
+
+    pub(super) fn finish<T>(
+        &mut self,
+        ticket: &Arc<()>,
+        result: &Result<Option<T>, String>,
+        completed: impl FnOnce(&T) -> Option<String>,
+    ) {
+        if matches!(&self.state, ActivityState::Running { ticket: active, .. } if Arc::ptr_eq(active, ticket))
+        {
+            self.state = ActivityState::Finished(match result {
+                Ok(Some(outcome)) => completed(outcome).unwrap_or_else(|| "Completed".into()),
+                Ok(None) => "Cancelled".into(),
+                Err(error) => format!("Failed · {error}"),
+            });
+        }
+    }
+
+    fn summary(&self) -> &str {
+        match &self.state {
+            ActivityState::Running {
+                stopping: false, ..
+            } => "Running",
+            ActivityState::Running { stopping: true, .. } => {
+                "Stop requested · saving collected data"
+            }
+            ActivityState::Finished(summary) => summary,
+        }
+    }
+}
+
+fn ssh_endpoint(user: &str, host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("{user}@[{host}]:{port}")
+    } else {
+        format!("{user}@{host}:{port}")
+    }
+}
+
 pub(super) fn menu() -> MenuItem {
     MenuItem::submenu(
         "diagnostics",
@@ -97,12 +161,8 @@ impl TerminalApp {
         let destination = match connection {
             Some(connection) => {
                 let options = connection.options();
-                let host = &options.host;
-                if host.contains(':') && !host.starts_with('[') {
-                    format!("SSH pane · {}@[{host}]:{}", options.user, options.port)
-                } else {
-                    format!("SSH pane · {}@{host}:{}", options.user, options.port)
-                }
+                let endpoint = ssh_endpoint(&options.user, &options.host, options.port);
+                format!("SSH pane · {endpoint}")
             }
             None => "Select a connected Linux SSH pane to run diagnostics.".into(),
         };
@@ -141,6 +201,7 @@ impl TerminalApp {
                 || Message::SyscallView(syscall_view::Action::Show),
             ),
         ];
+        let activity = self.diagnostics_activity_rows(ctx);
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
             .children((
@@ -168,10 +229,103 @@ impl TerminalApp {
                                     .text(triage::display_output(&destination))
                                     .text_wrapping(TextWrapping::Wrap),
                             ))
+                            .chain(activity)
                             .chain(rows),
                         ),
                     ),
                 ),
             ))
+    }
+
+    fn diagnostics_activity_rows(&self, ctx: &ViewContext<Self>) -> Vec<KeyedView> {
+        let row = |label, key, activity: &Activity, open: Callback<()>| {
+            let item = KeyedView::new(
+                key,
+                StackPanel::new().spacing(3.0).children((
+                    Button::new()
+                        .automation_name(format!("Open {label} activity"))
+                        .on_click(open)
+                        .content(format!("{label} activity")),
+                    TextBlock::new()
+                        .text(triage::display_output(&activity.endpoint))
+                        .text_wrapping(TextWrapping::Wrap),
+                    TextBlock::new()
+                        .text(triage::display_output(activity.summary()))
+                        .text_wrapping(TextWrapping::Wrap),
+                )),
+            );
+            (matches!(activity.state, ActivityState::Finished(_)), item)
+        };
+        let drawers: [(_, _, fn() -> Message); 3] = [
+            (triage::LABEL, self.triage.activity.as_ref(), || {
+                Message::Triage(triage::Action::Open)
+            }),
+            (
+                flame_graph::LABEL,
+                self.flame_graph.activity.as_ref(),
+                || Message::FlameGraph(flame_graph::Action::Open),
+            ),
+            (
+                packet_capture::LABEL,
+                self.packet_capture.activity.as_ref(),
+                || Message::PacketCapture(packet_capture::Action::Open),
+            ),
+        ];
+        let mut rows: Vec<_> = drawers
+            .into_iter()
+            .filter_map(|(label, activity, open)| {
+                Some(row(
+                    label,
+                    format!("activity-{label}"),
+                    activity?,
+                    ctx.callback(move |_| open()),
+                ))
+            })
+            .collect();
+        for tab in self.tabs.entries() {
+            if let Page::SyscallTrace(page) = &tab.value.page
+                && let Some(activity) = page.diagnostics_activity()
+            {
+                let id = tab.id;
+                rows.push(row(
+                    "Syscall capture",
+                    format!("activity-syscall-{id}"),
+                    activity,
+                    ctx.callback(move |_| Message::SyscallView(syscall_view::Action::Resume(id))),
+                ));
+            }
+        }
+        if rows.is_empty() {
+            return Vec::new();
+        }
+        rows.sort_by_key(|(finished, _)| *finished);
+        std::iter::once(KeyedView::new(
+            "activity-heading",
+            TextBlock::new().text("Activity").font_size(16.0),
+        ))
+        .chain(rows.into_iter().map(|(_, row)| row))
+        .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activity_retains_original_endpoint_and_ignores_unrelated_completion() {
+        let ticket = Arc::new(());
+        let mut activity = Activity::start(&ticket, "pilot", "2001:db8::1", 2222);
+        assert_eq!(activity.endpoint, "pilot@[2001:db8::1]:2222");
+        assert_eq!(activity.summary(), "Running");
+        activity.stopping();
+        let saved = Ok(Some("Saved"));
+        let summary = |outcome: &&str| Some((*outcome).into());
+        activity.finish(&Arc::new(()), &saved, summary);
+        assert_eq!(activity.summary(), "Stop requested · saving collected data");
+        activity.finish(&ticket, &saved, summary);
+        activity.stopping();
+        activity.finish(&ticket, &Err("Late callback".into()), summary);
+        assert_eq!(activity.summary(), "Saved");
     }
 }

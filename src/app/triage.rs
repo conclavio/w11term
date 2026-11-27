@@ -39,6 +39,7 @@ enum Content {
 #[derive(Default)]
 pub(super) struct Panel {
     pub(super) open: bool,
+    pub(super) activity: Option<diagnostics::Activity>,
     content: Option<Content>,
     sample: usize,
     resource: TriageResource,
@@ -471,6 +472,7 @@ impl TerminalApp {
                 .map(|session| (session.pane_id, session.triage_target()));
             match target {
                 Some((pane, Ok(target))) => {
+                    self.triage.activity = None;
                     self.triage.content = Some(Content::Review {
                         pane,
                         plan: Box::new(target.preview()),
@@ -506,7 +508,9 @@ impl TerminalApp {
                 pane: *pane,
                 generation: plan.connection_generation,
             };
+            let (user, host, port) = (plan.user.clone(), plan.host.clone(), plan.port);
             let ticket = self.triage.begin("Collecting Linux performance samples…");
+            self.triage.activity = Some(diagnostics::Activity::start(&ticket, &user, &host, port));
             let rejected = message(Action::Finished(
                 ticket.clone(),
                 Err("Triage worker unavailable".into()),
@@ -619,6 +623,11 @@ impl TerminalApp {
                     .is_some() =>
             {
                 panel.status = None;
+                if let Some(activity) = &mut panel.activity {
+                    activity.finish(&ticket, &result, |_| {
+                        Some("Collected Linux performance report".into())
+                    });
+                }
                 match result {
                     Ok(Some(Outcome::Report {
                         report,
@@ -626,6 +635,7 @@ impl TerminalApp {
                         source,
                     })) => {
                         if let Some(path) = path {
+                            panel.activity = None;
                             panel.status = Some("Opened Linux triage report".into());
                             panel.path = Some(path);
                         }

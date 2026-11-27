@@ -14,6 +14,7 @@ const RAW_PREVIEW_BYTES: usize = 4096;
 
 pub enum Action {
     Show,
+    Resume(TabId),
     Open(TabId),
     Opened(TabId, Arc<()>, Result<Option<Arc<Trace>>, String>),
     Query(TabId, String),
@@ -74,6 +75,14 @@ impl TerminalApp {
         }
 
         match action {
+            Action::Resume(id) => {
+                if self.syscall_page(id).is_some() {
+                    self.set_diagnostics_drawer(None);
+                    self.tabs.select(id);
+                    self.sync_selection(ctx);
+                    self.activate(ctx);
+                }
+            }
             Action::Open(id) => self.open_syscall_trace(id, ctx),
             Action::Apply(id) => self.filter_syscall_trace(id, ctx),
             Action::Opened(id, ticket, result) => {
@@ -82,6 +91,7 @@ impl TerminalApp {
                 {
                     match result {
                         Ok(Some(trace)) => {
+                            page.capture.activity = None;
                             page.load(trace);
                         }
                         Ok(None) => (),
@@ -233,6 +243,10 @@ fn send(action: Action) -> Message {
 }
 
 impl PageState {
+    pub(super) fn diagnostics_activity(&self) -> Option<&diagnostics::Activity> {
+        self.capture.activity.as_ref()
+    }
+
     pub(super) fn capture_open(&self) -> bool {
         self.capture.open
     }

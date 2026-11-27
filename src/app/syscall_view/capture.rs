@@ -122,6 +122,7 @@ impl Inputs {
 #[derive(Default)]
 pub(super) struct ViewState {
     pub(super) open: bool,
+    pub(super) activity: Option<diagnostics::Activity>,
     inputs: Inputs,
     source: Option<Connection>,
     review: Option<Review>,
@@ -245,6 +246,9 @@ impl TerminalApp {
                     && let Some(stop) = &page.capture.stop
                 {
                     stop.request();
+                    if let Some(activity) = &mut page.capture.activity {
+                        activity.stopping();
+                    }
                     page.status =
                         Some("Stop requested. Saving any collected trace records…".into());
                 }
@@ -257,6 +261,12 @@ impl TerminalApp {
                     return;
                 }
                 page.capture.stop = None;
+                if let Some(activity) = &mut page.capture.activity {
+                    activity.finish(&ticket, &result, |outcome| match outcome {
+                        Outcome::Saved(capture, trace) => Some(capture_summary(capture, trace)),
+                        _ => None,
+                    });
+                }
                 match result {
                     Ok(Some(Outcome::Reviewed(source, plan))) => {
                         page.capture.review = Some(Review {
@@ -269,17 +279,11 @@ impl TerminalApp {
                     }
                     Ok(Some(Outcome::Saved(capture, trace))) => {
                         page.capture.review = None;
-                        let summary = capture_summary(&capture);
-                        match trace {
-                            Ok(trace) => {
-                                page.load(trace);
-                                page.status = Some(summary);
-                            }
-                            Err(error) => {
-                                page.status =
-                                    Some(format!("{summary}\nOpening the saved trace: {error}"))
-                            }
+                        let summary = capture_summary(&capture, &trace);
+                        if let Ok(trace) = trace {
+                            page.load(trace);
                         }
+                        page.status = Some(summary);
                     }
                     Ok(None) => (),
                     Err(error) => page.status = Some(error),
@@ -382,6 +386,9 @@ impl TerminalApp {
         page.capture.stop = Some(stop.clone());
         let ticket = page
             .begin("Tracing the remote command. The completed file will be saved and opened here.");
+        page.capture.activity = Some(diagnostics::Activity::start(
+            &ticket, &plan.user, &plan.host, plan.port,
+        ));
         run(ctx, tab, ticket, move || {
             let capture = target.save_syscall_capture_blocking(source.pane, plan, path, stop)?;
             let trace = Trace::open(vec![capture.path.clone()])
@@ -417,7 +424,7 @@ fn run(
     );
 }
 
-fn capture_summary(capture: &SyscallCapture) -> String {
+fn capture_summary(capture: &SyscallCapture, trace: &Result<Arc<Trace>, String>) -> String {
     let reason = match capture.stop_reason {
         "stopped" => "Stopped by request".into(),
         "time-limit" => "Time limit reached".into(),
@@ -427,11 +434,15 @@ fn capture_summary(capture: &SyscallCapture) -> String {
             |code| format!("Command exit status {code}"),
         ),
     };
-    format!(
+    let mut summary = format!(
         "Saved syscall trace\n{reason}\n{} bytes\n{}",
         capture.bytes,
         safe_text(&capture.path.display().to_string())
-    )
+    );
+    if let Err(error) = trace {
+        summary.push_str(&format!("\nOpening the saved trace: {error}"));
+    }
+    summary
 }
 
 impl ViewState {

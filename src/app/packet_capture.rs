@@ -143,6 +143,7 @@ impl Review {
 #[derive(Default)]
 pub(super) struct Panel {
     pub(super) open: bool,
+    pub(super) activity: Option<diagnostics::Activity>,
     inputs: Inputs,
     interfaces: Option<(flame_graph::Connection, PacketCaptureInterfaces)>,
     review: Option<Review>,
@@ -155,6 +156,16 @@ pub(super) struct Panel {
 
 fn message(action: Action) -> Message {
     Message::PacketCapture(action)
+}
+
+fn stop_reason(saved: &PacketCapture) -> &'static str {
+    match saved.stop_reason {
+        "stopped" => "Stopped by request",
+        "time-limit" => "Time limit reached",
+        "packet-limit" => "Packet limit reached",
+        "byte-budget" => "Packet ceiling for the byte budget reached",
+        _ => "Capture ended",
+    }
 }
 
 fn text(key: &str, value: impl Into<String>) -> KeyedView {
@@ -389,13 +400,7 @@ impl Panel {
             fields.push(text("status", status));
         }
         if let Some(saved) = &self.saved {
-            let reason = match saved.stop_reason {
-                "stopped" => "Stopped by request",
-                "time-limit" => "Time limit reached",
-                "packet-limit" => "Packet limit reached",
-                "byte-budget" => "Packet ceiling for the byte budget reached",
-                _ => "Capture ended",
-            };
+            let reason = stop_reason(saved);
             let packets = if saved.rotation.is_some() {
                 "Packets retained"
             } else {
@@ -499,6 +504,9 @@ impl TerminalApp {
                     && let Some(stop) = &panel.stop
                 {
                     stop.request();
+                    if let Some(activity) = &mut panel.activity {
+                        activity.stopping();
+                    }
                     panel.status = Some("Stop requested. Saving the completed capture…".into());
                 }
             }
@@ -681,6 +689,16 @@ impl TerminalApp {
         }
         panel.status = None;
         panel.stop = None;
+        if let Some(activity) = &mut panel.activity {
+            activity.finish(&ticket, &result, |outcome| match outcome {
+                Outcome::Saved(capture) => Some(format!(
+                    "Saved packet capture\n{}\n{}",
+                    stop_reason(capture),
+                    capture.path.display(),
+                )),
+                _ => None,
+            });
+        }
         match result {
             Ok(Some(Outcome::Interfaces(source, list))) => {
                 if active == Some(source) {
@@ -740,6 +758,9 @@ impl TerminalApp {
             }
         };
         let ticket = panel.begin("Capturing packets and transferring the completed file…");
+        panel.activity = Some(diagnostics::Activity::start(
+            &ticket, &plan.user, &plan.host, plan.port,
+        ));
         let stop = CaptureStop::default();
         panel.stop = Some(stop.clone());
         work(ctx, ticket, move || {

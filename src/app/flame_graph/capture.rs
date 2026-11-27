@@ -1,6 +1,7 @@
 use super::{Action as ViewerAction, Outcome, Profile, message, text};
 use crate::app::*;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use w11term::{
     control::{CpuCallGraph, CpuProfileOptions},
     ssh::{CpuLaunchOptions, CpuLaunchPlan, CpuProfilePlan, TriageTarget},
@@ -37,6 +38,13 @@ pub enum Field {
 pub struct Review {
     connection: Connection,
     plan: ReviewedTarget,
+}
+
+pub struct Recording {
+    target: TriageTarget,
+    review: Review,
+    path: PathBuf,
+    keep_raw: bool,
 }
 
 #[derive(Clone)]
@@ -557,7 +565,50 @@ impl TerminalApp {
             .loaded
             .as_ref()
             .map_or_else(|| self.store.path().into(), |loaded| loaded.path.clone());
+        let ticket = self.flame_graph.begin("Choosing a Windows file…");
+        let rejected = message(ViewerAction::Finished(
+            ticket.clone(),
+            Err("CPU profile destination picker unavailable".into()),
+        ));
+        ctx.spawn_background_with_rejection(
+            move |scope| {
+                let result = (|| {
+                    if scope.is_cancelled() {
+                        return Ok(None);
+                    }
+                    Ok(
+                        file_picker::pick(owner, file_picker::Purpose::SaveCpuProfile(path))?.map(
+                            |file| {
+                                Outcome::Destination(Box::new(Recording {
+                                    target,
+                                    review,
+                                    path: file.path,
+                                    keep_raw,
+                                }))
+                            },
+                        ),
+                    )
+                })()
+                .map_err(|error: anyhow::Error| format!("{error:#}"));
+                message(ViewerAction::Finished(ticket, result))
+            },
+            rejected,
+        );
+    }
+
+    pub(super) fn start_cpu_capture(&mut self, recording: Recording, ctx: &ComponentContext<Self>) {
+        let Recording {
+            target,
+            review,
+            path,
+            keep_raw,
+        } = recording;
+        let (user, host, port) = match &review.plan {
+            ReviewedTarget::Process(plan) => (&plan.user, &plan.host, plan.port),
+            ReviewedTarget::Command(plan) => (&plan.user, &plan.host, plan.port),
+        };
         let ticket = self.flame_graph.begin("Recording the CPU profile…");
+        self.flame_graph.activity = Some(diagnostics::Activity::start(&ticket, user, host, port));
         let rejected = message(ViewerAction::Finished(
             ticket.clone(),
             Err("CPU profile worker unavailable".into()),
@@ -565,40 +616,31 @@ impl TerminalApp {
         ctx.spawn_background_with_rejection(
             move |scope| {
                 let result = (|| -> anyhow::Result<_> {
-                    let Some(file) =
-                        file_picker::pick(owner, file_picker::Purpose::SaveCpuProfile(path))?
-                    else {
-                        return Ok(None);
-                    };
                     if scope.is_cancelled() {
                         return Ok(None);
                     }
-                    let raw_path = keep_raw.then(|| file.path.with_extension("perf.data"));
+                    let raw_path = keep_raw.then(|| path.with_extension("perf.data"));
                     let summary = match (&review.plan, raw_path.as_deref()) {
                         (ReviewedTarget::Process(plan), None) => {
-                            target.save_cpu_profile_blocking(plan, &file.path)?
+                            target.save_cpu_profile_blocking(plan, &path)?
                         }
                         (ReviewedTarget::Command(plan), None) => {
-                            target.save_cpu_launch_blocking(plan, &file.path)?
+                            target.save_cpu_launch_blocking(plan, &path)?
                         }
                         (ReviewedTarget::Process(plan), raw @ Some(_)) => {
-                            target.save_cpu_profile_artifacts_blocking(plan, &file.path, raw)?
+                            target.save_cpu_profile_artifacts_blocking(plan, &path, raw)?
                         }
                         (ReviewedTarget::Command(plan), raw @ Some(_)) => {
-                            target.save_cpu_launch_artifacts_blocking(plan, &file.path, raw)?
+                            target.save_cpu_launch_artifacts_blocking(plan, &path, raw)?
                         }
                     };
-                    let profile = Profile::open(&file.path).with_context(|| {
+                    let profile = Profile::open(&path).with_context(|| {
                         format!(
                             "The profile was saved to {} but could not be opened",
-                            file.path.display()
+                            path.display()
                         )
                     })?;
-                    Ok(Some(Outcome::Captured(
-                        Arc::new(profile),
-                        file.path,
-                        summary,
-                    )))
+                    Ok(Some(Outcome::Captured(Arc::new(profile), path, summary)))
                 })()
                 .map_err(|error| format!("{error:#}"));
                 message(ViewerAction::Finished(ticket, result))

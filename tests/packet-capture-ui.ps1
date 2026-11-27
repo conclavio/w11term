@@ -148,9 +148,12 @@ try {
     Wait-Focus $local
     $null = Wait-Until 'overview follows the active local pane while the capture runs' {
         (Find-Element 'Diagnostics overview panel') -and
-            (Find-Element 'Select a connected Linux SSH pane to run diagnostics.')
+            (Find-Element 'Select a connected Linux SSH pane to run diagnostics.') -and
+            (Find-Element 'Open Packet capture activity' $button) -and
+            (Find-Element "$($sshProfile.user)@$($sshProfile.host):$($sshProfile.port)") -and
+            (Find-Element 'Running')
     }
-    Click 'Packet capture'
+    Click 'Open Packet capture activity'
     Click 'Stop and save'
     $null = Wait-Until 'verified capture published on Windows' {
         (Find-Element 'Saved packet capture') -and (Find-Element 'Packets dropped by kernel 0') -and
@@ -161,6 +164,11 @@ try {
 
     $null = Control @('close-pane','--pane',"$remote")
     Wait-Focus $local
+    Click 'Return to diagnostics overview'
+    $null = Wait-Until 'offline activity keeps the stop reason and local artifact' {
+        Find-Element ('Saved packet capture' + [char]10 + 'Stopped by request' + [char]10 + $destination)
+    }
+    Click 'Open Packet capture activity'
     Click $chooseViewerLabel
     $dialog = Wait-Until 'owned executable picker' { Find-OwnedDialog 'Choose Wireshark executable' }
     $null = Wait-Until 'enter the fixture viewer path' { [FixtureDialog]::SetFilename($dialog, $viewer, '') }

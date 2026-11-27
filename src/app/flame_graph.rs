@@ -29,6 +29,7 @@ pub enum Action {
 pub enum Outcome {
     Opened(Arc<Profile>, PathBuf),
     Reviewed(Box<capture::Review>),
+    Destination(Box<capture::Recording>),
     Captured(Arc<Profile>, PathBuf, CpuProfileSummary),
     Exported,
 }
@@ -43,6 +44,7 @@ struct Loaded {
 #[derive(Default)]
 pub(super) struct Panel {
     pub open: bool,
+    pub(super) activity: Option<diagnostics::Activity>,
     loaded: Option<Loaded>,
     pending: Option<Arc<()>>,
     status: Option<String>,
@@ -467,8 +469,21 @@ impl TerminalApp {
                     return;
                 }
                 panel.status = None;
+                if let Some(activity) = &mut panel.activity {
+                    activity.finish(&ticket, &result, |outcome| match outcome {
+                        Outcome::Captured(_, path, summary) => {
+                            let workload = summary
+                                .workload
+                                .as_ref()
+                                .map_or_else(String::new, |outcome| format!("\n{outcome}"));
+                            Some(format!("Saved CPU profile{workload}\n{}", path.display()))
+                        }
+                        _ => None,
+                    });
+                }
                 match result {
                     Ok(Some(Outcome::Opened(profile, path))) => {
+                        panel.activity = None;
                         panel.load(profile, path, None);
                     }
                     Ok(Some(Outcome::Reviewed(review))) => {
@@ -480,6 +495,9 @@ impl TerminalApp {
                         panel.load(profile, path, Some(summary));
                         panel.capture = None;
                         panel.status = Some("Captured CPU profile".into());
+                    }
+                    Ok(Some(Outcome::Destination(recording))) => {
+                        self.start_cpu_capture(*recording, ctx);
                     }
                     Ok(Some(Outcome::Exported)) => {
                         panel.status = Some("Saved flame graph SVG".into())
