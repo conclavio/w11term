@@ -41,7 +41,7 @@ pub struct Artifact {
 }
 
 impl Artifact {
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         let count = self.paths.len();
         count > 0
             && count <= self.kind.max_paths()

@@ -56,7 +56,7 @@ pub(super) struct Panel {
     pub(super) activity: Option<diagnostics::Activity>,
     loaded: Option<Loaded>,
     comparison: Option<compare::ViewState>,
-    pending: Option<Arc<()>>,
+    pub(super) pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
     status: Option<String>,
     capture: Option<capture::Form>,
@@ -627,6 +627,7 @@ impl TerminalApp {
                 }
                 panel.status = None;
                 panel.stop = None;
+                self.diagnostic_control.finish(&ticket, &result);
                 if let Some(activity) = &mut panel.activity {
                     activity.finish(&ticket, &result, |outcome| match outcome {
                         Outcome::Captured(_, path, summary) => {

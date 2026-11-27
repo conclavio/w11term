@@ -67,7 +67,7 @@ pub(super) struct Panel {
     resource: TriageResource,
     evidence_line: Option<usize>,
     status: Option<String>,
-    pending: Option<Arc<()>>,
+    pub(super) pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
     progress_timer: Option<crate::ui_timer::RetryTimer>,
     last_path: Option<PathBuf>,
@@ -809,6 +809,7 @@ impl TerminalApp {
                 panel.stop = None;
                 panel.progress_timer = None;
                 panel.status = None;
+                self.diagnostic_control.finish(&ticket, &result);
                 if let Some(activity) = &mut panel.activity {
                     activity.finish(&ticket, &result, |outcome| {
                         let collected = "Collected Linux performance report";

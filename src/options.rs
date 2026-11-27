@@ -1113,6 +1113,33 @@ pub enum DiagnosticLaunch {
     Compare { before: Artifact, after: Artifact },
 }
 
+impl DiagnosticLaunch {
+    pub(crate) fn from_paths(before: Artifact, comparison_paths: Vec<PathBuf>) -> Result<Self> {
+        ensure!(
+            before.valid(),
+            "Supply absolute paths for a saved diagnostic"
+        );
+        if comparison_paths.is_empty() {
+            return Ok(Self::Open(before));
+        }
+        let kind = before.kind;
+        ensure!(
+            kind != DiagnosticKind::PacketCapture,
+            "Choose a CPU profile, Linux triage report or syscall trace to compare"
+        );
+        let after = Artifact {
+            kind,
+            paths: comparison_paths,
+        };
+        ensure!(
+            after.valid(),
+            "Supply up to {} absolute comparison paths for this diagnostic",
+            kind.max_paths()
+        );
+        Ok(Self::Compare { before, after })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     pub source: Source,
@@ -1284,28 +1311,13 @@ impl Options {
                 _ => bail!("unknown argument: {arg}; use --help"),
             }
         }
-        let diagnostic = if comparison_paths.is_empty() {
-            diagnostic.map(DiagnosticLaunch::Open)
-        } else {
-            let before = diagnostic
-                .context("--compare-with requires a saved baseline from an --open-* option")?;
-            let kind = before.kind;
-            ensure!(
-                kind != DiagnosticKind::PacketCapture,
-                "Packet captures cannot be compared in w11term"
-            );
-            ensure!(
-                comparison_paths.len() <= kind.max_paths(),
-                "Use one --compare-with file for this diagnostic"
-            );
-            Some(DiagnosticLaunch::Compare {
-                before,
-                after: Artifact {
-                    kind,
-                    paths: comparison_paths,
-                },
-            })
-        };
+        ensure!(
+            diagnostic.is_some() || comparison_paths.is_empty(),
+            "--compare-with requires a saved baseline from an --open-* option"
+        );
+        let diagnostic = diagnostic
+            .map(|before| DiagnosticLaunch::from_paths(before, comparison_paths))
+            .transpose()?;
         ensure!(
             diagnostic.is_none()
                 || !(explicit_source || workspace_name.is_some() || list_profiles || benchmark),

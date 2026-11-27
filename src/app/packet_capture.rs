@@ -172,7 +172,7 @@ pub(super) struct Panel {
     review: Option<Review>,
     loaded: Option<LoadedCapture>,
     wireshark: Option<PathBuf>,
-    pending: Option<Arc<()>>,
+    pub(super) pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
     status: Option<String>,
 }
@@ -730,6 +730,7 @@ impl TerminalApp {
         }
         panel.status = None;
         panel.stop = None;
+        self.diagnostic_control.finish(&ticket, &result);
         if let Some(activity) = &mut panel.activity {
             activity.finish(&ticket, &result, |outcome| match outcome {
                 Outcome::Saved(capture) => Some(format!(

@@ -1370,6 +1370,7 @@ pub struct TerminalApp {
     command_reference: command_reference::Panel,
     diagnostics_open: bool,
     diagnostics_recent: diagnostics::Recent,
+    diagnostic_control: diagnostics::ControlOpen,
     triage: triage::Panel,
     flame_graph: flame_graph::Panel,
     packet_capture: packet_capture::Panel,
@@ -5975,6 +5976,7 @@ impl Component for TerminalApp {
             command_reference: Default::default(),
             diagnostics_open: false,
             diagnostics_recent: diagnostics::Recent::default(),
+            diagnostic_control: diagnostics::ControlOpen::default(),
             triage: Default::default(),
             flame_graph: Default::default(),
             packet_capture: Default::default(),
@@ -6958,6 +6960,9 @@ impl Component for TerminalApp {
                     };
                     let _ = reply.send(result.map_err(|error| format!("{error:#}")));
                 }
+            }
+            Message::Control(w11term::control::UiRequest::OpenDiagnostic { launch, reply }) => {
+                self.control_open_diagnostic(launch, reply, context);
             }
             Message::Control(w11term::control::UiRequest::TabAppearance {
                 tab_id,

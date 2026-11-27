@@ -1470,6 +1470,13 @@ To start in the comparison view, supply the Before or Working files with the `--
 .\w11term.exe --open-syscall-trace '.\working.321' --open-syscall-trace '.\working.322' --compare-with '.\failing.411' --compare-with '.\failing.412'
 ```
 
+Use `open-diagnostic` to open files in a running instance. Get the target ID with `list-windows`. The control command preserves desktop focus and returns the window ID, artifact kind, and whether it loaded a comparison. A load error produces a failed reply. Repeat `--file` or `--compare-with` for the parts of a split syscall trace.
+
+```powershell
+& $ctl --pid 12345 list-windows
+& $ctl --pid 12345 open-diagnostic --window 1 --kind cpu-profile --file '.\before.folded' --compare-with '.\after.folded'
+```
+
 **Activity** shows jobs started from the app in this window, with the original SSH endpoint, current state, and the latest result still available in each tool. Packet and syscall captures report their stop reason and saved path. Select an activity to return to the running job or its result even after switching panes. Linux performance triage shows the live count of checks that have finished, including checks that returned an error. **Stop and keep report** ends the collection early. The report retains collected output, labels unfinished checks as incomplete, and records that you stopped the collection.
 
 ### Capture Linux packets and open Wireshark

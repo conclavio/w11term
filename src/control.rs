@@ -1,6 +1,7 @@
 //! Local, current-user-only automation. Control requests never focus a desktop window.
 use crate::{
-    options::TabColor,
+    diagnostic_history::Artifact,
+    options::{DiagnosticLaunch, TabColor},
     pane_layout::{Axis, Direction},
     session::{Command, PaneDescription},
     tabs::TabTitle,
@@ -50,6 +51,7 @@ pub const MAX_BYTES: usize = 1024 * 1024;
 pub const MAX_SSH_GROUP_OUTPUT_LINES: usize = 128;
 const MAX_LINE: usize = MAX_BYTES * 2;
 const TIMEOUT: Duration = Duration::from_secs(10);
+const DIAGNOSTIC_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 pub type CapturePng =
     Arc<dyn Fn(&Snapshot, TerminalSize, &Path) -> Result<(u32, u32)> + Send + Sync>;
 
@@ -272,6 +274,12 @@ pub enum Request {
     ListWindows,
     ListTabs {
         window_id: WindowId,
+    },
+    OpenDiagnostic {
+        window_id: WindowId,
+        artifact: Artifact,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        compare_with: Vec<PathBuf>,
     },
     ReorderTabs {
         window_id: WindowId,
@@ -586,6 +594,10 @@ pub enum UiRequest {
         order: Option<Vec<crate::tabs::TabId>>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    OpenDiagnostic {
+        launch: DiagnosticLaunch,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     TabAppearance {
         tab_id: crate::tabs::TabId,
         change: TabAppearanceChange,
@@ -740,6 +752,7 @@ impl UiRequest {
             | Self::SaveWorkspace { reply, .. }
             | Self::RepairWorkspace { reply, .. }
             | Self::TabOrder { reply, .. }
+            | Self::OpenDiagnostic { reply, .. }
             | Self::TabAppearance { reply, .. }
             | Self::OpenWorkspace { reply, .. }
             | Self::OpenWorkspaceWindow { reply, .. }
@@ -1787,6 +1800,21 @@ impl Registry {
             }
             Request::ListWindows => Ok(self.list_windows()),
             Request::ListTabs { window_id } => self.tab_order(window_id, None).await,
+            Request::OpenDiagnostic {
+                window_id,
+                artifact,
+                compare_with,
+            } => {
+                let launch = DiagnosticLaunch::from_paths(artifact, compare_with)?;
+                let ui = self.window_ui(window_id)?;
+                let (reply, response) = oneshot::channel();
+                ui(UiRequest::OpenDiagnostic { launch, reply });
+                tokio::time::timeout(DIAGNOSTIC_OPEN_TIMEOUT, response)
+                    .await
+                    .context("open-diagnostic timed out; the viewer may still be loading")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
             Request::ReorderTabs { window_id, tab_ids } => {
                 self.tab_order(window_id, Some(tab_ids)).await
             }
@@ -2803,6 +2831,7 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
     let mut response = Vec::new();
     tokio::time::timeout(
         Duration::from_secs(match request {
+            Request::OpenDiagnostic { .. } => DIAGNOSTIC_OPEN_TIMEOUT.as_secs() + 5,
             Request::LinuxTriage { .. } => crate::ssh::triage::DEADLINE.as_secs() + 20,
             Request::CapturePackets { .. } => crate::ssh::triage::packet_capture::CONTROL_SECONDS,
             Request::CaptureSyscalls { .. } => crate::ssh::triage::syscall_capture::CONTROL_SECONDS,

@@ -11,6 +11,8 @@ use w11term::control::{self, Reply, Request};
 mod automation;
 #[path = "w11term-cli/cpu_profile.rs"]
 mod cpu_profile;
+#[path = "w11term-cli/diagnostics.rs"]
+mod diagnostics;
 #[path = "w11term-cli/offline.rs"]
 mod offline;
 #[path = "w11term-cli/packet_capture.rs"]
@@ -132,6 +134,17 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                     "invalid options before automation command"
                 );
                 return automation::parse(&arg, args, pid, pane);
+            }
+            "open-diagnostic" if verb.is_none() => {
+                ensure!(
+                    pane.is_none()
+                        && payload.is_none()
+                        && path.is_none()
+                        && !no_paste
+                        && connection_generation.is_none(),
+                    "open-diagnostic accepts --pid before the command"
+                );
+                return Ok(Invocation::new(pid, diagnostics::parse(args)?));
             }
             "preview-cpu-profile" | "capture-cpu-profile" if verb.is_none() => {
                 ensure!(
@@ -307,10 +320,15 @@ async fn main() -> ExitCode {
             syscall_capture::HELP,
             syscall_capture::COMPARE_HELP
         );
+        println!("\n{}", diagnostics::HELP);
         return ExitCode::SUCCESS;
     }
     if args == ["fetch-tool-bundle", "--help"] || args == ["fetch-tool-bundle", "-h"] {
         println!("{}", tool_bundles::HELP);
+        return ExitCode::SUCCESS;
+    }
+    if args == ["open-diagnostic", "--help"] || args == ["open-diagnostic", "-h"] {
+        println!("{}", diagnostics::HELP);
         return ExitCode::SUCCESS;
     }
     if let Some(exit) = offline::run(&args) {

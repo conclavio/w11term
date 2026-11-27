@@ -1,6 +1,7 @@
 use super::*;
 use std::{cell::RefCell, collections::VecDeque};
 use w11term::diagnostic_history::{Artifact, Entry, Kind, Store};
+use w11term::options::DiagnosticLaunch;
 
 pub(super) const LABEL: &str = "Diagnostics overview";
 
@@ -43,6 +44,34 @@ pub(super) struct Recent {
     edits: VecDeque<Edit>,
     pending: bool,
     status: Option<String>,
+}
+
+type ControlReply = tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>;
+
+#[derive(Default)]
+pub(super) struct ControlOpen(Option<PendingOpen>);
+
+struct PendingOpen {
+    ticket: Arc<()>,
+    receipt: serde_json::Value,
+    reply: ControlReply,
+}
+
+impl ControlOpen {
+    pub(super) fn finish<T>(&mut self, ticket: &Arc<()>, result: &Result<Option<T>, String>) {
+        if let Some(open) = self.0.take_if(|open| Arc::ptr_eq(&open.ticket, ticket)) {
+            let reply = match result {
+                Ok(Some(_)) => Ok(open.receipt),
+                Ok(None) => Err("Opening the diagnostic was canceled".into()),
+                Err(error) => Err(error.clone()),
+            };
+            let _ = open.reply.send(reply);
+        }
+    }
+
+    pub(super) fn cancel(&mut self, ticket: &Arc<()>) {
+        self.finish::<()>(ticket, &Ok(None));
+    }
 }
 
 struct RecentRow {
@@ -297,6 +326,64 @@ pub(super) fn header(
 }
 
 impl TerminalApp {
+    pub(super) fn control_open_diagnostic(
+        &mut self,
+        launch: DiagnosticLaunch,
+        reply: ControlReply,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if reply.is_closed() {
+            return;
+        }
+        let (before, after) = match launch {
+            DiagnosticLaunch::Open(artifact) => (artifact, None),
+            DiagnosticLaunch::Compare { before, after } => (before, Some(after)),
+        };
+        let kind = before.kind;
+        let busy = self
+            .diagnostic_control
+            .0
+            .as_ref()
+            .is_some_and(|job| !job.reply.is_closed())
+            || (kind != Kind::SyscallTrace && self.diagnostic_ticket(kind).is_some());
+        if !self.native_bound || self.incoming.is_some() || self.outgoing.is_some() || busy {
+            let _ = reply.send(Err(
+                "The window is busy opening another diagnostic or moving tabs".into(),
+            ));
+            return;
+        }
+        if let Some(after) = &after {
+            self.compare_saved_diagnostics(&before, after, ctx);
+        } else {
+            self.open_diagnostic_artifact(&before, ctx);
+        }
+        let Some(ticket) = self.diagnostic_ticket(kind) else {
+            let _ = reply.send(Err("The diagnostic viewer did not start loading".into()));
+            return;
+        };
+        self.diagnostic_control.0 = Some(PendingOpen {
+            ticket,
+            receipt: serde_json::json!({
+                "window_id": self.registry.window_id(),
+                "kind": kind,
+                "comparison": after.is_some(),
+            }),
+            reply,
+        });
+    }
+
+    fn diagnostic_ticket(&self, kind: Kind) -> Option<Arc<()>> {
+        match kind {
+            Kind::CpuProfile => self.flame_graph.pending.clone(),
+            Kind::TriageReport => self.triage.pending.clone(),
+            Kind::PacketCapture => self.packet_capture.pending.clone(),
+            Kind::SyscallTrace => match &self.tabs.active()?.page {
+                Page::SyscallTrace(page) => page.pending.clone(),
+                _ => None,
+            },
+        }
+    }
+
     pub(super) fn set_diagnostics_drawer(&mut self, drawer: Option<Drawer>) {
         self.diagnostics_open = drawer == Some(Drawer::Overview);
         self.triage.open = drawer == Some(Drawer::Triage);

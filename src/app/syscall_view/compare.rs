@@ -71,9 +71,13 @@ impl TerminalApp {
         match action {
             Action::Open(tab) => self.open_trace_comparison(tab, ctx),
             Action::Ready(tab, ticket, result) => {
-                if let Some(page) = self.syscall_page(tab)
+                if let Some(AppTab {
+                    page: Page::SyscallTrace(page),
+                    ..
+                }) = self.tabs.get_mut(tab)
                     && page.finish(&ticket)
                 {
+                    self.diagnostic_control.finish(&ticket, &result);
                     match result {
                         Ok(Some(comparison)) => {
                             let before = if page.loaded.is_none() {
@@ -106,6 +110,8 @@ impl TerminalApp {
                         Ok(None) => (),
                         Err(error) => page.status = Some(error),
                     }
+                } else {
+                    self.diagnostic_control.cancel(&ticket);
                 }
             }
             Action::Back(tab) => {

@@ -146,6 +146,61 @@ try {
 
     Open-Artifact @('--open-cpu-profile','"empty CPU.folded"') 'CPU flame graph'
     $null = Wait-Until 'a malformed artifact is reported in its viewer' { Find-Element 'The folded stacks file has no samples' }
+
+    $windowId = ((Control @('list-windows')).windows | Select-Object -First 1).window_id
+    $other = Start-Process -FilePath $Gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) `
+        -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'other-gui.log')
+    try {
+        $otherWindow = Wait-Until 'other window is ready' {
+            $other.Refresh()
+            if ($other.MainWindowTitle.StartsWith("w11term${dot}")) { $other.MainWindowHandle }
+        }
+        $foreground = [FixtureMessages]::GetForegroundWindow()
+        $open = @('open-diagnostic','--window',"$windowId")
+        $details = Control ($open + @('--kind','cpu-profile','--file',(Join-Path $State 'baseline CPU.folded'),
+            '--compare-with',(Join-Path $State 'candidate CPU.folded')))
+        if ($details.window_id -ne $windowId -or $details.kind -cne 'cpu-profile' -or !$details.comparison) {
+            throw 'Control replied with the wrong diagnosis target'
+        }
+        $null = Wait-Until 'control opens a comparison in the requested window' {
+            (Find-Element "Before${dot}baseline CPU.folded${dot}5 samples") -and
+                (Find-Element "After${dot}candidate CPU.folded${dot}6 samples")
+        }
+        if ($foreground -ne $window -and [FixtureMessages]::GetForegroundWindow() -eq $window) {
+            throw "Opening a diagnostic activated the target window over $foreground (other window $otherWindow)"
+        }
+
+        $empty = Join-Path $State 'empty CPU.folded'
+        $invalid = & $Cli --pid $app.Id @open --kind cpu-profile --file $empty | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 1 -or $invalid.ok -or $invalid.error -notmatch 'has no samples') {
+            throw 'Control did not return the diagnostic reader failure'
+        }
+        $badWindow = & $Cli --pid $app.Id open-diagnostic --window 999 --kind cpu-profile --file $empty | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 1 -or $badWindow.ok -or $badWindow.error -notmatch 'window') {
+            throw 'Control did not reject an unknown target window'
+        }
+
+        $null = Control ($open + @('--kind','triage-report','--file',(Join-Path $State 'saved triage.json')))
+        $null = Wait-Until 'control opens a saved triage report' { Find-Element 'Opened Linux triage report' }
+        $null = Control ($open + @('--kind','packet-capture','--file',(Join-Path $State 'saved packets.pcap')))
+        $null = Wait-Until 'control opens a saved packet capture' { Find-Element "PCAP${dot}24 bytes" }
+        $null = Control ($open + @('--kind','syscall-trace','--file',(Join-Path $State 'split trace.300'),
+            '--file',(Join-Path $State 'split trace.301')))
+        $null = Wait-Until 'control opens a split trace' { Find-Element 'Files merged by epoch timestamp' }
+        $details = Control ($open + @('--kind','syscall-trace','--file',(Join-Path $State 'working trace.600'),
+            '--file',(Join-Path $State 'working trace.601'),'--compare-with',(Join-Path $State 'failing trace.700'),
+            '--compare-with',(Join-Path $State 'failing trace.701')))
+        if (!$details.comparison) { throw 'Expected a completed syscall comparison' }
+        $null = Wait-Until 'control opens the requested split comparison' {
+            (Find-Element "Working${dot}working trace.600") -and (Find-Element "Failing${dot}failing trace.700")
+        }
+        if ($foreground -ne $window -and [FixtureMessages]::GetForegroundWindow() -eq $window) {
+            throw 'Opening a syscall viewer activated the target window'
+        }
+        if ((Control @('list')).sessions.Count -ne 0) { throw 'A diagnostic control request opened a terminal session' }
+    } finally {
+        Close-FixtureApp $other
+    }
 } finally {
     Close-Artifact
 }

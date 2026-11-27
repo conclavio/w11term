@@ -33,7 +33,7 @@ pub enum Action {
 pub(super) struct PageState {
     loaded: Option<Arc<Trace>>,
     visible: Vec<usize>,
-    pending: Option<Arc<()>>,
+    pub(super) pending: Option<Arc<()>>,
     status: Option<String>,
     query: String,
     filter: Filter,
@@ -90,9 +90,13 @@ impl TerminalApp {
             }
             Action::Apply(id) => self.filter_syscall_trace(id, ctx),
             Action::Opened(id, ticket, result) => {
-                if let Some(page) = self.syscall_page(id)
+                if let Some(AppTab {
+                    page: Page::SyscallTrace(page),
+                    ..
+                }) = self.tabs.get_mut(id)
                     && page.finish(&ticket)
                 {
+                    self.diagnostic_control.finish(&ticket, &result);
                     match result {
                         Ok(Some(trace)) => {
                             let paths = trace.paths();
@@ -107,6 +111,8 @@ impl TerminalApp {
                         Ok(None) => (),
                         Err(error) => page.status = Some(error),
                     }
+                } else {
+                    self.diagnostic_control.cancel(&ticket);
                 }
             }
             Action::Filtered(id, ticket, visible) => {
