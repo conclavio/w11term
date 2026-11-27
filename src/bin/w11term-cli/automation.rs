@@ -219,6 +219,7 @@ pub(super) fn parse(
                     "open-ssh-group"
                         | "open-workspace"
                         | "save-workspace"
+                        | "get-workspace"
                         | "rename-tab"
                         | "rename-pane"
                 ) =>
@@ -440,6 +441,7 @@ pub(super) fn parse(
                     "open"
                         | "open-workspace"
                         | "save-workspace"
+                        | "get-workspace"
                         | "open-ssh-group"
                         | "list-saved-ssh-groups"
                         | "move-tab"
@@ -577,6 +579,12 @@ pub(super) fn parse(
                 tab_ids: ordered_tabs,
             }
         }
+        "get-workspace" => Request::GetWorkspace {
+            name: name
+                .filter(|name| !name.trim().is_empty())
+                .context("provide a saved workspace name with --name")?,
+            window_id,
+        },
         "save-workspace" => Request::SaveWorkspace {
             window_id: window_id.context("--window is required (from list-windows)")?,
             name: name

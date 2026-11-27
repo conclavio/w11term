@@ -8,7 +8,7 @@ pub struct MissingProfile {
 }
 
 impl SavedSource {
-    fn ssh_profile(&self) -> Option<&str> {
+    pub(crate) fn ssh_profile(&self) -> Option<&str> {
         match self {
             Self::SavedProfile(name) | Self::Discovery(name) | Self::HerdrDiscovery(name) => {
                 Some(name)

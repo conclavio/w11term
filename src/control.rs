@@ -35,6 +35,7 @@ mod registry;
 pub(crate) mod security;
 mod sftp_transfers;
 mod ssh_groups;
+mod workspace_preview;
 pub use command_history::{CommandOutputFile, CommandStatus};
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
@@ -223,6 +224,11 @@ pub enum Request {
         rows: Option<usize>,
     },
     ListWorkspaces,
+    GetWorkspace {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_id: Option<WindowId>,
+    },
     SaveWorkspace {
         window_id: WindowId,
         name: String,
@@ -496,6 +502,10 @@ pub enum UiRequest {
         name: String,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    CheckWorkspaceProfiles {
+        names: Vec<String>,
+        reply: oneshot::Sender<Result<Vec<String>, String>>,
+    },
     TabOrder {
         order: Option<Vec<crate::tabs::TabId>>,
         reply: oneshot::Sender<Result<Value, String>>,
@@ -663,6 +673,10 @@ impl UiRequest {
             | Self::SshGroupQueue { reply, .. }
             | Self::InterruptSshGroupCommand { reply, .. } => reply,
             Self::ListSftpTransfers { reply, .. } => {
+                let _ = reply.send(Err(message.into()));
+                return;
+            }
+            Self::CheckWorkspaceProfiles { reply, .. } => {
                 let _ = reply.send(Err(message.into()));
                 return;
             }
@@ -1625,6 +1639,7 @@ impl Registry {
                     .collect();
                 Ok(json!({ "workspaces": workspaces }))
             }
+            Request::GetWorkspace { name, window_id } => self.get_workspace(&name, window_id).await,
             Request::SaveWorkspace { window_id, name } => {
                 let ui = self.window_ui(window_id)?;
                 let (reply, response) = oneshot::channel();

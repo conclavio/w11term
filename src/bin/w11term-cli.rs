@@ -12,7 +12,7 @@ mod automation;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 
-const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
+const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] get-workspace --name NAME [--window ID]\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nWithout --pid, exactly one live instance is required. No command starts a GUI or changes focus.";
 
 #[derive(Debug)]
 struct Invocation {
@@ -91,6 +91,7 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
             | "list-saved-ssh-groups"
             | "open-ssh-group"
             | "open-workspace"
+            | "get-workspace"
             | "save-workspace"
             | "get-ssh-group-roster"
             | "get-ssh-group-run"
@@ -730,6 +731,39 @@ mod tests {
             "open --profile fleet --new-window --window 1",
             "open --profile fleet --new-window --activate",
             "open --profile fleet --new-window --new-window",
+        ] {
+            assert!(parse_line(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn previews_a_saved_workspace_with_an_optional_window() {
+        let (_, request) =
+            parse(["get-workspace", "--name", "Fleet Ops", "--window", "12"].map(str::to_owned))
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"verb":"get-workspace","name":"Fleet Ops","window_id":12})
+        );
+        let parse_line = |command: &str| parse(command.split_whitespace().map(str::to_owned));
+        assert!(matches!(
+            parse_line("get-workspace --name Fleet").unwrap(),
+            (
+                _,
+                Request::GetWorkspace {
+                    window_id: None,
+                    ..
+                }
+            )
+        ));
+        for invalid in [
+            "get-workspace",
+            "get-workspace --window 12",
+            "get-workspace --name Fleet --window 0",
+            "get-workspace --name Fleet --window 12 --window 13",
+            "get-workspace --name Fleet --name Other",
+            "get-workspace --name Fleet --activate",
+            "get-workspace --name Fleet --new-window",
         ] {
             assert!(parse_line(invalid).is_err(), "{invalid}");
         }

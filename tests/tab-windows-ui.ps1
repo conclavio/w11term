@@ -1508,6 +1508,36 @@ function Test-ControlWorkspace {
     if ($catalog.Count -ne 3 -or $mixed.tab_count -ne 2 -or $mixed.pane_count -ne 3) {
         throw "Unexpected workspace catalog: $($catalog | ConvertTo-Json -Compress)"
     }
+    $preview = Control @('get-workspace','--name','two-windows')
+    $split = $preview.tabs[0]
+    $nodes = $split.layout
+    if ($preview.name -cne 'two-windows' -or $preview.active_tab -ne 0 -or $preview.tabs.Count -ne 2 -or
+        $preview.required_ssh_profiles.Count -ne 1 -or $preview.required_ssh_profiles[0] -cne 'window-ssh' -or
+        $null -ne $preview.profile_check -or $split.title -cne 'Cockpit tools' -or $split.focused_slot -ne 1 -or
+        $nodes.Count -ne 3 -or $nodes[0].axis -cne 'columns' -or $nodes[0].ratio -ne 0.375 -or
+        $nodes[$nodes[0].first].slot -ne $split.focused_slot -or $nodes[$nodes[0].first].source.kind -cne 'ssh_profile' -or
+        $nodes[$nodes[0].second].source.kind -cne 'local' -or $nodes[$nodes[0].second].source.profile -cne 'Moved PowerShell') {
+        throw "Unexpected saved workspace preview: $($preview | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    $check = (Control @('get-workspace','--name','two-windows','--window',"$targetId")).profile_check
+    $broken = Control @('get-workspace','--name','broken-copy','--window',"$targetId")
+    if ($check.window_id -ne $targetId -or $check.missing_ssh_profiles.Count -ne 0 -or
+        $broken.profile_check.window_id -ne $targetId -or
+        ($broken.profile_check.missing_ssh_profiles -join ',') -cne 'missing-window-profile') {
+        throw 'The destination profile check did not distinguish present and missing SSH profiles'
+    }
+    $localPreview = Control @('get-workspace','--name','Local Ops','--window',"$targetId")
+    if ($localPreview.required_ssh_profiles.Count -ne 0 -or $localPreview.profile_check.missing_ssh_profiles.Count -ne 0) {
+        throw 'An embedded local shell was incorrectly treated as a required SSH profile'
+    }
+    $unknown = & $Cli --pid $app.Id get-workspace --name 'unlisted recipe' | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $unknown.ok -or $unknown.error -cne 'Unknown workspace unlisted recipe') {
+        throw 'Previewing an unknown workspace did not return a lookup error'
+    }
+    $target = (Control @('list-windows')).windows | Where-Object window_id -eq $targetId
+    if ($target.tab_count -ne 1 -or $target.pane_count -ne 1) { throw 'Preview opened tabs in the destination' }
+    Expect-Focus $origin $ssh.id 'Workspace previews leave desktop focus alone'
+
     $failed = & $Cli --pid $app.Id open-workspace --window "$targetId" --name 'broken-copy' | ConvertFrom-Json
     if ($LASTEXITCODE -eq 0 -or $failed.ok -or $failed.error -notlike '*missing-window-profile*') {
         throw 'Opening a workspace with a missing profile did not report the profile'
