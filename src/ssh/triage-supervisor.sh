@@ -36,7 +36,7 @@ kill -s TERM "$monitor" 2>/dev/null || :
 wait "$monitor" 2>/dev/null || :
 if [ "$code" -ne 0 ]; then
     # The timeout leader can exit before a descendant that ignores TERM.
-    kill -s KILL "-$worker" 2>/dev/null || :
+    bash -c 'kill -KILL -- "-$1"' w11term-triage "$worker" 2>/dev/null || :
 fi
 finished=$(date +%s%3N)
 printf 'w11term-linux-triage-v1\t%s\t%s\t%s' "$started" "$finished" "$code"
