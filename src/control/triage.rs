@@ -51,7 +51,7 @@ impl Registry {
         Recording::check_destinations(&path, perf_data_file.as_deref())?;
         let target = self.diagnostic_target(pane, Some(generation)).await?;
         let profile = target
-            .capture_cpu_profile(options, process_start_ticks, perf_data_file)
+            .capture_cpu_profile(options, process_start_ticks, perf_data_file, None)
             .await?;
         let (path, summary) = tokio::task::spawn_blocking(move || -> Result<_> {
             let summary = profile.save(&path)?;

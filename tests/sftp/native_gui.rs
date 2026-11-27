@@ -95,13 +95,14 @@ async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "reviews and launches a Linux command for CPU profiling from the Windows viewer"]
-async fn native_cpu_launch_reviews_literal_arguments_and_displays_the_timeout_profile() {
+async fn native_cpu_launch_reviews_literal_arguments_and_saves_the_stopped_profile() {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, channels, server) =
         fixture_counting_accepts(false, 2, transports.clone()).await
     else {
         unreachable!()
     };
+    fs::write(remote.path().join("profile-wait-for-stop"), []).unwrap();
     let state = tempfile::tempdir().unwrap();
     let marker = remote.path().join("profile-launched");
     fs::write(state.path().join("launch-marker"), marker.to_str().unwrap()).unwrap();
@@ -138,10 +139,12 @@ async fn native_cpu_profile_reviews_the_triage_connection_before_recording() {
         &format!("pidstat\t1000\t2000\t0\t{pidstat}\t"),
     );
     fs::write(remote.path().join("triage-response"), triage).unwrap();
+    fs::write(remote.path().join("profile-wait-for-stop"), []).unwrap();
     fs::write(
         remote.path().join("profile-response"),
         concat!(
             "w11term-cpu-profile-v1\t800\td29ya2Vy\n",
+            "w11term-cpu-profile-stopped-v1\n",
             " 42 22.01: cpu-clock:u:\n",
             "\t   deadbeef hot_loop (/tmp/worker)\n",
             "\t   12ab34cd main (/tmp/worker)\n\n",

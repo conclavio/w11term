@@ -48,7 +48,8 @@ record_status=0
     ulimit -f "$record_kib" || exit 2
     exec perf record --no-buildid-cache --no-inherit --all-user --user-callchains -e cpu-clock:u \
         -F "$frequency" --call-graph "$call_graph" -p "$pid" \
-        -o "$work/perf.data" -- sleep "$seconds"
+        -o "$work/perf.data" -- /bin/bash -c "$runner" w11term-cpu-window "$work" "$seconds" \
+        "$record_kib" 0 sleep "$seconds"
 ) > /dev/null || record_status=$?
 if [[ -f "$work/perf.data" && $(wc -c < "$work/perf.data") -ge $((record_kib * 1024)) ]]; then
     fail 'The perf recording reached its file size limit.'
@@ -73,6 +74,9 @@ elif [[ -n $stack_error ]]; then
     fail "$stack_error"
 fi
 emit_process
+if [[ -f "$work/outcome" && $(< "$work/outcome") == stopped ]]; then
+    printf 'w11term-cpu-profile-stopped-v1\n'
+fi
 if [[ -z $stack_error ]]; then
     cat -- "$work/stacks"
 else

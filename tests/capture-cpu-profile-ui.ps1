@@ -74,8 +74,15 @@ try {
     }
     if ([IO.File]::Exists($marker)) { throw 'Recording started before choosing a destination' }
     $null = Wait-Until 'confirm the new profile file' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'recording started on the reviewed process' { [IO.File]::Exists($marker) }
+    Click-CaptureButton 'Return to diagnostics overview'
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    Click-CaptureButton 'Open CPU flame graph activity'
+    Click-CaptureButton 'Stop and save profile'
     $null = Wait-Until 'open the resulting graph and expose perf diagnostics' {
         (Find-Element 'Captured CPU profile') -and
+        (Find-Element 'Stopped by request') -and
         (Find-Element '1 sample') -and (Find-Element 'Perf output')
     }
     if ([IO.File]::ReadAllText($output) -cne ('worker;main;hot_loop 1' + [char]10)) {
@@ -84,7 +91,7 @@ try {
     $null = Control @('close-pane','--pane',"$remotePane")
     Wait-Focus $localPane
     Click-CaptureButton 'Return to diagnostics overview'
-    Wait-DiagnosticArtifact 'Saved CPU profile' $output
+    Wait-DiagnosticArtifact 'Saved CPU profile' $output 'Stopped by request'
     Click-CaptureButton 'Open CPU flame graph activity'
     $null = Wait-Until 'the completed graph survives closing SSH' {
         Find-Element ('All samples' + $dot + '1 sample' + $dot + '100.0% of capture')

@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use w11term::{
     control::{CpuCallGraph, CpuProfileOptions},
-    ssh::{CpuLaunchOptions, CpuLaunchPlan, CpuProfilePlan, TriageTarget},
+    ssh::{CaptureStop, CpuLaunchOptions, CpuLaunchPlan, CpuProfilePlan, TriageTarget},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -609,6 +609,8 @@ impl TerminalApp {
         };
         let ticket = self.flame_graph.begin("Recording the CPU profile…");
         self.flame_graph.activity = Some(diagnostics::Activity::start(&ticket, user, host, port));
+        let stop = CaptureStop::default();
+        self.flame_graph.stop = Some(stop.clone());
         let rejected = message(ViewerAction::Finished(
             ticket.clone(),
             Err("CPU profile worker unavailable".into()),
@@ -620,19 +622,21 @@ impl TerminalApp {
                         return Ok(None);
                     }
                     let raw_path = keep_raw.then(|| path.with_extension("perf.data"));
-                    let summary = match (&review.plan, raw_path.as_deref()) {
-                        (ReviewedTarget::Process(plan), None) => {
-                            target.save_cpu_profile_blocking(plan, &path)?
-                        }
-                        (ReviewedTarget::Command(plan), None) => {
-                            target.save_cpu_launch_blocking(plan, &path)?
-                        }
-                        (ReviewedTarget::Process(plan), raw @ Some(_)) => {
-                            target.save_cpu_profile_artifacts_blocking(plan, &path, raw)?
-                        }
-                        (ReviewedTarget::Command(plan), raw @ Some(_)) => {
-                            target.save_cpu_launch_artifacts_blocking(plan, &path, raw)?
-                        }
+                    let summary = match &review.plan {
+                        ReviewedTarget::Process(plan) => target
+                            .save_cpu_profile_artifacts_with_stop_blocking(
+                                plan,
+                                &path,
+                                raw_path.as_deref(),
+                                Some(&stop),
+                            )?,
+                        ReviewedTarget::Command(plan) => target
+                            .save_cpu_launch_artifacts_with_stop_blocking(
+                                plan,
+                                &path,
+                                raw_path.as_deref(),
+                                Some(&stop),
+                            )?,
                     };
                     let profile = Profile::open(&path).with_context(|| {
                         format!(

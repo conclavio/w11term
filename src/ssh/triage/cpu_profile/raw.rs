@@ -150,10 +150,19 @@ impl Target {
         deadline: Duration,
         transcript_limit: usize,
         perf_data: Option<PathBuf>,
+        stop: Option<&super::CaptureStop>,
     ) -> Result<(Vec<u8>, Vec<u8>, Option<Staged>)> {
         let Some(destination) = perf_data else {
-            let (stdout, stderr) = self
-                .run_diagnostic(operation, command, deadline, transcript_limit)
+            let mut stdout = Vec::new();
+            let stderr = self
+                .run_diagnostic_to(
+                    operation,
+                    command,
+                    deadline,
+                    transcript_limit,
+                    &mut stdout,
+                    stop,
+                )
                 .await?;
             return Ok((stdout, stderr, None));
         };
@@ -167,7 +176,7 @@ impl Target {
                 deadline,
                 transcript_limit + MAX_BYTES + HEADER_BYTES,
                 &mut receiver,
-                None,
+                stop,
             )
             .await?;
         let (stdout, recording) = receiver.finish().await?;

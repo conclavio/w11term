@@ -1,7 +1,7 @@
 use super::{
-    CpuCallGraph, CpuProfileSummary, END_MARKER, EXTRA_WORK_SECONDS, PROBE_SECONDS, RECORD_KIB,
-    Recording, SSH_MARGIN_SECONDS, STACKS_KIB, SUPERVISOR, Target, fold, quote, transfer_seconds,
-    validate_sampling,
+    CaptureStop, CpuCallGraph, CpuProfileSummary, END_MARKER, EXTRA_WORK_SECONDS, PROBE_SECONDS,
+    RECORD_KIB, RUNNER, Recording, SSH_MARGIN_SECONDS, STACKS_KIB, SUPERVISOR, Target, fold, quote,
+    transfer_seconds, validate_sampling,
 };
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -15,7 +15,6 @@ const WORKER: &str = concat!(
     include_str!("../cpu-perf-data.sh"),
     include_str!("../cpu-launch-worker.sh")
 );
-const RUNNER: &str = include_str!("../cpu-launch-command.sh");
 const REVIEW_BYTES: usize = 16 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 
@@ -82,6 +81,7 @@ pub struct CpuLaunchPlan {
 pub enum CpuWorkloadOutcome {
     Exited(u8),
     TimeLimit,
+    Stopped,
 }
 
 impl std::fmt::Display for CpuWorkloadOutcome {
@@ -89,6 +89,7 @@ impl std::fmt::Display for CpuWorkloadOutcome {
         match self {
             Self::Exited(code) => write!(f, "Command exited with status {code}"),
             Self::TimeLimit => f.write_str("Command reached its time limit"),
+            Self::Stopped => f.write_str("Command stopped by request"),
         }
     }
 }
@@ -112,6 +113,16 @@ impl Target {
         path: &Path,
         perf_data: Option<&Path>,
     ) -> Result<CpuProfileSummary> {
+        self.save_cpu_launch_artifacts_with_stop_blocking(plan, path, perf_data, None)
+    }
+
+    pub fn save_cpu_launch_artifacts_with_stop_blocking(
+        self,
+        plan: &CpuLaunchPlan,
+        path: &Path,
+        perf_data: Option<&Path>,
+        stop: Option<&CaptureStop>,
+    ) -> Result<CpuProfileSummary> {
         let (host, user, port, fingerprint) = self.link.verified_endpoint();
         ensure!(
             plan.connection_generation == self.generation
@@ -126,7 +137,7 @@ impl Target {
         );
         Recording::check_destinations(path, perf_data)?;
         crate::ssh::NETWORK
-            .block_on(self.capture_cpu_launch(plan, perf_data.map(Path::to_owned)))?
+            .block_on(self.capture_cpu_launch(plan, perf_data.map(Path::to_owned), stop))?
             .save(path)
     }
 
@@ -161,6 +172,7 @@ impl Target {
         mut self,
         plan: &CpuLaunchPlan,
         perf_data: Option<PathBuf>,
+        stop: Option<&CaptureStop>,
     ) -> Result<Recording> {
         let raw = perf_data.is_some();
         let (stdout, stderr, perf_data) = self
@@ -172,6 +184,7 @@ impl Target {
                 ),
                 STACKS_KIB * 1024 + REVIEW_BYTES + END_MARKER.len(),
                 perf_data,
+                stop,
             )
             .await?;
         let (directory, program, remainder) = command_header(&stdout)?;
@@ -197,6 +210,7 @@ impl Target {
                     .to_owned()
             })
             .map(|mut folded| {
+                folded.summary.stopped_by_user = matches!(outcome, CpuWorkloadOutcome::Stopped);
                 folded.summary.workload = Some(outcome);
                 folded.summary.diagnostics = stderr
                     .lines()
@@ -272,14 +286,14 @@ fn workload_result(bytes: &[u8]) -> Result<(CpuWorkloadOutcome, &[u8])> {
         .filter(|&end| end <= 8)
         .context("Missing CPU workload outcome")?;
     let text = std::str::from_utf8(&bytes[..end])?;
-    let outcome = if text == "timeout" {
-        CpuWorkloadOutcome::TimeLimit
-    } else {
-        CpuWorkloadOutcome::Exited(
+    let outcome = match text {
+        "timeout" => CpuWorkloadOutcome::TimeLimit,
+        "stopped" => CpuWorkloadOutcome::Stopped,
+        _ => CpuWorkloadOutcome::Exited(
             text.strip_prefix("exit\t")
                 .context("Invalid CPU workload outcome")?
                 .parse()?,
-        )
+        ),
     };
     Ok((outcome, &bytes[end + 1..]))
 }

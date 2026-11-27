@@ -2,7 +2,7 @@ use super::*;
 use plot::{Plot, Range};
 use profile::{Profile, Search};
 use std::path::PathBuf;
-use w11term::ssh::CpuProfileSummary;
+use w11term::ssh::{CaptureStop, CpuProfileSummary};
 
 mod capture;
 mod plot;
@@ -17,6 +17,7 @@ pub enum Action {
     OpenFile,
     Export,
     Capture(capture::Action),
+    Stop(Arc<()>),
     Query(String),
     Match(bool),
     Zoom(usize),
@@ -47,6 +48,7 @@ pub(super) struct Panel {
     pub(super) activity: Option<diagnostics::Activity>,
     loaded: Option<Loaded>,
     pending: Option<Arc<()>>,
+    stop: Option<CaptureStop>,
     status: Option<String>,
     capture: Option<capture::Form>,
     zoom: usize,
@@ -121,6 +123,16 @@ impl Panel {
         )];
         if let Some(status) = &self.status {
             fields.push(text("status", status));
+        }
+        if let Some((stop, ticket)) = self.stop.as_ref().zip(self.pending.as_ref()) {
+            let ticket = ticket.clone();
+            fields.push(KeyedView::new(
+                "stop",
+                Button::new()
+                    .is_enabled(!stop.is_requested())
+                    .on_click(ctx.callback(move |_| message(Action::Stop(ticket.clone()))))
+                    .content("Stop and save profile"),
+            ));
         }
         if let Some(capture) = &self.capture {
             fields.extend(capture.fields(active, idle, ctx));
@@ -334,8 +346,8 @@ impl Panel {
             if let Some(warning) = &capture.perf_data_warning {
                 fields.push(text("raw-recording-warning", warning));
             }
-            if let Some(outcome) = &capture.workload {
-                fields.push(text("workload-outcome", outcome.to_string()));
+            if let Some(outcome) = profile_outcome(capture) {
+                fields.push(text("workload-outcome", outcome));
             }
             fields.push(text(
                 "stack-resolution",
@@ -374,6 +386,14 @@ fn sample_count(samples: u64) -> String {
     format!("{samples} {unit}")
 }
 
+fn profile_outcome(summary: &CpuProfileSummary) -> Option<String> {
+    summary
+        .workload
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| summary.stopped_by_user.then(|| "Stopped by request".into()))
+}
+
 impl TerminalApp {
     pub(super) fn with_flame_graph(&self, content: View, ctx: &ViewContext<Self>) -> View {
         let width = (self.width * 0.67).clamp(275.0, 1100.0);
@@ -405,6 +425,20 @@ impl TerminalApp {
             Action::Close => {
                 panel.open = false;
                 panel.hovered = None;
+            }
+            Action::Stop(ticket) => {
+                if panel
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| Arc::ptr_eq(pending, &ticket))
+                    && let Some(stop) = &panel.stop
+                {
+                    stop.request();
+                    if let Some(activity) = &mut panel.activity {
+                        activity.stopping();
+                    }
+                    panel.status = Some("Stop requested. Saving collected CPU samples…".into());
+                }
             }
             Action::OpenFile | Action::Export => {
                 if panel.pending.is_some() {
@@ -469,14 +503,13 @@ impl TerminalApp {
                     return;
                 }
                 panel.status = None;
+                panel.stop = None;
                 if let Some(activity) = &mut panel.activity {
                     activity.finish(&ticket, &result, |outcome| match outcome {
                         Outcome::Captured(_, path, summary) => {
-                            let workload = summary
-                                .workload
-                                .as_ref()
+                            let outcome = profile_outcome(summary)
                                 .map_or_else(String::new, |outcome| format!("\n{outcome}"));
-                            Some(format!("Saved CPU profile{workload}\n{}", path.display()))
+                            Some(format!("Saved CPU profile{outcome}\n{}", path.display()))
                         }
                         _ => None,
                     });

@@ -8,14 +8,22 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from perf_data_fixture import split_perf_data
+from perf_data_fixture import split_perf_data, stop_recording
 
 
 SUPERVISOR = Path("src/ssh/triage/cpu-profile-supervisor.sh").read_text()
+RUNNER = Path("src/ssh/triage/cpu-launch-command.sh").read_text()
 WORKER = (Path("src/ssh/triage/cpu-perf-data.sh").read_text()
           + Path("src/ssh/triage/cpu-profile-worker.sh").read_text())
+
+
+def worker(runner=RUNNER):
+    return f"runner={shlex.quote(runner)}\n{WORKER}"
+
+
 PERF = """#!/usr/bin/env python3
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -32,11 +40,15 @@ if args[0] == "record":
         "-F", "99", "--call-graph", "dwarf,8192", "-p", expected_pid,
     ]
     destination = Path(args[args.index("-o") + 1])
-    assert args[-3:] == ["--", "sleep", "2"]
+    window = args[args.index("--") + 1:]
+    assert window[:2] == ["/bin/bash", "-c"]
+    assert window[-2:] == ["sleep", "20" if scenario == "stop" else "2"]
     assert destination.parent.stat().st_mode & 0o777 == 0o700
     Path(os.environ["W11TERM_TEST_REMOTE_DIR"]).write_text(str(destination.parent))
     if scenario == "hang":
         time.sleep(30)
+    if scenario == "stop":
+        subprocess.run(window, check=True)
     if scenario == "deny":
         print("No permission to enable cpu-clock:u event.", file=sys.stderr)
         sys.exit(1)
@@ -81,7 +93,7 @@ def fixture_tests():
 
         def run(scenario="ok", mode="capture", start="0", deadline="6"):
             return subprocess.run(
-                ["/bin/sh", "-c", script, "w11term-cpu-profile", WORKER, deadline,
+                ["/bin/sh", "-c", script, "w11term-cpu-profile", worker(), deadline,
                  mode, target_pid, start, "2", "99", "dwarf,8192", "64", "16"],
                 env={**env, "W11TERM_TEST_PERF": scenario},
                 capture_output=True,
@@ -107,6 +119,19 @@ def fixture_tests():
         assert b"hot_loop" in capture.stdout
         assert capture.stdout.endswith(b"\nw11term-cpu-profile-end\n")
         assert b"lost 1 chunks" in capture.stderr
+        assert not Path(recorded_directory.read_text()).exists()
+
+        stopped = stop_recording(
+            ["/bin/sh", "-c", script, "w11term-cpu-profile", worker(), "29",
+             "capture-raw", target_pid, start, "20", "99", "dwarf,8192", "64", "16"],
+            recorded_directory,
+            env={**env, "W11TERM_TEST_PERF": "stop"},
+        )
+        assert stopped.returncode == 0, stopped.stderr
+        recording, text = split_perf_data(stopped.stdout)
+        assert recording == b"perf-data"
+        assert text.startswith(preview.stdout + b"w11term-cpu-profile-stopped-v1\n")
+        assert b"hot_loop" in text
         assert not Path(recorded_directory.read_text()).exists()
 
         raw_only = run(scenario="large-stacks", mode="capture-raw", start=start)
@@ -147,14 +172,17 @@ int main(void) { hot_loop(); return 0; }
             try:
                 pid = str(hot.pid)
                 ticks = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
-                profile = subprocess.run(
-                    ["/bin/sh", "-c", SUPERVISOR, "w11term-cpu-profile", WORKER, "10",
-                     "capture-raw", pid, ticks, "2", "99", "fp", "32768", "4096"],
-                    capture_output=True,
-                    timeout=14,
+                ready = Path(root) / "recording-started"
+                runner = f"printf 'ready\\n' > {shlex.quote(str(ready))}\n{RUNNER}"
+                profile = stop_recording(
+                    ["/bin/sh", "-c", SUPERVISOR, "w11term-cpu-profile", worker(runner), "29",
+                     "capture-raw", pid, ticks, "20", "99", "fp", "32768", "4096"],
+                    ready, sample_time=0.5,
                 )
                 assert profile.returncode == 0, profile.stderr
+                assert hot.poll() is None, "Stopping perf killed the attached process"
                 recording, stacks = split_perf_data(profile.stdout)
+                assert b"w11term-cpu-profile-stopped-v1\n" in stacks
                 assert re.search(rb"(?m)^\s*" + pid.encode() + rb" +\d+\.\d+: +cpu-clock(?::u)?:",
                                  stacks), stacks[:2000]
                 assert b" hot_loop " in stacks, stacks[:2000]

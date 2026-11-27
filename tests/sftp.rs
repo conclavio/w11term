@@ -92,6 +92,25 @@ fn packet_capture_ready(
     Ok(())
 }
 
+fn hold_profile_for_stop(
+    root: &Path,
+    channel: ChannelId,
+    raw: bool,
+    response: &[u8],
+) -> std::io::Result<bool> {
+    if !root.join("profile-wait-for-stop").is_file() {
+        return Ok(false);
+    }
+    let mut payload = Vec::new();
+    if raw {
+        payload.extend_from_slice(perf_data_header().as_bytes());
+        payload.extend_from_slice(PERF_DATA_FIXTURE);
+    }
+    payload.extend_from_slice(response);
+    fs::write(root.join(format!("profile-stop-{channel}")), payload)?;
+    Ok(true)
+}
+
 fn perf_data_header() -> String {
     use sha2::{Digest, Sha256};
     let digest: String = Sha256::digest(PERF_DATA_FIXTURE)
@@ -457,16 +476,25 @@ impl server::Handler for Peer {
             s.channel_success(c)?;
             if command.ends_with(&launch) {
                 fs::write(self.root.join("profile-launched"), [])?;
-                if command.contains(" 74 launch-raw ") {
-                    s.data(c, perf_data_header().into_bytes())?;
-                    s.data(c, PERF_DATA_FIXTURE.to_vec())?;
-                }
+                let raw = command.contains(" 74 launch-raw ");
+                let outcome = if self.root.join("profile-wait-for-stop").is_file() {
+                    "stopped\n"
+                } else {
+                    "timeout\n"
+                };
+                reply.push_str(outcome);
                 reply.push_str(concat!(
-                    "timeout\n",
                     "42 20.0: cpu-clock:u: ab main (/tmp/work space/cpu worker)\n",
                     "43 20.1: cpu-clock:u: ac child (/tmp/work space/cpu worker)\n",
                     "\nw11term-cpu-profile-end\n",
                 ));
+                if hold_profile_for_stop(&self.root, c, raw, reply.as_bytes())? {
+                    return Ok(());
+                }
+                if raw {
+                    s.data(c, perf_data_header().into_bytes())?;
+                    s.data(c, PERF_DATA_FIXTURE.to_vec())?;
+                }
             } else if !command.ends_with(&inspect) {
                 let tail = command.chars().rev().take(200).collect::<Vec<_>>();
                 let tail: String = tail.into_iter().rev().collect();
@@ -511,6 +539,9 @@ impl server::Handler for Peer {
                 ] => {
                     let response = fs::read(self.root.join("profile-response"))?;
                     fs::write(self.root.join("profile-captured"), [])?;
+                    if hold_profile_for_stop(&self.root, c, args[1] == "capture-raw", &response)? {
+                        return Ok(());
+                    }
                     if args[1] == "capture-raw" {
                         s.data(c, perf_data_header().into_bytes())?;
                         for chunk in PERF_DATA_FIXTURE.chunks(7) {
@@ -733,6 +764,16 @@ impl server::Handler for Peer {
         s: &mut server::Session,
     ) -> anyhow::Result<()> {
         if data == b"stop\n" {
+            let profile = self.root.join(format!("profile-stop-{c}"));
+            if let Ok(report) = fs::read(&profile) {
+                fs::remove_file(profile)?;
+                s.data(c, report)?;
+                s.extended_data(c, 1, b"Processed 3 events and lost 1 chunks!\n".to_vec())?;
+                s.exit_status_request(c, 0)?;
+                s.eof(c)?;
+                s.close(c)?;
+                return Ok(());
+            }
             let triage = self.root.join(format!("triage-stop-{c}"));
             if let Ok(report) = fs::read(&triage) {
                 fs::remove_file(triage)?;

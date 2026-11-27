@@ -8,7 +8,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from perf_data_fixture import split_perf_data
+from perf_data_fixture import split_perf_data, stop_recording
 
 SCRIPTS = Path("src/ssh/triage")
 SUPERVISOR = (SCRIPTS / "cpu-profile-supervisor.sh").read_text()
@@ -54,9 +54,9 @@ sys.exit(124)
 """
 
 
-def arguments(script, mode, root, executable, reviewed, argv, record_kib="64", stacks_kib="16"):
-    seconds = "1"
-    deadline = "4" if mode == "inspect" else "9"
+def arguments(script, mode, root, executable, reviewed, argv, record_kib="64", stacks_kib="16",
+              seconds="1"):
+    deadline = "4" if mode == "inspect" else str(int(seconds) + 8)
     return [
         "/bin/sh", "-c", script, "w11term-cpu-profile", WORKER, deadline, mode,
         RUNNER, seconds, "99", "fp", record_kib, stacks_kib, str(root), executable,
@@ -121,6 +121,21 @@ def fixture():
             assert_child_stopped(root)
             assert not Path(record_directory.read_text()).exists()
 
+        stopped = stop_recording(
+            arguments(supervisor, "launch-raw", root, "./cpu worker", reviewed, ["delay"],
+                      seconds="20"),
+            root / "child-pid",
+            env=env,
+        )
+        assert stopped.returncode == 0, stopped.stderr
+        recording, text = split_perf_data(stopped.stdout)
+        assert recording == b"perf-data"
+        actual, stacks = paths(text)
+        assert actual == reviewed and stacks.startswith(b"stopped\n")
+        assert b"child (/tmp/cmd)" in stacks
+        assert_child_stopped(root)
+        assert not Path(record_directory.read_text()).exists()
+
 
 def live():
     with tempfile.TemporaryDirectory(prefix="w11term-cpu-launch-live.") as directory:
@@ -129,23 +144,32 @@ def live():
             ["cc", "-x", "c", "-", "-g", "-O1", "-fno-omit-frame-pointer",
              "-fno-optimize-sibling-calls", "-o", root / "hotspot"],
             input=b"""
+#include <stdio.h>
 volatile unsigned long counter;
 __attribute__((noinline)) void launched_hotspot(void) { for (;;) ++counter; }
-int main(void) { launched_hotspot(); return 0; }
+int main(void) {
+    FILE *ready = fopen("hotspot-ready", "w");
+    if (!ready) return 1;
+    fputs("ready\\n", ready);
+    fclose(ready);
+    launched_hotspot();
+    return 0;
+}
 """,
             check=True, timeout=10,
         )
         preview = run(SUPERVISOR, "inspect", root, "./hotspot", ["", ""], [])
         assert preview.returncode == 0, preview.stderr
         reviewed, _ = paths(preview.stdout)
-        capture = subprocess.run(
-            arguments(SUPERVISOR, "launch-raw", root, "./hotspot", reviewed, [], "32768", "4096"),
-            capture_output=True, timeout=14,
+        capture = stop_recording(
+            arguments(SUPERVISOR, "launch-raw", root, "./hotspot", reviewed, [],
+                      "32768", "4096", seconds="20"),
+            root / "hotspot-ready", sample_time=0.5,
         )
         assert capture.returncode == 0, capture.stderr
         recording, text = split_perf_data(capture.stdout)
         actual, stacks = paths(text)
-        assert actual == reviewed and stacks.startswith(b"timeout\n")
+        assert actual == reviewed and stacks.startswith(b"stopped\n")
         assert b" launched_hotspot " in stacks, stacks[:2048]
         assert stacks.endswith(b"\nw11term-cpu-profile-end\n")
         raw_file = root / "launched.perf.data"
@@ -155,7 +179,7 @@ int main(void) { launched_hotspot(); return 0; }
             capture_output=True, check=True, timeout=10,
         )
         assert b"launched_hotspot" in reopened.stdout, reopened.stdout[:2000]
-        print("Live perf report reopened the raw launch recording after the time limit.")
+        print("Live perf report reopened the raw launch recording after an early stop.")
 
 
 if __name__ == "__main__":

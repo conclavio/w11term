@@ -88,14 +88,16 @@ try {
     }
     if ([IO.File]::Exists($marker)) { throw 'The workload started before destination confirmation' }
     $null = Wait-Until 'confirm recording destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the command is running on the reviewed SSH pane' { [IO.File]::Exists($marker) }
+    Click-LaunchButton 'Stop and save profile'
     $rawPrefix = 'Raw perf recording saved to '
     $profileText = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Text)
     try {
-        $null = Wait-Until 'timeout profile was saved and opened' {
+        $null = Wait-Until 'stopped command profile was saved and opened' {
             if (!(Find-Element 'Captured CPU profile') -or
-                !(Find-Element 'Command reached its time limit') -or
+                !(Find-Element 'Command stopped by request') -or
                 !(Find-Element '2 samples') -or ![IO.File]::Exists($folded)) { return }
             $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
             foreach ($item in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $profileText)) {

@@ -1,4 +1,4 @@
-use super::{Target, diagnostic_destination, quote};
+use super::{Target, capture_job::CaptureStop, diagnostic_destination, quote};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ const WORKER: &str = concat!(
     include_str!("cpu-perf-data.sh"),
     include_str!("cpu-profile-worker.sh")
 );
+const RUNNER: &str = include_str!("cpu-launch-command.sh");
 const MAX_SECONDS: u8 = 30;
 const RECORD_KIB: usize = 32 * 1024;
 const STACKS_KIB: usize = 4 * 1024;
@@ -23,6 +24,7 @@ const EXTRA_WORK_SECONDS: u64 = 12;
 const SSH_MARGIN_SECONDS: u64 = 6;
 const PROBE_SECONDS: u64 = 4;
 const END_MARKER: &[u8] = b"\nw11term-cpu-profile-end\n";
+const STOP_MARKER: &[u8] = b"w11term-cpu-profile-stopped-v1\n";
 pub(crate) mod launch;
 mod raw;
 pub use launch::CpuWorkloadOutcome;
@@ -125,6 +127,16 @@ impl Target {
         path: &Path,
         perf_data: Option<&Path>,
     ) -> Result<CpuProfileSummary> {
+        self.save_cpu_profile_artifacts_with_stop_blocking(plan, path, perf_data, None)
+    }
+
+    pub fn save_cpu_profile_artifacts_with_stop_blocking(
+        self,
+        plan: &CpuProfilePlan,
+        path: &Path,
+        perf_data: Option<&Path>,
+        stop: Option<&CaptureStop>,
+    ) -> Result<CpuProfileSummary> {
         let (host, user, port, fingerprint) = self.link.verified_endpoint();
         ensure!(
             plan.connection_generation == self.generation
@@ -143,6 +155,7 @@ impl Target {
                 plan.options,
                 plan.process_start_ticks,
                 perf_data.map(Path::to_owned),
+                stop,
             ))?
             .save(path)
     }
@@ -187,6 +200,7 @@ impl Target {
         options: CpuProfileOptions,
         expected_ticks: u64,
         perf_data: Option<PathBuf>,
+        stop: Option<&CaptureStop>,
     ) -> Result<Recording> {
         let options = options.validate()?;
         let raw = perf_data.is_some();
@@ -196,8 +210,9 @@ impl Target {
                 "Linux CPU profile",
                 command(options, Some(expected_ticks), raw),
                 Duration::from_secs(deadline + SSH_MARGIN_SECONDS),
-                STACKS_KIB * 1024 + PROCESS_WIRE_BYTES + END_MARKER.len(),
+                STACKS_KIB * 1024 + PROCESS_WIRE_BYTES + END_MARKER.len() + STOP_MARKER.len(),
                 perf_data,
+                stop,
             )
             .await?;
         let (ticks, name, remainder) = process_header(&bytes)?;
@@ -205,7 +220,9 @@ impl Target {
             ticks == expected_ticks,
             "The CPU profile process identity changed"
         );
-        let samples = remainder
+        let stopped = remainder.strip_prefix(STOP_MARKER);
+        let samples = stopped
+            .unwrap_or(remainder)
             .strip_suffix(END_MARKER)
             .context("The CPU profile response is incomplete")?;
         let stderr = String::from_utf8_lossy(&stderr);
@@ -225,6 +242,7 @@ impl Target {
             })
             .map(|mut folded| {
                 folded.summary.diagnostics = diagnostics;
+                folded.summary.stopped_by_user = stopped.is_some();
                 folded
             });
         Ok(Recording { folded, perf_data })
@@ -244,10 +262,11 @@ fn command(options: CpuProfileOptions, expected_ticks: Option<u64>, raw: bool) -
         (Some(_), false) => ("capture", options.worker_seconds()),
         (None, _) => ("inspect", PROBE_SECONDS),
     };
+    let worker = format!("runner={}\n{WORKER}", quote(RUNNER));
     format!(
         "/bin/sh -c {} w11term-cpu-profile {} {deadline} {mode} {} {} {} {} {} {RECORD_KIB} {STACKS_KIB}",
         quote(SUPERVISOR),
-        quote(WORKER),
+        quote(&worker),
         options.target_pid,
         expected_ticks.unwrap_or_default(),
         options.seconds,
@@ -293,6 +312,8 @@ pub struct CpuProfileSummary {
     pub distinct_stacks: usize,
     pub unresolved_frames: u64,
     pub diagnostics: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stopped_by_user: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workload: Option<CpuWorkloadOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
