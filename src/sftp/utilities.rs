@@ -31,6 +31,7 @@ const PROBE: &str = r#"/bin/sh -c 'printf "%s\n" w11term-tools-v1; command -p un
 enum InstallMode {
     Replace,
     Add,
+    Sync,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -488,18 +489,29 @@ impl Engine {
             Some(_) => "present",
             None => "missing",
         };
-        let manual = mode == InstallMode::Add
-            && (selector.manual || selector.version.as_ref() != bundle_sha256.as_ref());
         let bin_matches_active = mode == InstallMode::Add
             || self
                 .utility_bin_matches_active(&store_path, &selector, &release)
                 .await?;
-        blocked |= selector.conflict
-            || !bin_matches_active
-            || selector.version.as_ref().is_some_and(|current| {
-                !atomic_replace
-                    && (selector.manual != manual || Some(current) != bundle_sha256.as_ref())
-            });
+        blocked |= selector.conflict || !bin_matches_active;
+        let repairs = match bundle_sha256.as_deref() {
+            Some(id) if mode == InstallMode::Replace && !blocked => {
+                self.review_tool_repairs(session, &store_path, &release, id)
+                    .await?
+            }
+            _ => Vec::new(),
+        };
+        let keeping_active = mode == InstallMode::Replace
+            && selector.version.is_some()
+            && selector.version == bundle_sha256;
+        let manual = (mode == InstallMode::Add
+            && (selector.manual || selector.version != bundle_sha256))
+            || (keeping_active && selector.manual);
+        blocked |= !atomic_replace
+            && (repairs.iter().any(|repair| repair.replaces_file())
+                || selector.version.as_ref().is_some_and(|current| {
+                    selector.manual != manual || Some(current) != bundle_sha256.as_ref()
+                }));
         let mut report = json!({
             "bundle": release.name, "bundle_sha256": bundle_sha256,
             "host": {"os": "Linux", "architecture": host.architecture, "home": home, "glibc": host.glibc.map(|v| v.to_string())},
@@ -510,6 +522,9 @@ impl Engine {
         });
         if mode == InstallMode::Add {
             report["mode"] = json!("add");
+            report["automatic_sync_paused"] = json!(manual);
+        } else if mode == InstallMode::Replace {
+            report["repairs"] = json!(repairs);
             report["automatic_sync_paused"] = json!(manual);
         }
         Ok(InstallPlan {
@@ -524,6 +539,7 @@ impl Engine {
             id: bundle_sha256,
             manual,
             configure_launchers: true,
+            repairs,
         })
     }
 

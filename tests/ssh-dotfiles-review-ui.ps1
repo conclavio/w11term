@@ -31,6 +31,26 @@ function Wait-Review {
         (Find-Element $target) -and (Find-Element 'SFTP home /') -and $apply -and $apply.Current.IsEnabled
     }
 }
+function Expand-ReviewDetail([string]$Name) {
+    $search = @{ scroll = $null }
+    try {
+        $null = Wait-Until "visible '$Name' details" {
+            $element = Find-Element $Name $button
+            if ($element -and !$element.Current.IsOffscreen) { return $element }
+            Move-NativeControlIntoView $element $search
+        }
+        Set-NativeExpansion $Name $true
+    } catch {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $controls = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition) | Where-Object {
+                $_.Current.Name -like '*hook*' -or $_.Current.Name -like '*fragment*'
+            } | ForEach-Object {
+                "$($_.Current.ControlType.ProgrammaticName) [$($_.Current.Name)] offscreen=$($_.Current.IsOffscreen) expand=$($_.GetSupportedPatterns().ProgrammaticName -contains 'ExpandCollapsePatternIdentifiers.Pattern')"
+            }
+        throw "$_ Review controls $($controls -join ' | ')"
+    }
+}
 function Select-RetainedDotfile([int]$Pane, [string]$Id) {
     $report = (Control @('sftp','--pane',"$Pane",'list-dotfile-versions','--shell','bash')).sftp
     $version = $report.versions | Where-Object bundle_sha256 -ceq $Id
@@ -89,6 +109,16 @@ try {
         !(Find-Element "Create${dot}/.profile") -or [IO.Directory]::Exists($remoteStore)) {
         throw 'The read-only review did not describe the actual startup changes'
     }
+    Expand-ReviewDetail "Startup hook${dot}/.bashrc"
+    Expand-ReviewDetail 'Prompt fragment changes'
+    $null = Wait-Until 'first review shows the new hook and added prompt line' {
+        $labels = Get-NativeTextLabels
+        ($labels | Where-Object { $_.Contains('# >>> w11term dotfiles >>>') -and $_.Contains('bash-current') }) -and
+            ($labels | Where-Object { $_.Contains("Added line 1${dot}PS1='reviewed> '") })
+    }
+    if (Get-NativeTextLabels | Where-Object { $_.Contains('# keep my local shell settings') }) {
+        throw 'The dotfiles review exposed unrelated startup-file contents'
+    }
     $null = Control @('focus-pane','--pane',"$localPane")
     Wait-Focus $localPane
     $null = Wait-Until 'the other pane cannot apply this review' {
@@ -120,7 +150,9 @@ try {
     $null = Wait-Until 'the reviewed reinstall is a no-op' { Find-Element 'Dotfiles are already current' }
 
     $startup = Join-Path $remote '.bashrc'
-    $installed = [IO.File]::ReadAllText($startup)
+    $installed = [IO.File]::ReadAllText($startup) + "# keep my trailing shell settings"
+    $selectorPath = Join-Path $remoteStore 'bash-current'
+    $beforeHookRepair = [IO.File]::ReadAllText($selectorPath)
     $drift = $installed.Replace('/prompt.sh', '/edited-prompt.sh')
     if ($drift -ceq $installed) { throw 'The installed Bash hook was missing' }
     [IO.File]::WriteAllText($startup, $drift)
@@ -130,13 +162,45 @@ try {
         $apply -and !$apply.Current.IsEnabled -and (Find-Element "Startup hook conflict${dot}/.bashrc")
     }
     if ([IO.File]::ReadAllText($startup) -cne $drift) { throw 'Reading a conflict replaced the edited startup hook' }
-    [IO.File]::WriteAllText($startup, $installed)
+    Click 'Review startup hook repair'
+    $null = Wait-Until 'repair review finds only the edited hook' {
+        (Find-Element "Replace managed startup hook${dot}/.bashrc") -and
+            (Find-Element "Already current${dot}/.profile") -and
+            (Find-Element 'Repair reviewed startup hooks' $button -Visible)
+    }
+    Expand-ReviewDetail "Startup hook changes${dot}/.bashrc"
+    $null = Wait-Until 'review shows the edited and replacement hook lines' {
+        Get-NativeTextLabels | Where-Object { $_.Contains('/edited-prompt.sh') -and $_.Contains('/prompt.sh') }
+    }
+    if (Get-NativeTextLabels | Where-Object { $_.Contains('# keep my trailing shell settings') }) {
+        throw 'The repair review exposed text outside the managed hook'
+    }
+    if ([IO.File]::ReadAllText($startup) -cne $drift) { throw 'The repair review wrote the hook' }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'the local pane cannot confirm SSH startup hook changes' {
+        $repair = Find-Element 'Repair reviewed startup hooks' $button
+        $repair -and !$repair.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$pane")
+    Wait-Focus $pane
+    Click 'Repair reviewed startup hooks'
+    $null = Wait-Until 'repair updates the hook without switching the active bundle' {
+        (Find-Element "Startup hooks repaired${dot}1 file changed") -and
+            [IO.File]::ReadAllText($startup) -ceq $installed -and
+            [IO.File]::ReadAllText($selectorPath) -ceq $beforeHookRepair
+    }
 
-    $selectorPath = Join-Path $remoteStore 'bash-current'
     $first = [IO.File]::ReadAllText($selectorPath).Trim()
     Write-Bundle 'second'
     Click 'Review dotfiles changes'
     Wait-Review
+    Expand-ReviewDetail 'Prompt fragment changes'
+    $null = Wait-Until 'install review compares the active and proposed prompt lines' {
+        Get-NativeTextLabels | Where-Object {
+            $_.Contains("Removed line 1${dot}PS1='verified> '") -and $_.Contains("Added line 1${dot}PS1='second> '")
+        }
+    }
     Click 'Apply reviewed dotfiles'
     $null = Wait-Until 'a second version is active' { Find-Element "Dotfiles applied${dot}3 files changed" }
     $second = [IO.File]::ReadAllText($selectorPath).Trim()
@@ -145,10 +209,56 @@ try {
     Click 'Dotfile versions'
     $null = Wait-Until 'history shows the current version' { Find-Element "Active version $second" }
     Select-RetainedDotfile $pane $first
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot save the retained dotfiles' {
+        $save = Find-Element 'Save selected dotfile bundle' $button
+        $save -and !$save.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$pane")
+    Wait-Focus $pane
+    $snapshot = Join-Path $State ('Retained shell bundle ' + [char]0x96ea + '.json')
+    $savedPrefix = "Saved dotfile bundle${dot}"
+    Click 'Save selected dotfile bundle'
+    $saveDialog = Wait-OwnedDialog 'Save new dotfiles bundle'
+    $null = Wait-Until 'cancel the Windows bundle picker' { [FixtureDialog]::ClickButton($saveDialog, 2) }
+    $null = Wait-Until 'cancel returns to the retained version' {
+        (Find-Element "Selected version $first") -and !(Find-OwnedDialog 'Save new dotfiles bundle')
+    }
+    Click 'Save selected dotfile bundle'
+    $saveDialog = Wait-OwnedDialog 'Save new dotfiles bundle'
+    $null = Wait-Until 'enter a draft retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($saveDialog, "$snapshot.draft") }
+    $null = Wait-Until 'choose the retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($saveDialog, $snapshot) }
+    $null = Wait-Until 'save the retained bundle' { [FixtureDialog]::ClickButton($saveDialog, 1) }
+    $null = Wait-Until 'saved bundle is available at the selected Windows destination' {
+        if ([IO.File]::Exists($snapshot)) {
+            Get-NativeTextLabels | Where-Object {
+                $_.StartsWith($savedPrefix) -and [FixtureDialog]::SameFile($snapshot, $_.Substring($savedPrefix.Length))
+            }
+        }
+    }
+    $saved = [IO.File]::ReadAllText($snapshot) | ConvertFrom-Json
+    if ($saved.version -ne 1 -or $saved.bash -cne "PS1='verified> '`n" -or
+        $saved.environment -cne "export EDITOR=vi`n" -or $null -ne $saved.zsh) {
+        throw 'The saved bundle did not contain the chosen older version'
+    }
+    $cliSnapshot = Join-Path $State 'CLI saved shell bundle.json'
+    $receipt = (Control @('sftp','--pane',"$pane",'export-dotfile-bundle',$second,$cliSnapshot,'--shell','bash')).sftp
+    $savedCli = [IO.File]::ReadAllText($cliSnapshot) | ConvertFrom-Json
+    if ($receipt.bundle_sha256 -cne $second -or ![FixtureDialog]::SameFile($cliSnapshot, $receipt.local) -or
+        $savedCli.bash -cne "PS1='second> '`n" -or [IO.File]::ReadAllText($selectorPath).Trim() -cne $second) {
+        throw 'CLI export did not save the expected active bundle'
+    }
     Click 'Review dotfile restore'
     $null = Wait-Until 'restore reviews the before and after versions' {
         (Find-Element "Reviewed active version $second") -and (Find-Element "Restore version $first") -and
             (Find-Element 'This choice pauses automatic dotfile sync on reconnect.')
+    }
+    Expand-ReviewDetail 'Prompt fragment changes'
+    $null = Wait-Until 'restore review shows the inverse prompt changes' {
+        Get-NativeTextLabels | Where-Object {
+            $_.Contains("Removed line 1${dot}PS1='second> '") -and $_.Contains("Added line 1${dot}PS1='verified> '")
+        }
     }
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
     $resize = $root.GetCurrentPattern([System.Windows.Automation.TransformPattern]::Pattern)
@@ -188,6 +298,12 @@ try {
     $null = Wait-Until 'disable confirmation stays visible in the short window' {
         (Find-Element 'Disable managed dotfiles for new shells') -and
             (Find-Element 'Disable reviewed dotfiles' $button -Visible)
+    }
+    Expand-ReviewDetail 'Prompt fragment changes'
+    $null = Wait-Until 'disable review shows the prompt that will stop loading' {
+        Get-NativeTextLabels | Where-Object {
+            $_.Contains("Removed line 1${dot}PS1='verified> '") -and !$_.Contains('Added line')
+        }
     }
     Click 'Disable reviewed dotfiles'
     $null = Wait-Until 'history shows disabled dotfiles' { Find-Element 'Managed dotfiles disabled' }

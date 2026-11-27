@@ -63,7 +63,7 @@ pub(crate) async fn sync_login_tools(
         "The manifest name or bin directory changed. Approve the tool bundle again."
     );
     let plan = engine
-        .utility_plan(session, bundle, InstallMode::Replace)
+        .utility_plan(session, bundle, InstallMode::Sync)
         .await?;
     ensure!(
         plan.home == settings.home,

@@ -33,12 +33,17 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   remove-from-tool-bundle NAME TOOL --review TOKEN\n\
   preview-tool-bundle-rollback NAME SHA256\n\
   rollback-tool-bundle NAME SHA256 --review TOKEN\n\
+  preview-tool-bundle-prune NAME SHA256\n\
+  prune-tool-bundle-release NAME SHA256 --review TOKEN\n\
   preview-tool-bundle-resume NAME SHA256\n\
   resume-tool-bundle-updates NAME SHA256 --review TOKEN\n\
   preview-tool-bundle-pause NAME SHA256\n\
   pause-tool-bundle-updates NAME SHA256 --review TOKEN\n\
   preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  preview-dotfile-hooks --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
+  repair-dotfile-hooks --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh\n\
   list-dotfile-versions --shell bash|zsh\n\
   preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   switch-dotfiles SHA256|disabled|automatic --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
@@ -364,13 +369,18 @@ pub fn parse(
         }
         "preview-tool-bundle-rollback"
         | "rollback-tool-bundle"
+        | "preview-tool-bundle-prune"
+        | "prune-tool-bundle-release"
         | "preview-tool-bundle-resume"
         | "resume-tool-bundle-updates"
         | "preview-tool-bundle-pause"
         | "pause-tool-bundle-updates" => {
             if matches!(
                 command.as_str(),
-                "rollback-tool-bundle" | "resume-tool-bundle-updates" | "pause-tool-bundle-updates"
+                "rollback-tool-bundle"
+                    | "prune-tool-bundle-release"
+                    | "resume-tool-bundle-updates"
+                    | "pause-tool-bundle-updates"
             ) {
                 let token = opts
                     .remove("--review")
@@ -384,6 +394,9 @@ pub fn parse(
                 "preview-tool-bundle-pause" | "pause-tool-bundle-updates" => {
                     "pause-tool-bundle-updates"
                 }
+                "preview-tool-bundle-prune" | "prune-tool-bundle-release" => {
+                    "prune-tool-bundle-release"
+                }
                 _ => "rollback-tool-bundle",
             };
             fields.insert("op".into(), json!(op));
@@ -396,19 +409,40 @@ pub fn parse(
                 json!(dotfile_shell(opts.remove("--shell").as_deref())?),
             );
         }
-        "preview-dotfiles" | "apply-dotfiles" | "preview-dotfiles-switch" | "switch-dotfiles" => {
+        "export-dotfile-bundle" => {
+            fields.insert(
+                "shell".into(),
+                json!(dotfile_shell(opts.remove("--shell").as_deref())?),
+            );
+            fields.insert("bundle_sha256".into(), json!(normalize_sha256(&path()?)?));
+            fields.insert("local".into(), json!(std::path::absolute(path()?)?));
+        }
+        "preview-dotfiles"
+        | "apply-dotfiles"
+        | "preview-dotfile-hooks"
+        | "repair-dotfile-hooks"
+        | "preview-dotfiles-switch"
+        | "switch-dotfiles" => {
             let shell = dotfile_shell(opts.remove("--shell").as_deref())?;
             let zdotdir = opts.remove("--zdotdir");
             validate_zdotdir(shell, zdotdir.as_deref())?;
-            if matches!(command.as_str(), "apply-dotfiles" | "switch-dotfiles") {
+            if matches!(
+                command.as_str(),
+                "apply-dotfiles" | "repair-dotfile-hooks" | "switch-dotfiles"
+            ) {
                 let review = opts
                     .remove("--review")
-                    .context("--review is required. Preview the bundle first.")?;
+                    .context("--review is required. Preview the changes first.")?;
                 fields.insert("review".into(), json!(normalize_sha256(&review)?));
             }
             fields.insert("shell".into(), json!(shell));
             fields.insert("zdotdir".into(), json!(zdotdir));
             if matches!(
+                command.as_str(),
+                "preview-dotfile-hooks" | "repair-dotfile-hooks"
+            ) {
+                fields.insert("op".into(), json!("repair-dotfile-hooks"));
+            } else if matches!(
                 command.as_str(),
                 "preview-dotfiles-switch" | "switch-dotfiles"
             ) {
@@ -659,6 +693,147 @@ mod tests {
                 ..
             } if name == "fleet" && tool == "rg" && review == token
         ));
+    }
+
+    #[test]
+    fn exporting_dotfiles_requires_a_shell_digest_and_new_local_destination() {
+        let id = "a".repeat(64);
+        let (_, request) = p(&[
+            "--pane",
+            "2",
+            "export-dotfile-bundle",
+            &id,
+            "Retained shell bundle.json",
+            "--shell",
+            "zsh",
+        ])
+        .unwrap();
+        assert!(matches!(request, Request::Sftp {
+            pane: 2,
+            operation: Operation::ExportDotfileBundle {
+                shell: DotfileShell::Zsh, bundle_sha256, local,
+            },
+            ..
+        } if bundle_sha256 == id && local == std::path::absolute("Retained shell bundle.json").unwrap()));
+        assert!(
+            p(&[
+                "--pane",
+                "2",
+                "export-dotfile-bundle",
+                &id,
+                "bundle.json",
+                "--shell",
+                "fish"
+            ])
+            .is_err()
+        );
+        assert!(
+            p(&[
+                "--pane",
+                "2",
+                "export-dotfile-bundle",
+                "latest",
+                "bundle.json",
+                "--shell",
+                "bash"
+            ])
+            .is_err()
+        );
+        assert!(
+            p(&[
+                "--pane",
+                "2",
+                "export-dotfile-bundle",
+                &id,
+                "bundle.json",
+                "--shell",
+                "bash",
+                "--overwrite"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn startup_hook_repair_requires_a_review_without_a_bundle() {
+        let (_, preview) = p(&[
+            "--pane",
+            "2",
+            "preview-dotfile-hooks",
+            "--shell",
+            "zsh",
+            "--zdotdir",
+            "config/zsh",
+        ])
+        .unwrap();
+        assert!(matches!(preview, Request::Sftp {
+            pane: 2,
+            operation: Operation::RepairDotfileHooks {
+                shell: DotfileShell::Zsh, zdotdir: Some(directory), review: None,
+            },
+            ..
+        } if directory == "config/zsh"));
+        assert!(p(&["--pane", "2", "repair-dotfile-hooks", "--shell", "bash"]).is_err());
+        let token = "a".repeat(64);
+        let (_, apply) = p(&[
+            "--pane",
+            "2",
+            "repair-dotfile-hooks",
+            "--shell",
+            "bash",
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(apply, Request::Sftp {
+            pane: 2,
+            operation: Operation::RepairDotfileHooks {
+                shell: DotfileShell::Bash, zdotdir: None, review: Some(review),
+            },
+            ..
+        } if review == token));
+    }
+
+    #[test]
+    fn pruning_a_tool_release_requires_its_digest_and_a_review() {
+        let version = "a".repeat(64);
+        let token = "b".repeat(64);
+        let (_, preview) = p(&[
+            "--pane",
+            "9",
+            "preview-tool-bundle-prune",
+            "fleet",
+            &version,
+        ])
+        .unwrap();
+        assert!(matches!(preview, Request::Sftp {
+            pane: 9,
+            operation: Operation::PruneToolBundleRelease { name, bundle_sha256, review: None }, ..
+        } if name == "fleet" && bundle_sha256 == version));
+        assert!(
+            p(&[
+                "--pane",
+                "9",
+                "prune-tool-bundle-release",
+                "fleet",
+                &version
+            ])
+            .is_err()
+        );
+        let (_, apply) = p(&[
+            "--pane",
+            "9",
+            "prune-tool-bundle-release",
+            "fleet",
+            &version,
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(apply, Request::Sftp {
+            pane: 9,
+            operation: Operation::PruneToolBundleRelease { bundle_sha256, review: Some(review), .. }, ..
+        } if bundle_sha256 == version && review == token));
     }
 
     #[test]

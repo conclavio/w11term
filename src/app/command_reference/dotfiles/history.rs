@@ -5,10 +5,13 @@ pub enum Action {
     Open,
     Refresh,
     Select(Option<usize>),
+    Save,
+    Saved(Arc<()>, Result<Option<PathBuf>, String>),
     ReviewRestore,
     ReviewDisable,
     ReviewResume,
     Apply,
+    Reviewed(Arc<()>, Result<Box<SwitchReview>, String>),
     Completed(Arc<()>, Result<serde_json::Value, String>),
     Back,
 }
@@ -17,16 +20,17 @@ pub enum Action {
 pub(super) struct Panel {
     listing: Option<DotfileVersions>,
     selected: Option<usize>,
-    review: Option<SwitchReview>,
+    review: Option<Box<SwitchReview>>,
 }
 
 #[derive(Deserialize)]
-struct SwitchReview {
+pub struct SwitchReview {
     home: String,
     target: DotfileTarget,
     active_bundle_sha256: Option<String>,
     selector: Edit,
     supports_atomic_replace: bool,
+    fragment_changes: Comparison,
     review: String,
 }
 
@@ -34,6 +38,11 @@ struct SwitchReview {
 struct Switched {
     target: DotfileTarget,
     changed: bool,
+}
+
+#[derive(Deserialize)]
+struct SavedBundle {
+    local: PathBuf,
 }
 
 fn send(action: Action) -> Message {
@@ -161,6 +170,14 @@ impl Panel {
         }
         fields.extend([
             KeyedView::new(
+                "save-bundle",
+                button(
+                    "Save selected dotfile bundle",
+                    idle && self.selected_id().is_some(),
+                    || Action::Save,
+                ),
+            ),
+            KeyedView::new(
                 "review-restore",
                 button(
                     "Review dotfile restore",
@@ -229,6 +246,7 @@ impl Panel {
                     review.selector.path
                 ),
             ));
+            review.fragment_changes.describe(&mut fields);
             footer.push(KeyedView::new(
                 "apply-switch",
                 button(
@@ -251,6 +269,7 @@ impl Panel {
         if let Some(status) = installer.status.as_deref().or_else(|| {
             installer.pending.as_ref().map(|(_, work)| match work {
                 Work::ListVersions => "Reading retained dotfile versions…",
+                Work::SaveVersion => "Saving the verified dotfile bundle…",
                 Work::ReviewSwitch => "Verifying the dotfile change…",
                 Work::SwitchVersion => "Applying the reviewed dotfile change…",
                 _ => unreachable!("history only runs version operations"),
@@ -295,6 +314,7 @@ impl TerminalApp {
         current: Option<(ToolPane, tokio::sync::mpsc::UnboundedSender<Command>)>,
         ctx: &ComponentContext<Self>,
     ) {
+        let owner = self.keyboard.hwnd().map(|window| window.0 as usize);
         let Some(installer) = &mut self.command_reference.dotfiles else {
             return;
         };
@@ -331,6 +351,33 @@ impl TerminalApp {
                         history.selected = selected;
                         history.review = None;
                         installer.status = None;
+                    }
+                    None
+                }
+                Action::Save if idle => {
+                    let (Some(id), Some(owner), Some(input)) =
+                        (history.selected_id(), owner, input)
+                    else {
+                        return;
+                    };
+                    let id = id.to_owned();
+                    let current = installer
+                        .bundle
+                        .as_deref()
+                        .unwrap_or(self.store.path())
+                        .to_owned();
+                    installer.save_dotfile_version(owner, current, id, input, ctx);
+                    return;
+                }
+                Action::Saved(ticket, result) => {
+                    if installer.finish(&ticket, Work::SaveVersion) {
+                        installer.status = match result {
+                            Ok(Some(path)) => {
+                                Some(format!("Saved dotfile bundle · {}", path.display()))
+                            }
+                            Ok(None) => None,
+                            Err(error) => Some(error),
+                        };
                     }
                     None
                 }
@@ -394,11 +441,18 @@ impl TerminalApp {
                         },
                     ))
                 }
+                Action::Reviewed(ticket, result) => {
+                    if installer.finish(&ticket, Work::ReviewSwitch) {
+                        match result {
+                            Ok(review) => installer.history.as_mut().unwrap().review = Some(review),
+                            Err(error) => installer.status = Some(error),
+                        }
+                    }
+                    None
+                }
                 Action::Completed(ticket, result) => {
-                    let Some((
-                        _,
-                        work @ (Work::ListVersions | Work::ReviewSwitch | Work::SwitchVersion),
-                    )) = installer.pending.as_ref()
+                    let Some((_, work @ (Work::ListVersions | Work::SwitchVersion))) =
+                        installer.pending.as_ref()
                     else {
                         return;
                     };
@@ -410,10 +464,6 @@ impl TerminalApp {
                     match work {
                         Work::ListVersions => match decode(result) {
                             Ok(listing) => history.listing = Some(listing),
-                            Err(error) => installer.status = Some(error),
-                        },
-                        Work::ReviewSwitch => match decode(result) {
-                            Ok(review) => history.review = Some(review),
                             Err(error) => installer.status = Some(error),
                         },
                         Work::SwitchVersion => match decode::<Switched>(result) {
@@ -461,6 +511,57 @@ impl TerminalApp {
 }
 
 impl Installer {
+    fn save_dotfile_version(
+        &mut self,
+        owner: usize,
+        current: PathBuf,
+        bundle_sha256: String,
+        input: tokio::sync::mpsc::UnboundedSender<Command>,
+        ctx: &ComponentContext<TerminalApp>,
+    ) {
+        let target = self.target;
+        let shell = self.shell;
+        let name = match shell {
+            DotfileShell::Bash => "bash",
+            DotfileShell::Zsh => "zsh",
+        };
+        let purpose = file_picker::Purpose::SaveDotfilesBundle {
+            current,
+            suggestion: format!("dotfiles-{name}-{}.json", short_id(&bundle_sha256)),
+        };
+        let ticket = self.begin(Work::SaveVersion);
+        let rejected = send(Action::Saved(
+            ticket.clone(),
+            Err("Dotfile bundle save unavailable".into()),
+        ));
+        ctx.spawn_background_with_rejection(
+            move |scope| {
+                let result = (|| {
+                    let file =
+                        file_picker::pick(owner, purpose).map_err(|error| format!("{error:#}"))?;
+                    let Some(file) = file.filter(|_| !scope.is_cancelled()) else {
+                        return Ok(None);
+                    };
+                    let operation = Operation::ExportDotfileBundle {
+                        shell,
+                        bundle_sha256,
+                        local: file.path,
+                    };
+                    decode::<SavedBundle>(run_pane_sftp_job(
+                        input,
+                        target,
+                        operation,
+                        Duration::from_secs(30),
+                        None,
+                    ))
+                    .map(|saved| Some(saved.local))
+                })();
+                send(Action::Saved(ticket, result))
+            },
+            rejected,
+        );
+    }
+
     fn run_history(
         &mut self,
         (work, operation): (Work, Operation),
@@ -472,10 +573,17 @@ impl Installer {
             self.review = None;
         }
         let ticket = self.begin(work);
-        let rejected = send(Action::Completed(
+        let complete = move |ticket, result| {
+            if work == Work::ReviewSwitch {
+                send(Action::Reviewed(ticket, decode(result)))
+            } else {
+                send(Action::Completed(ticket, result))
+            }
+        };
+        let rejected = complete(
             ticket.clone(),
             Err("Dotfile version worker unavailable".into()),
-        ));
+        );
         ctx.spawn_background_with_rejection(
             move |scope| {
                 let result = if scope.is_cancelled() {
@@ -483,7 +591,7 @@ impl Installer {
                 } else {
                     run_pane_sftp_job(input, target, operation, Duration::from_secs(30), None)
                 };
-                send(Action::Completed(ticket, result))
+                complete(ticket, result)
             },
             rejected,
         );

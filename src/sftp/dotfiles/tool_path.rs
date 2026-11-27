@@ -1,10 +1,10 @@
+use super::hooks::{candidate_marker, hook_markers, managed_block, repair_hook};
 use super::*;
 use crate::options::{ToolPath, ToolSync};
 use crate::sftp::{
     InstalledToolPath,
     utilities::{managed_tool_store, valid_bin_directory, with_lock},
 };
-use std::ops::Range;
 
 struct PathPlan {
     edits: Vec<Edit>,
@@ -45,29 +45,6 @@ fn path_hook(bin: &str) -> String {
     )
 }
 
-fn managed_block(before: &str, hook: &str) -> Option<Range<usize>> {
-    let [begin, end] = path_markers(hook);
-    let mut offset = 0;
-    let mut markers = before.split_inclusive('\n').filter_map(|line| {
-        let start = offset;
-        offset += line.len();
-        [begin, end].contains(&line.trim()).then_some((start, line))
-    });
-    let (start, first) = markers.next()?;
-    let (finish, last) = markers.next()?;
-    (first.trim_end_matches(['\r', '\n']) == begin
-        && last.trim_end_matches(['\r', '\n']) == end
-        && markers.next().is_none())
-    .then_some(start..finish + last.len())
-}
-
-fn path_markers(hook: &str) -> [&str; 2] {
-    [
-        hook.lines().next().expect("generated opening marker"),
-        hook.lines().last().expect("generated closing marker"),
-    ]
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PathEdit {
     Sync,
@@ -79,29 +56,20 @@ fn plan_edit(path: String, original: Option<String>, hook: String, mode: PathEdi
     if mode == PathEdit::Remove {
         return remove_path_hook(path, original, &hook);
     }
-    let mut edit = hook_change(path, original, hook);
-    if mode == PathEdit::Repair
-        && edit.after.is_none()
-        && let (Some(before), Some(hook)) = (&edit.before, &edit.hook)
-        && let Some(range) = managed_block(before, hook)
-        && before.len() - range.len() + hook.len() <= TEXT_PREVIEW_MAX_BYTES
-    {
-        let mut after = before.clone();
-        let replaced = before[range.clone()].to_owned();
-        after.replace_range(range, hook);
-        edit.action = "replace-hook";
-        edit.after = Some(after);
-        edit.replaced_hook = Some(replaced);
+    let edit = hook_change(path, original, hook);
+    if mode == PathEdit::Repair {
+        repair_hook(edit)
+    } else {
+        edit
     }
-    edit
 }
 
 fn remove_path_hook(path: String, original: Option<String>, hook: &str) -> Edit {
     let Some(before) = original.as_deref() else {
         return Edit::new(path, "unchanged", None, None);
     };
-    let markers = path_markers(hook);
-    if !before.lines().any(|line| markers.contains(&line.trim())) {
+    let markers = hook_markers(hook);
+    if !before.lines().any(|line| candidate_marker(line, markers)) {
         return Edit::new(path, "unchanged", original.clone(), original);
     }
     let Some(range) = managed_block(before, hook) else {

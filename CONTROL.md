@@ -1264,6 +1264,8 @@ Direct pipe clients send
 
 From a connected SSH pane, open **More → Command reference → Apply SSH dotfiles**. The panel starts with the profile's bundle and shell if set. You can also choose a local bundle, Bash or Zsh, and an optional startup directory for Zsh. Select **Review dotfiles changes** to see the account, resolved SFTP home, planned file changes, and any conflicts. Check that the resolved directory is the shell account's home, then select **Apply reviewed dotfiles** on the same connection. A changed bundle or remote startup file requires another review. Applying updates the managed startup files for future shells and leaves the profile's login-sync settings in place.
 
+Expand **Environment fragment changes** or **Prompt fragment changes** to review the lines that will be added and removed. Expand a proposed **Startup hook** to see the generated block in context of its target path. The review omits unrelated startup-file contents. If the active managed fragments cannot be verified, the review identifies that condition and shows the proposed lines. A verified active fragment that changes after review makes the confirmation stale.
+
 `sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. For a Zsh setup that uses a different startup directory under that home, pass `--zdotdir RELATIVE_DIR`.
 
 Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` fragment is shared by the chosen shells. Set `bash` or `zsh` for the prompt, aliases, and interactive setup specific to that shell. Each fragment supports up to 16 KiB. The preview computes planned file hashes with LF line endings and a final newline on nonempty fragments.
@@ -1292,6 +1294,12 @@ Pass the returned `review` token to apply on the same pane with the same bundle,
 
 Apply replies with `shell`, `home`, `bundle_sha256` and the ordered `changed_files`. An unchanged bundle returns an empty list. A missing fragment becomes an empty managed file. Direct pipe clients can send `{"op":"preview-dotfiles","shell":"bash","bundle":{"version":1,"bash":"PS1='ops> '"}}` with the normal SFTP request fields. Use `"op":"apply-dotfiles"` plus the returned `"review"` for the reviewed installation.
 
+Install and switch previews include `fragment_changes`. Its `baseline` is `verified`, `inactive`, or `unavailable`, and each entry in `fragments` includes its `role` and complete managed `before` and `after` text. A null side has no verified text for that state. An empty string is an empty managed fragment. Disable previews have null proposed text, and resuming a held version shows matching before and after text.
+
+To recover an edited or missing startup hook, choose **Review startup hook repair** in the dotfiles installer and confirm **Repair reviewed startup hooks**. The review shows changed lines inside a replaced block and the full block for a missing hook. Repair uses the selected shell and Zsh startup directory, preserves the surrounding file text, and keeps the active version and update policy. Duplicate, incomplete, or nested w11term markers block repair. Changes to existing files require the server's atomic rename support.
+
+Scripts use `preview-dotfile-hooks --shell bash|zsh [--zdotdir RELATIVE_DIR]` and `repair-dotfile-hooks --shell bash|zsh --review TOKEN` with the same optional `--zdotdir`. The preview includes `ready` and `files`, with the old managed block in `replaced_hook` and replacement in `hook`. Repair returns `changed_files`. A failed or interrupted repair requires a fresh review.
+
 ### Restore or disable SSH dotfiles
 
 In **Command reference → Apply SSH dotfiles**, choose the shell and its startup directory, then open **Dotfile versions**. Select a retained version and choose **Review dotfile restore** followed by **Restore reviewed dotfiles**. To disable managed fragments, use **Review disabling managed dotfiles** followed by **Disable reviewed dotfiles**. Both actions pause automatic dotfile sync for that shell on the remote account.
@@ -1313,6 +1321,10 @@ $preview.result.sftp
 Use the same two commands with `disabled` to stop loading managed dotfiles in new shells, or with `automatic` to lift a hold from a restore or disable. Switching only changes the selector. The startup hooks and retained files stay available for the next review. Restoring a version or lifting its hold checks that the retained fragments match their bundle hash and that both startup hooks are installed. A stale token or edited fragment prevents the change. The reply reports `shell`, `home`, `target`, the selected `bundle_sha256` or null, and `changed`.
 
 Direct pipe clients use `{"op":"list-dotfile-versions","shell":"bash"}` to list the versions and `{"op":"switch-dotfiles","shell":"bash","target":{"kind":"disabled"}}` for preview. To target a bundle, provide `"target":{"kind":"bundle","sha256":"SHA256"}`. To lift a hold, use `"target":{"kind":"automatic"}`. Include the returned `"review"` to publish the switch.
+
+Select an active or older version in **Dotfile versions** and choose **Save selected dotfile bundle** to write a new Windows JSON manifest. The manifest contains the verified environment and prompt fragments for the selected shell. Choose that shell when reviewing the saved manifest for another SSH account. The destination must be a new file.
+
+Scripts use `sftp --pane ID export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh`. The result includes `shell`, `home`, `bundle_sha256`, and the saved `local` path. Direct pipe clients send `"op":"export-dotfile-bundle"` with `shell`, `bundle_sha256`, and an absolute Windows `local` path.
 
 ### Sync dotfiles on SSH connect
 
@@ -1403,6 +1415,8 @@ The preview uses the pane's verified SSH connection. A read-only SSH exec probe 
 
 From a connected SSH pane, open **More → Command reference → Install SSH tools**. Choose a Windows manifest or use the bundle from the pane's profile. Select **Review bundle** to see the resolved home, architecture, launcher paths, PATH status, and any blocking conflicts. **Install reviewed bundle** applies that review on the same connection. The installation runs alongside the SSH shell and uses the manual SFTP deadline.
 
+To repair an installed release, select the Windows manifest with the same bundle and executable pins. **Review bundle** identifies missing, changed, and non-executable files. **Repair from reviewed bundle** restores the verified Windows builds. Repairing the active release keeps its update policy. Repairing a retained release also activates it. A missing or invalid release manifest and unexpected file types block repair. Replacing an existing file requires OpenSSH atomic rename. Run a fresh review to continue after an interrupted repair.
+
 From the manual for a built-in Linux tool such as `jq` or `rg`, choose **Review installing jq** or the corresponding action for that tool. The review shows the SSH account, launcher, retained tools, and the pinned build for the host's architecture. Choose **Download pinned Linux build** if the Windows cache needs the executable, then confirm **Install reviewed jq**. The install adds the command to the shared built-in bundle and preserves its active binaries. A new release pauses that bundle's automatic updates until you resume them from **Bundle versions**.
 
 After a manual install or a review of an already installed built-in tool, choose **Manage PATH for new shells**. Pick Bash or Zsh and enter the relative Zsh startup directory if your account uses a custom `ZDOTDIR`. **Review PATH setup** shows the exact startup files and managed blocks. **Apply reviewed PATH setup** appends the verified bundle's launcher directory after your existing PATH entries for new shells. This is a one-time change to the connected account and requires no profile approval.
@@ -1421,6 +1435,8 @@ $plan = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle '.\Fleet tools
 ```
 
 Installation verifies the uploaded files over SFTP and publishes the version under `~/.local/share/w11term/tools/<name>/versions/<sha256>/`. It adds launchers to the bundle's `bin_directory`, preserving entries already owned by the account. Add that directory to the shell's `PATH` if the preview reports it missing. Keep the bin directory fixed across versions of one named bundle. The installer reuses a verified copy when the requested version is already present and copies unchanged tools from the active version when building a new one. The `previous_bundle_sha256` in an update reply identifies the version to restore.
+
+The same CLI commands review and apply repairs. The preview adds `repairs` with each executable's expected `pin`, observed `before` state, and `reason`. The apply reply lists `repaired_tools` and reports `automatic_sync_paused`. A repair can succeed with `changed: false` when the active selector already chose the repaired version.
 
 Use `preview-tool-bundle-add BUNDLE.json` and `add-to-tool-bundle BUNDLE.json --review TOKEN` to add tools to the named bundle. The review shows the retained executables and checks their hashes. The addition keeps the active bundle's launcher directory and each existing tool's exact binary, including when the input names an existing tool. It uses the manifest's launcher directory when creating a bundle. A new version pauses automatic sync for that bundle so an older profile manifest cannot remove the added tools on reconnect. Use **Bundle versions** to review a rollback or resume automatic updates.
 
@@ -1443,6 +1459,10 @@ $restore = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-rollback my
 Rollback uses the retained remote files. The client checks their hashes and executable permissions before activating them. Launchers for commands omitted from the active version remain dormant so older versions can restore them. Installation and rollback require the host's `flock` command and SFTP symlinks. Switching an active version requires OpenSSH's atomic rename extension. Run a fresh preview after changing the manifest, moving to another pane or connection, or retrying an interrupted operation.
 
 The rollback preview includes `changes` in command-name order. Each row has an `action` of `add`, `remove`, `change`, or `keep`, plus `before` and `after` pins with `sha256` and `bytes`. A missing pin is `null`. The before pins come from the active release manifest so the review is available even if an active executable needs repair. `changes` is `null` if the active selector is invalid.
+
+To remove an inactive release permanently, select it in **Bundle versions**, choose **Review release deletion**, and confirm **Delete reviewed release**. The review lists the managed files and their total size. The active release and unrecognized files are protected. If cleanup is interrupted, refresh the versions and review the remaining files again. An inactive release that has lost its manifest can only be deleted if its directory is empty.
+
+For scripts, use `preview-tool-bundle-prune NAME SHA256` followed by `prune-tool-bundle-release NAME SHA256 --review TOKEN`. The preview reports `files`, `remaining_bytes`, and `incomplete`. The result reports `removed_bytes`.
 
 ### Sync a tool bundle on SSH connect
 

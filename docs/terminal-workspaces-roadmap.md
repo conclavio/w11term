@@ -335,7 +335,13 @@ The SSH dotfiles editor can create a bundle locally or revise an existing bundle
 
 For an already connected SSH pane, **More → Command reference → Apply SSH dotfiles** reviews and applies a bundle on that connection. The review shows the target home, managed files, startup hooks, and conflicts. Open a new shell to use the installed fragments. [Reviewed dotfile installation](../CONTROL.md#preview-and-apply-ssh-dotfiles)
 
+Install and version reviews show which lines change in the managed environment and prompt fragments. The install review also shows the generated startup hooks it will add. [Dotfile content review](../CONTROL.md#preview-and-apply-ssh-dotfiles)
+
+**Review startup hook repair** restores an edited or missing Bash or Zsh hook while keeping the active dotfile version and the surrounding startup text. [Startup hook repair](../CONTROL.md#preview-and-apply-ssh-dotfiles)
+
 **Dotfile versions** lists the active and retained versions for Bash or Zsh. Review and restore a previous version, or disable managed fragments for the account. Both pause automatic sync. Resume it from the same panel to let approved profiles sync on reconnect. [Dotfile version history](../CONTROL.md#restore-or-disable-ssh-dotfiles)
+
+Select a version and save its verified fragments as a Windows bundle for reuse in another SSH profile. [Save a retained version](../CONTROL.md#restore-or-disable-ssh-dotfiles)
 
 From that pane, **More → Command reference** shows both login sync results for the current connection. **Apply SSH dotfiles** shows the reason when dotfiles sync was skipped or unconfirmed. The command manual can show the managed launcher path. With Bash or Zsh PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)
 
@@ -359,7 +365,11 @@ Built-in Linux manuals offer **Review installing** for the selected command. Rev
 
 Use **Bundle versions → Save pinned bundle on Windows** to capture the active Linux builds as a verified local manifest. **Review in this SSH profile** opens a review for the authenticated account, ready for approval and saving. [Save an installed release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
+Use that saved manifest or the original bundle to repair missing or damaged executables. The reviewed install identifies the affected commands and restores their exact pinned builds. [Repair an installed release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+
 Select a command from **Installed SSH tools** to review removing it. The new release keeps the remaining pins and pauses automatic updates. Use **Bundle versions** to restore the previous release. [Remove a managed tool](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+
+In **Bundle versions**, review and permanently delete an inactive release to reclaim space on the SSH host. The review shows the file names and their total size before confirmation. [Delete an inactive release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
 **Manage PATH for new shells** reviews Bash or Zsh startup-file changes for the installed bundle. It can append the verified launcher directory after existing entries or remove its managed blocks while preserving the surrounding settings. [Manual PATH management](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 

@@ -6,9 +6,12 @@ pub enum Action {
     Listed(Arc<()>, Result<ToolBundleVersions, String>),
     Select(Option<usize>),
     Review,
+    ReviewPrune,
     ReviewPolicy(UpdatePolicy),
     Reviewed(Arc<()>, Result<ReviewedVersion, String>),
     Restore,
+    Prune,
+    Pruned(Arc<()>, Result<PrunedRelease, String>),
     SetPolicy(UpdatePolicy),
     Switched(Arc<()>, Result<SwitchReport, String>),
     Save,
@@ -21,6 +24,7 @@ pub enum Action {
 pub enum ReviewedVersion {
     Rollback(Box<RollbackReview>),
     UpdatePolicy(UpdatePolicy, PolicyReview),
+    Prune(PruneReview),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,6 +40,28 @@ pub struct PolicyReview {
     bundle_sha256: String,
     ready: bool,
     review: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PruneReview {
+    version_directory: String,
+    remaining_bytes: u64,
+    incomplete: bool,
+    files: Vec<PruneFile>,
+    review: String,
+}
+
+#[derive(Deserialize)]
+struct PruneFile {
+    name: String,
+    bytes: u64,
+}
+
+#[derive(Deserialize)]
+pub struct PrunedRelease {
+    bundle: String,
+    bundle_sha256: String,
+    removed_bytes: u64,
 }
 
 #[derive(Deserialize)]
@@ -99,15 +125,20 @@ pub struct SavedBundle {
 enum Work {
     List,
     Review,
+    ReviewPrune,
     ReviewPolicy(UpdatePolicy),
     Restore,
+    Prune,
     SetPolicy(UpdatePolicy),
     Save,
 }
 
 impl Work {
     fn writes(self) -> bool {
-        matches!(self, Self::Restore | Self::SetPolicy(_) | Self::Save)
+        matches!(
+            self,
+            Self::Restore | Self::Prune | Self::SetPolicy(_) | Self::Save
+        )
     }
 }
 
@@ -165,6 +196,7 @@ impl Panel {
             {
                 review.review.as_deref()
             }
+            (ReviewedVersion::Prune(review), Work::Prune) => Some(&review.review),
             _ => None,
         }
     }
@@ -201,8 +233,10 @@ impl Panel {
             Some(match work {
                 Work::List => "Reading retained tool bundles…",
                 Work::Review => "Verifying retained tool bundle…",
+                Work::ReviewPrune => "Checking the inactive release files…",
                 Work::ReviewPolicy(_) => "Reviewing automatic updates…",
                 Work::Restore => "Restoring reviewed tool bundle…",
+                Work::Prune => "Deleting the reviewed inactive release…",
                 Work::SetPolicy(UpdatePolicy::Pause) => "Pausing automatic updates…",
                 Work::SetPolicy(UpdatePolicy::Resume) => "Resuming automatic updates…",
                 Work::Save => "Saving the pinned Linux executables on Windows…",
@@ -257,12 +291,19 @@ impl Panel {
                     format!("Modified {}", time.format("%Y-%m-%d %H:%M UTC")),
                 ));
             }
+            if !selected.active {
+                fields.push(KeyedView::new(
+                    "review-deletion",
+                    button("Review release deletion", available, || Action::ReviewPrune),
+                ));
+            }
         }
         match &self.review {
             Some(ReviewedVersion::Rollback(review)) => review.describe(&mut fields),
             Some(ReviewedVersion::UpdatePolicy(policy, review)) => {
                 review.describe(*policy, &mut fields)
             }
+            Some(ReviewedVersion::Prune(review)) => review.describe(&mut fields),
             None => (),
         }
         let actions = if let Some(row) = self.selected().filter(|row| row.active) {
@@ -290,17 +331,21 @@ impl Panel {
                     .content(confirm),
             ))
         } else {
+            let (label, work, confirm): (&str, Work, fn() -> Action) =
+                if matches!(self.review, Some(ReviewedVersion::Prune(_))) {
+                    ("Delete reviewed release", Work::Prune, || Action::Prune)
+                } else {
+                    ("Restore reviewed version", Work::Restore, || {
+                        Action::Restore
+                    })
+                };
             StackPanel::new().spacing(8.0).children((
                 button(
                     "Review rollback",
                     available && self.selected().is_some_and(|row| !row.active),
                     || Action::Review,
                 ),
-                button(
-                    "Restore reviewed version",
-                    available && self.token(Work::Restore).is_some(),
-                    || Action::Restore,
-                ),
+                button(label, available && self.token(work).is_some(), confirm),
             ))
         };
         if self.selected().is_some_and(|row| row.active) {
@@ -386,6 +431,38 @@ impl PolicyReview {
                 }
             },
         ));
+    }
+}
+
+impl PruneReview {
+    fn describe(&self, fields: &mut Vec<KeyedView>) {
+        fields.extend([
+            detail("prune-path", &self.version_directory),
+            detail(
+                "prune-effect",
+                "Deleting this release permanently removes it from rollback history.",
+            ),
+            detail(
+                "prune-size",
+                format!(
+                    "Files to remove {} · {} bytes",
+                    self.files.len(),
+                    self.remaining_bytes
+                ),
+            ),
+        ]);
+        if self.incomplete {
+            fields.push(detail(
+                "prune-incomplete",
+                "This release has missing files. Confirm to finish the remaining cleanup.",
+            ));
+        }
+        fields.extend(self.files.iter().map(|file| {
+            detail(
+                &format!("prune-file-{}", file.name),
+                format!("{} · {} bytes", file.name, file.bytes),
+            )
+        }));
     }
 }
 
@@ -563,8 +640,10 @@ impl TerminalApp {
             }
             Action::Open
             | Action::Review
+            | Action::ReviewPrune
             | Action::ReviewPolicy(_)
             | Action::Restore
+            | Action::Prune
             | Action::SetPolicy(_)
             | Action::Save => {
                 let Some(input) = input else { return };
@@ -574,6 +653,8 @@ impl TerminalApp {
                 let work = match action {
                     Action::Open => Work::List,
                     Action::Review => Work::Review,
+                    Action::ReviewPrune => Work::ReviewPrune,
+                    Action::Prune => Work::Prune,
                     Action::ReviewPolicy(policy) => Work::ReviewPolicy(policy),
                     Action::SetPolicy(policy) => Work::SetPolicy(policy),
                     Action::Save => Work::Save,
@@ -624,6 +705,13 @@ impl TerminalApp {
                             bundle_sha256: row.bundle_sha256.clone(),
                             review,
                         },
+                        None if matches!(work, Work::ReviewPrune | Work::Prune) => {
+                            Operation::PruneToolBundleRelease {
+                                name: row.bundle.clone(),
+                                bundle_sha256: row.bundle_sha256.clone(),
+                                review,
+                            }
+                        }
                         None => Operation::RollbackToolBundle {
                             name: row.bundle.clone(),
                             bundle_sha256: row.bundle_sha256.clone(),
@@ -644,7 +732,14 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |_| {
                         let timeout = Duration::from_secs(
-                            if matches!(work, Work::Review | Work::Restore | Work::Save) {
+                            if matches!(
+                                work,
+                                Work::Review
+                                    | Work::Restore
+                                    | Work::ReviewPrune
+                                    | Work::Prune
+                                    | Work::Save
+                            ) {
                                 600
                             } else {
                                 30
@@ -683,7 +778,10 @@ impl TerminalApp {
             Action::Reviewed(ticket, result) => {
                 if history
                     .finish(&ticket, |work| {
-                        matches!(work, Work::Review | Work::ReviewPolicy(_))
+                        matches!(
+                            work,
+                            Work::Review | Work::ReviewPrune | Work::ReviewPolicy(_)
+                        )
                     })
                     .is_none()
                 {
@@ -754,6 +852,25 @@ impl TerminalApp {
                     Err(error) => error,
                 });
             }
+            Action::Pruned(ticket, result)
+                if history
+                    .finish(&ticket, |work| work == Work::Prune)
+                    .is_some() =>
+            {
+                history.status = Some(match result {
+                    Ok(removed) => {
+                        if let Some(versions) = &mut history.versions {
+                            versions.versions.retain(|row| {
+                                row.bundle != removed.bundle
+                                    || row.bundle_sha256 != removed.bundle_sha256
+                            });
+                        }
+                        history.selected = None;
+                        format!("Deleted retained release · {} bytes", removed.removed_bytes)
+                    }
+                    Err(error) => error,
+                });
+            }
             _ => {}
         }
     }
@@ -767,11 +884,13 @@ fn result_message(
     message(match work {
         Work::List => Action::Listed(ticket, decode(result)),
         Work::Review => Action::Reviewed(ticket, decode(result).map(ReviewedVersion::Rollback)),
+        Work::ReviewPrune => Action::Reviewed(ticket, decode(result).map(ReviewedVersion::Prune)),
         Work::ReviewPolicy(policy) => Action::Reviewed(
             ticket,
             decode(result).map(|report| ReviewedVersion::UpdatePolicy(policy, report)),
         ),
         Work::Restore | Work::SetPolicy(_) => Action::Switched(ticket, decode(result)),
+        Work::Prune => Action::Pruned(ticket, decode(result)),
         Work::Save => Action::Saved(ticket, decode(result)),
     })
 }

@@ -333,6 +333,12 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         review: Option<String>,
     },
+    PruneToolBundleRelease {
+        name: String,
+        bundle_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
     ResumeToolBundleUpdates {
         name: String,
         bundle_sha256: String,
@@ -354,12 +360,24 @@ pub enum Operation {
     ListDotfileVersions {
         shell: DotfileShell,
     },
+    ExportDotfileBundle {
+        shell: DotfileShell,
+        bundle_sha256: String,
+        local: PathBuf,
+    },
     ApplyDotfiles {
         bundle: DotfileBundle,
         shell: DotfileShell,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zdotdir: Option<String>,
         review: String,
+    },
+    RepairDotfileHooks {
+        shell: DotfileShell,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        zdotdir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
     },
     SwitchDotfiles {
         target: DotfileTarget,
@@ -1094,6 +1112,9 @@ pub(crate) async fn run(
                 Operation::SaveInstalledToolBundle { .. } => {
                     JobStage::Checking("Saving the installed tool bundle did not finish")
                 }
+                Operation::ExportDotfileBundle { .. } => {
+                    JobStage::Checking("Saving the retained dotfile bundle did not finish")
+                }
                 Operation::ReviewToolPath { .. } | Operation::ReviewInstalledToolPath { .. } => {
                     JobStage::Checking(
                         "Tool PATH review did not finish. Review the startup files again.",
@@ -1103,12 +1124,16 @@ pub(crate) async fn run(
                 | Operation::AddToToolBundle { .. }
                 | Operation::RemoveFromToolBundle { .. }
                 | Operation::RollbackToolBundle { .. }
+                | Operation::PruneToolBundleRelease { .. }
                 | Operation::PauseToolBundleUpdates { .. }
                 | Operation::ResumeToolBundleUpdates { .. } => {
                     JobStage::Checking("Tool bundle review did not finish")
                 }
                 Operation::ApplyDotfiles { .. } => JobStage::Checking(
                     "Dotfiles installation did not finish. Preview again to check the active bundle.",
+                ),
+                Operation::RepairDotfileHooks { .. } => JobStage::Checking(
+                    "Startup hook repair did not finish. Review the startup files again.",
                 ),
                 Operation::SwitchDotfiles { .. } => JobStage::Checking(
                     "Dotfiles switch did not finish. Preview again to check the active bundle.",
@@ -1691,6 +1716,20 @@ impl Engine {
                 self.rollback_utility_bundle(session, name, bundle_sha256, review.as_deref(), stage)
                     .await?
             }
+            PruneToolBundleRelease {
+                name,
+                bundle_sha256,
+                review,
+            } => {
+                self.prune_tool_bundle_release(
+                    session,
+                    &name,
+                    &bundle_sha256,
+                    review.as_deref(),
+                    stage,
+                )
+                .await?
+            }
             ResumeToolBundleUpdates {
                 name,
                 bundle_sha256,
@@ -1858,6 +1897,14 @@ impl Engine {
                 self.preview_dotfiles(bundle, shell, zdotdir.as_deref())
                     .await?
             }
+            ExportDotfileBundle {
+                shell,
+                bundle_sha256,
+                local,
+            } => {
+                self.export_dotfile_bundle(shell, &bundle_sha256, local, cancel)
+                    .await?
+            }
             ApplyDotfiles {
                 bundle,
                 shell,
@@ -1865,6 +1912,14 @@ impl Engine {
                 review,
             } => {
                 self.apply_dotfiles(bundle, shell, zdotdir.as_deref(), &review, stage)
+                    .await?
+            }
+            RepairDotfileHooks {
+                shell,
+                zdotdir,
+                review,
+            } => {
+                self.repair_dotfile_hooks(shell, zdotdir.as_deref(), review.as_deref(), stage)
                     .await?
             }
             SwitchDotfiles {

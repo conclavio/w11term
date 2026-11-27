@@ -433,6 +433,285 @@ fn rollback(id: &str, preview: Option<&Value>) -> Operation {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reviewed_install_repairs_exact_pins_without_resuming_updates() {
+    let (pane, _, root, _, server) = fixture(false).await;
+    let remote = root.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(remote, "x86_64", "/", "/usr/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    let architecture = UtilityArchitecture::X86_64;
+    let original = executable(architecture, None);
+    let bundle = UtilityBundle {
+        version: 1,
+        name: "portable".into(),
+        bin_directory: ".local/bin".into(),
+        tools: ["jq", "rg", "team-report"]
+            .into_iter()
+            .map(|name| UtilityTool {
+                name: name.into(),
+                builds: vec![build(local.path(), name, architecture, original.clone())],
+            })
+            .collect(),
+    };
+    let install = || Operation::PreviewToolBundle {
+        bundle: bundle.clone(),
+    };
+    let preview = guarded_job(&pane, None, install()).await.unwrap();
+    guarded_job(&pane, None, apply(install(), &preview))
+        .await
+        .unwrap();
+    let id = preview["bundle_sha256"].as_str().unwrap();
+    let pause = |review: Option<&Value>| Operation::PauseToolBundleUpdates {
+        name: "portable".into(),
+        bundle_sha256: id.into(),
+        review: review.map(|report| report["review"].as_str().unwrap().into()),
+    };
+    let pause_review = guarded_job(&pane, None, pause(None)).await.unwrap();
+    guarded_job(&pane, None, pause(Some(&pause_review)))
+        .await
+        .unwrap();
+    let store = remote.join(".local/share/w11term/tools/portable");
+    let selector = fs::read(store.join("current")).unwrap();
+    let release = store.join("versions").join(id);
+    let manifest = fs::read(release.join(".w11term-manifest.json")).unwrap();
+    let launcher = fs::read(remote.join(".local/bin/rg")).unwrap();
+    let remote_tool =
+        |name: &str| format!("/.local/share/w11term/tools/portable/versions/{id}/{name}");
+    guarded_job(
+        &pane,
+        None,
+        Operation::Setstat {
+            path: remote_tool("team-report"),
+            attrs: w11term::sftp::Attributes {
+                permissions: Some(0o600),
+                ..Default::default()
+            },
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut damaged = original.clone();
+    damaged[255] = 1;
+    fs::write(release.join("jq"), &damaged).unwrap();
+    fs::remove_file(release.join("rg")).unwrap();
+    fs::create_dir(release.join("rg")).unwrap();
+    let error = guarded_job(&pane, None, install()).await.unwrap_err();
+    assert!(
+        error.contains("needs a regular file or a missing file"),
+        "{error}"
+    );
+    fs::remove_dir(release.join("rg")).unwrap();
+
+    let preview = guarded_job(&pane, None, install()).await.unwrap();
+    assert_eq!(preview["bundle_sha256"], id);
+    assert_eq!(preview["automatic_sync_paused"], true);
+    assert_eq!(preview["repairs"][0]["reason"], "contents-changed");
+    assert_eq!(
+        preview["repairs"][0]["before"]["sha256"],
+        tool_sha256(&damaged)
+    );
+    assert_eq!(preview["repairs"][1]["reason"], "missing");
+    assert_eq!(preview["repairs"][2]["reason"], "permissions-changed");
+    assert_eq!(fs::read(release.join("jq")).unwrap(), damaged);
+    assert!(!release.join("rg").exists());
+
+    damaged[255] = 2;
+    fs::write(release.join("jq"), &damaged).unwrap();
+    let error = guarded_job(&pane, None, apply(install(), &preview))
+        .await
+        .unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    let fresh = guarded_job(&pane, None, install()).await.unwrap();
+    fs::write(remote.join("race-next-rename"), []).unwrap();
+    assert!(
+        guarded_job(&pane, None, apply(install(), &fresh))
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(release.join("jq")).unwrap(), original);
+    assert_eq!(fs::read(release.join("rg")).unwrap(), b"racing entry");
+    assert_eq!(fs::read(store.join("current")).unwrap(), selector);
+    fs::remove_file(release.join("rg")).unwrap();
+
+    let partial = guarded_job(&pane, None, install()).await.unwrap();
+    assert_eq!(partial["repairs"].as_array().unwrap().len(), 2);
+    let repaired = guarded_job(&pane, None, apply(install(), &partial))
+        .await
+        .unwrap();
+    assert_eq!(repaired["bundle_sha256"], id);
+    assert_eq!(repaired["repaired_tools"], json!(["rg", "team-report"]));
+    assert_eq!(repaired["changed"], false);
+    assert_eq!(repaired["automatic_sync_paused"], true);
+    for name in ["jq", "rg", "team-report"] {
+        assert_eq!(fs::read(release.join(name)).unwrap(), original);
+    }
+    assert_eq!(fs::read(store.join("current")).unwrap(), selector);
+    assert_eq!(fs::read(remote.join(".local/bin/rg")).unwrap(), launcher);
+    assert_eq!(
+        fs::read(release.join(".w11term-manifest.json")).unwrap(),
+        manifest
+    );
+    assert_eq!(fs::read_dir(store.join("versions")).unwrap().count(), 1);
+    let healthy = guarded_job(&pane, None, install()).await.unwrap();
+    assert_eq!(healthy["repairs"], json!([]));
+    assert_eq!(healthy["automatic_sync_paused"], true);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pruning_only_deletes_reviewed_inactive_files_and_can_resume() {
+    let (pane, _, root, _, server) = fixture(false).await;
+    let remote = root.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(remote, "x86_64", "/", "/usr/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    let version = |variant| {
+        let arch = UtilityArchitecture::X86_64;
+        let mut code = executable(arch, None);
+        code[255] = variant;
+        Operation::PreviewToolBundle {
+            bundle: UtilityBundle {
+                version: 1,
+                name: "portable".into(),
+                bin_directory: ".local/bin".into(),
+                tools: ["jq", "rg"]
+                    .into_iter()
+                    .map(|name| UtilityTool {
+                        name: name.into(),
+                        builds: vec![build(local.path(), name, arch, code.clone())],
+                    })
+                    .collect(),
+            },
+        }
+    };
+    let store = remote.join(".local/share/w11term/tools/portable");
+    let selector = store.join("current");
+    let original = guarded_job(&pane, None, version(1)).await.unwrap();
+    guarded_job(&pane, None, apply(version(1), &original))
+        .await
+        .unwrap();
+    let old_selection = fs::read(&selector).unwrap();
+    let next = guarded_job(&pane, None, version(2)).await.unwrap();
+    guarded_job(&pane, None, apply(version(2), &next))
+        .await
+        .unwrap();
+    let active_selection = fs::read(&selector).unwrap();
+    let old = original["bundle_sha256"].as_str().unwrap();
+    let active = next["bundle_sha256"].as_str().unwrap();
+    let retained = store.join("versions").join(old);
+    let active_rg = store.join("versions").join(active).join("rg");
+    let launcher = remote.join(".local/bin/rg");
+    let launcher_contents = fs::read(&launcher).unwrap();
+    let prune = |id: &str, review: Option<&Value>| Operation::PruneToolBundleRelease {
+        name: "portable".into(),
+        bundle_sha256: id.into(),
+        review: review.map(|report| report["review"].as_str().unwrap().into()),
+    };
+
+    let error = guarded_job(&pane, None, prune(active, None))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("active tool release cannot be deleted"),
+        "{error}"
+    );
+    let untracked = retained.join("operator-notes");
+    fs::write(&untracked, "keep my notes").unwrap();
+    let error = guarded_job(&pane, None, prune(old, None))
+        .await
+        .unwrap_err();
+    assert!(error.contains("outside its manifest"), "{error}");
+    assert_eq!(fs::read_to_string(&untracked).unwrap(), "keep my notes");
+    fs::remove_file(&untracked).unwrap();
+
+    let preview = guarded_job(&pane, None, prune(old, None)).await.unwrap();
+    assert_eq!(preview["incomplete"], false);
+    assert_eq!(preview["files"][0]["name"], "jq");
+    assert_eq!(preview["files"][1]["name"], "rg");
+    assert_eq!(preview["files"][2]["name"], ".w11term-manifest.json");
+    let bytes: u64 = fs::read_dir(&retained)
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
+    assert_eq!(preview["remaining_bytes"], bytes);
+    assert_eq!(fs::read(&selector).unwrap(), active_selection);
+    fs::write(&selector, old_selection).unwrap();
+    let error = guarded_job(&pane, None, prune(old, Some(&preview)))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("active tool release cannot be deleted"),
+        "{error}"
+    );
+    assert!(retained.join("jq").is_file());
+    fs::write(&selector, &active_selection).unwrap();
+
+    let old_rg = retained.join("rg");
+    let original_rg = fs::read(&old_rg).unwrap();
+    let mut edited_rg = original_rg.clone();
+    edited_rg[255] ^= 0xff;
+    fs::write(&old_rg, &edited_rg).unwrap();
+    let error = guarded_job(&pane, None, prune(old, Some(&preview)))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("Managed executable contents changed"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&old_rg).unwrap(), edited_rg);
+    assert!(retained.join("jq").is_file());
+    fs::write(&old_rg, original_rg).unwrap();
+
+    let fail = remote.join("refuse-delete-path");
+    fs::write(
+        &fail,
+        format!("/.local/share/w11term/tools/portable/versions/{old}/rg"),
+    )
+    .unwrap();
+    let error = guarded_job(&pane, None, prune(old, Some(&preview)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("Deletion did not finish"), "{error}");
+    assert!(!retained.join("jq").exists());
+    assert!(retained.join("rg").is_file());
+    assert!(retained.join(".w11term-manifest.json").is_file());
+    assert_eq!(fs::read(&selector).unwrap(), active_selection);
+    fs::remove_file(fail).unwrap();
+
+    let error = guarded_job(&pane, None, prune(old, Some(&preview)))
+        .await
+        .unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    let partial = guarded_job(&pane, None, prune(old, None)).await.unwrap();
+    assert_eq!(partial["incomplete"], true);
+    assert_eq!(partial["remaining_bytes"], bytes - 256);
+    let removed = guarded_job(&pane, None, prune(old, Some(&partial)))
+        .await
+        .unwrap();
+    assert_eq!(removed["removed_bytes"], partial["remaining_bytes"]);
+    assert!(!retained.exists());
+    assert_eq!(fs::read(&selector).unwrap(), active_selection);
+    assert_eq!(fs::read(&active_rg).unwrap()[255], 2);
+    assert_eq!(fs::read(&launcher).unwrap(), launcher_contents);
+    let versions = guarded_job(&pane, None, Operation::ToolBundleVersions)
+        .await
+        .unwrap();
+    assert_eq!(versions["versions"].as_array().unwrap().len(), 1);
+    assert_eq!(versions["versions"][0]["bundle_sha256"], active);
+
+    fs::create_dir(&retained).unwrap();
+    let empty = guarded_job(&pane, None, prune(old, None)).await.unwrap();
+    assert_eq!(empty["incomplete"], true);
+    assert_eq!(empty["remaining_bytes"], 0);
+    guarded_job(&pane, None, prune(old, Some(&empty)))
+        .await
+        .unwrap();
+    assert!(!retained.exists());
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn removing_managed_tools_keeps_exact_pins_and_can_be_rolled_back() {
     let (pane, _, root, _, server) = fixture(false).await;
     let remote = root.path();
@@ -786,8 +1065,17 @@ async fn retained_tool_verification_uses_server_hashes_with_sftp_fallback() {
     fs::write(&trace, []).unwrap();
     let mut changed = bytes.clone();
     changed[255] = 17;
-    fs::write(&installed_path, changed).unwrap();
+    fs::write(&installed_path, &changed).unwrap();
     let error = guarded_job(&pane, None, apply(operation(), &reviewed))
+        .await
+        .unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    assert!(sftp_opened_tool(&trace));
+    assert_eq!(fs::read(&installed_path).unwrap(), changed);
+
+    fs::write(&trace, []).unwrap();
+    let id = reviewed["bundle_sha256"].as_str().unwrap();
+    let error = guarded_job(&pane, None, rollback(id, None))
         .await
         .unwrap_err();
     assert!(

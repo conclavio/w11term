@@ -1,7 +1,11 @@
 use super::*;
 use crate::events::DotfileSyncStatus;
 
+mod comparison;
+mod hooks;
+mod snapshot;
 mod tool_path;
+use comparison::FragmentBaseline;
 
 const DIRECTORY: &str = ".config/w11term/dotfiles";
 const PARENTS: [&str; 3] = [".config", ".config/w11term", DIRECTORY];
@@ -14,6 +18,7 @@ const BEGIN: &str = "# >>> w11term dotfiles >>>";
 const END: &str = "# <<< w11term dotfiles <<<";
 const MAX_FRAGMENT_BYTES: usize = 16 * 1024;
 const MAX_LISTED_VERSIONS: usize = 64;
+const FRAGMENT_ROLES: [&str; 2] = ["environment", "prompt"];
 
 pub(crate) async fn sync_login_dotfiles(
     session: &russh::client::Handle<crate::ssh::Handler>,
@@ -67,7 +72,7 @@ pub(crate) async fn sync_login_dotfiles(
     }
     let mut stage = JobStage::Checking("Syncing dotfiles");
     let changed = engine
-        .install_dotfiles(&plan, &bundle, zdotdir, &mut stage)
+        .install_dotfiles(&plan, &bundle, zdotdir, None, &mut stage)
         .await
         .with_context(|| stage.interrupted())?;
     Ok(if changed.is_empty() {
@@ -216,6 +221,13 @@ impl DotfileBundle {
             DotfileShell::Zsh => self.zsh.as_deref(),
         }
     }
+
+    fn fragments(&self, shell: DotfileShell) -> [String; 2] {
+        [
+            payload(self.environment.as_deref()),
+            payload(self.prompt(shell)),
+        ]
+    }
 }
 
 pub fn validate_zdotdir(shell: DotfileShell, zdotdir: Option<&str>) -> Result<()> {
@@ -300,6 +312,14 @@ impl Edit {
         });
         if let Some(hook) = &self.hook {
             report["hook"] = json!(hook);
+            if self.action == "append-hook"
+                && self
+                    .before
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty() && !text.ends_with('\n'))
+            {
+                report["add_newline_before_hook"] = json!(true);
+            }
         }
         if let Some(replaced) = &self.replaced_hook {
             report["replaced_hook"] = json!(replaced);
@@ -390,11 +410,10 @@ fi
 
 fn hook_change(path: String, original: Option<String>, hook: String) -> Edit {
     let text = original.as_deref().unwrap_or_default();
-    let begin = hook.lines().next().expect("generated opening marker");
-    let end = hook.lines().last().expect("generated closing marker");
+    let [begin, end] = hooks::hook_markers(&hook);
     let markers: Vec<_> = text
         .lines()
-        .filter(|line| [begin, end].contains(&line.trim()))
+        .filter(|line| hooks::candidate_marker(line, [begin, end]))
         .take(3)
         .collect();
     let (action, after) = if markers.is_empty() {
@@ -497,7 +516,8 @@ impl Engine {
         shell: DotfileShell,
         zdotdir: Option<&str>,
     ) -> Result<Value> {
-        let mut report = self.dotfiles_plan(&bundle, shell, zdotdir).await?.report();
+        let plan = self.dotfiles_plan(&bundle, shell, zdotdir).await?;
+        let (mut report, _) = self.review_dotfile_install(&plan, &bundle).await?;
         report["review"] = json!(self.dotfiles_review(&report)?);
         Ok(report)
     }
@@ -511,9 +531,10 @@ impl Engine {
         stage: &mut JobStage,
     ) -> Result<Value> {
         let plan = self.dotfiles_plan(&bundle, shell, zdotdir).await?;
-        self.check_dotfiles_review(review, &plan.report())?;
+        let (report, baseline) = self.review_dotfile_install(&plan, &bundle).await?;
+        self.check_dotfiles_review(review, &report)?;
         let changed = self
-            .install_dotfiles(&plan, &bundle, zdotdir, stage)
+            .install_dotfiles(&plan, &bundle, zdotdir, Some(baseline), stage)
             .await?;
         Ok(
             json!({ "shell": shell, "home": plan.home, "bundle_sha256": plan.id, "changed_files": changed }),
@@ -525,6 +546,7 @@ impl Engine {
         plan: &'a Plan,
         bundle: &DotfileBundle,
         zdotdir: Option<&str>,
+        baseline: Option<FragmentBaseline>,
         stage: &mut JobStage,
     ) -> Result<Vec<&'a str>> {
         for edit in plan.edits() {
@@ -580,6 +602,13 @@ impl Engine {
                     && current.selector.before == plan.selector.before,
                 "Remote dotfiles changed during staging. Preview again before activating."
             );
+            if baseline == Some(FragmentBaseline::Verified)
+                && let Some(active) = plan.selector.active_version()
+            {
+                self.verified_dotfile_fragments(&plan.home, plan.shell, active)
+                    .await
+                    .context("The active dotfile fragments changed during staging. Review them again before activating.")?;
+            }
             self.write_dotfile(&plan.selector, stage).await?;
             changed.push(plan.selector.path.as_str());
         }
@@ -626,14 +655,19 @@ impl Engine {
             }
         };
         let id = selector_version(&desired).map(str::to_owned);
-        let files = match &id {
+        let (files, proposed) = match &id {
             Some(id) => {
-                self.verified_dotfile_version(&home, shell, zdotdir, id)
-                    .await?
+                let (files, fragments) = self
+                    .verified_dotfile_version(&home, shell, zdotdir, id)
+                    .await?;
+                (files, Some(fragments))
             }
-            None => Vec::new(),
+            None => (Vec::new(), None),
         };
         let selector = Edit::selector(path, before, desired);
+        let comparison = self
+            .dotfile_comparison(&home, shell, selector.active_version(), proposed)
+            .await?;
         let atomic_replace = self.extension(editor::POSIX_RENAME, "1").is_ok();
         let mut report = json!({
             "operation": "switch-dotfiles",
@@ -644,6 +678,7 @@ impl Engine {
             "active_bundle_sha256": selector.active_version(),
             "selector": selector.report(),
             "files": files,
+            "fragment_changes": comparison,
             "supports_atomic_replace": atomic_replace,
         });
         let Some(review) = review else {
@@ -676,32 +711,8 @@ impl Engine {
         shell: DotfileShell,
         zdotdir: Option<&str>,
         id: &str,
-    ) -> Result<Vec<Value>> {
-        let directory = under_home(home, &version_directory(shell, id));
-        ensure!(
-            self.dotfile_directory_exists(&directory).await?,
-            "Retained dotfiles bundle not found: {id}"
-        );
-        let read = |role| {
-            let path = format!("{directory}/{role}.sh");
-            async move {
-                let contents = self
-                    .dotfile_text(&path)
-                    .await?
-                    .with_context(|| format!("Retained dotfile is missing: {path}"))?;
-                ensure!(
-                    contents.len() <= MAX_FRAGMENT_BYTES + 1,
-                    "Retained dotfile exceeds its size limit: {path}"
-                );
-                Ok::<_, anyhow::Error>((path, contents))
-            }
-        };
-        let (environment_path, environment) = read("environment").await?;
-        let (prompt_path, prompt) = read("prompt").await?;
-        ensure!(
-            bundle_id(&environment, &prompt) == id,
-            "Retained dotfiles do not match bundle {id}"
-        );
+    ) -> Result<(Vec<Value>, [String; 2])> {
+        let fragments = self.verified_dotfile_fragments(home, shell, id).await?;
         let hooks = self.dotfile_hooks(home, shell, zdotdir).await?;
         for hook in &hooks {
             ensure!(
@@ -711,13 +722,21 @@ impl Engine {
             );
         }
         let mut files = Vec::with_capacity(4);
-        for (path, contents) in [(environment_path, environment), (prompt_path, prompt)] {
+        let directory = under_home(home, &version_directory(shell, id));
+        for (role, contents) in FRAGMENT_ROLES.into_iter().zip(&fragments) {
+            let path = format!("{directory}/{role}.sh");
             files.push(
-                Edit::new(path, "unchanged", Some(contents.clone()), Some(contents)).report(),
+                Edit::new(
+                    path,
+                    "unchanged",
+                    Some(contents.clone()),
+                    Some(contents.clone()),
+                )
+                .report(),
             );
         }
         files.extend(hooks.iter().map(Edit::report));
-        Ok(files)
+        Ok((files, fragments))
     }
 
     fn dotfiles_review(&self, report: &Value) -> Result<String> {
@@ -766,8 +785,7 @@ impl Engine {
         shell: DotfileShell,
         zdotdir: Option<&str>,
     ) -> Result<Plan> {
-        let environment = payload(bundle.environment.as_deref());
-        let prompt = payload(bundle.prompt(shell));
+        let [environment, prompt] = bundle.fragments(shell);
         let id = bundle_id(&environment, &prompt);
         let version_directory = version_directory(shell, &id);
         let mut directories_to_create = Vec::new();
