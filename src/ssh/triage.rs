@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path, time::Duration};
 use tokio::sync::watch;
 
+pub(crate) mod cpu_profile;
 mod findings;
 pub use findings::{Finding, Resource};
 
@@ -82,14 +83,10 @@ impl Target {
 
     pub(crate) async fn collect(mut self) -> Result<Report> {
         let plan = self.preview();
-        let _lease = self.link.try_lock_triage()?;
-        let capture = tokio::time::timeout(DEADLINE, collect(&self.link));
-        let bytes = tokio::select! {
-            biased;
-            _ = self.lease.changed() => bail!("The selected SSH connection closed or changed during triage"),
-            result = capture => result.context("Linux triage exceeded its 60-second deadline")??,
-        };
-        let collection = parse(&bytes)?;
+        let (stdout, _) = self
+            .run_diagnostic("Linux triage", command(), DEADLINE, WIRE_BYTES)
+            .await?;
+        let collection = parse(&stdout)?;
         Ok(Report {
             version: 1,
             target: plan,
@@ -100,6 +97,27 @@ impl Target {
 
     pub fn collect_blocking(self) -> Result<Report> {
         super::NETWORK.block_on(self.collect())
+    }
+
+    async fn run_diagnostic(
+        &mut self,
+        operation: &str,
+        command: String,
+        deadline: Duration,
+        stdout_limit: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let _busy = self.link.try_lock_diagnostic()?;
+        let request = tokio::time::timeout(
+            deadline,
+            read_diagnostic(&self.link, operation, command, stdout_limit),
+        );
+        tokio::select! {
+            biased;
+            _ = self.lease.changed() => bail!("The selected SSH connection closed or changed during {operation}"),
+            result = request => result.with_context(|| {
+                format!("{operation} exceeded its {}-second deadline", deadline.as_secs())
+            })?,
+        }
     }
 }
 
@@ -179,22 +197,7 @@ impl Report {
     }
 
     pub(crate) fn check_destination(path: &Path) -> Result<&Path> {
-        ensure!(
-            path.is_absolute() && path.file_name().is_some(),
-            "Choose an absolute path for a new triage report"
-        );
-        let parent = path
-            .parent()
-            .context("The triage report has no parent directory")?;
-        ensure!(
-            parent.is_dir(),
-            "The triage report directory does not exist"
-        );
-        ensure!(
-            !path.try_exists()?,
-            "The triage report destination already exists"
-        );
-        Ok(parent)
+        diagnostic_destination(path, "triage report")
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -210,8 +213,23 @@ impl Report {
     }
 }
 
+fn diagnostic_destination<'a>(path: &'a Path, artifact: &str) -> Result<&'a Path> {
+    ensure!(
+        path.is_absolute() && path.file_name().is_some(),
+        "Choose an absolute path for a new {artifact}"
+    );
+    let parent = path
+        .parent()
+        .with_context(|| format!("The {artifact} has no parent directory"))?;
+    ensure!(parent.is_dir(), "The {artifact} directory does not exist");
+    ensure!(
+        !path.try_exists()?,
+        "The {artifact} destination already exists"
+    );
+    Ok(parent)
+}
+
 fn command() -> String {
-    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
     format!(
         "/bin/sh -c {} w11term-triage {}",
         quote(SUPERVISOR),
@@ -219,15 +237,24 @@ fn command() -> String {
     )
 }
 
-async fn collect(link: &ConnectionShare) -> Result<Vec<u8>> {
+fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+async fn read_diagnostic(
+    link: &ConnectionShare,
+    operation: &str,
+    command: String,
+    stdout_limit: usize,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut channel = PendingChannel(Some(
         link.handle()
             .channel_open_session()
             .await
-            .context("Opening SSH triage channel")?,
+            .with_context(|| format!("Opening SSH channel for {operation}"))?,
     ));
     let channel = channel.0.as_mut().expect("opened channel");
-    channel.exec(true, command()).await?;
+    channel.exec(true, command).await?;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut result = None;
@@ -236,19 +263,21 @@ async fn collect(link: &ConnectionShare) -> Result<Vec<u8>> {
         match message {
             ChannelMsg::Data { data } => {
                 ensure!(
-                    stdout.len() + data.len() <= WIRE_BYTES,
-                    "Remote triage report exceeds its byte limit"
+                    stdout.len() + data.len() <= stdout_limit,
+                    "Remote {operation} output exceeds its byte limit"
                 );
                 stdout.extend_from_slice(&data);
             }
             ChannelMsg::ExtendedData { data, .. } => {
                 ensure!(
                     stderr.len() + data.len() <= STREAM_BYTES,
-                    "Remote triage error output exceeds its byte limit"
+                    "Remote {operation} diagnostic messages exceed their byte limit"
                 );
                 stderr.extend_from_slice(&data);
             }
-            ChannelMsg::Failure => bail!("The server rejected the SSH triage command"),
+            ChannelMsg::Failure => {
+                bail!("The server rejected the SSH exec request for {operation}")
+            }
             ChannelMsg::Eof => eof = true,
             ChannelMsg::ExitStatus { exit_status } => result = Some(exit_status),
             ChannelMsg::Close => break,
@@ -260,10 +289,10 @@ async fn collect(link: &ConnectionShare) -> Result<Vec<u8>> {
     }
     ensure!(
         result == Some(0),
-        "Remote Linux triage failed ({result:?}): {}",
+        "Remote {operation} failed ({result:?}): {}",
         crate::events::display_field(&String::from_utf8_lossy(&stderr))
     );
-    Ok(stdout)
+    Ok((stdout, stderr))
 }
 
 struct PendingChannel(Option<Channel<client::Msg>>);

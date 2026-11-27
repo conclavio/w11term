@@ -9,6 +9,8 @@ use std::{
 use w11term::control::{self, Reply, Request};
 #[path = "w11term-cli/automation.rs"]
 mod automation;
+#[path = "w11term-cli/cpu_profile.rs"]
+mod cpu_profile;
 #[path = "w11term-cli/sftp.rs"]
 mod sftp_args;
 #[path = "w11term-cli/tool_bundles.rs"]
@@ -120,6 +122,14 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                     "invalid options before automation command"
                 );
                 return automation::parse(&arg, args, pid, pane);
+            }
+            "preview-cpu-profile" | "capture-cpu-profile" if verb.is_none() => {
+                ensure!(
+                    payload.is_none() && path.is_none() && !no_paste,
+                    "invalid options before CPU profile command"
+                );
+                let request = cpu_profile::parse(&arg, args, pane)?;
+                return Ok(Invocation::new(pid, request));
             }
             "sftp" if verb.is_none() => {
                 ensure!(
@@ -253,6 +263,7 @@ async fn main() -> ExitCode {
         println!(
             "\nw11term-cli [--pid PID] preview-linux-triage --pane ID\nw11term-cli [--pid PID] linux-triage --pane ID --connection-generation N --output-file PATH"
         );
+        println!("\n{}", cpu_profile::HELP);
         return ExitCode::SUCCESS;
     }
     if args == ["fetch-tool-bundle", "--help"] || args == ["fetch-tool-bundle", "-h"] {

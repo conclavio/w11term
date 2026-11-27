@@ -252,6 +252,43 @@ impl server::Handler for Peer {
             s.close(c)?;
             return Ok(());
         }
+        if let Some((_, args)) = std::str::from_utf8(command)
+            .ok()
+            .filter(|command| command.starts_with("/bin/sh -c '# w11term-cpu-profile-v1"))
+            .and_then(|command| command.rsplit_once("' "))
+        {
+            let args: Vec<_> = args.split_ascii_whitespace().collect();
+            s.channel_success(c)?;
+            match args.as_slice() {
+                ["4", "inspect", "42", "0", "2", "99", "fp", "32768", "4096"] => {
+                    s.data(c, b"w11term-cpu-profile-v1\t800\td29ya2Vy\n".to_vec())?;
+                    s.exit_status_request(c, 0)?;
+                }
+                [
+                    "14",
+                    "capture",
+                    "42",
+                    "800",
+                    "2",
+                    "99",
+                    "fp",
+                    "32768",
+                    "4096",
+                ] => {
+                    let response = fs::read(self.root.join("profile-response"))?;
+                    s.data(c, response)?;
+                    s.extended_data(c, 1, b"Processed 3 events and lost 1 chunks!\n".to_vec())?;
+                    s.exit_status_request(c, 0)?;
+                }
+                _ => {
+                    s.extended_data(c, 1, b"The target PID was reused.\n".to_vec())?;
+                    s.exit_status_request(c, 2)?;
+                }
+            }
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
         if let Some(args) = std::str::from_utf8(command).ok().and_then(|command| {
             command
                 .split_once("' w11term-tools-sha256 ")
@@ -1896,6 +1933,97 @@ const TRIAGE_RESPONSE: &str = concat!(
     "top\t1000\t1010\t0\t\t\n",
     "end\n"
 );
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cpu_profile_reuses_the_verified_ssh_transport_and_saves_only_complete_stacks() {
+    let (pane, _, remote, opens, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let destination = local.path().join("profile.folded");
+    let profile_response = remote.path().join("profile-response");
+    let capture: control::CapturePng = Arc::new(|_, _, _| unreachable!("no screen capture"));
+    let registry = registry(&pane);
+    let options = control::CpuProfileOptions {
+        target_pid: 42.try_into().unwrap(),
+        seconds: 2,
+        frequency: 99,
+        call_graph: control::CpuCallGraph::Fp,
+    };
+    let preview = registry
+        .execute(
+            Request::PreviewCpuProfile { pane: 1, options },
+            capture.clone(),
+        )
+        .await
+        .unwrap();
+    let plan = &preview["plan"];
+    assert_eq!(plan["host"], "127.0.0.1");
+    assert_eq!(plan["process_name"], "worker");
+    assert_eq!(plan["event"], "cpu-clock:u");
+    let generation = plan["connection_generation"].as_u64().unwrap();
+    let ticks = plan["process_start_ticks"].as_u64().unwrap();
+    let request = |generation: u64, process_start_ticks| Request::CaptureCpuProfile {
+        pane: 1,
+        options,
+        connection_generation: generation.try_into().unwrap(),
+        process_start_ticks,
+        output_file: destination.clone(),
+    };
+    let prior = opens.load(Ordering::SeqCst);
+    assert!(
+        registry
+            .execute(request(generation + 1, ticks), capture.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), prior);
+    let error = registry
+        .execute(request(generation, ticks + 1), capture.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("target PID was reused"));
+    let partial = concat!(
+        "w11term-cpu-profile-v1\t800\td29ya2Vy\n",
+        " 42 22.01: cpu-clock:u:\n",
+        "\t   deadbeef hot_loop (/tmp/worker)\n",
+        "\t   12ab34cd main (/tmp/worker)\n\n",
+    );
+    fs::write(&profile_response, partial).unwrap();
+    assert!(
+        registry
+            .execute(request(generation, ticks), capture.clone())
+            .await
+            .is_err()
+    );
+    assert!(!destination.exists());
+    fs::write(
+        &profile_response,
+        format!("{partial}\nw11term-cpu-profile-end\n"),
+    )
+    .unwrap();
+    let result = registry
+        .execute(request(generation, ticks), capture.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["profile_path"], json!(destination));
+    assert_eq!(result["summary"]["samples"], 1);
+    assert_eq!(
+        result["summary"]["diagnostics"][0],
+        "Processed 3 events and lost 1 chunks!"
+    );
+    let saved = fs::read_to_string(&destination).unwrap();
+    assert_eq!(saved, "worker;main;hot_loop 1\n");
+    let prior = opens.load(Ordering::SeqCst);
+    assert!(
+        registry
+            .execute(request(generation, ticks), capture)
+            .await
+            .is_err()
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), prior);
+    assert_eq!(fs::read_to_string(&destination).unwrap(), saved);
+    drop(pane);
+    server.abort();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn linux_triage_saves_a_generation_bound_report_without_touching_the_shell() {

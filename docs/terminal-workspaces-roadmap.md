@@ -309,7 +309,7 @@ Give the collection a shared remote deadline and limit concurrency and bytes. Al
 
 ### CPU profiles and flame graphs
 
-Start with a selected PID or a newly launched command and a bounded Linux `perf record` call-stack capture. Let the operator review the target, sampling frequency, call-stack mode, and duration. Check the host’s available perf capabilities and report permission, symbolization, and lost-sample issues. Run `perf script` against the finalized capture on the host, resolve symbols where available, and transfer folded stacks over SFTP. Offer the raw profile as a separately saved artifact. Reuse the diagnostic job’s timeout, storage, and cleanup rules. [CPU Flame Graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html)
+Start with a selected PID and a bounded Linux `perf record` call-stack capture. Let the operator review the verified target, sampling frequency, call-stack mode, and duration. Report perf errors, symbolization, and lost-sample warnings. Run `perf script` on the host and fold its bounded output into a local artifact. Follow with capture of a newly launched command and an option to retain and transfer the raw profile separately. Reuse the diagnostic job’s timeout, storage, and cleanup rules. [CPU Flame Graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html)
 
 Render the folded stacks locally with zoom, symbol search, sample counts, and each frame’s share of samples. Frame width represents sample weight. Keep unresolved frames visible and offer an export for sharing. Ship the triage collector and offline report first, then CPU capture and viewing.
 

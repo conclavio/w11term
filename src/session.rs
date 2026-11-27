@@ -1222,7 +1222,7 @@ async fn run(
                         Some(Command::InterruptCommand { reply, .. }) => { let _ = reply.send(Err("No active terminal connection; Ctrl+C was not sent.".into())); continue; }
                         Some(Command::Raw(_, reply) | Command::ScopedRaw { reply, .. }) => { let _ = reply.send(Err("No active terminal connection; input was not sent".into())); continue; }
                         Some(Command::Sftp(job)) => { let _ = job.reply.send(Err("No active terminal connection; SFTP operation was not started".into())); continue; }
-                        Some(Command::TriageTarget { reply, .. }) => { let _ = reply.send(Err("An active SSH connection is required for Linux triage".into())); continue; }
+                        Some(Command::TriageTarget { reply, .. }) => { let _ = reply.send(Err("An active SSH connection is required for Linux performance diagnostics".into())); continue; }
                         Some(Command::NotificationReply(_)) => continue,
                         Some(Command::Focus(focused)) => { terminal.set_focus_without_reporting(focused); continue; }
                         Some(Command::Key {..} | Command::DetailedKey {..} | Command::Composed(_) | Command::Text(_) | Command::Paste(_) | Command::Mouse(_) | Command::MouseLeave { .. }) => continue,

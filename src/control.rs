@@ -37,6 +37,7 @@ mod sftp_transfers;
 mod ssh_groups;
 mod triage;
 mod workspace_preview;
+pub use crate::ssh::triage::cpu_profile::{CpuCallGraph, CpuProfileOptions};
 pub use command_history::{CommandOutputFile, CommandStatus};
 pub use registry::{PaneTransfer, Registry, WindowId, native_window_matches};
 use security::PipeSecurity;
@@ -59,6 +60,17 @@ pub enum Request {
         connection_generation: Option<std::num::NonZeroU64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_file: Option<PathBuf>,
+    },
+    PreviewCpuProfile {
+        pane: u64,
+        options: CpuProfileOptions,
+    },
+    CaptureCpuProfile {
+        pane: u64,
+        options: CpuProfileOptions,
+        connection_generation: std::num::NonZeroU64,
+        process_start_ticks: u64,
+        output_file: PathBuf,
     },
     Record {
         pane: u64,
@@ -1414,6 +1426,25 @@ impl Registry {
                 self.linux_triage(pane, connection_generation, output_file)
                     .await
             }
+            Request::PreviewCpuProfile { pane, options } => {
+                self.preview_cpu_profile(pane, options).await
+            }
+            Request::CaptureCpuProfile {
+                pane,
+                options,
+                connection_generation,
+                process_start_ticks,
+                output_file,
+            } => {
+                self.capture_cpu_profile(
+                    pane,
+                    options,
+                    connection_generation,
+                    process_start_ticks,
+                    output_file,
+                )
+                .await
+            }
             Request::Sftp {
                 pane,
                 timeout_seconds,
@@ -2670,6 +2701,9 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
     tokio::time::timeout(
         Duration::from_secs(match request {
             Request::LinuxTriage { .. } => crate::ssh::triage::DEADLINE.as_secs() + 20,
+            Request::PreviewCpuProfile { .. } | Request::CaptureCpuProfile { .. } => {
+                crate::ssh::triage::cpu_profile::CONTROL_TIMEOUT_SECONDS
+            }
             Request::Sftp {
                 timeout_seconds, ..
             } => (*timeout_seconds).clamp(1, 3600) + 5,

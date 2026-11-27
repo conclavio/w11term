@@ -1461,6 +1461,21 @@ $report.collection.samples | Select-Object id, status, exit_status
 
 The collector uses a sibling SSH channel with a 60-second client deadline and a 50-second remote collection deadline. It runs the ten checklist probes in parallel with Bash and GNU coreutils, captures up to 16 KiB per command per stream, and uses a private temporary directory. The report keeps the verified endpoint, commands, timing, output, and individual outcomes such as missing utilities or denied kernel logs. It marks streams that reached their byte limit and keeps the original bytes in base64 when they contain invalid UTF-8. [Linux Performance Analysis in 60,000 Milliseconds](https://www.brendangregg.com/Articles/Netflix_Linux_Perf_Analysis_60s.pdf)
 
+### Capture a Linux CPU profile
+
+Choose a running PID on the remote Linux host. Preview the verified SSH endpoint, process name and start time, the sampling options, and file and time limits. Use the same options and the returned connection generation and process start ticks when starting the capture.
+
+```powershell
+$sampling = @('--pane', $pane, '--target-pid', 4102, '--seconds', 10, '--frequency', 99, '--call-graph', 'fp')
+$plan = (& $ctl --pid 12345 preview-cpu-profile @sampling | ConvertFrom-Json).result.plan
+$plan
+& $ctl --pid 12345 capture-cpu-profile @sampling --connection-generation $plan.connection_generation --process-start-ticks $plan.process_start_ticks --output-file '.\cpu.folded'
+```
+
+The defaults are 10 seconds, 99 Hz, and frame pointers. Choose 1–30 seconds, 1–199 Hz, or `dwarf` for DWARF unwinding with an 8 KiB stack snapshot. The remote Linux host needs `perf`, Bash, GNU coreutils, and permission to sample the process. w11term samples user-space CPU activity on the selected process and checks that its start time matches before and after recording. It runs under the signed-in SSH account. [perf record](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-record.txt) · [Linux perf permissions](https://docs.kernel.org/admin-guide/perf-security.html)
+
+The capture uses a sibling SSH exec channel, with up to 32 MiB for the temporary recording and 4 MiB for the `perf script` output. The worker has a deadline and its private files are removed at completion. w11term folds the captured stacks into a new Windows file and reports the sample count, unresolved frames, and any diagnostics printed by perf, including lost-sample warnings when reported. Open the folded stacks with a flame-graph tool. [perf script](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-script.txt) · [CPU flame graphs](https://www.brendangregg.com/FlameGraphs/cpuflamegraphs.html)
+
 ### Run SFTP operations
 
 ```powershell

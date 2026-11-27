@@ -177,6 +177,8 @@ jobs:
       - *checkout
       - name: Verify samples, deadline and cleanup with Linux shell utilities
         run: python3 tests/linux-triage.py
+      - name: Verify CPU profile identity, byte limits, deadline and cleanup
+        run: python3 tests/linux-cpu-profile.py
 
   remote-mux:
     name: Stock Linux multiplexers over SSH
