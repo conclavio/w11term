@@ -1467,6 +1467,10 @@ In the Windows app, select a connected Linux SSH pane and open **More → CPU fl
 
 Choose **Review CPU profile** to check the live process and verified SSH endpoint. Then choose **Record CPU profile** and a new local folded stacks file. Changes to the settings require a fresh review. Recording stays tied to the pane, connection, and process start time from review. The resulting file opens in the flame graph with the unresolved frame count and **Perf output**, when available.
 
+To profile a fresh run, choose **Launch command** as the target. Enter a Linux executable, an optional absolute working directory, and arguments as a JSON array of strings such as `["--threads", "4", "input file"]`. Relative executable paths resolve from that directory. Bare names use the diagnostic PATH. The directory defaults to the SSH account's home. Review shows the resolved paths and literal arguments before launch.
+
+The executable runs non-interactively in an SSH exec channel. Samples include its child processes, and the time limit stops processes in the workload's process group. The viewer reports the command's exit status or that it reached its time limit. It can open sampled stacks from a timed-out run. Command input and output are disconnected from the terminal, and perf diagnostics appear in **Perf output**. [perf record](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-record.txt) · [GNU timeout](https://www.gnu.org/software/coreutils/manual/html_node/timeout-invocation.html)
+
 For CLI capture, choose a running PID on the remote Linux host. Preview the verified SSH endpoint, process name and start time, sampling options, and file and time limits. Use the same options and the returned connection generation and process start ticks when starting the capture.
 
 ```powershell

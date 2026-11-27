@@ -3,7 +3,7 @@ use crate::app::*;
 use std::num::NonZeroU32;
 use w11term::{
     control::{CpuCallGraph, CpuProfileOptions},
-    ssh::CpuProfilePlan,
+    ssh::{CpuLaunchOptions, CpuLaunchPlan, CpuProfilePlan, TriageTarget},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub enum Action {
     Back,
     Edit(Field, String),
     Mode(usize),
+    TargetMode(usize),
     Review,
     Record,
 }
@@ -26,16 +27,39 @@ pub enum Field {
     Pid,
     Seconds,
     Frequency,
+    Program,
+    Arguments,
+    Directory,
 }
 
 #[derive(Clone)]
 pub struct Review {
     connection: Connection,
-    plan: CpuProfilePlan,
+    plan: ReviewedTarget,
+}
+
+#[derive(Clone)]
+enum ReviewedTarget {
+    Process(CpuProfilePlan),
+    Command(CpuLaunchPlan),
+}
+
+enum Options {
+    Process(CpuProfileOptions),
+    Command(CpuLaunchOptions),
+}
+
+enum TargetInput {
+    Process(String),
+    Command {
+        program: String,
+        arguments: String,
+        directory: String,
+    },
 }
 
 pub(super) struct Form {
-    pid: String,
+    target: TargetInput,
     seconds: String,
     frequency: String,
     mode: CpuCallGraph,
@@ -46,7 +70,7 @@ pub(super) struct Form {
 impl Form {
     fn new() -> Self {
         Self {
-            pid: String::new(),
+            target: TargetInput::Process(String::new()),
             seconds: CpuProfileOptions::DEFAULT_SECONDS.to_string(),
             frequency: CpuProfileOptions::DEFAULT_FREQUENCY.to_string(),
             mode: CpuCallGraph::Fp,
@@ -57,32 +81,61 @@ impl Form {
 
     pub fn from_triage(source: Connection, pid: NonZeroU32) -> Self {
         Self {
-            pid: pid.to_string(),
+            target: TargetInput::Process(pid.to_string()),
             source: Some(source),
             ..Self::new()
         }
     }
 
-    fn options(&self) -> anyhow::Result<CpuProfileOptions> {
-        CpuProfileOptions {
-            target_pid: self
-                .pid
-                .trim()
-                .parse()
-                .context("Enter a positive Linux PID")?,
-            seconds: self
-                .seconds
-                .trim()
-                .parse()
-                .context("Enter a duration from 1 to 30 seconds")?,
-            frequency: self
-                .frequency
-                .trim()
-                .parse()
-                .context("Enter a frequency from 1 to 199 Hz")?,
-            call_graph: self.mode,
+    fn launches(&self) -> bool {
+        matches!(self.target, TargetInput::Command { .. })
+    }
+
+    fn options(&self) -> anyhow::Result<Options> {
+        let seconds = self
+            .seconds
+            .trim()
+            .parse()
+            .context("Enter a duration from 1 to 30 seconds")?;
+        let frequency = self
+            .frequency
+            .trim()
+            .parse()
+            .context("Enter a frequency from 1 to 199 Hz")?;
+        let call_graph = self.mode;
+        match &self.target {
+            TargetInput::Process(pid) => Ok(Options::Process(
+                CpuProfileOptions {
+                    target_pid: pid.trim().parse().context("Enter a positive Linux PID")?,
+                    seconds,
+                    frequency,
+                    call_graph,
+                }
+                .validate()?,
+            )),
+            TargetInput::Command {
+                program,
+                arguments,
+                directory,
+            } => {
+                let arguments = if arguments.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    serde_json::from_str(arguments)
+                        .context("Arguments must be a JSON array of strings")?
+                };
+                let options = CpuLaunchOptions {
+                    program: program.clone(),
+                    directory: directory.clone(),
+                    arguments,
+                    seconds,
+                    frequency,
+                    call_graph,
+                };
+                options.validate()?;
+                Ok(Options::Command(options))
+            }
         }
-        .validate()
     }
 
     fn available(&self, active: Option<Connection>) -> bool {
@@ -110,19 +163,65 @@ impl Form {
                 )),
             )
         };
-        let mut fields = vec![
-            KeyedView::new(
-                "capture-back",
-                Button::new()
+        let mut fields = vec![KeyedView::new(
+            "capture-back",
+            Button::new()
+                .is_enabled(idle)
+                .on_click(ctx.callback(|_| send(Action::Back)))
+                .content("Back to flame graph"),
+        )];
+        if self.source.is_none() {
+            fields.push(KeyedView::new(
+                "target-mode",
+                ComboBox::new()
+                    .automation_name("CPU profile target")
                     .is_enabled(idle)
-                    .on_click(ctx.callback(|_| send(Action::Back)))
-                    .content("Back to flame graph"),
-            ),
-            input("pid", Field::Pid, "Linux process ID", &self.pid),
+                    .items_source(["Attach to PID", "Launch command"])
+                    .selected_index(usize::from(self.launches()))
+                    .on_selection_changed(ctx.callback(|index: Option<usize>| {
+                        index.map_or(Message::ControlIdle, |index| {
+                            send(Action::TargetMode(index))
+                        })
+                    })),
+            ));
+        }
+        let has_target = match &self.target {
+            TargetInput::Process(pid) => {
+                fields.push(input("pid", Field::Pid, "Linux process ID", pid));
+                !pid.trim().is_empty()
+            }
+            TargetInput::Command {
+                program,
+                arguments,
+                directory,
+            } => {
+                fields.extend([
+                    input("program", Field::Program, "Linux executable", program),
+                    input(
+                        "args",
+                        Field::Arguments,
+                        "Arguments (JSON array)",
+                        arguments,
+                    ),
+                    input(
+                        "directory",
+                        Field::Directory,
+                        "Working directory (defaults to home)",
+                        directory,
+                    ),
+                ]);
+                !program.trim().is_empty()
+            }
+        };
+        fields.extend([
             input(
                 "seconds",
                 Field::Seconds,
-                "Duration in seconds",
+                if self.launches() {
+                    "Time limit in seconds"
+                } else {
+                    "Duration in seconds"
+                },
                 &self.seconds,
             ),
             input(
@@ -148,11 +247,11 @@ impl Form {
             KeyedView::new(
                 "profile-review",
                 Button::new()
-                    .is_enabled(idle && self.available(active) && !self.pid.trim().is_empty())
+                    .is_enabled(idle && self.available(active) && has_target)
                     .on_click(ctx.callback(|_| send(Action::Review)))
                     .content("Review CPU profile"),
             ),
-        ];
+        ]);
         if !self.available(active) {
             fields.push(text(
                 "connection-needed",
@@ -164,51 +263,100 @@ impl Form {
             ));
         }
         if let Some(review) = &self.review {
-            let plan = &review.plan;
             let ready = Some(review.connection) == active;
-            fields.extend([
-                text(
-                    "process",
-                    format!("PID {} · {}", plan.options.target_pid, plan.process_name),
-                ),
-                text(
-                    "endpoint",
-                    format!(
-                        "{}@{}:{}\nHost key {}",
-                        plan.user, plan.host, plan.port, plan.host_key_fingerprint
-                    ),
-                ),
-                text(
-                    "sampling",
-                    format!(
-                        "{} seconds · {} Hz · {}\n{}-second deadline · {} MiB recording · {} MiB stack output",
-                        plan.options.seconds,
-                        plan.options.frequency,
-                        match plan.options.call_graph {
-                            CpuCallGraph::Fp => "Frame pointers",
-                            CpuCallGraph::Dwarf => "DWARF",
-                        },
-                        plan.deadline_seconds,
-                        plan.max_recording_bytes / (1024 * 1024),
-                        plan.max_stack_output_bytes / (1024 * 1024),
-                    ),
-                ),
-                KeyedView::new(
-                    "record",
-                    Button::new()
-                        .is_enabled(idle && ready)
-                        .on_click(ctx.callback(|_| send(Action::Record)))
-                        .content("Record CPU profile"),
-                ),
-            ]);
+            review.plan.describe(&mut fields);
+            fields.extend([KeyedView::new(
+                "record",
+                Button::new()
+                    .is_enabled(idle && ready)
+                    .on_click(ctx.callback(|_| send(Action::Record)))
+                    .content("Record CPU profile"),
+            )]);
             if !ready {
                 fields.push(text(
                     "review-stale",
-                    "Return to the reviewed SSH connection or review the process again.",
+                    "Return to the reviewed SSH connection or review the target again.",
                 ));
             }
         }
         fields
+    }
+}
+
+impl ReviewedTarget {
+    fn describe(&self, fields: &mut Vec<KeyedView>) {
+        let (host, user, port, key, seconds, frequency, graph, deadline, record_bytes, stack_bytes) =
+            match self {
+                Self::Process(plan) => {
+                    fields.push(text(
+                        "process",
+                        format!("PID {} · {}", plan.options.target_pid, plan.process_name),
+                    ));
+                    (
+                        &plan.host,
+                        &plan.user,
+                        plan.port,
+                        &plan.host_key_fingerprint,
+                        plan.options.seconds,
+                        plan.options.frequency,
+                        plan.options.call_graph,
+                        plan.deadline_seconds,
+                        plan.max_recording_bytes,
+                        plan.max_stack_output_bytes,
+                    )
+                }
+                Self::Command(plan) => {
+                    fields.extend([
+                        text("command", format!("Executable {:?}", plan.program)),
+                        text(
+                            "directory-reviewed",
+                            format!("Working directory {:?}", plan.directory),
+                        ),
+                        text(
+                            "args-reviewed",
+                            format!("Arguments {}", serde_json::json!(plan.options.arguments)),
+                        ),
+                    ]);
+                    (
+                        &plan.host,
+                        &plan.user,
+                        plan.port,
+                        &plan.host_key_fingerprint,
+                        plan.options.seconds,
+                        plan.options.frequency,
+                        plan.options.call_graph,
+                        plan.deadline_seconds,
+                        plan.max_recording_bytes,
+                        plan.max_stack_output_bytes,
+                    )
+                }
+            };
+        fields.push(text(
+            "endpoint",
+            format!("{user}@{host}:{port}\nHost key {key}"),
+        ));
+        let graph = match graph {
+            CpuCallGraph::Fp => "Frame pointers",
+            CpuCallGraph::Dwarf => "DWARF",
+        };
+        fields.push(text("sampling", format!(
+            "{seconds} seconds · {frequency} Hz · {graph}\n{deadline}-second deadline · {} MiB recording · {} MiB stack output",
+            record_bytes / (1024 * 1024),
+            stack_bytes / (1024 * 1024),
+        )));
+    }
+}
+
+impl Options {
+    fn preview(self, target: TriageTarget) -> anyhow::Result<ReviewedTarget> {
+        match self {
+            Self::Process(options) => target
+                .preview_cpu_profile_blocking(options)
+                .map(ReviewedTarget::Process),
+            Self::Command(options) => target
+                .preview_cpu_launch_blocking(options)
+                .map(ReviewedTarget::Command),
+        }
     }
 }
 
@@ -255,16 +403,38 @@ impl TerminalApp {
             }
             Action::Edit(field, value) => {
                 if let Some(form) = &mut self.flame_graph.capture {
-                    let current = match field {
-                        Field::Pid => &mut form.pid,
-                        Field::Seconds => &mut form.seconds,
-                        Field::Frequency => &mut form.frequency,
+                    let current = match (field, &mut form.target) {
+                        (Field::Seconds, _) => &mut form.seconds,
+                        (Field::Frequency, _) => &mut form.frequency,
+                        (Field::Pid, TargetInput::Process(pid)) => pid,
+                        (Field::Program, TargetInput::Command { program, .. }) => program,
+                        (Field::Arguments, TargetInput::Command { arguments, .. }) => arguments,
+                        (Field::Directory, TargetInput::Command { directory, .. }) => directory,
+                        _ => return,
                     };
                     if *current != value {
                         *current = value;
                         form.review = None;
                         self.flame_graph.status = None;
                     }
+                }
+            }
+            Action::TargetMode(index) => {
+                if let Some(form) = &mut self.flame_graph.capture
+                    && form.source.is_none()
+                    && index != usize::from(form.launches())
+                {
+                    form.target = if index == 1 {
+                        TargetInput::Command {
+                            program: String::new(),
+                            arguments: "[]".into(),
+                            directory: String::new(),
+                        }
+                    } else {
+                        TargetInput::Process(String::new())
+                    };
+                    form.review = None;
+                    self.flame_graph.status = None;
                 }
             }
             Action::Mode(index) => {
@@ -314,15 +484,15 @@ impl TerminalApp {
         if let Some(form) = &mut self.flame_graph.capture {
             form.review = None;
         }
-        let ticket = self.flame_graph.begin("Reviewing the Linux process…");
+        let ticket = self.flame_graph.begin("Reviewing the CPU profile target…");
         let rejected = message(ViewerAction::Finished(
             ticket.clone(),
             Err("CPU profile worker unavailable".into()),
         ));
         ctx.spawn_background_with_rejection(
             move |_| {
-                let result = target
-                    .preview_cpu_profile_blocking(options)
+                let result = options
+                    .preview(target)
                     .map(|plan| Some(Outcome::Reviewed(Box::new(Review { connection, plan }))))
                     .map_err(|error| format!("{error:#}"));
                 message(ViewerAction::Finished(ticket, result))
@@ -378,7 +548,14 @@ impl TerminalApp {
                     if scope.is_cancelled() {
                         return Ok(None);
                     }
-                    let summary = target.save_cpu_profile_blocking(&review.plan, &file.path)?;
+                    let summary = match &review.plan {
+                        ReviewedTarget::Process(plan) => {
+                            target.save_cpu_profile_blocking(plan, &file.path)?
+                        }
+                        ReviewedTarget::Command(plan) => {
+                            target.save_cpu_launch_blocking(plan, &file.path)?
+                        }
+                    };
                     let profile = Profile::open(&file.path).with_context(|| {
                         format!(
                             "The profile was saved to {} but could not be opened",

@@ -333,6 +333,9 @@ impl Panel {
             ));
         }
         if let Some(capture) = &loaded.capture {
+            if let Some(outcome) = &capture.workload {
+                fields.push(text("workload-outcome", outcome.to_string()));
+            }
             fields.push(text(
                 "stack-resolution",
                 format!("{} unresolved frames", capture.unresolved_frames),

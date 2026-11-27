@@ -252,6 +252,52 @@ impl server::Handler for Peer {
             s.close(c)?;
             return Ok(());
         }
+        if let Ok(command) = std::str::from_utf8(command)
+            && command.starts_with("/bin/sh -c '# w11term-cpu-profile-v1")
+            && command.contains("w11term-cpu-launch-v1")
+        {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            let directory = "/tmp/work space";
+            let program = "/tmp/work space/cpu worker";
+            let mut reply = format!(
+                "w11term-cpu-launch-v1\t{}\t{}\n",
+                STANDARD.encode(directory),
+                STANDARD.encode(program),
+            );
+            let argv = r#"'one arg' 'it'\''s $literal' '' '--child'"#;
+            let inspect = format!(" 2 99 fp 32768 4096 '{directory}' './cpu worker' '' '' {argv}");
+            let launch = format!(
+                " 2 99 fp 32768 4096 '{directory}' './cpu worker' '{directory}' '{program}' {argv}"
+            );
+            fs::write(self.root.join("profile-launch-wire"), command)?;
+            s.channel_success(c)?;
+            if command.ends_with(&launch) {
+                fs::write(self.root.join("profile-launched"), [])?;
+                reply.push_str(concat!(
+                    "timeout\n",
+                    "42 20.0: cpu-clock:u: ab main (/tmp/work space/cpu worker)\n",
+                    "43 20.1: cpu-clock:u: ac child (/tmp/work space/cpu worker)\n",
+                    "\nw11term-cpu-profile-end\n",
+                ));
+            } else if !command.ends_with(&inspect) {
+                let tail = command.chars().rev().take(200).collect::<Vec<_>>();
+                let tail: String = tail.into_iter().rev().collect();
+                s.extended_data(
+                    c,
+                    1,
+                    format!("Unexpected reviewed command suffix: {tail}").into_bytes(),
+                )?;
+                s.exit_status_request(c, 2)?;
+                s.eof(c)?;
+                s.close(c)?;
+                return Ok(());
+            }
+            s.data(c, reply.into_bytes())?;
+            s.exit_status_request(c, 0)?;
+            s.eof(c)?;
+            s.close(c)?;
+            return Ok(());
+        }
         if let Some((_, args)) = std::str::from_utf8(command)
             .ok()
             .filter(|command| command.starts_with("/bin/sh -c '# w11term-cpu-profile-v1"))

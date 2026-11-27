@@ -23,6 +23,30 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews and launches a Linux command for CPU profiling from the Windows viewer"]
+async fn native_cpu_launch_reviews_literal_arguments_and_displays_the_timeout_profile() {
+    let transports = Arc::new(AtomicUsize::new(0));
+    let (Source::Ssh(ssh), remote, channels, server) =
+        fixture_counting_accepts(false, 2, transports.clone()).await
+    else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let marker = remote.path().join("profile-launched");
+    fs::write(state.path().join("launch-marker"), marker.to_str().unwrap()).unwrap();
+    fs::write(
+        state.path().join("launch-wire"),
+        remote.path().join("profile-launch-wire").to_str().unwrap(),
+    )
+    .unwrap();
+    drive_mixed_gui("cpu-launch-ui.ps1", &ssh, state.path());
+    assert!(marker.exists());
+    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    assert_eq!(channels.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "records a reviewed CPU profile from the native Linux triage report"]
 async fn native_cpu_profile_reviews_the_triage_connection_before_recording() {
     use base64::{Engine as _, engine::general_purpose::STANDARD};

@@ -20,6 +20,8 @@ const EXTRA_WORK_SECONDS: u64 = 12;
 const SSH_MARGIN_SECONDS: u64 = 6;
 const PROBE_SECONDS: u64 = 4;
 const END_MARKER: &[u8] = b"\nw11term-cpu-profile-end\n";
+pub(crate) mod launch;
+pub use launch::CpuWorkloadOutcome;
 pub(crate) const CONTROL_TIMEOUT_SECONDS: u64 =
     MAX_SECONDS as u64 + EXTRA_WORK_SECONDS + SSH_MARGIN_SECONDS + 20;
 
@@ -41,20 +43,25 @@ impl CpuProfileOptions {
             i32::try_from(self.target_pid.get()).is_ok(),
             "Invalid Linux PID"
         );
-        ensure!(
-            (1..=MAX_SECONDS).contains(&self.seconds),
-            "CPU profile duration must be 1..={MAX_SECONDS} seconds"
-        );
-        ensure!(
-            (1..=199).contains(&self.frequency),
-            "CPU profile frequency must be 1..=199 Hz"
-        );
+        validate_sampling(self.seconds, self.frequency)?;
         Ok(self)
     }
 
     fn worker_seconds(self) -> u64 {
         u64::from(self.seconds) + EXTRA_WORK_SECONDS
     }
+}
+
+fn validate_sampling(seconds: u8, frequency: u8) -> Result<()> {
+    ensure!(
+        (1..=MAX_SECONDS).contains(&seconds),
+        "CPU profile duration must be 1..={MAX_SECONDS} seconds"
+    );
+    ensure!(
+        (1..=199).contains(&frequency),
+        "CPU profile frequency must be 1..=199 Hz"
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -252,6 +259,8 @@ pub struct CpuProfileSummary {
     pub distinct_stacks: usize,
     pub unresolved_frames: u64,
     pub diagnostics: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload: Option<CpuWorkloadOutcome>,
 }
 
 impl Folded {
@@ -278,7 +287,8 @@ impl Folded {
     }
 }
 
-fn fold(input: &str, pid: NonZeroU32, process: &str) -> Result<Folded> {
+fn fold(input: &str, pid: impl Into<Option<NonZeroU32>>, process: &str) -> Result<Folded> {
+    let pid = pid.into();
     let mut result = Folded::default();
     let process = frame_label(process);
     // perf script emits leaf through caller. Fold samples in caller-to-leaf order.
@@ -302,19 +312,19 @@ fn fold(input: &str, pid: NonZeroU32, process: &str) -> Result<Folded> {
         }
     }
     finish_sample(&mut result, &process, stack)?;
-    ensure!(
-        result.summary.samples > 0,
-        "perf recorded no CPU samples for the selected process"
-    );
+    ensure!(result.summary.samples > 0, "perf recorded no CPU samples");
     result.summary.distinct_stacks = result.stacks.len();
     Ok(result)
 }
 
-fn sample_header(line: &str, pid: NonZeroU32) -> Option<&str> {
+fn sample_header(line: &str, pid: Option<NonZeroU32>) -> Option<&str> {
     let (prefix, event) = line.split_once(": ")?;
     let mut parts = prefix.split_ascii_whitespace();
     let reported_pid: NonZeroU32 = parts.next()?.parse().ok()?;
-    if reported_pid != pid || !parts.next()?.contains('.') || parts.next().is_some() {
+    if pid.is_some_and(|pid| reported_pid != pid)
+        || !parts.next()?.contains('.')
+        || parts.next().is_some()
+    {
         return None;
     }
     let event = event.trim_start();
