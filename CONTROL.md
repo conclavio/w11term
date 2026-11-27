@@ -1457,6 +1457,8 @@ In the Windows app, select a connected Linux SSH pane and open **More → Diagno
 
 Choose **Open in Wireshark** after saving. w11term looks in the standard Windows Program Files folders. Use **Choose Wireshark executable…** for another installation. The saved capture stays available after you disconnect the SSH pane or close the packet capture panel.
 
+Choose **Open capture file…** in the same panel to reopen a local PCAP or PCAPNG file from an earlier session. This works without SSH. The panel checks the file header and shows the format and size. **Open in Wireshark** opens the selected capture for packet analysis. [PCAP format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcap/) · [PCAPNG format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/)
+
 Choose **List capture interfaces** to see the devices that tcpdump reports for the selected SSH connection. Selecting a device fills the editable interface field. You can also type a name directly. From the CLI, `w11term-cli [--pid PID] list-packet-interfaces --pane ID` returns device names, details, and the connection generation. [tcpdump device listing](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in)
 
 Use a connected Linux SSH pane and review the interface, literal tcpdump filter, limits, and scratch location. Pass the same capture options and the returned connection generation and review ID to record. The host needs tcpdump, Bash, GNU coreutils, flock, the SSH SFTP subsystem, and permission to capture on the selected interface. [tcpdump manual](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in)

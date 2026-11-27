@@ -21,7 +21,9 @@ const INTERFACE_BYTES: usize = 64 * 1024;
 const MAX_INTERFACES: usize = 512;
 const CAPTURE_OVERHEAD_SECONDS: u64 = 72;
 pub(crate) const CONTROL_SECONDS: u64 = 155;
+mod local;
 mod ring;
+pub use local::LocalCapture;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -640,16 +642,21 @@ fn count_packets(file: std::fs::File, size: u64) -> Result<u32> {
     count_packet_records(&mut file, &header, size)
 }
 
+fn classic_little_endian(magic: [u8; 4]) -> Option<bool> {
+    match magic {
+        [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1] => Some(true),
+        [0xa1, 0xb2, 0xc3, 0xd4] | [0xa1, 0xb2, 0x3c, 0x4d] => Some(false),
+        _ => None,
+    }
+}
+
 fn count_packet_records(
     file: &mut BufReader<std::fs::File>,
     header: &[u8; 24],
     size: u64,
 ) -> Result<u32> {
-    let little = match &header[..4] {
-        [0xd4, 0xc3, 0xb2, 0xa1] | [0x4d, 0x3c, 0xb2, 0xa1] => true,
-        [0xa1, 0xb2, 0xc3, 0xd4] | [0xa1, 0xb2, 0x3c, 0x4d] => false,
-        _ => bail!("The transferred file is not a classic pcap capture"),
-    };
+    let little = classic_little_endian(header[..4].try_into().unwrap())
+        .context("The transferred file is not a classic pcap capture")?;
     let number = if little {
         u32::from_le_bytes
     } else {

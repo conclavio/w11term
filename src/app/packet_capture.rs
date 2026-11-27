@@ -1,9 +1,9 @@
 use super::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use w11term::{
     control::PacketCaptureOptions,
     ssh::{
-        CaptureStop, PacketCapture, PacketCaptureInterfaces, PacketCapturePlan,
+        CaptureStop, LocalPacketCapture, PacketCapture, PacketCaptureInterfaces, PacketCapturePlan,
         open_capture_in_wireshark,
     },
 };
@@ -32,6 +32,7 @@ pub enum Action {
     Review,
     Save,
     Stop(Arc<()>),
+    OpenCaptureFile,
     ChooseWireshark,
     OpenWireshark,
     Finished(Arc<()>, Result<Option<Outcome>, String>),
@@ -42,8 +43,30 @@ pub enum Outcome {
     Reviewed(u64, Box<PacketCapturePlan>),
     Destination(PathBuf),
     Saved(PacketCapture),
+    Loaded(LocalPacketCapture),
     Wireshark(PathBuf),
     Opened,
+}
+
+#[derive(Clone, Copy)]
+enum FileChoice {
+    Capture,
+    Save,
+    Wireshark,
+}
+
+enum LoadedCapture {
+    Captured(PacketCapture),
+    Local(LocalPacketCapture),
+}
+
+impl LoadedCapture {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Captured(capture) => &capture.path,
+            Self::Local(capture) => &capture.path,
+        }
+    }
 }
 
 struct Inputs {
@@ -147,7 +170,7 @@ pub(super) struct Panel {
     inputs: Inputs,
     interfaces: Option<(flame_graph::Connection, PacketCaptureInterfaces)>,
     review: Option<Review>,
-    saved: Option<PacketCapture>,
+    loaded: Option<LoadedCapture>,
     wireshark: Option<PathBuf>,
     pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
@@ -396,17 +419,21 @@ impl Panel {
                 ));
             }
         }
+        let mut files = vec![KeyedView::new(
+            "open-capture-file",
+            button("Open capture file…", idle, || Action::OpenCaptureFile),
+        )];
         if let Some(status) = &self.status {
-            fields.push(text("status", status));
+            files.push(text("status", status));
         }
-        if let Some(saved) = &self.saved {
+        if let Some(LoadedCapture::Captured(saved)) = &self.loaded {
             let reason = stop_reason(saved);
             let packets = if saved.rotation.is_some() {
                 "Packets retained"
             } else {
                 "Packets captured"
             };
-            fields.extend([
+            files.extend([
                 text("saved-path", saved.path.display().to_string()),
                 text(
                     "saved-counts",
@@ -417,13 +444,13 @@ impl Panel {
                 ),
             ]);
             if let Some(dropped) = saved.dropped_by_kernel {
-                fields.push(text(
+                files.push(text(
                     "drops",
                     format!("Packets dropped by kernel {dropped}"),
                 ));
             }
             if let Some(rotation) = &saved.rotation {
-                fields.push(text(
+                files.push(text(
                     "rotation-saved",
                     format!(
                         "Rolling capture · {} captured · {} files kept · {} overwritten",
@@ -433,7 +460,17 @@ impl Panel {
                     ),
                 ));
             }
-            fields.extend([
+        } else if let Some(LoadedCapture::Local(capture)) = &self.loaded {
+            files.extend([
+                text("local-capture-path", capture.path.display().to_string()),
+                text(
+                    "local-capture-details",
+                    format!("{} · {} bytes", capture.format_label(), capture.bytes),
+                ),
+            ]);
+        }
+        if self.loaded.is_some() {
+            files.extend([
                 KeyedView::new(
                     "open",
                     button("Open in Wireshark", idle, || Action::OpenWireshark),
@@ -446,6 +483,7 @@ impl Panel {
                 ),
             ]);
         }
+        files.append(&mut fields);
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
             .children((
@@ -457,7 +495,7 @@ impl Panel {
                 )),
                 Border::new().grid_row(1).padding(12.0).content(
                     ScrollViewer::new()
-                        .content(StackPanel::new().spacing(8.0).keyed_children(fields)),
+                        .content(StackPanel::new().spacing(8.0).keyed_children(files)),
                 ),
             ))
     }
@@ -557,16 +595,17 @@ impl TerminalApp {
                 }
             }
             Action::Review => self.review_packet_capture(ctx),
-            Action::Save => self.choose_capture_file(false, ctx),
-            Action::ChooseWireshark => self.choose_capture_file(true, ctx),
+            Action::Save => self.choose_capture_file(FileChoice::Save, ctx),
+            Action::OpenCaptureFile => self.choose_capture_file(FileChoice::Capture, ctx),
+            Action::ChooseWireshark => self.choose_capture_file(FileChoice::Wireshark, ctx),
             Action::OpenWireshark => {
-                let Some(saved) = &panel.saved else { return };
-                let capture = saved.path.clone();
+                let Some(capture) = &panel.loaded else { return };
+                let capture = capture.path().to_owned();
                 let configured = panel.wireshark.clone();
                 let ticket = panel.begin("Opening Wireshark…");
                 work(ctx, ticket, move || {
                     let executable = configured.or_else(default_wireshark).context(
-                        "Wireshark was not found. Choose its executable to open the saved capture.",
+                        "Wireshark was not found. Choose its executable to open the capture.",
                     )?;
                     open_capture_in_wireshark(&capture, &executable)?;
                     Ok(Some(Outcome::Opened))
@@ -628,47 +667,48 @@ impl TerminalApp {
         });
     }
 
-    fn choose_capture_file(&mut self, wireshark: bool, ctx: &ComponentContext<Self>) {
+    fn choose_capture_file(&mut self, choice: FileChoice, ctx: &ComponentContext<Self>) {
         let active = self.profile_connection();
         let panel = &mut self.packet_capture;
-        if wireshark {
-            if panel.saved.is_none() {
+        match choice {
+            FileChoice::Wireshark if panel.loaded.is_none() => return,
+            FileChoice::Save
+                if !panel
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.matches(active)) =>
+            {
                 return;
             }
-        } else if !panel
-            .review
-            .as_ref()
-            .is_some_and(|review| review.matches(active))
-        {
-            return;
+            _ => (),
         }
         let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
             return;
         };
         let initial = self.store.path();
-        let purpose = if wireshark {
-            file_picker::Purpose::WiresharkExecutable(
+        let capture = || {
+            panel
+                .loaded
+                .as_ref()
+                .map_or_else(|| initial.into(), |capture| capture.path().into())
+        };
+        let purpose = match choice {
+            FileChoice::Wireshark => file_picker::Purpose::WiresharkExecutable(
                 panel.wireshark.clone().unwrap_or_else(|| initial.into()),
-            )
-        } else {
-            file_picker::Purpose::SavePacketCapture(
-                panel
-                    .saved
-                    .as_ref()
-                    .map_or_else(|| initial.into(), |saved| saved.path.clone()),
-            )
+            ),
+            FileChoice::Capture => file_picker::Purpose::OpenPacketCapture(capture()),
+            FileChoice::Save => file_picker::Purpose::SavePacketCapture(capture()),
         };
         let ticket = panel.begin("Choosing a Windows file…");
         work(ctx, ticket, move || {
-            file_picker::pick(owner, purpose).map(|selected| {
-                selected.map(|file| {
-                    if wireshark {
-                        Outcome::Wireshark(file.path)
-                    } else {
-                        Outcome::Destination(file.path)
-                    }
-                })
-            })
+            let Some(file) = file_picker::pick(owner, purpose)? else {
+                return Ok(None);
+            };
+            Ok(Some(match choice {
+                FileChoice::Capture => Outcome::Loaded(LocalPacketCapture::open(file.path)?),
+                FileChoice::Save => Outcome::Destination(file.path),
+                FileChoice::Wireshark => Outcome::Wireshark(file.path),
+            }))
         });
     }
 
@@ -722,8 +762,12 @@ impl TerminalApp {
                 self.save_packet_capture(path, ctx)
             }
             Ok(Some(Outcome::Saved(capture))) => {
-                panel.saved = Some(capture);
+                panel.loaded = Some(LoadedCapture::Captured(capture));
                 panel.status = Some("Saved packet capture".into());
+            }
+            Ok(Some(Outcome::Loaded(capture))) => {
+                panel.loaded = Some(LoadedCapture::Local(capture));
+                panel.activity = None;
             }
             Ok(Some(Outcome::Wireshark(path))) => {
                 panel.status = Some(format!("Wireshark executable {}", path.display()));

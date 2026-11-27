@@ -4,15 +4,24 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $destination = Join-Path $State 'reviewed capture.pcap'
+$olderCapture = Join-Path $State 'older capture.pcapng'
+$invalidCapture = Join-Path $State 'not a capture.pcap'
 $viewer = Join-Path $State 'Fixture Wireshark.exe'
 $startMarker = [IO.File]::ReadAllText((Join-Path $State 'pcap-start-marker'))
 $saveLabel = 'Capture and save' + [char]0x2026
+$openCaptureLabel = 'Open capture file' + [char]0x2026
 $chooseViewerLabel = 'Choose Wireshark executable' + [char]0x2026
 $edit = [System.Windows.Automation.ControlType]::Edit
 $check = [System.Windows.Automation.ControlType]::CheckBox
 $value = [System.Windows.Automation.ValuePattern]::Pattern
 $toggle = [System.Windows.Automation.TogglePattern]::Pattern
 $dot = ' ' + [char]0xb7 + ' '
+[IO.File]::WriteAllBytes($olderCapture, [byte[]]@(
+    # Little-endian Section Header Block and an empty Ethernet interface.
+    10,13,13,10, 28,0,0,0, 77,60,43,26, 1,0,0,0, 255,255,255,255,255,255,255,255, 28,0,0,0,
+    1,0,0,0, 20,0,0,0, 1,0,0,0, 255,255,0,0, 20,0,0,0
+))
+[IO.File]::WriteAllText($invalidCapture, 'plain text')
 Add-Type -OutputType WindowsApplication -OutputAssembly $viewer -TypeDefinition @'
 using System.IO;
 public static class Viewer {
@@ -44,6 +53,22 @@ function Set-Field([string]$Name, [string]$Text) {
     }
 }
 
+function Select-Capture([string]$Path) {
+    Click $openCaptureLabel
+    $dialog = Wait-Until 'owned source capture picker' { Find-OwnedDialog 'Open packet capture' }
+    $null = Wait-Until 'enter the source capture path' { [FixtureDialog]::SetFilename($dialog, $Path, '') }
+    $null = Wait-Until 'select the source capture' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'source capture picker closed' { !(Find-OwnedDialog 'Open packet capture') }
+}
+
+function Select-Viewer {
+    Click $chooseViewerLabel
+    $dialog = Wait-Until 'owned executable picker' { Find-OwnedDialog 'Choose Wireshark executable' }
+    $null = Wait-Until 'enter the fixture viewer path' { [FixtureDialog]::SetFilename($dialog, $viewer, '') }
+    $null = Wait-Until 'select the fixture viewer' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'viewer picker closed' { !(Find-OwnedDialog 'Choose Wireshark executable') }
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -53,6 +78,23 @@ try {
         (Find-Element 'Diagnostics overview panel') -and
             (Find-Element 'Select a connected Linux SSH pane to run diagnostics.')
     }
+    Click 'Packet capture'
+    Select-Capture $olderCapture
+    $null = Wait-Until 'an earlier capture opens before any SSH connection' {
+        Find-Element "PCAPNG${dot}48 bytes"
+    }
+    Select-Capture $invalidCapture
+    $null = Wait-Until 'a non-capture file leaves the previous capture selected' {
+        (Find-Element 'Choose a PCAP or PCAPNG capture file') -and (Find-Element "PCAPNG${dot}48 bytes")
+    }
+    Select-Viewer
+    if ([IO.File]::Exists($olderCapture + '.opened')) { throw 'Selecting the local file launched Wireshark' }
+    Click 'Open in Wireshark'
+    $null = Wait-Until 'the local capture reaches Wireshark without an SSH pane' {
+        $opened = $olderCapture + '.opened'
+        [IO.File]::Exists($opened) -and [IO.File]::ReadAllText($opened) -ceq '-r'
+    }
+    Click 'Return to diagnostics overview'
     Click 'CPU flame graph'
     $null = Wait-Until 'flame graph can open a saved artifact offline' {
         $openStacks = Find-Element 'Open folded stacks' $button
@@ -167,11 +209,7 @@ try {
     Click 'Return to diagnostics overview'
     Wait-DiagnosticArtifact 'Saved packet capture' $destination 'Stopped by request'
     Click 'Open Packet capture activity'
-    Click $chooseViewerLabel
-    $dialog = Wait-Until 'owned executable picker' { Find-OwnedDialog 'Choose Wireshark executable' }
-    $null = Wait-Until 'enter the fixture viewer path' { [FixtureDialog]::SetFilename($dialog, $viewer, '') }
-    $null = Wait-Until 'select the fixture viewer' { [FixtureDialog]::ClickButton($dialog, 1) }
-    $null = Wait-Until 'viewer picker closed' { !(Find-OwnedDialog 'Choose Wireshark executable') }
+    Select-Viewer
     if ([IO.File]::Exists($destination + '.opened')) { throw 'Selecting a viewer opened it without activation' }
     Click 'Open in Wireshark'
     $null = Wait-Until 'viewer receives the saved path and -r flag' {

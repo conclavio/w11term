@@ -61,6 +61,7 @@ pub(super) enum Purpose {
     OpenTriageReport(PathBuf),
     SaveTriageReport(PathBuf),
     SaveCpuProfile(PathBuf),
+    OpenPacketCapture(PathBuf),
     SavePacketCapture(PathBuf),
     WiresharkExecutable(PathBuf),
     OpenSyscallTrace(PathBuf),
@@ -223,6 +224,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::CompareLocalFolder
                 | Purpose::OpenRecording
                 | Purpose::OpenTriageReport(_)
+                | Purpose::OpenPacketCapture(_)
                 | Purpose::WiresharkExecutable(_)
                 | Purpose::OpenSyscallTrace(_)
                 | Purpose::FlameGraph { export: false, .. }
@@ -269,6 +271,25 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     | FOS_PATHMUSTEXIST
                     | FOS_DONTADDTORECENT
                     | FOS_ALLOWMULTISELECT;
+                if let Some(folder) = path.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
+            Purpose::OpenPacketCapture(path) => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                dialog.SetTitle(w!("Open packet capture"))?;
+                dialog.SetFileTypes(&[
+                    COMDLG_FILTERSPEC {
+                        pszName: w!("Packet captures"),
+                        pszSpec: w!("*.pcap;*.pcapng;*.cap"),
+                    },
+                    COMDLG_FILTERSPEC {
+                        pszName: w!("All files"),
+                        pszSpec: w!("*.*"),
+                    },
+                ])?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 if let Some(folder) = path.parent() {
                     local_folder(&dialog, folder);
                 }
