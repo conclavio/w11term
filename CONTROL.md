@@ -1470,7 +1470,9 @@ On an ordinary SSH connect or reconnect, w11term checks the verified endpoint an
 
 When the login PATH update is skipped, **Review PATH repair** checks the approved startup files over the current SSH connection. The review shows each file and the current and proposed text for any managed block it would replace. **Apply reviewed PATH repair** validates the review and writes the changes for new shells. Replacement requires one complete marker pair and preserves the text around it. Duplicate or incomplete marker pairs require manual correction.
 
-A manual rollback, addition, or removal pauses automatic bundle updates. In **Bundle versions**, select the active release marked **Updates paused**, choose **Review update resumption**, and then **Resume automatic updates**. Approved profiles can sync the bundle on their next SSH connection. Use the manual installation flow to apply a specific bundle immediately. **Disable tool sync** stops automatic updates from that profile.
+A manual rollback, addition, or removal pauses automatic bundle updates. To hold the current release, select it in **Bundle versions**, choose **Review update pause**, and then **Pause automatic updates**. The same release stays installed and future SSH logins skip sync for that bundle on the account. To re-enable sync, select the active release marked **Updates paused**, choose **Review update resumption**, and then **Resume automatic updates**. Approved profiles can sync the bundle on their next SSH connection. Use the manual installation flow to apply a specific bundle immediately. **Disable tool sync** stops automatic updates from that profile.
+
+For scripts, use `preview-tool-bundle-pause NAME SHA256` followed by `pause-tool-bundle-updates NAME SHA256 --review TOKEN`. The pause review applies to the reviewed active release and reports `automatic_sync_paused`. The corresponding resume commands are `preview-tool-bundle-resume` and `resume-tool-bundle-updates`.
 
 ```powershell
 $resume = (& $ctl --pid 12345 sftp --pane $pane preview-tool-bundle-resume my-tools $activeSha256 | ConvertFrom-Json).result.sftp

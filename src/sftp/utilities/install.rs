@@ -774,11 +774,12 @@ impl Engine {
         .await
     }
 
-    pub(in crate::sftp) async fn resume_utility_updates(
+    pub(in crate::sftp) async fn set_utility_updates_paused(
         &self,
         session: &Ssh,
         name: &str,
         id: &str,
+        paused: bool,
         review: Option<&str>,
         stage: &mut JobStage,
     ) -> Result<Value> {
@@ -799,20 +800,28 @@ impl Engine {
         );
         let selector = self.utility_selector_state(&store, &managed).await?;
         ensure!(
-            !selector.conflict && selector.manual && selector.version.as_deref() == Some(&id),
-            "The chosen version is no longer the active paused release. Refresh versions."
+            !selector.conflict
+                && selector.manual != paused
+                && selector.version.as_deref() == Some(&id),
+            "{}",
+            if paused {
+                "The chosen version is no longer the active release with automatic updates enabled. Refresh versions."
+            } else {
+                "The chosen version is no longer the active paused release. Refresh versions."
+            }
         );
         self.utility_release_manifest(&store, name, None, &id)
             .await?;
         let atomic = self.extension(editor::POSIX_RENAME, "1").is_ok();
         let mut report = json!({
-            "operation": "resume-tool-bundle-updates",
+            "operation": if paused { "pause-tool-bundle-updates" } else { "resume-tool-bundle-updates" },
             "home": home,
             "bundle": name,
             "bundle_sha256": id,
             "current": selector,
             "ready": atomic,
             "supports_atomic_replace": atomic,
+            "automatic_sync_paused": paused,
         });
         let Some(review) = review else {
             if atomic {
@@ -823,17 +832,17 @@ impl Engine {
         self.check_utility_review(&report, review)?;
         ensure!(
             atomic,
-            "Resuming updates requires the server's atomic rename extension"
+            "Changing automatic updates requires the server's atomic rename extension"
         );
         *stage = JobStage::Checking(
-            "Update resumption did not finish. Refresh versions to check the active release.",
+            "The update policy change did not finish. Refresh versions to check the active release.",
         );
         with_lock(session, &store, async {
             let changed = self
-                .switch_utility_selector(&store, &id, false, &selector)
+                .switch_utility_selector(&store, &id, paused, &selector)
                 .await?;
             Ok(json!({
-                "bundle": name, "bundle_sha256": id, "changed": changed,
+                "bundle": name, "bundle_sha256": id, "changed": changed, "automatic_sync_paused": paused,
             }))
         })
         .await

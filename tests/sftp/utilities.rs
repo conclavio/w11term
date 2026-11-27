@@ -1602,6 +1602,100 @@ fn connect_tools(options: &SshOptions) -> Session {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pausing_updates_keeps_the_same_release_until_updates_resume() {
+    let (source, remote, _, server) = fixture_connections(false, 3).await;
+    let root = remote.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(root, "x86_64", "/", "/usr/bin");
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("utility-shell-probe"), []).unwrap();
+    save_login_manifest(local.path(), 1);
+    let options = approved_login(source, local.path());
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("updated")).await;
+
+    let store = root.join(".local/share/w11term/tools/portable");
+    let selector_path = store.join("current");
+    let selector = || fs::read_to_string(&selector_path).unwrap();
+    let original = selector();
+    let release = original.lines().nth(1).unwrap();
+    let id = release.strip_prefix("versions/").unwrap();
+    let executable = store.join(release).join("rg");
+    let installed = fs::read(&executable).unwrap();
+    let startup = fs::read(root.join(".bashrc")).unwrap();
+    let pause = |review| Operation::PauseToolBundleUpdates {
+        name: "portable".into(),
+        bundle_sha256: id.into(),
+        review,
+    };
+    let resume = |review| Operation::ResumeToolBundleUpdates {
+        name: "portable".into(),
+        bundle_sha256: id.into(),
+        review,
+    };
+    save_login_manifest(local.path(), 2);
+    let report = guarded_job(&pane, Some(1), pause(None)).await.unwrap();
+    assert_eq!(report["ready"], true);
+    assert_eq!(report["current"]["manual"], false);
+    assert_eq!(report["automatic_sync_paused"], true);
+    assert_eq!(selector(), original);
+    let token = || Some(report["review"].as_str().unwrap().to_owned());
+    let stale = original.replace(id, &"0".repeat(64));
+    fs::write(&selector_path, &stale).unwrap();
+    let error = guarded_job(&pane, Some(1), pause(token()))
+        .await
+        .unwrap_err();
+    assert!(error.contains("no longer the active release"), "{error}");
+    assert_eq!(selector(), stale);
+    fs::write(&selector_path, &original).unwrap();
+
+    let paused = guarded_job(&pane, Some(1), pause(token())).await.unwrap();
+    assert_eq!(paused["bundle_sha256"], id);
+    assert_eq!(paused["automatic_sync_paused"], true);
+    assert!(selector().ends_with(&format!("./versions/{id}\n")));
+    let error = guarded_job(&pane, Some(1), resume(token()))
+        .await
+        .unwrap_err();
+    assert!(error.contains("review is stale"), "{error}");
+    assert!(selector().ends_with(&format!("./versions/{id}\n")));
+    let versions = guarded_job(&pane, Some(1), Operation::ToolBundleVersions)
+        .await
+        .unwrap();
+    assert_eq!(versions["versions"][0]["bundle_sha256"], id);
+    assert_eq!(versions["versions"][0]["held"], true);
+
+    let held = connect_tools(&options);
+    wait_tool_login(&held, 1, "held", None).await;
+    assert!(
+        held.frames
+            .load()
+            .rows
+            .iter()
+            .any(|row| { row.as_str().contains(&format!("tools-at-shell:{id}:true")) })
+    );
+    assert_eq!(fs::read_dir(store.join("versions")).unwrap().count(), 1);
+    assert_eq!(fs::read(&executable).unwrap(), installed);
+    assert_eq!(fs::read(root.join(".bashrc")).unwrap(), startup);
+
+    let review = guarded_job(&held, Some(1), resume(None)).await.unwrap();
+    guarded_job(
+        &held,
+        Some(1),
+        resume(Some(review["review"].as_str().unwrap().to_owned())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(selector(), original);
+    let updated = connect_tools(&options);
+    wait_tool_login(&updated, 1, "updated", Some("current")).await;
+    let next = selector();
+    let release = next.lines().nth(1).unwrap();
+    assert_ne!(release, format!("versions/{id}"));
+    assert_eq!(fs::read(store.join(release).join("rg")).unwrap()[255], 2);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn approved_tool_sync_installs_before_shell_and_respects_manual_changes() {
     let (source, remote, _, server) = fixture_connections(false, 8).await;
     let root = remote.path();

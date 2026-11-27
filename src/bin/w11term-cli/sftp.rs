@@ -35,6 +35,8 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   rollback-tool-bundle NAME SHA256 --review TOKEN\n\
   preview-tool-bundle-resume NAME SHA256\n\
   resume-tool-bundle-updates NAME SHA256 --review TOKEN\n\
+  preview-tool-bundle-pause NAME SHA256\n\
+  pause-tool-bundle-updates NAME SHA256 --review TOKEN\n\
   preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
   apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   list-dotfile-versions --shell bash|zsh\n\
@@ -363,10 +365,12 @@ pub fn parse(
         "preview-tool-bundle-rollback"
         | "rollback-tool-bundle"
         | "preview-tool-bundle-resume"
-        | "resume-tool-bundle-updates" => {
+        | "resume-tool-bundle-updates"
+        | "preview-tool-bundle-pause"
+        | "pause-tool-bundle-updates" => {
             if matches!(
                 command.as_str(),
-                "rollback-tool-bundle" | "resume-tool-bundle-updates"
+                "rollback-tool-bundle" | "resume-tool-bundle-updates" | "pause-tool-bundle-updates"
             ) {
                 let token = opts
                     .remove("--review")
@@ -376,6 +380,9 @@ pub fn parse(
             let op = match command.as_str() {
                 "preview-tool-bundle-resume" | "resume-tool-bundle-updates" => {
                     "resume-tool-bundle-updates"
+                }
+                "preview-tool-bundle-pause" | "pause-tool-bundle-updates" => {
+                    "pause-tool-bundle-updates"
                 }
                 _ => "rollback-tool-bundle",
             };
@@ -691,6 +698,48 @@ mod tests {
         .unwrap();
         assert!(matches!(apply, Request::Sftp {
             pane: 9, operation: Operation::ResumeToolBundleUpdates { bundle_sha256, review: Some(review), .. }, ..
+        } if bundle_sha256 == version && review == token));
+    }
+
+    #[test]
+    fn pausing_tool_updates_requires_a_review_for_one_release() {
+        let version = "a".repeat(64);
+        let token = "b".repeat(64);
+        assert!(
+            p(&[
+                "--pane",
+                "9",
+                "pause-tool-bundle-updates",
+                "fleet",
+                &version
+            ])
+            .is_err()
+        );
+        let (_, preview) = p(&[
+            "--pane",
+            "9",
+            "preview-tool-bundle-pause",
+            "fleet",
+            &version,
+        ])
+        .unwrap();
+        assert!(matches!(preview, Request::Sftp {
+            pane: 9,
+            operation: Operation::PauseToolBundleUpdates { name, bundle_sha256, review: None }, ..
+        } if name == "fleet" && bundle_sha256 == version));
+        let (_, apply) = p(&[
+            "--pane",
+            "9",
+            "pause-tool-bundle-updates",
+            "fleet",
+            &version,
+            "--review",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(apply, Request::Sftp {
+            pane: 9,
+            operation: Operation::PauseToolBundleUpdates { bundle_sha256, review: Some(review), .. }, ..
         } if bundle_sha256 == version && review == token));
     }
 

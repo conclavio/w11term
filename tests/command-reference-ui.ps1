@@ -325,6 +325,31 @@ try {
         (Find-Element 'Resumed automatic updates for portable') -and
         [IO.File]::ReadAllText($selectorPath).TrimEnd().EndsWith("`nversions/$oldId")
     }
+    $unpaused = [IO.File]::ReadAllText($selectorPath)
+    Click 'Review update pause'
+    $null = Wait-Until 'pause review explains that the current release stays installed' {
+        Find-Element 'Keep this release installed and skip this bundle on future SSH logins.'
+    }
+    if ([IO.File]::ReadAllText($selectorPath) -cne $unpaused) { throw 'Review paused the bundle before approval' }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot pause automatic updates' {
+        $pause = Find-Element 'Pause automatic updates' $button
+        $pause -and !$pause.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    Click 'Pause automatic updates'
+    $null = Wait-Until 'automatic updates paused for the same active version' {
+        (Find-Element 'Paused automatic updates for portable') -and
+        [IO.File]::ReadAllText($selectorPath).TrimEnd().EndsWith("`n./versions/$oldId")
+    }
+    Click 'Review update resumption'
+    Click 'Resume automatic updates'
+    $null = Wait-Until 'resuming returns the same release to automatic updates' {
+        (Find-Element 'Resumed automatic updates for portable') -and
+        [IO.File]::ReadAllText($selectorPath) -ceq $unpaused
+    }
     $originalProfile = ($beforeSave | ConvertFrom-Json).profiles.'palette-ssh'
     Click 'Review in this SSH profile'
     $null = Wait-Until 'profile reviews the saved manifest for the authenticated SSH account' {

@@ -339,6 +339,12 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         review: Option<String>,
     },
+    PauseToolBundleUpdates {
+        name: String,
+        bundle_sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
     PreviewDotfiles {
         bundle: DotfileBundle,
         shell: DotfileShell,
@@ -1097,6 +1103,7 @@ pub(crate) async fn run(
                 | Operation::AddToToolBundle { .. }
                 | Operation::RemoveFromToolBundle { .. }
                 | Operation::RollbackToolBundle { .. }
+                | Operation::PauseToolBundleUpdates { .. }
                 | Operation::ResumeToolBundleUpdates { .. } => {
                     JobStage::Checking("Tool bundle review did not finish")
                 }
@@ -1689,10 +1696,26 @@ impl Engine {
                 bundle_sha256,
                 review,
             } => {
-                self.resume_utility_updates(
+                self.set_utility_updates_paused(
                     session,
                     &name,
                     &bundle_sha256,
+                    false,
+                    review.as_deref(),
+                    stage,
+                )
+                .await?
+            }
+            PauseToolBundleUpdates {
+                name,
+                bundle_sha256,
+                review,
+            } => {
+                self.set_utility_updates_paused(
+                    session,
+                    &name,
+                    &bundle_sha256,
+                    true,
                     review.as_deref(),
                     stage,
                 )

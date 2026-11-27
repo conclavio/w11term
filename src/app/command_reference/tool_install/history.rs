@@ -6,10 +6,10 @@ pub enum Action {
     Listed(Arc<()>, Result<ToolBundleVersions, String>),
     Select(Option<usize>),
     Review,
-    ReviewResume,
+    ReviewPolicy(UpdatePolicy),
     Reviewed(Arc<()>, Result<ReviewedVersion, String>),
     Restore,
-    Resume,
+    SetPolicy(UpdatePolicy),
     Switched(Arc<()>, Result<SwitchReport, String>),
     Save,
     Saved(Arc<()>, Result<SavedBundle, String>),
@@ -20,11 +20,17 @@ pub enum Action {
 
 pub enum ReviewedVersion {
     Rollback(Box<RollbackReview>),
-    Resume(ResumeReview),
+    UpdatePolicy(UpdatePolicy, PolicyReview),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePolicy {
+    Pause,
+    Resume,
 }
 
 #[derive(Deserialize)]
-pub struct ResumeReview {
+pub struct PolicyReview {
     home: String,
     bundle: String,
     bundle_sha256: String,
@@ -93,15 +99,15 @@ pub struct SavedBundle {
 enum Work {
     List,
     Review,
-    ReviewResume,
+    ReviewPolicy(UpdatePolicy),
     Restore,
-    Resume,
+    SetPolicy(UpdatePolicy),
     Save,
 }
 
 impl Work {
     fn writes(self) -> bool {
-        matches!(self, Self::Restore | Self::Resume | Self::Save)
+        matches!(self, Self::Restore | Self::SetPolicy(_) | Self::Save)
     }
 }
 
@@ -136,10 +142,10 @@ impl Panel {
         ticket
     }
 
-    fn finish(&mut self, ticket: &Arc<()>, work: Work) -> bool {
+    fn finish(&mut self, ticket: &Arc<()>, accepts: impl FnOnce(Work) -> bool) -> Option<Work> {
         self.pending
-            .take_if(|(pending, kind)| *kind == work && Arc::ptr_eq(pending, ticket))
-            .is_some()
+            .take_if(|(pending, work)| Arc::ptr_eq(pending, ticket) && accepts(*work))
+            .map(|(_, work)| work)
     }
 
     fn selected(&self) -> Option<&RetainedToolVersion> {
@@ -154,7 +160,9 @@ impl Panel {
             {
                 review.review.as_deref()
             }
-            (ReviewedVersion::Resume(review), Work::Resume) if review.ready => {
+            (ReviewedVersion::UpdatePolicy(reviewed, review), Work::SetPolicy(policy))
+                if *reviewed == policy && review.ready =>
+            {
                 review.review.as_deref()
             }
             _ => None,
@@ -193,9 +201,10 @@ impl Panel {
             Some(match work {
                 Work::List => "Reading retained tool bundles…",
                 Work::Review => "Verifying retained tool bundle…",
-                Work::ReviewResume => "Reviewing automatic updates…",
+                Work::ReviewPolicy(_) => "Reviewing automatic updates…",
                 Work::Restore => "Restoring reviewed tool bundle…",
-                Work::Resume => "Resuming automatic updates…",
+                Work::SetPolicy(UpdatePolicy::Pause) => "Pausing automatic updates…",
+                Work::SetPolicy(UpdatePolicy::Resume) => "Resuming automatic updates…",
                 Work::Save => "Saving the pinned Linux executables on Windows…",
             })
         } else if !active {
@@ -251,19 +260,34 @@ impl Panel {
         }
         match &self.review {
             Some(ReviewedVersion::Rollback(review)) => review.describe(&mut fields),
-            Some(ReviewedVersion::Resume(review)) => review.describe(&mut fields),
+            Some(ReviewedVersion::UpdatePolicy(policy, review)) => {
+                review.describe(*policy, &mut fields)
+            }
             None => (),
         }
-        let actions = if self.selected().is_some_and(|row| row.held) {
-            StackPanel::new().spacing(8.0).children((
-                button("Review update resumption", available, || {
-                    Action::ReviewResume
-                }),
-                button(
+        let actions = if let Some(row) = self.selected().filter(|row| row.active) {
+            let (policy, review, confirm) = if row.held {
+                (
+                    UpdatePolicy::Resume,
+                    "Review update resumption",
                     "Resume automatic updates",
-                    available && self.token(Work::Resume).is_some(),
-                    || Action::Resume,
-                ),
+                )
+            } else {
+                (
+                    UpdatePolicy::Pause,
+                    "Review update pause",
+                    "Pause automatic updates",
+                )
+            };
+            StackPanel::new().spacing(8.0).children((
+                Button::new()
+                    .is_enabled(available)
+                    .on_click(ctx.callback(move |_| message(Action::ReviewPolicy(policy))))
+                    .content(review),
+                Button::new()
+                    .is_enabled(available && self.token(Work::SetPolicy(policy)).is_some())
+                    .on_click(ctx.callback(move |_| message(Action::SetPolicy(policy))))
+                    .content(confirm),
             ))
         } else {
             StackPanel::new().spacing(8.0).children((
@@ -338,21 +362,28 @@ fn version_label(row: &RetainedToolVersion) -> String {
     format!("{} · {digest}{suffix}", row.bundle)
 }
 
-impl ResumeReview {
-    fn describe(&self, fields: &mut Vec<KeyedView>) {
+impl PolicyReview {
+    fn describe(&self, policy: UpdatePolicy, fields: &mut Vec<KeyedView>) {
         fields.push(detail(
-            "resume-destination",
+            "update-destination",
             format!(
                 "{} · Home {}\nActive SHA-256 {}",
                 self.bundle, self.home, self.bundle_sha256
             ),
         ));
         fields.push(detail(
-            "resume-effect",
-            if self.ready {
-                "Approved SSH profiles can sync this bundle on their next connection."
+            "update-effect",
+            if !self.ready {
+                "Changing automatic updates requires the server's atomic rename extension."
             } else {
-                "Resuming updates requires the server's atomic rename extension."
+                match policy {
+                    UpdatePolicy::Pause => {
+                        "Keep this release installed and skip this bundle on future SSH logins."
+                    }
+                    UpdatePolicy::Resume => {
+                        "Approved SSH profiles can sync this bundle on their next connection."
+                    }
+                }
             },
         ));
     }
@@ -532,9 +563,9 @@ impl TerminalApp {
             }
             Action::Open
             | Action::Review
-            | Action::ReviewResume
+            | Action::ReviewPolicy(_)
             | Action::Restore
-            | Action::Resume
+            | Action::SetPolicy(_)
             | Action::Save => {
                 let Some(input) = input else { return };
                 if history.pending.is_some() {
@@ -543,8 +574,8 @@ impl TerminalApp {
                 let work = match action {
                     Action::Open => Work::List,
                     Action::Review => Work::Review,
-                    Action::ReviewResume => Work::ReviewResume,
-                    Action::Resume => Work::Resume,
+                    Action::ReviewPolicy(policy) => Work::ReviewPolicy(policy),
+                    Action::SetPolicy(policy) => Work::SetPolicy(policy),
                     Action::Save => Work::Save,
                     _ => Work::Restore,
                 };
@@ -563,11 +594,15 @@ impl TerminalApp {
                         directory,
                     }
                 } else {
-                    let resume = matches!(work, Work::ReviewResume | Work::Resume);
-                    let Some(row) = history
-                        .selected()
-                        .filter(|row| if resume { row.held } else { !row.active })
-                    else {
+                    let policy = match work {
+                        Work::ReviewPolicy(policy) | Work::SetPolicy(policy) => Some(policy),
+                        _ => None,
+                    };
+                    let Some(row) = history.selected().filter(|row| match policy {
+                        Some(UpdatePolicy::Pause) => row.active && !row.held,
+                        Some(UpdatePolicy::Resume) => row.active && row.held,
+                        None => !row.active,
+                    }) else {
                         return;
                     };
                     let review = if work.writes() {
@@ -578,18 +613,22 @@ impl TerminalApp {
                     } else {
                         None
                     };
-                    if resume {
-                        Operation::ResumeToolBundleUpdates {
+                    match policy {
+                        Some(UpdatePolicy::Pause) => Operation::PauseToolBundleUpdates {
                             name: row.bundle.clone(),
                             bundle_sha256: row.bundle_sha256.clone(),
                             review,
-                        }
-                    } else {
-                        Operation::RollbackToolBundle {
+                        },
+                        Some(UpdatePolicy::Resume) => Operation::ResumeToolBundleUpdates {
                             name: row.bundle.clone(),
                             bundle_sha256: row.bundle_sha256.clone(),
                             review,
-                        }
+                        },
+                        None => Operation::RollbackToolBundle {
+                            name: row.bundle.clone(),
+                            bundle_sha256: row.bundle_sha256.clone(),
+                            review,
+                        },
                     }
                 };
                 if work == Work::Save {
@@ -633,13 +672,20 @@ impl TerminalApp {
                     history.saved = None;
                 }
             }
-            Action::Listed(ticket, result) if history.finish(&ticket, Work::List) => match result {
-                Ok(versions) => history.versions = Some(versions),
-                Err(error) => history.status = Some(error),
-            },
+            Action::Listed(ticket, result)
+                if history.finish(&ticket, |work| work == Work::List).is_some() =>
+            {
+                match result {
+                    Ok(versions) => history.versions = Some(versions),
+                    Err(error) => history.status = Some(error),
+                }
+            }
             Action::Reviewed(ticket, result) => {
-                if !history.finish(&ticket, Work::Review)
-                    && !history.finish(&ticket, Work::ReviewResume)
+                if history
+                    .finish(&ticket, |work| {
+                        matches!(work, Work::Review | Work::ReviewPolicy(_))
+                    })
+                    .is_none()
                 {
                     return;
                 }
@@ -648,7 +694,9 @@ impl TerminalApp {
                     Err(error) => history.status = Some(error),
                 }
             }
-            Action::Saved(ticket, result) if history.finish(&ticket, Work::Save) => {
+            Action::Saved(ticket, result)
+                if history.finish(&ticket, |work| work == Work::Save).is_some() =>
+            {
                 history.status = Some(match result {
                     Ok(saved) => {
                         history.saved = Some(saved);
@@ -668,15 +716,17 @@ impl TerminalApp {
                 }
             }
             Action::Switched(ticket, result) => {
-                let held = history.finish(&ticket, Work::Restore);
-                if !held && !history.finish(&ticket, Work::Resume) {
+                let Some(work) = history.finish(&ticket, |work| {
+                    matches!(work, Work::Restore | Work::SetPolicy(_))
+                }) else {
                     return;
-                }
+                };
                 history.status = Some(match result {
                     Ok(switch) => {
-                        if held {
+                        if work == Work::Restore {
                             reference.tools = None;
                         }
+                        let held = work != Work::SetPolicy(UpdatePolicy::Resume);
                         installer.review = None;
                         installer.path_setup = None;
                         installer.status = None;
@@ -690,10 +740,15 @@ impl TerminalApp {
                                 row.held = row.active && held;
                             }
                         }
-                        if held {
-                            format!("Restored tool bundle {}", switch.bundle)
-                        } else {
-                            format!("Resumed automatic updates for {}", switch.bundle)
+                        match work {
+                            Work::Restore => format!("Restored tool bundle {}", switch.bundle),
+                            Work::SetPolicy(UpdatePolicy::Pause) => {
+                                format!("Paused automatic updates for {}", switch.bundle)
+                            }
+                            Work::SetPolicy(UpdatePolicy::Resume) => {
+                                format!("Resumed automatic updates for {}", switch.bundle)
+                            }
+                            _ => unreachable!("only version and policy changes complete here"),
                         }
                     }
                     Err(error) => error,
@@ -712,8 +767,11 @@ fn result_message(
     message(match work {
         Work::List => Action::Listed(ticket, decode(result)),
         Work::Review => Action::Reviewed(ticket, decode(result).map(ReviewedVersion::Rollback)),
-        Work::ReviewResume => Action::Reviewed(ticket, decode(result).map(ReviewedVersion::Resume)),
-        Work::Restore | Work::Resume => Action::Switched(ticket, decode(result)),
+        Work::ReviewPolicy(policy) => Action::Reviewed(
+            ticket,
+            decode(result).map(|report| ReviewedVersion::UpdatePolicy(policy, report)),
+        ),
+        Work::Restore | Work::SetPolicy(_) => Action::Switched(ticket, decode(result)),
         Work::Save => Action::Saved(ticket, decode(result)),
     })
 }
