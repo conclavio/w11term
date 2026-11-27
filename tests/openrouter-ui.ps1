@@ -98,6 +98,67 @@ function Review-VisibleSshPane {
     $null = Wait-Until 'reviewed viewport response' { Find-Element 'explained the reviewed viewport' }
 }
 
+function Review-SyscallComparison {
+    $working = Join-Path $State 'private working trace.strace'
+    $failing = Join-Path $State 'private failing trace.strace'
+    [IO.File]::WriteAllText($working, @'
+21 1700000000.000000 execve("/bin/diag", ["diag"], NULL) = 0
+21 1700000000.001000 openat(AT_FDCWD, "/tmp/unmatched-private", O_RDONLY) = 3
+21 1700000000.002000 openat(AT_FDCWD, "/tmp/review-data", O_RDONLY) = 4
+21 1700000000.003000 read(4</tmp/review-data>, "raw-sensitive-buffer", 20) = 20
+21 1700000000.004000 read(4</tmp/review-data>, "extra-buffer", 12) = 12
+'@ + "`n")
+    [IO.File]::WriteAllText($failing, @'
+77 1800000000.000000 execve("/bin/diag", ["diag"], NULL) = 0
+77 1800000000.001000 openat(AT_FDCWD, "/tmp/unmatched-private", O_RDONLY) = -1 ENOENT (No such file or directory)
+77 1800000000.002000 openat(AT_FDCWD, "/tmp/review-data", O_RDONLY) = 8
+77 1800000000.003000 read(8</tmp/review-data>, "raw-sensitive-buffer", 20) = 20
+'@ + "`n")
+    $windowId = ((Control @('list-windows')).windows | Select-Object -First 1).window_id
+    $null = Control @('open-diagnostic','--window',"$windowId",'--kind','syscall-trace','--file',$working,'--compare-with',$failing)
+    Set-Field 'Filter syscall changes' 'read /tmp/review-data'
+    Click 'Apply change filter'
+    $dot = ' ' + [char]0xb7 + ' '
+    $null = Wait-Until 'the applied filter selects the count change' {
+        (Find-Element "1 matching change row${dot}Page 1 of 1") -and (Find-Element 'Evidence 2 of 2')
+    }
+    Click 'Previous comparison evidence'
+    $null = Wait-Until 'the first pair is selected' { Find-Element 'Evidence 1 of 2' }
+    Set-Field 'Filter syscall changes' 'unapplied-private-filter'
+    Click ('Review comparison with OpenRouter' + [char]0x2026)
+    $seed = Wait-Until 'the syscall review draft reflects the selected evidence' {
+        $field = Find-Element $preview $edit
+        if ($field -and $field.Current.IsEnabled) {
+            $text = $field.GetCurrentPattern($value).Current.Value
+            if ($text.Contains('Syscall trace comparison') -and
+                $text.Contains('1 of 2 change rows match the applied filter') -and
+                $text.Contains('Evidence pair 1 of 2') -and
+                $text.Contains('Working') -and $text.Contains('Failing') -and
+                $text.Contains('Source 1 line 4')) { $text }
+        }
+    }
+    foreach ($excluded in @('raw-sensitive-buffer','extra-buffer','unmatched-private',
+            'unapplied-private-filter','private working trace.strace','private failing trace.strace')) {
+        if ($seed.Contains($excluded)) { throw "Syscall review unexpectedly included '$excluded'" }
+    }
+    Confirm-NoRequest 5
+    $edited = $seed.Replace("`r`n", "`r").Replace("`n", "`r").Replace('/tmp/review-data', '[resource hidden]')
+    if ($edited -ceq $seed) { throw 'The syscall preview omitted its normalized resource before redaction' }
+    Set-Field $preview $edited
+    Click 'Review OpenRouter request'
+    $null = Wait-Until 'the revised syscall evidence is ready to send' { Find-Element 'Send reviewed request' $button }
+    Confirm-NoRequest 5
+    [IO.File]::WriteAllText((Join-Path $State 'approved-syscall'), $edited.Replace("`r", "`n"))
+    Click 'Send reviewed request'
+    $null = Wait-Until 'the reviewed syscall response is displayed' { Find-Element 'reviewed the syscall evidence' }
+    Click 'Back to syscall viewer'
+    $null = Wait-Until 'return restores the selected trace evidence' {
+        (Find-Element 'Evidence 1 of 2') -and (Find-Element "1 matching change row${dot}Page 1 of 1")
+    }
+    Click ('Review comparison with OpenRouter' + [char]0x2026)
+    $null = Wait-Until 'the source can start another draft' { Find-Element 'Review syscall comparison evidence' }
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', '"Palette PowerShell"', '--cols', '120', '--rows', '24') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -159,6 +220,7 @@ try {
     }
     if (Find-Element 'late fixture reply') { throw 'Cancellation allowed a late response' }
     Review-VisibleSshPane
+    Review-SyscallComparison
     Click 'Remove OpenRouter key'
     $null = Wait-Until 'saved key is removed' { Find-Element 'Saved OpenRouter API key removed' }
     if ((Find-Element 'late fixture reply') -or (Test-Path -LiteralPath $credential)) {

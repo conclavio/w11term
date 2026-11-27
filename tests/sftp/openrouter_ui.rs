@@ -41,7 +41,7 @@ async fn native_openrouter_requires_an_explicit_review_and_never_submits_the_rep
 fn serve(listener: TcpListener, directory: &Path) {
     listener.set_nonblocking(true).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    for index in 0..5 {
+    for index in 0..6 {
         let mut client = loop {
             match listener.accept() {
                 Ok((client, _)) => break client,
@@ -94,6 +94,14 @@ fn serve(listener: TcpListener, directory: &Path) {
                         .unwrap()
                         .contains("quoted terminal evidence")
                 );
+            } else if index == 5 {
+                let expected = fs::read_to_string(directory.join("approved-syscall")).unwrap();
+                assert_eq!(text, expected);
+                assert!(text.contains("Resource [resource hidden]"));
+                assert!(!text.contains("/tmp/review-data"));
+                let prompt = request["messages"][0]["content"].as_str().unwrap();
+                assert!(prompt.contains("quoted diagnostic evidence"));
+                assert!(prompt.contains("run side, source number, and line number"));
             } else {
                 assert_eq!(
                     text,
@@ -136,9 +144,13 @@ fn serve(listener: TcpListener, directory: &Path) {
                 "200 OK",
                 json!({"choices": [{"message": {"content": "late fixture reply"}}]}),
             ),
-            _ => (
+            4 => (
                 "200 OK",
                 json!({"choices": [{"message": {"content": "explained the reviewed viewport"}}]}),
+            ),
+            _ => (
+                "200 OK",
+                json!({"choices": [{"message": {"content": "reviewed the syscall evidence"}}]}),
             ),
         };
         let body = serde_json::to_string(&reply).unwrap();

@@ -1594,6 +1594,8 @@ Open **More → Draft a Bash command with OpenRouter** to describe a task, or se
 
 In a triage comparison, **Review comparison with OpenRouter…** drafts an editable preview of the changes, coverage limitations, and paired evidence for the selected row. The default preview leaves out report paths, host addresses, usernames, and host fingerprints from the report headers. It keeps the comparison open beside the review so you can check the output against both sources.
 
+In a syscall comparison, select a change and its evidence pair, then choose **Review comparison with OpenRouter…**. The draft shows the selected outcomes, relative timing and numbered source lines, plus a bounded list of changes within the applied filter. The preview includes normalized remote resource and executable names. Raw syscall lines and local filenames stay in the viewer. Use **Back to syscall viewer** to return to the same comparison.
+
 Edit the preview to remove any details you want to keep local. The preview accepts up to 16 KiB of text. **Review OpenRouter request** shows the destination, model, and privacy policy. **Send reviewed request** submits the displayed text.
 
 The response appears as selectable text. **Copy response** puts it on the Windows clipboard for manual use. Token usage appears when OpenRouter returns it. **Stop waiting** discards the eventual response in w11term. A request already sent can still finish at OpenRouter.

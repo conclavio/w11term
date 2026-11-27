@@ -30,6 +30,7 @@ pub enum Action {
     Send(TabId),
     Cancel(TabId),
     Copy(TabId),
+    BackToSyscall(TabId),
     Ready(TabId, Arc<()>, Result<Outcome, String>),
 }
 
@@ -52,6 +53,7 @@ struct Pending {
 
 enum Evidence {
     Text(String),
+    SyscallComparison { source: TabId, text: String },
     MissingSelection,
     Viewport(Arc<Snapshot>),
 }
@@ -59,7 +61,7 @@ enum Evidence {
 impl Evidence {
     fn read(self) -> Result<String, &'static str> {
         match self {
-            Self::Text(text) => Ok(text),
+            Self::Text(text) | Self::SyscallComparison { text, .. } => Ok(text),
             Self::MissingSelection => {
                 Err("Select terminal text or paste an excerpt into the preview.")
             }
@@ -79,6 +81,7 @@ impl Evidence {
 pub(super) struct PageState {
     loaded: bool,
     task: Option<Task>,
+    syscall_source: Option<TabId>,
     prefs: Preferences,
     models: Vec<Model>,
     key: Zeroizing<String>,
@@ -128,6 +131,19 @@ impl TerminalApp {
         self.show_openrouter(Task::TriageComparison, Evidence::Text(evidence), ctx);
     }
 
+    pub(super) fn review_syscall_comparison_with_openrouter(
+        &mut self,
+        source: TabId,
+        text: String,
+        ctx: &ComponentContext<Self>,
+    ) {
+        self.show_openrouter(
+            Task::SyscallComparison,
+            Evidence::SyscallComparison { source, text },
+            ctx,
+        );
+    }
+
     fn show_openrouter(&mut self, task: Task, evidence: Evidence, ctx: &ComponentContext<Self>) {
         self.set_diagnostics_drawer(
             matches!(task, Task::Triage | Task::TriageComparison)
@@ -160,6 +176,10 @@ impl TerminalApp {
         page.review = None;
         page.reply = None;
         page.task = Some(task);
+        page.syscall_source = match &evidence {
+            Evidence::SyscallComparison { source, .. } => Some(*source),
+            _ => None,
+        };
         page.evidence.clear();
         let viewport = matches!(evidence, Evidence::Viewport(_));
         let load_settings = !page.loaded;
@@ -228,6 +248,22 @@ impl TerminalApp {
                     self.show_openrouter(Task::Explain, Evidence::Viewport(frame), ctx);
                 } else {
                     self.window_error = Some("The focused pane changed. Choose the pane again to review its visible text.".into());
+                }
+                return;
+            }
+            Action::BackToSyscall(id) => {
+                if self.tabs.active_id() == Some(*id)
+                    && let Some(source) = self
+                        .openrouter_page(*id)
+                        .and_then(|page| page.syscall_source)
+                {
+                    if self.tabs.get(source).is_some() {
+                        self.tabs.select(source);
+                        self.sync_selection(ctx);
+                        self.activate(ctx);
+                    } else if let Some(page) = self.openrouter_page(*id) {
+                        page.status = Some("The source syscall viewer is no longer open.".into());
+                    }
                 }
                 return;
             }
@@ -556,6 +592,7 @@ impl PageState {
                     Task::Draft => "Describe the Bash task",
                     Task::Triage => "Review Linux performance evidence",
                     Task::TriageComparison => "Review Linux performance changes",
+                    Task::SyscallComparison => "Review syscall comparison evidence",
                 },
             ),
             KeyedView::new(
@@ -578,6 +615,15 @@ impl PageState {
                 ),
             ),
         ]);
+        if self.syscall_source.is_some() {
+            fields.insert(
+                1,
+                KeyedView::new(
+                    "return-to-syscall",
+                    button("Back to syscall viewer", true, Action::BackToSyscall),
+                ),
+            );
+        }
         if let Some(review) = &self.review {
             fields.extend([
                 line(

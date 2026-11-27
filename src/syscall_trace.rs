@@ -87,6 +87,13 @@ pub struct Raw {
     len: u32,
 }
 
+impl Raw {
+    /// The one-based position of this record's file in the trace's source list.
+    pub fn source_number(self) -> usize {
+        usize::from(self.source) + 1
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Stamp {
     ns: u64,

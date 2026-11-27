@@ -1,13 +1,151 @@
 use super::{
     COMPARISON_LIMIT, Comparison, ComparisonRow, ViewState, delta, evidence_text, safe_text,
 };
+use crate::app::openrouter_assistance::clip;
 use std::{
+    fmt::Write as _,
     io::{self, BufWriter, Write},
     path::Path,
     sync::Arc,
 };
 
 const SIDES: [&str; 2] = ["Working", "Failing"];
+const REVIEW_OTHER_ROWS: usize = 12;
+
+impl ViewState {
+    pub(super) fn openrouter_preview(&self) -> Option<String> {
+        let selected = self.selected?;
+        let (comparison, row) = self.current()?;
+        let first = comparison.first_divergence();
+        let mut preview = String::from("Syscall trace comparison\n");
+        for (label, trace) in SIDES.into_iter().zip(comparison.traces()) {
+            let _ = writeln!(
+                preview,
+                "{label} · {} source files · {} calls",
+                trace.file_count(),
+                trace.events().len(),
+            );
+        }
+        let scope = if self.applied.is_some() {
+            "match the applied filter"
+        } else {
+            "are shown"
+        };
+        let timing = if self.timing { "included" } else { "hidden" };
+        let _ = writeln!(
+            preview,
+            "{} of {} change rows {scope}. Timing-only changes are {timing}.",
+            self.visible.len(),
+            comparison.rows().len(),
+        );
+        if comparison.limited {
+            let _ = writeln!(preview, "{COMPARISON_LIMIT}");
+        }
+        preview.push_str("\nSelected change\n");
+        review_row(&mut preview, row, first == Some(selected));
+        let _ = writeln!(
+            preview,
+            "Evidence pair {} of {}",
+            self.sample + 1,
+            row.evidence_count(),
+        );
+        for (side, label) in SIDES.into_iter().enumerate() {
+            let Some(index) = comparison.event(row, side, self.sample) else {
+                let _ = writeln!(preview, "{label} · No corresponding call");
+                continue;
+            };
+            let trace = &comparison.traces()[side];
+            let event = &trace.events()[index];
+            let outcome = event
+                .error
+                .as_deref()
+                .unwrap_or_else(|| event.outcome.label());
+            let _ = write!(preview, "{label} · {}", review_field(outcome));
+            for raw in event.originals() {
+                let _ = write!(
+                    preview,
+                    " · Source {} line {}",
+                    raw.source_number(),
+                    raw.line
+                );
+            }
+            if let Some(elapsed) = trace.relative_start(index) {
+                let _ = write!(
+                    preview,
+                    " · +{:.3} ms from run start",
+                    elapsed as f64 / 1_000_000.0
+                );
+            }
+            if let Some(duration) = event.duration {
+                let _ = write!(
+                    preview,
+                    " · {:.3} ms duration",
+                    duration as f64 / 1_000_000.0
+                );
+            }
+            if event.later_success {
+                preview.push_str(" · Later success on the same resource");
+            }
+            preview.push('\n');
+        }
+        if self.visible.len() > 1 {
+            preview.push_str("\nOther matching changes\n");
+            for &index in self
+                .visible
+                .iter()
+                .filter(|&&index| index != selected)
+                .take(REVIEW_OTHER_ROWS)
+            {
+                review_row(
+                    &mut preview,
+                    &comparison.rows()[index],
+                    first == Some(index),
+                );
+            }
+            let omitted = self.visible.len().saturating_sub(REVIEW_OTHER_ROWS + 1);
+            if omitted != 0 {
+                let _ = writeln!(preview, "{omitted} additional matching changes omitted.");
+            }
+        }
+        Some(preview)
+    }
+}
+
+fn review_row(output: &mut String, row: &ComparisonRow, first_divergence: bool) {
+    let _ = write!(output, "{} · {}", row.kind.label(), review_field(&row.call),);
+    if !row.resource.is_empty() {
+        let _ = write!(output, " · Resource {}", review_field(&row.resource));
+    }
+    if !row.process.is_empty() {
+        let _ = write!(output, " · Executable {}", review_field(&row.process));
+    }
+    let [working, failing] = row.counts();
+    let _ = write!(output, " · Working {working}, failing {failing}");
+    if let [Some(before), Some(after)] = row.durations {
+        let _ = write!(
+            output,
+            " · Total duration delta {:+.3} ms",
+            delta(before, after)
+        );
+    }
+    if first_divergence {
+        output.push_str(" · First observed divergence");
+    }
+    if row.uncertain {
+        output.push_str(" · Uncertain alignment");
+    }
+    output.push('\n');
+}
+
+fn review_field(text: &str) -> String {
+    let safe = safe_text(text);
+    let clipped = clip(&safe, 192);
+    if clipped.len() < safe.len() {
+        format!("{clipped}…")
+    } else {
+        safe
+    }
+}
 
 pub(super) struct Snapshot {
     comparison: Arc<Comparison>,
@@ -242,5 +380,15 @@ mod tests {
         assert!(text.contains("45. Added call · stat · \"/tmp/setting-44\""));
         assert!(text.contains("Failing · OK · failing.strace line 46"));
         assert!(text.contains("Evidence for change 1 · pair 1 of 1"));
+
+        let preview = state.openrouter_preview().unwrap();
+        assert!(preview.len() < w11term::openrouter::MAX_INPUT);
+        assert!(preview.contains("45 of 45 change rows are shown"));
+        assert!(preview.contains("32 additional matching changes omitted"));
+        assert!(preview.contains("Failing · OK · Source 1 line 2"));
+        assert!(!preview.contains("working.strace"));
+        assert!(!preview.contains("failing.strace"));
+        assert!(!preview.contains("/tmp/setting-44"));
+        assert!(!preview.contains("stat("));
     }
 }

@@ -21,6 +21,7 @@ pub enum Action {
     Filter(TabId),
     Filtered(TabId, Arc<()>, Result<AppliedFilter, String>),
     Export(TabId),
+    OpenRouter(TabId),
 }
 
 pub struct AppliedFilter {
@@ -189,6 +190,15 @@ impl TerminalApp {
                         },
                         ctx,
                     );
+                }
+            }
+            Action::OpenRouter(tab) => {
+                if self.tabs.active_id() == Some(tab)
+                    && let Some(text) = self
+                        .comparison_input(tab)
+                        .and_then(|state| state.openrouter_preview())
+                {
+                    self.review_syscall_comparison_with_openrouter(tab, text, ctx);
                 }
             }
         }
@@ -647,6 +657,13 @@ impl ViewState {
                     ctx.callback(move |_| message(Action::Evidence(tab, false))),
                     ctx.callback(move |_| message(Action::Evidence(tab, true))),
                 ),
+            ));
+            heading.push(KeyedView::new(
+                "review-with-openrouter",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(ctx.callback(move |_| message(Action::OpenRouter(tab))))
+                    .content("Review comparison with OpenRouter…"),
             ));
         } else {
             let text = if compare.rows().is_empty() {
