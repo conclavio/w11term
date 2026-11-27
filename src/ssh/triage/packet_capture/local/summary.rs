@@ -7,9 +7,12 @@ use std::{
 };
 
 mod conversations;
+mod ip;
 mod pcapng;
+mod protocols;
 mod timeline;
 pub use conversations::{Conversations, Traffic};
+pub use protocols::IpProtocols;
 pub use timeline::{Bucket, Timeline};
 
 const MAX_RECORDS: u32 = 1_000_000;
@@ -23,6 +26,7 @@ pub struct Summary {
     pub issue: Option<String>,
     pub timeline: Option<Timeline>,
     pub conversations: Conversations,
+    pub ip_protocols: IpProtocols,
 }
 
 pub struct InterfaceSummary {
@@ -100,7 +104,7 @@ impl Summary {
             1_000_000
         };
         let mut remaining = bytes - 24;
-        let mut prefix = [0; conversations::PREFIX_BYTES];
+        let mut prefix = [0; ip::PREFIX_BYTES];
         while remaining > 0 {
             check_record_limit(self.stats.packets)?;
             let ([seconds, fraction, captured, original], kept) =
@@ -110,10 +114,13 @@ impl Summary {
                     + i128::from(fraction)
                         * i128::from(NANOS_PER_SECOND / u64::from(fraction_limit))
             });
-            self.packet(0, captured, original, timestamp);
-            conversations.record(
-                conversations::decode(format.link_type, &prefix[..kept]),
+            self.packet(
+                0,
                 captured,
+                original,
+                timestamp,
+                ip::decode(format.link_type, &prefix[..kept]),
+                conversations,
             );
         }
         Ok(())
@@ -124,7 +131,15 @@ impl Summary {
         self.interfaces.push(interface);
     }
 
-    fn packet(&mut self, interface: usize, captured: u32, original: u32, timestamp: Option<i128>) {
+    fn packet(
+        &mut self,
+        interface: usize,
+        captured: u32,
+        original: u32,
+        timestamp: Option<i128>,
+        decoded: Option<ip::Packet>,
+        conversations: &mut conversations::Scan,
+    ) {
         self.stats.record(captured, original, timestamp);
         self.interfaces[interface]
             .stats
@@ -134,6 +149,8 @@ impl Summary {
                 .get_or_insert_with(Timeline::default)
                 .record(timestamp, captured);
         }
+        conversations.record(decoded.as_ref().map(|packet| packet.addresses), captured);
+        self.ip_protocols.record(decoded, captured);
     }
 }
 
@@ -433,6 +450,8 @@ mod tests {
         assert!(summary.issue.is_none());
         assert_eq!(summary.stats.packets, 4);
         assert_eq!(summary.conversations.unclassified_packets, 1);
+        assert_eq!(summary.ip_protocols.unclassified_packets, 1);
+        assert_eq!(summary.ip_protocols.by_number[&0].packets, 3);
         assert_eq!(summary.conversations.tracked_pairs, 1);
         let pair = &summary.conversations.top[0];
         assert_eq!(
@@ -447,6 +466,7 @@ mod tests {
         let partial = scan(&bytes, Format::PcapNg);
         assert!(partial.issue.unwrap().contains("block lengths disagree"));
         assert_eq!(partial.stats.packets, 2);
+        assert_eq!(partial.ip_protocols.by_number[&0].packets, 2);
         assert_eq!(partial.conversations.top[0].b_to_a.packets, 0);
     }
 }

@@ -12,7 +12,7 @@ use std::{
 mod compare;
 mod summary;
 pub use compare::CaptureComparison;
-use summary::{Bucket, CaptureCounters, Conversations, PacketStats, Summary};
+use summary::{Bucket, CaptureCounters, Conversations, IpProtocols, PacketStats, Summary};
 
 pub struct LocalCapture {
     pub path: PathBuf,
@@ -40,6 +40,7 @@ struct Report<'a> {
     interface_details: Vec<InterfaceReport<'a>>,
     timeline: Option<TimelineReport>,
     ip_conversations: &'a Conversations,
+    ip_protocols: &'a IpProtocols,
     link_types: &'a BTreeSet<u16>,
     complete: bool,
     issue: Option<&'a str>,
@@ -154,6 +155,7 @@ impl LocalCapture {
                 })
             }),
             ip_conversations: &summary.conversations,
+            ip_protocols: &summary.ip_protocols,
             link_types: &summary.link_types,
             complete: summary.issue.is_none(),
             issue: summary.issue.as_deref(),

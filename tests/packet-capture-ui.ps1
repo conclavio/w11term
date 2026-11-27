@@ -7,6 +7,7 @@ $destination = Join-Path $State 'reviewed capture.pcap'
 $olderCapture = Join-Path $State 'older capture.pcapng'
 $partialCapture = Join-Path $State 'incomplete capture.pcapng'
 $conversationCapture = Join-Path $State 'IP conversations.pcap'
+$protocolCapture = Join-Path $State 'IP protocols.pcap'
 $invalidCapture = Join-Path $State 'not a capture.pcap'
 $viewer = Join-Path $State 'Fixture Wireshark.exe'
 $startMarker = [IO.File]::ReadAllText((Join-Path $State 'pcap-start-marker'))
@@ -57,29 +58,59 @@ $sameVersionTunnel[3] = 40
 $sameVersionTunnel[9] = 4
 $sameVersionTunnel[15] = 3
 $sameVersionTunnel[19] = 4
-$writer = [IO.BinaryWriter]::new([IO.File]::Create($conversationCapture))
-try {
-    $writer.Write([byte[]]@(212,195,178,161, 2,0,4,0, 0,0,0,0, 0,0,0,0, 128,0,0,0, 1,0,0,0))
-    $number = 0
-    foreach ($frame in @(
-        ,([byte[]]($eth4 + $ipv4))
-        ,([byte[]]($eth4 + $reverse))
-        ,([byte[]](@(0) * 12 + @(8,6)))
-        ,([byte[]]($eth6 + $ipv6))
-        ,([byte[]]($eth4 + $ipv4Tunnel + $ipv6))
-        ,([byte[]]($eth6 + $ipv6Tunnel + $ipv4))
-        ,([byte[]]($eth4 + $sameVersionTunnel + $ipv4))
-    )) {
-        $number++
-        $writer.Write([uint32]$number)
-        $writer.Write([uint32]0)
-        $writer.Write([uint32]$frame.Length)
-        $writer.Write([uint32]$frame.Length)
-        $writer.Write($frame)
+function Write-CaptureFixture([string]$Path, [uint32]$LinkType, [byte[][]]$Frames) {
+    $writer = [IO.BinaryWriter]::new([IO.File]::Create($Path))
+    try {
+        $writer.Write([byte[]]@(212,195,178,161, 2,0,4,0, 0,0,0,0, 0,0,0,0, 128,0,0,0))
+        $writer.Write($LinkType)
+        $number = 0
+        foreach ($frame in $Frames) {
+            $number++
+            $writer.Write([uint32]$number)
+            $writer.Write([uint32]0)
+            $writer.Write([uint32]$frame.Length)
+            $writer.Write([uint32]$frame.Length)
+            $writer.Write($frame)
+        }
+    } finally {
+        $writer.Dispose()
     }
-} finally {
-    $writer.Dispose()
 }
+Write-CaptureFixture $conversationCapture 1 @(
+    ,([byte[]]($eth4 + $ipv4))
+    ,([byte[]]($eth4 + $reverse))
+    ,([byte[]](@(0) * 12 + @(8,6)))
+    ,([byte[]]($eth6 + $ipv6))
+    ,([byte[]]($eth4 + $ipv4Tunnel + $ipv6))
+    ,([byte[]]($eth6 + $ipv6Tunnel + $ipv4))
+    ,([byte[]]($eth4 + $sameVersionTunnel + $ipv4))
+)
+$protocolFrames = [System.Collections.Generic.List[byte[]]]::new()
+foreach ($flags in @(0x02, 0x12, 0x04, 0x11, 0x02)) {
+    $tcp = [byte[]]($ipv4 + [byte[]]::new(20))
+    $tcp[3] = 40
+    $tcp[9] = 6
+    $tcp[32] = 0x50
+    $tcp[33] = $flags
+    $protocolFrames.Add($tcp)
+}
+$protocolFrames[4][7] = 1 # Later IPv4 fragment with bytes that look like a SYN.
+$udp = [byte[]]($ipv4 + [byte[]]::new(8))
+$udp[3] = 28
+$udp[9] = 17
+$udp[25] = 8
+$protocolFrames.Add($udp)
+$icmpv6 = [byte[]]($ipv6 + [byte[]]::new(8))
+$icmpv6[5] = 8
+$icmpv6[6] = 58
+$icmpv6[40] = 128
+$protocolFrames.Add($icmpv6)
+$missingExtension = [byte[]]$ipv6.Clone()
+$missingExtension[5] = 8
+$missingExtension[6] = 60
+$protocolFrames.Add($missingExtension)
+$protocolFrames.Add([byte[]]@(0))
+Write-CaptureFixture $protocolCapture 101 ($protocolFrames.ToArray())
 [IO.File]::WriteAllText($invalidCapture, 'plain text')
 Add-Type -OutputType WindowsApplication -OutputAssembly $viewer -TypeDefinition @'
 using System.IO;
@@ -404,6 +435,28 @@ try {
         (Find-Element "After${dot}Pair coverage unavailable")
     }
     Click 'Back to capture'
+    Select-Capture $protocolCapture
+    $null = Wait-Until 'the standalone protocol fixture opens' { Find-Element $protocolCapture }
+    $expander = Open-PacketSection 'packet-ip-protocols'
+    $null = Wait-Until 'protocol totals and TCP flag coverage are visible' {
+        (Find-Element "TCP${dot}5 packets${dot}200 captured bytes") -and
+        (Find-Element "UDP${dot}1 packets${dot}28 captured bytes") -and
+        (Find-Element "ICMPv6${dot}1 packets${dot}48 captured bytes") -and
+        (Find-Element "Unclassified packets 1${dot}Unresolved IP protocols 1${dot}Fragmented IP packets 1") -and
+        (Find-Element 'TCP flags available on 4 of 5 TCP packets') -and
+        (Find-Element "SYN without ACK 1${dot}SYN-ACK 1${dot}RST 1${dot}FIN 1")
+    }
+    $summary = & $Cli inspect-packet-capture $protocolCapture | ConvertFrom-Json
+    $protocols = $summary.ip_protocols
+    if ($LASTEXITCODE -ne 0 -or !$summary.complete -or $protocols.by_number.'6'.packets -ne 5 -or
+        $protocols.by_number.'17'.captured_bytes -ne 28 -or $protocols.by_number.'58'.captured_bytes -ne 48 -or
+        $protocols.unclassified_packets -ne 1 -or $protocols.unresolved_protocol_packets -ne 1 -or
+        $protocols.fragmented_packets -ne 1 -or $protocols.tcp_flags.decoded_headers -ne 4 -or
+        $protocols.tcp_flags.syn_without_ack -ne 1 -or $protocols.tcp_flags.syn_ack -ne 1 -or
+        $protocols.tcp_flags.rst -ne 1 -or $protocols.tcp_flags.fin -ne 1) {
+        throw 'The CLI protocol report differs from the capture panel'
+    }
+    $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     Click 'Return to diagnostics overview'
     Click 'CPU flame graph'
     $null = Wait-Until 'flame graph can open a saved artifact offline' {

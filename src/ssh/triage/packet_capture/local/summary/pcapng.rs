@@ -1,6 +1,6 @@
 use super::{
     CaptureCounters, CounterSnapshot, InterfaceSummary, NANOS_PER_SECOND, PacketStats, Summary,
-    check_record_limit, conversations,
+    check_record_limit, conversations, ip,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::io::{Read, Seek};
@@ -78,7 +78,7 @@ enum Entry {
         captured: u32,
         original: u32,
         timestamp: Option<i128>,
-        addresses: Option<conversations::Addresses>,
+        decoded: Option<ip::Packet>,
     },
     Statistics {
         interface: usize,
@@ -174,10 +174,16 @@ pub(super) fn scan(
                 captured,
                 original,
                 timestamp,
-                addresses,
+                decoded,
             } => {
-                summary.packet(section_start + interface, captured, original, timestamp);
-                conversations.record(addresses, captured);
+                summary.packet(
+                    section_start + interface,
+                    captured,
+                    original,
+                    timestamp,
+                    decoded,
+                    conversations,
+                );
             }
             Entry::Statistics {
                 interface,
@@ -380,7 +386,7 @@ impl<T: Read + Seek> Block<'_, T> {
             captured,
             original,
             timestamp: Some(interface.timestamp_ns(ticks)),
-            addresses: self.packet_addresses(interface.link_type, captured)?,
+            decoded: self.decode_ip(interface.link_type, captured)?,
         })
     }
 
@@ -403,18 +409,14 @@ impl<T: Read + Seek> Block<'_, T> {
             captured,
             original,
             timestamp: None,
-            addresses: self.packet_addresses(interface.link_type, captured)?,
+            decoded: self.decode_ip(interface.link_type, captured)?,
         })
     }
 
-    fn packet_addresses(
-        &mut self,
-        link_type: u16,
-        captured: u32,
-    ) -> Result<Option<conversations::Addresses>> {
-        let mut prefix = [0; conversations::PREFIX_BYTES];
+    fn decode_ip(&mut self, link_type: u16, captured: u32) -> Result<Option<ip::Packet>> {
+        let mut prefix = [0; ip::PREFIX_BYTES];
         let kept = prefix.len().min(captured as usize);
         self.read_into(&mut prefix[..kept])?;
-        Ok(conversations::decode(link_type, &prefix[..kept]))
+        Ok(ip::decode(link_type, &prefix[..kept]))
     }
 }

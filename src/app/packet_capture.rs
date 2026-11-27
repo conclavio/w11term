@@ -39,6 +39,7 @@ pub enum Action {
     SelectSavedInterface(PathBuf, usize),
     TimelineExpanded(bool),
     SelectTimelineInterval(PathBuf, usize),
+    ProtocolsExpanded(bool),
     ConversationsExpanded(bool),
     SelectConversation(PathBuf, Option<usize>),
     LimitConversationInterval(PathBuf, bool),
@@ -205,6 +206,7 @@ pub(super) struct Panel {
     saved_interface: usize,
     timeline_expanded: bool,
     timeline_interval: Option<usize>,
+    protocols_expanded: bool,
     conversations_expanded: bool,
     selected_conversation: Option<usize>,
     limit_conversation_interval: bool,
@@ -251,6 +253,7 @@ impl Panel {
         self.saved_interface = 0;
         self.timeline_expanded = false;
         self.timeline_interval = None;
+        self.protocols_expanded = false;
         self.conversations_expanded = false;
         self.selected_conversation = None;
         self.limit_conversation_interval = false;
@@ -652,6 +655,73 @@ impl Panel {
                 }
             }
             if stats.packets != 0 {
+                let protocols = &summary.ip_protocols;
+                let mut rows = Vec::new();
+                if self.protocols_expanded {
+                    rows.push(text(
+                        "coverage",
+                        format!(
+                            "Unclassified packets {} · Unresolved IP protocols {} · Fragmented IP packets {}",
+                            protocols.unclassified_packets,
+                            protocols.unresolved_protocol_packets,
+                            protocols.fragmented_packets,
+                        ),
+                    ));
+                    let mut ranked: Vec<_> = protocols.by_number.iter().collect();
+                    ranked.sort_unstable_by_key(|&(number, traffic)| {
+                        (std::cmp::Reverse(traffic.captured_bytes), *number)
+                    });
+                    rows.extend(ranked.into_iter().map(|(&number, traffic)| {
+                        let name = protocol_name(number)
+                            .map_or_else(|| format!("IP protocol {number}"), str::to_owned);
+                        text(
+                            &format!("protocol-{number}"),
+                            format!(
+                                "{name} · {} packets · {} captured bytes",
+                                traffic.packets, traffic.captured_bytes
+                            ),
+                        )
+                    }));
+                    if let Some(tcp) = protocols.by_number.get(&6) {
+                        let flags = &protocols.tcp_flags;
+                        rows.extend([
+                            text(
+                                "tcp-coverage",
+                                format!(
+                                    "TCP flags available on {} of {} TCP packets",
+                                    flags.decoded_headers, tcp.packets
+                                ),
+                            ),
+                            text(
+                                "tcp-counts",
+                                format!(
+                                    "SYN without ACK {} · SYN-ACK {} · RST {} · FIN {}",
+                                    flags.syn_without_ack, flags.syn_ack, flags.rst, flags.fin
+                                ),
+                            ),
+                        ]);
+                    }
+                }
+                files.push(KeyedView::new(
+                    "local-protocols",
+                    Expander::new()
+                        .automation_name("IP protocols")
+                        .automation_id("packet-ip-protocols")
+                        .is_expanded(self.protocols_expanded)
+                        .on_is_expanded_changed(
+                            ctx.callback(|expanded| message(Action::ProtocolsExpanded(expanded))),
+                        )
+                        .slots([
+                            SlotView::new(
+                                ExpanderSlot::Header,
+                                TextBlock::new().text("IP protocols"),
+                            ),
+                            SlotView::new(
+                                ExpanderSlot::Content,
+                                StackPanel::new().spacing(6.0).keyed_children(rows),
+                            ),
+                        ]),
+                ));
                 let conversations = &summary.conversations;
                 let mut rows = vec![text(
                     "coverage",
@@ -952,6 +1022,25 @@ fn link_type(value: u16) -> String {
     .into()
 }
 
+fn protocol_name(number: u8) -> Option<&'static str> {
+    Some(match number {
+        1 => "ICMP",
+        2 => "IGMP",
+        4 => "IPv4 encapsulation",
+        6 => "TCP",
+        17 => "UDP",
+        41 => "IPv6 encapsulation",
+        47 => "GRE",
+        50 => "ESP",
+        51 => "AH",
+        58 => "ICMPv6",
+        59 => "No Next Header",
+        89 => "OSPF",
+        132 => "SCTP",
+        _ => return None,
+    })
+}
+
 fn default_wireshark() -> Option<PathBuf> {
     ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
         .into_iter()
@@ -1024,6 +1113,7 @@ impl TerminalApp {
                         || matches!(
                             action,
                             Action::SelectConversation(..)
+                                | Action::ProtocolsExpanded(_)
                                 | Action::ConversationsExpanded(_)
                                 | Action::Comparison(_, compare::Change::Pair { .. })
                         )) =>
@@ -1081,6 +1171,7 @@ impl TerminalApp {
                 }
             }
             Action::TimelineExpanded(expanded) => panel.timeline_expanded = expanded,
+            Action::ProtocolsExpanded(expanded) => panel.protocols_expanded = expanded,
             Action::ConversationsExpanded(expanded) => panel.conversations_expanded = expanded,
             Action::SelectConversation(path, index) => {
                 if let Some(LoadedCapture::Local(capture)) = &panel.loaded
