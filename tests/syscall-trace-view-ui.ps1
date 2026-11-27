@@ -308,6 +308,18 @@ try {
             !(Find-TraceGroup 'Changed count*read*')
     }
     if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($trace)) -cne $before) { throw 'The viewer changed the original trace' }
+    Run-Palette 'Diagnostics overview'
+    $recent = Wait-Until 'split trace remembered as a recent file set' {
+        $item = Find-Element 'Reopen clock trace.601' $button
+        if (!$item) { $item = Find-Element 'Reopen clock trace.602' $button }
+        if ($item -and $item.Current.IsEnabled) { $item }
+    }
+    Invoke-Button $recent
+    $null = Wait-Until 'recent split trace retains both sources and their order' {
+        $raw = Raw-Text
+        (Find-Element 'Files merged by time of day') -and (Find-TraceGroup '*PID 602*close*+30.000 ms*') -and
+        $raw -and $raw.Contains('clock trace.601')
+    }
 } finally {
     Close-FixtureApp $app
 }

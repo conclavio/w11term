@@ -5,6 +5,7 @@ pub mod conpty;
 pub mod control;
 pub mod copy_mode;
 pub mod demo;
+pub mod diagnostic_history;
 pub mod durable;
 pub mod enroll;
 pub mod events;

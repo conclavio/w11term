@@ -97,6 +97,10 @@ impl Comparison {
         }
     }
 
+    pub(super) fn after_path(&self) -> Option<&std::path::Path> {
+        self.paths[1].as_deref()
+    }
+
     fn value(&self, change: &Change, side: usize) -> String {
         let report = &self.reports[side];
         match change.kind {

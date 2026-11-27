@@ -1,6 +1,7 @@
 use super::*;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use w11term::diagnostic_history::Kind as ArtifactKind;
 use w11term::ssh::{CaptureStop, TriagePlan, TriageReport, TriageResource, TriageSampleStatus};
 
 pub(super) const LABEL: &str = "Linux performance triage";
@@ -15,7 +16,7 @@ pub enum Action {
     Run,
     Progress(Arc<()>, usize, usize),
     Stop(Arc<()>),
-    OpenReport,
+    OpenReport(Option<PathBuf>),
     SaveReport,
     CompareReport,
     BackFromComparison,
@@ -146,7 +147,7 @@ impl Panel {
                         .orientation(Orientation::Horizontal)
                         .spacing(8.0)
                         .children((
-                            button("Open report", idle, || Action::OpenReport),
+                            button("Open report", idle, || Action::OpenReport(None)),
                             button(
                                 "Save report",
                                 idle && matches!(self.content, Some(Content::Report { .. })),
@@ -682,9 +683,16 @@ impl TerminalApp {
                     comparison.select(&marker, index);
                 }
             }
-            Action::OpenReport | Action::SaveReport | Action::CompareReport
-                if panel.pending.is_none() && panel.comparison.is_none() =>
+            Action::OpenReport(_) | Action::SaveReport | Action::CompareReport
+                if panel.pending.is_none() =>
             {
+                let recent = match &action {
+                    Action::OpenReport(path) => path.clone(),
+                    _ => None,
+                };
+                if panel.comparison.is_some() && recent.is_none() {
+                    return;
+                }
                 let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
                     return;
                 };
@@ -709,7 +717,11 @@ impl TerminalApp {
                 } else {
                     file_picker::Purpose::OpenTriageReport(path)
                 };
-                let ticket = panel.begin("Choosing a triage report file…");
+                let ticket = panel.begin(if recent.is_some() {
+                    "Opening Linux triage report…"
+                } else {
+                    "Choosing a triage report file…"
+                });
                 let rejected = message(Action::Finished(
                     ticket.clone(),
                     Err("Triage file picker unavailable".into()),
@@ -717,27 +729,32 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |scope| {
                         let result = (|| -> anyhow::Result<_> {
-                            let Some(file) = file_picker::pick(owner, purpose)? else {
-                                return Ok(None);
+                            let file = if let Some(path) = recent {
+                                path
+                            } else {
+                                let Some(file) = file_picker::pick(owner, purpose)? else {
+                                    return Ok(None);
+                                };
+                                file.path
                             };
                             if scope.is_cancelled() {
                                 return Ok(None);
                             }
                             Ok(Some(match report {
                                 Some((before, before_path)) if compare => {
-                                    let after = Arc::new(TriageReport::load(&file.path)?);
+                                    let after = Arc::new(TriageReport::load(&file)?);
                                     Outcome::Compared(Box::new(compare::Comparison::new(
                                         [before, after],
-                                        [before_path, Some(file.path)],
+                                        [before_path, Some(file)],
                                     )))
                                 }
                                 Some((report, _)) => {
-                                    report.save(&file.path)?;
-                                    Outcome::Saved(file.path)
+                                    report.save(&file)?;
+                                    Outcome::Saved(file)
                                 }
                                 None => Outcome::Report {
-                                    report: Arc::new(TriageReport::load(&file.path)?),
-                                    path: Some(file.path),
+                                    report: Arc::new(TriageReport::load(&file)?),
+                                    path: Some(file),
                                     source: None,
                                 },
                             }))
@@ -782,20 +799,32 @@ impl TerminalApp {
                         panel.busy_processes =
                             source.map_or_else(Vec::new, |_| processes::busy_processes(&report));
                         panel.profile_source = source;
-                        panel.content = Some(Content::Report { report, path });
+                        panel.content = Some(Content::Report {
+                            report,
+                            path: path.clone(),
+                        });
+                        panel.comparison = None;
                         panel.sample = 0;
                         panel.resource = TriageResource::default();
                         panel.evidence_line = None;
+                        if let Some(path) = path {
+                            self.remember_diagnostic(ArtifactKind::TriageReport, [path], ctx);
+                        }
                     }
                     Ok(Some(Outcome::Saved(path))) => {
                         if let Some(Content::Report { path: source, .. }) = &mut panel.content {
                             *source = Some(path.clone());
                         }
-                        panel.last_path = Some(path);
+                        panel.last_path = Some(path.clone());
                         panel.status = Some("Saved Linux triage report".into());
+                        self.remember_diagnostic(ArtifactKind::TriageReport, [path], ctx);
                     }
                     Ok(Some(Outcome::Compared(comparison))) => {
+                        let path = comparison.after_path().map(std::path::Path::to_owned);
                         panel.comparison = Some(*comparison);
+                        if let Some(path) = path {
+                            self.remember_diagnostic(ArtifactKind::TriageReport, [path], ctx);
+                        }
                     }
                     Ok(None) => (),
                     Err(error) => panel.status = Some(error),

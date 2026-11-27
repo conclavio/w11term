@@ -2,6 +2,7 @@ use super::*;
 use plot::{Plot, Range};
 use profile::{Profile, Search};
 use std::path::PathBuf;
+use w11term::diagnostic_history::Kind as ArtifactKind;
 use w11term::ssh::{CaptureStop, CpuProfileSummary};
 
 mod capture;
@@ -15,7 +16,7 @@ pub(super) const LABEL: &str = "CPU flame graph";
 pub enum Action {
     Open,
     Close,
-    OpenFile,
+    OpenFile(Option<PathBuf>),
     CompareFile,
     Compare(compare::Action),
     Export,
@@ -155,7 +156,7 @@ impl Panel {
                     .children((
                         Button::new()
                             .is_enabled(idle)
-                            .on_click(send(|| Action::OpenFile))
+                            .on_click(send(|| Action::OpenFile(None)))
                             .content("Open folded stacks"),
                         Button::new()
                             .is_enabled(idle && self.loaded.is_some())
@@ -458,8 +459,12 @@ impl TerminalApp {
                     panel.status = Some("Stop requested. Saving collected CPU samples…".into());
                 }
             }
-            Action::OpenFile | Action::CompareFile | Action::Export => {
-                if panel.pending.is_some() || panel.comparison.is_some() {
+            Action::OpenFile(_) | Action::CompareFile | Action::Export => {
+                let recent = match &action {
+                    Action::OpenFile(path) => path.clone(),
+                    _ => None,
+                };
+                if panel.pending.is_some() || (panel.comparison.is_some() && recent.is_none()) {
                     return;
                 }
                 let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
@@ -473,7 +478,9 @@ impl TerminalApp {
                 let compare_path = matches!(action, Action::CompareFile).then(|| path.clone());
                 let profile = panel.loaded.as_ref().map(|loaded| loaded.profile.clone());
                 let zoom = panel.zoom;
-                let ticket = panel.begin(if export {
+                let ticket = panel.begin(if recent.is_some() {
+                    "Opening folded stacks…"
+                } else if export {
                     "Choose an SVG destination…"
                 } else if compare_path.is_some() {
                     "Choose the after profile…"
@@ -487,12 +494,17 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |scope| {
                         let result = (|| -> anyhow::Result<_> {
-                            let Some(file) = file_picker::pick(
-                                owner,
-                                file_picker::Purpose::FlameGraph { path, export },
-                            )?
-                            else {
-                                return Ok(None);
+                            let file = if let Some(path) = recent {
+                                path
+                            } else {
+                                let Some(file) = file_picker::pick(
+                                    owner,
+                                    file_picker::Purpose::FlameGraph { path, export },
+                                )?
+                                else {
+                                    return Ok(None);
+                                };
+                                file.path
                             };
                             if scope.is_cancelled() {
                                 return Ok(None);
@@ -500,21 +512,18 @@ impl TerminalApp {
                             if export {
                                 let profile =
                                     profile.context("Open folded stacks before exporting")?;
-                                plot::export(&profile, zoom, &file.path)?;
+                                plot::export(&profile, zoom, &file)?;
                                 Ok(Some(Outcome::Exported))
                             } else if let Some(before_path) = compare_path {
                                 let before = profile.context("Open a before profile to compare")?;
-                                let after = Arc::new(Profile::open(&file.path)?);
+                                let after = Arc::new(Profile::open(&file)?);
                                 Ok(Some(Outcome::Compared(Box::new(compare::ViewState::new(
                                     before,
                                     after,
-                                    [before_path, file.path],
+                                    [before_path, file],
                                 )))))
                             } else {
-                                Ok(Some(Outcome::Opened(
-                                    Arc::new(Profile::open(&file.path)?),
-                                    file.path,
-                                )))
+                                Ok(Some(Outcome::Opened(Arc::new(Profile::open(&file)?), file)))
                             }
                         })()
                         .map_err(|error| format!("{error:#}"));
@@ -594,10 +603,14 @@ impl TerminalApp {
                 match result {
                     Ok(Some(Outcome::Opened(profile, path))) => {
                         panel.activity = None;
-                        panel.load(profile, path, None);
+                        panel.capture = None;
+                        panel.load(profile, path.clone(), None);
+                        self.remember_diagnostic(ArtifactKind::CpuProfile, [path], ctx);
                     }
                     Ok(Some(Outcome::Compared(comparison))) => {
+                        let path = comparison.after_path().to_owned();
                         panel.comparison = Some(*comparison);
+                        self.remember_diagnostic(ArtifactKind::CpuProfile, [path], ctx);
                     }
                     Ok(Some(Outcome::ComparisonFiltered(query, rows))) => {
                         if let Some(comparison) = &mut panel.comparison {
@@ -610,9 +623,10 @@ impl TerminalApp {
                         }
                     }
                     Ok(Some(Outcome::Captured(profile, path, summary))) => {
-                        panel.load(profile, path, Some(summary));
+                        panel.load(profile, path.clone(), Some(summary));
                         panel.capture = None;
                         panel.status = Some("Captured CPU profile".into());
+                        self.remember_diagnostic(ArtifactKind::CpuProfile, [path], ctx);
                     }
                     Ok(Some(Outcome::Destination(recording))) => {
                         self.start_cpu_capture(*recording, ctx);

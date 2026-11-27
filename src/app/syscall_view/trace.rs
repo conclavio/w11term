@@ -458,6 +458,13 @@ impl Trace {
         &self.sources[0].path
     }
 
+    pub(super) fn paths(&self) -> Vec<PathBuf> {
+        self.sources
+            .iter()
+            .map(|source| source.path.clone())
+            .collect()
+    }
+
     pub fn file_count(&self) -> usize {
         self.sources.len()
     }

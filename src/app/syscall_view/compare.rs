@@ -53,6 +53,7 @@ impl TerminalApp {
                 {
                     match result {
                         Ok(Some(comparison)) => {
+                            let paths = comparison.traces[1].paths();
                             let state = &mut page.comparison;
                             *state = ViewState {
                                 open: true,
@@ -60,6 +61,11 @@ impl TerminalApp {
                                 ..Default::default()
                             };
                             state.filter(false);
+                            self.remember_diagnostic(
+                                w11term::diagnostic_history::Kind::SyscallTrace,
+                                paths,
+                                ctx,
+                            );
                         }
                         Ok(None) => (),
                         Err(error) => page.status = Some(error),

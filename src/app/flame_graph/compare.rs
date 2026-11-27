@@ -191,6 +191,10 @@ impl ViewState {
         self.selected = self.visible.first().copied();
     }
 
+    pub(super) fn after_path(&self) -> &std::path::Path {
+        &self.comparison.paths[1]
+    }
+
     fn page_rows(&self) -> &[usize] {
         let first = self.page * PAGE_SIZE;
         &self.visible[first..(first + PAGE_SIZE).min(self.visible.len())]

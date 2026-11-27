@@ -32,7 +32,7 @@ pub enum Action {
     Review,
     Save,
     Stop(Arc<()>),
-    OpenCaptureFile,
+    OpenCaptureFile(Option<PathBuf>),
     ChooseWireshark,
     OpenWireshark,
     Finished(Arc<()>, Result<Option<Outcome>, String>),
@@ -421,7 +421,9 @@ impl Panel {
         }
         let mut files = vec![KeyedView::new(
             "open-capture-file",
-            button("Open capture file…", idle, || Action::OpenCaptureFile),
+            button("Open capture file…", idle, || {
+                Action::OpenCaptureFile(None)
+            }),
         )];
         if let Some(status) = &self.status {
             files.push(text("status", status));
@@ -596,7 +598,13 @@ impl TerminalApp {
             }
             Action::Review => self.review_packet_capture(ctx),
             Action::Save => self.choose_capture_file(FileChoice::Save, ctx),
-            Action::OpenCaptureFile => self.choose_capture_file(FileChoice::Capture, ctx),
+            Action::OpenCaptureFile(None) => self.choose_capture_file(FileChoice::Capture, ctx),
+            Action::OpenCaptureFile(Some(path)) => {
+                let ticket = panel.begin("Opening packet capture…");
+                work(ctx, ticket, move || {
+                    Ok(Some(Outcome::Loaded(LocalPacketCapture::open(path)?)))
+                });
+            }
             Action::ChooseWireshark => self.choose_capture_file(FileChoice::Wireshark, ctx),
             Action::OpenWireshark => {
                 let Some(capture) = &panel.loaded else { return };
@@ -762,12 +770,24 @@ impl TerminalApp {
                 self.save_packet_capture(path, ctx)
             }
             Ok(Some(Outcome::Saved(capture))) => {
+                let path = capture.path.clone();
                 panel.loaded = Some(LoadedCapture::Captured(capture));
                 panel.status = Some("Saved packet capture".into());
+                self.remember_diagnostic(
+                    w11term::diagnostic_history::Kind::PacketCapture,
+                    [path],
+                    ctx,
+                );
             }
             Ok(Some(Outcome::Loaded(capture))) => {
+                let path = capture.path.clone();
                 panel.loaded = Some(LoadedCapture::Local(capture));
                 panel.activity = None;
+                self.remember_diagnostic(
+                    w11term::diagnostic_history::Kind::PacketCapture,
+                    [path],
+                    ctx,
+                );
             }
             Ok(Some(Outcome::Wireshark(path))) => {
                 panel.status = Some(format!("Wireshark executable {}", path.display()));

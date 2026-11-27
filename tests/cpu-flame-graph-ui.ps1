@@ -132,6 +132,28 @@ try {
     $null = Wait-Until 'whole profile is visible again' {
         Find-Element ('All samples' + $dot + '4 samples' + $dot + '100.0% of capture')
     }
-} finally {
+    Click-GraphButton 'Return to diagnostics overview'
+    $null = Wait-Until 'both source profiles have been remembered' {
+        (Find-Element 'Reopen worker profile.folded' $button) -and
+        (Find-Element 'Reopen after recording.folded' $button)
+    }
     Close-FixtureApp $app
+    $app = $null
+    $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui-restart.log')
+    $window = Wait-InputWindow
+    Run-Palette 'Diagnostics overview'
+    Click-GraphButton 'Reopen worker profile.folded'
+    $null = Wait-Until 'recent CPU profile reopened after a full restart' {
+        (Find-Element '4 samples') -and !(Find-Element 'Diagnostics overview panel')
+    }
+    Click-GraphButton 'Return to diagnostics overview'
+    Click-GraphButton 'Forget after recording.folded'
+    $null = Wait-Until 'forget removes the persisted entry and keeps the artifact' {
+        if (Find-Element 'Reopen after recording.folded' $button) { return }
+        $catalog = Join-Path $env:W11TERM_DATA_DIR 'recent-diagnostics.json'
+        $history = [IO.File]::ReadAllText($catalog) | ConvertFrom-Json
+        ($history.entries.Count -eq 1) -and [IO.File]::Exists($after)
+    }
+} finally {
+    if ($app) { Close-FixtureApp $app }
 }

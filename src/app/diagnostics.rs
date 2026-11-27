@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::VecDeque;
+use w11term::diagnostic_history::{Artifact, Kind, Store};
 
 pub(super) const LABEL: &str = "Diagnostics overview";
 
@@ -13,6 +15,23 @@ pub(super) enum Drawer {
 pub enum Action {
     Open,
     Close,
+    OpenRecent(Arc<Artifact>),
+    ForgetRecent(Arc<Artifact>),
+    RecentReady(Result<Vec<Artifact>, String>),
+}
+
+enum Edit {
+    Load,
+    Remember(Artifact),
+    Forget(Arc<Artifact>),
+}
+
+#[derive(Default)]
+pub(super) struct Recent {
+    entries: Vec<Arc<Artifact>>,
+    edits: VecDeque<Edit>,
+    pending: bool,
+    error: Option<String>,
 }
 
 pub(super) struct Activity {
@@ -156,13 +175,107 @@ impl TerminalApp {
         self.packet_capture.open = drawer == Some(Drawer::PacketCapture);
     }
 
-    pub(super) fn diagnostics_action(&mut self, action: Action) {
+    pub(super) fn diagnostics_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         match action {
             Action::Open => {
                 self.command_reference.close();
                 self.set_diagnostics_drawer(Some(Drawer::Overview));
+                self.edit_diagnostics_recent(Edit::Load, ctx);
             }
             Action::Close => self.diagnostics_open = false,
+            Action::OpenRecent(artifact)
+                if self.diagnostics_open && self.diagnostics_recent.entries.contains(&artifact) =>
+            {
+                self.open_recent_diagnostic(artifact, ctx);
+            }
+            Action::ForgetRecent(artifact) if self.diagnostics_open => {
+                self.edit_diagnostics_recent(Edit::Forget(artifact), ctx);
+            }
+            Action::RecentReady(result) if self.diagnostics_recent.pending => {
+                let recent = &mut self.diagnostics_recent;
+                recent.pending = false;
+                match result {
+                    Ok(entries) => {
+                        recent.entries = entries.into_iter().map(Arc::new).collect();
+                        recent.error = None;
+                    }
+                    Err(error) => recent.error = Some(error),
+                }
+                self.write_next_diagnostics_edit(ctx);
+            }
+            _ => (),
+        }
+    }
+
+    pub(super) fn remember_diagnostic(
+        &mut self,
+        kind: Kind,
+        paths: impl IntoIterator<Item = std::path::PathBuf>,
+        ctx: &ComponentContext<Self>,
+    ) {
+        self.edit_diagnostics_recent(
+            Edit::Remember(Artifact {
+                kind,
+                paths: paths.into_iter().collect(),
+            }),
+            ctx,
+        );
+    }
+
+    fn edit_diagnostics_recent(&mut self, edit: Edit, ctx: &ComponentContext<Self>) {
+        self.diagnostics_recent.edits.push_back(edit);
+        self.write_next_diagnostics_edit(ctx);
+    }
+
+    fn write_next_diagnostics_edit(&mut self, ctx: &ComponentContext<Self>) {
+        let recent = &mut self.diagnostics_recent;
+        if recent.pending {
+            return;
+        }
+        let Some(edit) = recent.edits.pop_front() else {
+            return;
+        };
+        recent.pending = true;
+        ctx.spawn_background_with_rejection(
+            move |_| {
+                let result = (|| {
+                    let store = Store::user()?;
+                    match edit {
+                        Edit::Load => store.list(),
+                        Edit::Remember(artifact) => store.remember(&artifact),
+                        Edit::Forget(artifact) => store.forget(&artifact),
+                    }
+                })()
+                .map_err(|error: anyhow::Error| format!("{error:#}"));
+                Message::Diagnostics(Action::RecentReady(result))
+            },
+            Message::Diagnostics(Action::RecentReady(Err(
+                "Recent diagnostics worker unavailable".into(),
+            ))),
+        );
+    }
+
+    fn open_recent_diagnostic(&mut self, artifact: Arc<Artifact>, ctx: &ComponentContext<Self>) {
+        match (artifact.kind, artifact.paths.as_slice()) {
+            (Kind::TriageReport, [path]) => {
+                self.set_diagnostics_drawer(Some(Drawer::Triage));
+                self.triage_action(triage::Action::OpenReport(Some(path.clone())), ctx);
+            }
+            (Kind::CpuProfile, [path]) => {
+                self.set_diagnostics_drawer(Some(Drawer::FlameGraph));
+                self.flame_graph_action(flame_graph::Action::OpenFile(Some(path.clone())), ctx);
+            }
+            (Kind::PacketCapture, [path]) => {
+                self.set_diagnostics_drawer(Some(Drawer::PacketCapture));
+                self.packet_capture_action(
+                    packet_capture::Action::OpenCaptureFile(Some(path.clone())),
+                    ctx,
+                );
+            }
+            (Kind::SyscallTrace, paths) => {
+                self.syscall_view_action(syscall_view::Action::OpenRecent(paths.to_vec()), ctx);
+            }
+            _ => (),
         }
     }
 
@@ -228,6 +341,7 @@ impl TerminalApp {
             ),
         ];
         let activity = self.diagnostics_activity_rows(ctx);
+        let recent = self.diagnostics_recent_rows(ctx);
         Grid::new()
             .rows([GridLength::Auto, GridLength::Star(1.0)])
             .children((
@@ -256,11 +370,89 @@ impl TerminalApp {
                                     .text_wrapping(TextWrapping::Wrap),
                             ))
                             .chain(activity)
-                            .chain(rows),
+                            .chain(rows)
+                            .chain(recent),
                         ),
                     ),
                 ),
             ))
+    }
+
+    fn diagnostics_recent_rows(&self, ctx: &ViewContext<Self>) -> Vec<KeyedView> {
+        let recent = &self.diagnostics_recent;
+        if recent.entries.is_empty() && recent.error.is_none() {
+            return Vec::new();
+        }
+        let mut rows = vec![KeyedView::new(
+            "recent-diagnostics",
+            TextBlock::new().text("Recent files").font_size(16.0),
+        )];
+        if let Some(error) = &recent.error {
+            rows.push(KeyedView::new(
+                "recent-error",
+                TextBlock::new()
+                    .text(triage::display_output(error))
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        rows.extend(recent.entries.iter().enumerate().map(|(index, artifact)| {
+            let path = &artifact.paths[0];
+            let filename = path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy();
+            let filename = triage::display_output(&filename);
+            let kind = match artifact.kind {
+                Kind::TriageReport => "Linux triage report",
+                Kind::CpuProfile => "Folded CPU profile",
+                Kind::PacketCapture => "Packet capture",
+                Kind::SyscallTrace => "Syscall trace",
+            };
+            let count = artifact.paths.len();
+            let scope = if count > 1 {
+                format!(" · {count} files")
+            } else {
+                String::new()
+            };
+            let open = artifact.clone();
+            let forget = artifact.clone();
+            KeyedView::new(
+                format!("recent-{index}"),
+                StackPanel::new().spacing(3.0).children((
+                    Grid::new()
+                        .columns([GridLength::Star(1.0), GridLength::Auto])
+                        .column_spacing(6.0)
+                        .children((
+                            Button::new()
+                                .automation_name(format!("Reopen {filename}"))
+                                .horizontal_alignment(HorizontalAlignment::Stretch)
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Diagnostics(Action::OpenRecent(open.clone()))
+                                }))
+                                .content(
+                                    TextBlock::new()
+                                        .text(&filename)
+                                        .text_trimming(TextTrimming::CharacterEllipsis),
+                                ),
+                            Button::new()
+                                .grid_column(1)
+                                .automation_name(format!("Forget {filename}"))
+                                .is_enabled(!recent.pending)
+                                .on_click(ctx.callback(move |_| {
+                                    Message::Diagnostics(Action::ForgetRecent(forget.clone()))
+                                }))
+                                .content("Forget"),
+                        )),
+                    TextBlock::new()
+                        .text(triage::display_output(&format!(
+                            "{kind}{scope} · {}",
+                            path.display()
+                        )))
+                        .text_wrapping(TextWrapping::Wrap),
+                )),
+            )
+        }));
+        rows
     }
 
     fn diagnostics_activity_rows(&self, ctx: &ViewContext<Self>) -> Vec<KeyedView> {

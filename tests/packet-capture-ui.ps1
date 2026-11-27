@@ -87,6 +87,13 @@ try {
     $null = Wait-Until 'a non-capture file leaves the previous capture selected' {
         (Find-Element 'Choose a PCAP or PCAPNG capture file') -and (Find-Element "PCAPNG${dot}48 bytes")
     }
+    Click 'Return to diagnostics overview'
+    Click ('Reopen ' + [IO.Path]::GetFileName($olderCapture))
+    $null = Wait-Until 'recent packet capture reopens and is validated again' {
+        (Find-Element "PCAPNG${dot}48 bytes") -and
+        !(Find-Element 'Choose a PCAP or PCAPNG capture file') -and
+        !(Find-Element 'Diagnostics overview panel')
+    }
     Select-Viewer
     if ([IO.File]::Exists($olderCapture + '.opened')) { throw 'Selecting the local file launched Wireshark' }
     Click 'Open in Wireshark'
@@ -208,6 +215,9 @@ try {
     Wait-Focus $local
     Click 'Return to diagnostics overview'
     Wait-DiagnosticArtifact 'Saved packet capture' $destination 'Stopped by request'
+    $null = Wait-Until 'saved packet capture appears in recent files' {
+        Find-Element ('Reopen ' + [IO.Path]::GetFileName($destination)) $button
+    }
     Click 'Open Packet capture activity'
     Select-Viewer
     if ([IO.File]::Exists($destination + '.opened')) { throw 'Selecting a viewer opened it without activation' }

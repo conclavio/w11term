@@ -284,6 +284,11 @@ impl TerminalApp {
                             page.load(trace);
                         }
                         page.status = Some(summary);
+                        self.remember_diagnostic(
+                            w11term::diagnostic_history::Kind::SyscallTrace,
+                            [capture.path],
+                            ctx,
+                        );
                     }
                     Ok(None) => (),
                     Err(error) => page.status = Some(error),

@@ -1,5 +1,5 @@
 use super::*;
-use std::fmt::Write as _;
+use std::{fmt::Write as _, path::PathBuf};
 use trace::{Filter, Group, Raw, Trace};
 
 mod capture;
@@ -16,6 +16,7 @@ pub enum Action {
     Show,
     Resume(TabId),
     Open(TabId),
+    OpenRecent(Vec<PathBuf>),
     Opened(TabId, Arc<()>, Result<Option<Arc<Trace>>, String>),
     Query(TabId, String),
     Filter(TabId, usize),
@@ -83,7 +84,17 @@ impl TerminalApp {
                     self.activate(ctx);
                 }
             }
-            Action::Open(id) => self.open_syscall_trace(id, ctx),
+            Action::Open(id) => self.open_syscall_trace(id, None, ctx),
+            Action::OpenRecent(paths) => {
+                self.set_diagnostics_drawer(None);
+                let tab = self.tabs.insert(AppTab {
+                    label: LABEL.into(),
+                    page: Page::SyscallTrace(Box::default()),
+                });
+                self.sync_selection(ctx);
+                self.activate(ctx);
+                self.open_syscall_trace(tab, Some(paths), ctx);
+            }
             Action::Apply(id) => self.filter_syscall_trace(id, ctx),
             Action::Opened(id, ticket, result) => {
                 if let Some(page) = self.syscall_page(id)
@@ -91,8 +102,14 @@ impl TerminalApp {
                 {
                     match result {
                         Ok(Some(trace)) => {
+                            let paths = trace.paths();
                             page.capture.activity = None;
                             page.load(trace);
+                            self.remember_diagnostic(
+                                w11term::diagnostic_history::Kind::SyscallTrace,
+                                paths,
+                                ctx,
+                            );
                         }
                         Ok(None) => (),
                         Err(error) => page.status = Some(error),
@@ -166,7 +183,12 @@ impl TerminalApp {
         }
     }
 
-    fn open_syscall_trace(&mut self, id: TabId, ctx: &ComponentContext<Self>) {
+    fn open_syscall_trace(
+        &mut self,
+        id: TabId,
+        recent: Option<Vec<PathBuf>>,
+        ctx: &ComponentContext<Self>,
+    ) {
         if self.tabs.active_id() != Some(id) {
             return;
         }
@@ -190,10 +212,14 @@ impl TerminalApp {
         ctx.spawn_background_with_rejection(
             move |scope| {
                 let result = (|| -> anyhow::Result<_> {
-                    let files = file_picker::pick_paths(
-                        owner,
-                        file_picker::Purpose::OpenSyscallTrace(path),
-                    )?;
+                    let files = if let Some(paths) = recent {
+                        paths
+                    } else {
+                        file_picker::pick_paths(
+                            owner,
+                            file_picker::Purpose::OpenSyscallTrace(path),
+                        )?
+                    };
                     if files.is_empty() || scope.is_cancelled() {
                         return Ok(None);
                     }

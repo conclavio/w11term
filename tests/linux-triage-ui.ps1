@@ -206,6 +206,11 @@ try {
         throw "$_ Preview exists: $($null -ne $field). Enabled: $($field.Current.IsEnabled). Triage open: $($null -ne (Find-Element 'Triage samples' $combo)). Preview: $text"
     }
     if (Find-Element 'Send reviewed request' $button) { throw 'Opening the report created a reviewed request' }
+    Click 'Return to diagnostics overview'
+    Click 'Reopen after triage.json'
+    $null = Wait-Until 'recent comparison source reopens as its own local triage report' {
+        (Find-Element 'Opened Linux triage report') -and (Find-Element '8 of 10 checks complete')
+    }
 } finally {
     Close-FixtureApp $app
 }
