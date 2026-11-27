@@ -174,6 +174,14 @@ pub fn validate_zdotdir(shell: DotfileShell, zdotdir: Option<&str>) -> Result<()
     Ok(())
 }
 
+pub fn validate_dotfiles_home(home: &str) -> Result<()> {
+    ensure!(
+        home.len() <= 4096 && (home == "/" || home.strip_prefix('/').is_some_and(relative_path)),
+        "Enter an absolute Linux home directory"
+    );
+    Ok(())
+}
+
 fn relative_path(path: &str) -> bool {
     !path.contains('\\')
         && !path.chars().any(char::is_control)
@@ -644,11 +652,7 @@ impl Engine {
             bail!("SFTP did not resolve the remote home directory to one path");
         };
         let home = home.filename.as_str();
-        ensure!(
-            home.len() <= 4096
-                && (home == "/" || home.strip_prefix('/').is_some_and(relative_path)),
-            "SFTP did not return an absolute remote home directory"
-        );
+        validate_dotfiles_home(home).context("SFTP returned an invalid home directory")?;
         Ok(home.to_owned())
     }
 

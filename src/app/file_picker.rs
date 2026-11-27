@@ -22,6 +22,7 @@ pub(super) enum Purpose {
     CompareLocalFile,
     CompareLocalFolder,
     SshConfig(PathBuf),
+    DotfilesBundle(PathBuf),
     OpenSshHostList,
     OpenSshGroupDefinition,
     SshIdentity {
@@ -204,6 +205,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::CompareLocalFolder
                 | Purpose::OpenRecording
                 | Purpose::SshConfig(_)
+                | Purpose::DotfilesBundle(_)
                 | Purpose::OpenSshHostList
                 | Purpose::OpenSshGroupDefinition
                 | Purpose::SshIdentity { .. }
@@ -271,6 +273,14 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 dialog.SetTitle(w!("Open OpenSSH config"))?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 // Leave file types unrestricted: OpenSSH usually names this file "config".
+                if let Some(folder) = current.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
+            Purpose::DotfilesBundle(current) => {
+                dialog.SetTitle(w!("Choose dotfiles bundle"))?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 if let Some(folder) = current.parent() {
                     local_folder(&dialog, folder);
                 }

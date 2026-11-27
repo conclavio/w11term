@@ -33,6 +33,18 @@ function Key-Field {
     $field = Wait-Until 'private key path field' { Find-Element 'Private key file' $edit }
     return $field.GetCurrentPattern($value)
 }
+function Set-Field([string]$Name, [string]$Text) {
+    $field = Wait-Until "'$Name' field" { Find-Element $Name $edit }
+    $field.SetFocus()
+    $field = Wait-Until "'$Name' editor focused" {
+        $current = Find-Element $Name $edit -Visible
+        if ($current -and $current.Current.HasKeyboardFocus) { $current }
+    }
+    $field.GetCurrentPattern($value).SetValue($Text)
+    $null = Wait-Until "'$Name' contains the entered value" {
+        (Find-Element $Name $edit).GetCurrentPattern($value).Current.Value -ceq $Text
+    }
+}
 function Wait-Browse {
     $null = Wait-Until 'key picker releases the draft' {
         $control = Find-Element $browseLabel $button
@@ -90,6 +102,49 @@ try {
     }
     if ([IO.File]::ReadAllText($homeKey) -cne 'test placeholder' -or [IO.File]::ReadAllText($chosen) -cne 'test placeholder') {
         throw 'The key picker changed a selected file'
+    }
+
+    $bundleName = 'Fleet dotfiles.json'
+    $bundle = Join-Path $State $bundleName
+    [IO.File]::WriteAllText($bundle, '{"version":2,"bash":"export EDITOR=vi"}')
+    Set-NativeExpansion 'SSH dotfiles' $true
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'fingerprint required' {
+        Find-Element 'Enter the verified SHA256 host-key fingerprint for this account'
+    }
+    Click 'Browse for dotfiles bundle'
+    $bundleTitle = 'Choose dotfiles bundle'
+    $bundleDialog = Wait-Until 'owned dotfiles bundle picker' { Find-OwnedDialog $bundleTitle }
+    Select-DialogItem $bundleDialog $bundleName
+    $null = Wait-Until 'select dotfiles bundle' { [FixtureDialog]::ClickButton($bundleDialog, 1) }
+    $null = Wait-Until 'use selected dotfiles bundle' {
+        $field = Find-Element 'Dotfiles bundle' $edit
+        if ($field) { [FixtureDialog]::SameFile($bundle, $field.GetCurrentPattern($value).Current.Value) }
+    }
+    $fingerprint = 'SHA256:' + ('A' * 43)
+    Set-Field 'Remote SFTP home' '/home/test'
+    Set-Field 'Dotfiles host-key fingerprint' $fingerprint
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'unsupported bundle rejected' {
+        Find-Element 'Checking the dotfiles bundle: Unsupported dotfiles bundle version'
+    }
+    [IO.File]::WriteAllText($bundle, '{"version":1,"bash":"export EDITOR=vi"}')
+    Click 'Approve dotfiles sync'
+    $approval = 'Approved for test@example.test:22 ' + [char]0x00b7 + ' /home/test'
+    $null = Wait-Until 'approval for account and home' { Find-Element $approval }
+    Click 'Save profile changes'
+    $null = Wait-Until 'dotfiles approval saved' {
+        $dotfiles = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles
+        $dotfiles.shell -ceq 'bash' -and $dotfiles.host -ceq 'example.test' -and
+            $dotfiles.user -ceq 'test' -and $dotfiles.port -eq 22 -and
+            $dotfiles.home -ceq '/home/test' -and $dotfiles.fingerprint -ceq $fingerprint -and
+            [FixtureDialog]::SameFile($bundle, $dotfiles.bundle)
+    }
+    Click 'Disable dotfiles sync'
+    $null = Wait-Until 'dotfiles sync disabled in the editor' { Find-Element 'Sync off' }
+    Click 'Save profile changes'
+    $null = Wait-Until 'dotfiles approval removed' {
+        !(([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles)
     }
 } finally {
     if (!$app.HasExited) {

@@ -6,6 +6,7 @@ use anyhow::Context as _;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, VecDeque},
+    path::Path,
     rc::Rc,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
@@ -69,6 +70,7 @@ mod local_profile;
 mod pane_drop;
 mod pane_text_size;
 mod pattern_settings;
+mod profile_dotfiles;
 mod profile_forwards;
 mod profile_jumps;
 mod saved_commands;
@@ -525,7 +527,7 @@ struct ProfileDraft {
     proxy_jump: Vec<w11term::options::JumpHost>,
     jump_editor: profile_jumps::Editor,
     local_forwards: Vec<w11term::options::LocalForwardPreset>,
-    dotfiles: Option<Box<w11term::options::DotfileSync>>,
+    dotfiles: Box<profile_dotfiles::Editor>,
     forward_editor: profile_forwards::Editor,
     durable: bool,
     saved: bool,
@@ -568,7 +570,7 @@ impl Default for ProfileDraft {
             proxy_jump: Vec::new(),
             jump_editor: Default::default(),
             local_forwards: Vec::new(),
-            dotfiles: None,
+            dotfiles: Default::default(),
             forward_editor: Default::default(),
             durable: false,
             saved: false,
@@ -641,7 +643,7 @@ impl ProfileDraft {
             player,
             proxy_jump: self.proxy_jump.clone(),
             local_forwards: self.local_forwards.clone(),
-            dotfiles: self.dotfiles.clone(),
+            dotfiles: self.dotfiles.approval(),
             group_prompt: (!self.group_prompt.trim().is_empty())
                 .then(|| self.group_prompt.clone().try_into())
                 .transpose()?,
@@ -669,7 +671,7 @@ impl ProfileDraft {
         Self {
             proxy_jump: options.proxy_jump.clone(),
             local_forwards: options.local_forwards.clone(),
-            dotfiles: options.dotfiles.clone(),
+            dotfiles: Box::new(profile_dotfiles::Editor::new(options.dotfiles.clone())),
             name,
             durable: options.durable,
             host: options.host.clone(),
@@ -1509,6 +1511,7 @@ pub enum Message {
     ProfileMenu(String),
     QuickConnect(quick_connect::Action),
     SshIdentity(identity_picker::Action),
+    ProfileDotfiles(TabId, profile_dotfiles::Action),
     MoveProfile(String, isize, Arc<[String]>),
     SetProfilePin(String, bool),
     FilterProfiles(String),
@@ -5346,6 +5349,12 @@ impl TerminalApp {
                     ),
             )),
         );
+        fields.push(draft.dotfiles.view(
+            id,
+            draft,
+            self.store.path().parent().unwrap_or(Path::new(".")),
+            context,
+        ));
         fields.push(draft.jump_editor.view(
             id,
             &draft.proxy_jump,
@@ -7680,6 +7689,7 @@ impl Component for TerminalApp {
             }
             Message::QuickConnect(action) => self.edit_quick_connect(action, context),
             Message::SshIdentity(action) => self.ssh_identity_action(action, context),
+            Message::ProfileDotfiles(id, action) => self.edit_profile_dotfiles(id, action, context),
             Message::EditProfile(name) => self.edit_profile(name, context),
             Message::DuplicateProfile(id) => self.duplicate_profile(id, context),
             Message::DeleteProfile(id) => {

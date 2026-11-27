@@ -1307,7 +1307,9 @@ Direct pipe clients use `{"op":"switch-dotfiles","shell":"bash","target":{"kind"
 
 ### Sync dotfiles on SSH connect
 
-To opt an SSH profile into sync, add a `dotfiles` object to that profile in `profiles.json`. Use the destination's verified host-key fingerprint and SFTP home. A relative bundle path resolves beside the profile catalog. For Zsh with an alternate directory under the approved home, add `"zdotdir":"relative/directory"`.
+Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.
+
+The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. For Zsh with an alternate startup directory under the approved home, set `"zdotdir":"relative/directory"` or fill in the corresponding field in the editor.
 
 ```json
 {

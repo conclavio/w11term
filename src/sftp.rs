@@ -29,7 +29,9 @@ mod atomic_upload;
 mod directory;
 mod dotfiles;
 pub(crate) use dotfiles::sync_login_dotfiles;
-pub use dotfiles::{DotfileBundle, DotfileShell, DotfileTarget, validate_zdotdir};
+pub use dotfiles::{
+    DotfileBundle, DotfileShell, DotfileTarget, validate_dotfiles_home, validate_zdotdir,
+};
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};
 mod group_upload;

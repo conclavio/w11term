@@ -4032,7 +4032,7 @@ async fn native_saving_an_ssh_profile_keeps_the_original_live_pane() {
 }
 
 #[test]
-#[ignore = "selects SSH key paths through the native file dialog in Quick Connect and a profile"]
+#[ignore = "selects SSH key and dotfiles paths through native dialogs and saves a profile"]
 fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
     let state = tempfile::tempdir().unwrap();
     fs::write(
