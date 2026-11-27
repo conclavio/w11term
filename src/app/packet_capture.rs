@@ -29,6 +29,7 @@ pub enum Action {
     ListInterfaces,
     SelectInterface(flame_graph::Connection, String),
     SelectSavedInterface(PathBuf, usize),
+    TimelineExpanded(bool),
     Tmpfs(bool),
     Review,
     Save,
@@ -44,7 +45,7 @@ pub enum Outcome {
     Reviewed(u64, Box<PacketCapturePlan>),
     Destination(PathBuf),
     Saved(PacketCapture),
-    Loaded(LocalPacketCapture),
+    Loaded(Box<LocalPacketCapture>),
     Wireshark(PathBuf),
     Opened,
 }
@@ -173,6 +174,7 @@ pub(super) struct Panel {
     review: Option<Review>,
     loaded: Option<LoadedCapture>,
     saved_interface: usize,
+    timeline_expanded: bool,
     wireshark: Option<PathBuf>,
     pub(super) pending: Option<Arc<()>>,
     stop: Option<CaptureStop>,
@@ -494,6 +496,61 @@ impl Panel {
             } else if stats.packets != 0 {
                 files.push(text("local-packet-span", "No usable packet timestamps"));
             }
+            if let Some(timeline) = &summary.timeline {
+                let buckets: Vec<_> = timeline.buckets().collect();
+                if let Some((index, peak)) = buckets
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(index, bucket)| (bucket.packets, std::cmp::Reverse(*index)))
+                {
+                    const CHART_HEIGHT: f64 = 56.0;
+                    let width = timeline.bucket_width_ns();
+                    let bars = Grid::new()
+                        .columns((0..buckets.len()).map(|_| GridLength::Star(1.0)))
+                        .column_spacing(1.0)
+                        .keyed_children(
+                            buckets
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, bucket)| bucket.packets > 0)
+                                .map(|(column, bucket)| {
+                                    KeyedView::new(
+                                        column.to_string(),
+                                        Border::new()
+                                            .grid_column(column as i32)
+                                            .vertical_alignment(VerticalAlignment::Bottom)
+                                            .height(
+                                                (f64::from(bucket.packets)
+                                                    / f64::from(peak.packets)
+                                                    * CHART_HEIGHT)
+                                                    .max(1.0),
+                                            )
+                                            .background(Color::rgb(96, 165, 230)),
+                                    )
+                                }),
+                        );
+                    let unit = if peak.packets == 1 {
+                        "packet"
+                    } else {
+                        "packets"
+                    };
+                    files.push(KeyedView::new("local-timeline",
+                        Expander::new().automation_name("Packet timeline").automation_id("packet-timeline")
+                            .is_expanded(self.timeline_expanded)
+                            .on_is_expanded_changed(ctx.callback(|expanded| message(Action::TimelineExpanded(expanded))))
+                            .slots([
+                            SlotView::new(ExpanderSlot::Header, TextBlock::new().text("Packet timeline")),
+                            SlotView::new(ExpanderSlot::Content, StackPanel::new().spacing(6.0).children((
+                                TextBlock::new().text(format!("Bucket width {} s", seconds_text(width))),
+                                Border::new().height(CHART_HEIGHT).background(Color::rgb(44, 44, 48))
+                                    .automation_name("Packet timeline chart").content(bars),
+                                TextBlock::new().text(format!("Peak {} {unit} · {} bytes · +{} s from timeline start",
+                                    peak.packets, peak.captured_bytes, seconds_text(width * index as u128)))
+                                    .text_wrapping(TextWrapping::Wrap),
+                            ))),
+                        ])));
+                }
+            }
             if !summary.interfaces.is_empty() {
                 let mut types: Vec<_> = summary
                     .link_types
@@ -765,13 +822,16 @@ impl TerminalApp {
                     panel.saved_interface = index;
                 }
             }
+            Action::TimelineExpanded(expanded) => panel.timeline_expanded = expanded,
             Action::Review => self.review_packet_capture(ctx),
             Action::Save => self.choose_capture_file(FileChoice::Save, ctx),
             Action::OpenCaptureFile(None) => self.choose_capture_file(FileChoice::Capture, ctx),
             Action::OpenCaptureFile(Some(path)) => {
                 let ticket = panel.begin("Opening packet capture…");
                 work(ctx, ticket, move || {
-                    Ok(Some(Outcome::Loaded(LocalPacketCapture::open(path)?)))
+                    Ok(Some(Outcome::Loaded(Box::new(LocalPacketCapture::open(
+                        path,
+                    )?))))
                 });
             }
             Action::ChooseWireshark => self.choose_capture_file(FileChoice::Wireshark, ctx),
@@ -882,7 +942,9 @@ impl TerminalApp {
                 return Ok(None);
             };
             Ok(Some(match choice {
-                FileChoice::Capture => Outcome::Loaded(LocalPacketCapture::open(file.path)?),
+                FileChoice::Capture => {
+                    Outcome::Loaded(Box::new(LocalPacketCapture::open(file.path)?))
+                }
                 FileChoice::Save => Outcome::Destination(file.path),
                 FileChoice::Wireshark => Outcome::Wireshark(file.path),
             }))
@@ -951,8 +1013,9 @@ impl TerminalApp {
             }
             Ok(Some(Outcome::Loaded(capture))) => {
                 let path = capture.path.clone();
-                panel.loaded = Some(LoadedCapture::Local(capture));
+                panel.loaded = Some(LoadedCapture::Local(*capture));
                 panel.saved_interface = 0;
+                panel.timeline_expanded = false;
                 panel.activity = None;
                 self.remember_diagnostic(
                     w11term::diagnostic_history::Kind::PacketCapture,

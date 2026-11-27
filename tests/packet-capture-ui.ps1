@@ -101,6 +101,19 @@ try {
             (Find-Element "Reported${dot}Received 12") -and
             (Find-Element "Reported${dot}Interface drops 1")
     }
+    $expander = Wait-Until 'the capture exposes a timeline expander' {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+        $condition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'packet-timeline')
+        $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    }
+    $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $null = Wait-Until 'the timeline chart and its earliest peak are visible' {
+        (Find-Element 'Packet timeline chart' -Visible) -and
+            (Find-Element 'Bucket width 0.008192 s' -Visible) -and
+            (Find-Element "Peak 1 packet${dot}4 bytes${dot}+0.000 s from timeline start" -Visible)
+    }
+    $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
     $picker = Find-Element 'Saved capture interfaces' ([System.Windows.Automation.ControlType]::ComboBox)
     $picker.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
     $wireless = Wait-Until 'the second saved interface can be selected' {
@@ -128,6 +141,13 @@ try {
         $summary.interface_details[1].capture_statistics.interface_dropped -ne 0 -or
         $summary.interface_details[1].capture_statistics.os_dropped -ne 5) {
         throw 'The offline inspection differs from the saved capture panel'
+    }
+    $timeline = $summary.timeline
+    if ($timeline.start_unix_ns -cne '999424000' -or $timeline.bucket_width_ns -cne '8192000' -or
+        $timeline.buckets.Count -ne 62 -or $timeline.buckets[0].packets -ne 1 -or
+        $timeline.buckets[1].packets -ne 0 -or $timeline.buckets[-1].packets -ne 1 -or
+        ($timeline.buckets | Measure-Object -Property captured_bytes -Sum).Sum -ne 8) {
+        throw 'The CLI timeline disagrees with the capture timestamps or counts the untimed packet'
     }
     Select-Capture $invalidCapture
     $null = Wait-Until 'a non-capture file leaves the previous capture selected' {

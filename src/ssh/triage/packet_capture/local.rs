@@ -10,7 +10,7 @@ use std::{
 };
 
 mod summary;
-use summary::{CaptureCounters, PacketStats, Summary};
+use summary::{Bucket, CaptureCounters, PacketStats, Summary};
 
 pub struct LocalCapture {
     pub path: PathBuf,
@@ -36,9 +36,17 @@ struct Report<'a> {
     stats: StatsReport,
     interfaces: usize,
     interface_details: Vec<InterfaceReport<'a>>,
+    timeline: Option<TimelineReport>,
     link_types: &'a BTreeSet<u16>,
     complete: bool,
     issue: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct TimelineReport {
+    start_unix_ns: String,
+    bucket_width_ns: String,
+    buckets: Vec<Bucket>,
 }
 
 #[derive(Serialize)]
@@ -135,6 +143,13 @@ impl LocalCapture {
                     stats: (&interface.stats).into(),
                 })
                 .collect(),
+            timeline: summary.timeline.as_ref().and_then(|timeline| {
+                Some(TimelineReport {
+                    start_unix_ns: timeline.start_unix_ns()?.to_string(),
+                    bucket_width_ns: timeline.bucket_width_ns().to_string(),
+                    buckets: timeline.buckets().collect(),
+                })
+            }),
             link_types: &summary.link_types,
             complete: summary.issue.is_none(),
             issue: summary.issue.as_deref(),

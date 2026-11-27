@@ -43,8 +43,17 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
     let output = inspect(root, input, &[]);
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty());
+    let mut report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let timeline = report.as_object_mut().unwrap().remove("timeline").unwrap();
+    assert_eq!(timeline["start_unix_ns"], "10223616000");
+    assert_eq!(timeline["bucket_width_ns"], "32768000");
+    let buckets = timeline["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 39);
+    assert_eq!(buckets[0], json!({"packets": 1, "captured_bytes": 4}));
+    assert_eq!(buckets[1], json!({"packets": 0, "captured_bytes": 0}));
+    assert_eq!(buckets[38], json!({"packets": 1, "captured_bytes": 2}));
     assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        report,
         json!({
             "schema_version": 1,
             "format": "pcap",
@@ -103,7 +112,19 @@ fn reports_a_partial_capture_and_rejects_an_unrecognized_file() {
     assert_eq!(report["complete"], false);
     assert_eq!(report["packets"], 1);
     assert_eq!(report["timestamp_span_ns"], "0");
+    assert_eq!(
+        report["timeline"]["buckets"],
+        json!([{"packets": 1, "captured_bytes": 4}])
+    );
     assert!(report["issue"].as_str().unwrap().contains("incomplete"));
+
+    let input = "empty.pcap";
+    fs::write(root.join(input), &classic_capture()[..24]).unwrap();
+    let empty = inspect(root, input, &[]);
+    assert!(empty.status.success(), "{empty:?}");
+    let report: Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(report["complete"], true);
+    assert!(report["timeline"].is_null());
 
     let input = "not a capture.pcap";
     fs::write(root.join(input), b"not a capture file").unwrap();

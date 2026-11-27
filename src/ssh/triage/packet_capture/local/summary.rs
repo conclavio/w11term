@@ -7,6 +7,8 @@ use std::{
 };
 
 mod pcapng;
+mod timeline;
+pub use timeline::{Bucket, Timeline};
 
 const MAX_RECORDS: u32 = 1_000_000;
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -17,6 +19,7 @@ pub struct Summary {
     pub interfaces: Vec<InterfaceSummary>,
     pub link_types: BTreeSet<u16>,
     pub issue: Option<String>,
+    pub timeline: Option<Timeline>,
 }
 
 pub struct InterfaceSummary {
@@ -111,6 +114,11 @@ impl Summary {
         self.interfaces[interface]
             .stats
             .record(captured, original, timestamp);
+        if let Some(timestamp) = timestamp {
+            self.timeline
+                .get_or_insert_with(Timeline::default)
+                .record(timestamp, captured);
+        }
     }
 }
 

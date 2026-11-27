@@ -1497,6 +1497,8 @@ Use **Saved capture interfaces** when a capture contains multiple interfaces. Ea
 
 If a PCAPNG file records interface statistics, the panel shows the newest timestamped counter snapshot for that interface. These cumulative counters can report packets received, accepted by the filter, delivered, dropped by the interface, or dropped by the OS. The JSON `capture_statistics` object includes the snapshot time as `timestamp_unix_ns`, a decimal nanosecond string. Missing counters are `null`. Each snapshot is reported once, and the packet-record totals still describe the packets stored in the file. [PCAPNG Interface Statistics Block](https://datatracker.ietf.org/doc/html/draft-ietf-opsawg-pcapng-06#section-4.6)
 
+Expand **Packet timeline** to see packet activity across the whole capture, with the peak bucket and its captured bytes. The timeline uses up to 64 equal-width buckets of at least one microsecond, including empty intervals, and counts packets that have usable timestamps. The JSON `timeline` object gives the start and bucket width as decimal nanosecond strings, followed by packet and byte counts for each bucket. Bucket intervals include their start and exclude their end. A capture without usable timestamps has a `null` timeline. The timeline covers the scanned prefix when the report is partial.
+
 ```powershell
 $summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
 $summary.packets
