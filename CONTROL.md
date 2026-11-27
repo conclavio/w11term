@@ -1455,6 +1455,8 @@ Use **Back** in the triage, flame graph, or packet capture panel to return to th
 
 In **Diagnostics overview**, choose **Open saved diagnostic…** or drop files into the labelled area. The overview recognizes `.folded`, `.collapsed`, triage `.json`, `.pcap`, `.pcapng`, `.cap`, `.strace`, and split `name.PID` traces. Select one saved file or all the parts of a single split trace. Each viewer validates the file before adding it to recent diagnostics.
 
+Choose **Compare saved diagnostics…** to browse for two CPU profiles, Linux triage reports, or syscall traces. Pick the baseline first. It becomes **Before** in a CPU or triage comparison and **Working** in a syscall comparison. For a split trace, select all the files for that run in its dialog. Cancel either dialog to return to the overview.
+
 Use `w11term.exe` to launch directly into the corresponding offline viewer. Paths can be relative to the working directory or absolute. Repeat `--open-syscall-trace` for all parts of a split trace. A diagnostics-only window uses the full width and starts without opening a terminal or applying the startup profile.
 
 ```powershell

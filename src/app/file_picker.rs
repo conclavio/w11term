@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
 };
+use w11term::diagnostic_history::Kind;
 use windows::{
     Win32::{
         Foundation::{ERROR_CANCELLED, HWND},
@@ -58,7 +59,10 @@ pub(super) enum Purpose {
     SshGroupDefinition,
     StartRecording,
     OpenRecording,
-    OpenDiagnostic(PathBuf),
+    OpenDiagnostic {
+        path: PathBuf,
+        stage: DiagnosticStage,
+    },
     OpenTriageReport(PathBuf),
     CompareTriageReport(PathBuf),
     SaveTriageReport(PathBuf),
@@ -75,6 +79,13 @@ pub(super) enum Purpose {
         path: PathBuf,
         export: bool,
     },
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DiagnosticStage {
+    Open,
+    Baseline,
+    Candidate(Kind),
 }
 
 fn is_local_folder(folder: &Path) -> bool {
@@ -233,7 +244,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::CompareLocalFile
                 | Purpose::CompareLocalFolder
                 | Purpose::OpenRecording
-                | Purpose::OpenDiagnostic(_)
+                | Purpose::OpenDiagnostic { .. }
                 | Purpose::OpenTriageReport(_)
                 | Purpose::CompareTriageReport(_)
                 | Purpose::OpenPacketCapture(_)
@@ -260,7 +271,14 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
         let confirmed = Rc::new(RefCell::new(None));
         let multiple = matches!(
             purpose,
-            Purpose::UploadFiles | Purpose::OpenDiagnostic(_) | Purpose::OpenSyscallTrace(_)
+            Purpose::UploadFiles
+                | Purpose::OpenSyscallTrace(_)
+                | Purpose::OpenDiagnostic {
+                    stage: DiagnosticStage::Open
+                        | DiagnosticStage::Baseline
+                        | DiagnosticStage::Candidate(Kind::SyscallTrace),
+                    ..
+                }
         );
         let setting_download_folder = matches!(purpose, Purpose::DefaultDownloadFolder);
         let comparison_formats = matches!(
@@ -284,16 +302,48 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::OpenSyscallTrace(ref path) | Purpose::OpenDiagnostic(ref path) => {
-                dialog.SetTitle(if matches!(purpose, Purpose::OpenDiagnostic(_)) {
-                    w!("Open saved diagnostic")
-                } else {
-                    w!("Open syscall trace")
-                })?;
-                options |= FOS_FILEMUSTEXIST
-                    | FOS_PATHMUSTEXIST
-                    | FOS_DONTADDTORECENT
-                    | FOS_ALLOWMULTISELECT;
+            Purpose::OpenSyscallTrace(ref path) | Purpose::OpenDiagnostic { ref path, .. } => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                let (title, filter) = match purpose {
+                    Purpose::OpenDiagnostic {
+                        stage: DiagnosticStage::Open,
+                        ..
+                    } => (w!("Open saved diagnostic"), None),
+                    Purpose::OpenDiagnostic {
+                        stage: DiagnosticStage::Baseline,
+                        ..
+                    } => (w!("Choose baseline diagnostic"), None),
+                    Purpose::OpenDiagnostic {
+                        stage: DiagnosticStage::Candidate(kind),
+                        ..
+                    } => match kind {
+                        Kind::CpuProfile => (
+                            w!("Choose after CPU profile"),
+                            Some(COMDLG_FILTERSPEC {
+                                pszName: w!("Folded stacks"),
+                                pszSpec: w!("*.folded;*.collapsed"),
+                            }),
+                        ),
+                        Kind::TriageReport => (
+                            w!("Choose after triage report"),
+                            Some(COMDLG_FILTERSPEC {
+                                pszName: w!("Linux triage reports"),
+                                pszSpec: w!("*.json"),
+                            }),
+                        ),
+                        Kind::SyscallTrace => (w!("Choose failing syscall trace"), None),
+                        Kind::PacketCapture => anyhow::bail!("Packet captures cannot be compared"),
+                    },
+                    _ => (w!("Open syscall trace"), None),
+                };
+                dialog.SetTitle(title)?;
+                if let Some(filter) = filter {
+                    dialog.SetFileTypes(&[filter])?;
+                }
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if multiple {
+                    options |= FOS_ALLOWMULTISELECT;
+                }
                 if let Some(folder) = path.parent() {
                     local_folder(&dialog, folder);
                 }

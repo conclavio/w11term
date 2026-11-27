@@ -11,6 +11,7 @@ $env:W11TERM_TEST_DIAGNOSTIC_DROP = $dropFixture
 [IO.File]::WriteAllText((Join-Path $State 'saved CPU.folded'), "worker;main 5`n")
 [IO.File]::WriteAllText((Join-Path $State 'baseline CPU.folded'), "worker;main 5`n")
 [IO.File]::WriteAllText((Join-Path $State 'candidate CPU.folded'), "worker;main 3`nworker;other 3`n")
+[IO.File]::WriteAllText((Join-Path $State 'cancelled CPU.folded'), "worker;main 1`n")
 [IO.File]::WriteAllText((Join-Path $State 'empty CPU.folded'), '')
 [IO.File]::WriteAllText((Join-Path $State 'split trace.300'), "1700000000.001000 getpid() = 300`n")
 [IO.File]::WriteAllText((Join-Path $State 'split trace.301'), "1700000000.002000 close(3) = 0`n")
@@ -26,6 +27,10 @@ $failingTrace = @'
 [IO.File]::WriteAllText((Join-Path $State 'failing trace.700'), $failingTrace + "`n")
 [IO.File]::WriteAllText((Join-Path $State 'working trace.601'), '1700000000.002000 execve("/bin/helper", ["helper"], NULL) = 0' + "`n")
 [IO.File]::WriteAllText((Join-Path $State 'failing trace.701'), '1800000000.002000 execve("/bin/helper", ["helper"], NULL) = 0' + "`n")
+[IO.File]::Copy((Join-Path $State 'working trace.600'), (Join-Path $State 'picker working.710'))
+[IO.File]::Copy((Join-Path $State 'working trace.601'), (Join-Path $State 'picker working.711'))
+[IO.File]::Copy((Join-Path $State 'failing trace.700'), (Join-Path $State 'picker failing.810'))
+[IO.File]::Copy((Join-Path $State 'failing trace.701'), (Join-Path $State 'picker failing.811'))
 [IO.File]::WriteAllBytes((Join-Path $State 'saved packets.pcap'), [byte[]]@(
     0xd4,0xc3,0xb2,0xa1, 2,0,4,0, 0,0,0,0, 0,0,0,0, 0xff,0xff,0,0, 1,0,0,0
 ))
@@ -70,6 +75,19 @@ function Close-Artifact {
         Close-FixtureApp $script:app
         $script:app = $null
     }
+}
+
+function Choose-Diagnostic([string]$Title, [string]$Filename) {
+    $dialog = Wait-Until "owned dialog '$Title'" { Find-OwnedDialog $Title }
+    $null = Wait-Until "enter source in '$Title'" { [FixtureDialog]::SetFilename($dialog, $Filename, '') }
+    $null = Wait-Until "accept '$Title'" { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+
+function Start-SavedComparison {
+    Invoke-Button (Wait-Until 'comparison picker is enabled' {
+        $start = Find-Element ('Compare saved diagnostics' + [char]0x2026) $button
+        if ($start -and $start.Current.IsEnabled) { $start }
+    })
 }
 
 try {
@@ -172,6 +190,52 @@ try {
     [IO.File]::WriteAllText($dropFixture, (ConvertTo-Json -InputObject $splitPaths))
     Invoke-Button (Find-Element 'Drop fixture diagnostic' $button)
     $null = Wait-Until 'the diagnostic drop opens both parts of the trace' { Find-Element 'Files merged by epoch timestamp' }
+    Close-Artifact
+
+    Open-Artifact @('--open-cpu-profile','"saved CPU.folded"') 'CPU flame graph'
+    $null = Wait-Until 'profile is ready before comparing files from the overview' { Find-Element '5 samples' }
+    Invoke-Button (Find-Element 'Return to diagnostics overview' $button)
+    Start-SavedComparison
+    Choose-Diagnostic 'Choose baseline diagnostic' (Join-Path $State 'cancelled CPU.folded')
+    $picker = Wait-Until 'the baseline determines the type of the after dialog' {
+        Find-OwnedDialog 'Choose after CPU profile'
+    }
+    $null = Wait-Until 'cancel the after dialog' { [FixtureDialog]::ClickButton($picker, 2) }
+    Start-SavedComparison
+    Choose-Diagnostic 'Choose baseline diagnostic' (Join-Path $State 'baseline CPU.folded')
+    Choose-Diagnostic 'Choose after CPU profile' (Join-Path $State 'candidate CPU.folded')
+    $null = Wait-Until 'the picker preserves the before and after CPU roles' {
+        (Find-Element "Before${dot}baseline CPU.folded${dot}5 samples") -and
+            (Find-Element "After${dot}candidate CPU.folded${dot}6 samples")
+    }
+    Invoke-Button (Find-Element 'Return to diagnostics overview' $button)
+
+    Start-SavedComparison
+    Choose-Diagnostic 'Choose baseline diagnostic' (Join-Path $State 'baseline triage.json')
+    Choose-Diagnostic 'Choose after triage report' (Join-Path $State 'candidate triage.json')
+    $null = Wait-Until 'the picker opens the triage comparison with its coverage regression' {
+        (Find-Element "Before${dot}baseline triage.json") -and
+            (Find-Element "After${dot}candidate triage.json") -and
+            (Find-Element "After${dot}Permission denied${dot}Exit 1")
+    }
+    Invoke-Button (Find-Element 'Return to diagnostics overview' $button)
+
+    Start-SavedComparison
+    Choose-Diagnostic 'Choose baseline diagnostic' '"picker working.710" "picker working.711"'
+    Choose-Diagnostic 'Choose failing syscall trace' '"picker failing.810" "picker failing.811"'
+    $null = Wait-Until 'both picked syscall runs show their roles and first result divergence' {
+        (Find-Element "Working${dot}picker working.710") -and
+            (Find-Element "Failing${dot}picker failing.810") -and
+            (Find-Element "First divergence${dot}Changed result${dot}openat${dot}`"/tmp/settings`"")
+    }
+    $null = Wait-Until 'both picked split sets enter history and the cancelled baseline stays out' {
+        $recent = [IO.File]::ReadAllText($history) | ConvertFrom-Json
+        $working = $recent.entries | Where-Object { $_.paths -contains (Join-Path $State 'picker working.710') }
+        $failing = $recent.entries | Where-Object { $_.paths -contains (Join-Path $State 'picker failing.810') }
+        $cancelled = $recent.entries | Where-Object { $_.paths -contains (Join-Path $State 'cancelled CPU.folded') }
+        !$cancelled -and ($working.paths -contains (Join-Path $State 'picker working.711')) -and
+            ($failing.paths -contains (Join-Path $State 'picker failing.811'))
+    }
     Close-Artifact
 
     Open-Artifact @('--open-cpu-profile','"empty CPU.folded"') 'CPU flame graph'
