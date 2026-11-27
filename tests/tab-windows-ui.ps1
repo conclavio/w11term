@@ -138,7 +138,12 @@ function Open-TabSearch([IntPtr]$Hwnd, [string]$Query, [string]$Result) {
         $element = Find-Here $Hwnd 'Search tabs'
         if ($element -and $element.Current.HasKeyboardFocus) { $element }
     }
-    $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Query)
+    $value = $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    # The wanted row can also be present before filtering. Wait for an empty result
+    # first so Enter can only act on a selection from the requested query.
+    $value.SetValue('w11term fixture search with no matching tab')
+    $null = Wait-Until 'tab search renders an empty result' { Find-Here $Hwnd 'No matching tabs' }
+    $value.SetValue($Query)
     $null = Wait-Until "tab search result '$Result'" { Find-Here $Hwnd $Result }
 }
 
