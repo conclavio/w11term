@@ -117,6 +117,15 @@ pub fn builtin_tool_names() -> &'static [String] {
     &NAMES
 }
 
+/// Select one pinned command under the shared built-in bundle name.
+pub fn builtin_tool_bundle(name: &str) -> Result<UtilityBundle> {
+    let mut bundle = tool_catalog()?;
+    bundle.tools.retain(|tool| tool.name == name);
+    ensure!(!bundle.tools.is_empty(), "Unknown built-in tool {name}");
+    bundle.validate()?;
+    Ok(bundle)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "format", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum UtilityDownload {
@@ -301,10 +310,7 @@ pub fn prepare_builtin_tool_bundle(
     let bytes = preset.bytes()?;
     let manifest = managed_builtin_manifest(&data, &bytes, preset)?;
     let bundle = serde_json::from_slice(&bytes).context("Reading the built-in tool bundle")?;
-    fetch_bundle_at(&bundle, None, &cache_dir()?, |url, limit| {
-        crate::https::get(url, limit, &cancelled)
-    })?;
-    ensure!(!cancelled(), "Tool download cancelled");
+    fetch_tool_bundle_cancellable(&bundle, None, cancelled)?;
     Ok(manifest)
 }
 
@@ -357,9 +363,20 @@ pub fn fetch_tool_bundle(
     bundle: &UtilityBundle,
     architecture: Option<UtilityArchitecture>,
 ) -> Result<Value> {
-    fetch_bundle_at(bundle, architecture, &cache_dir()?, |url, limit| {
-        crate::https::get(url, limit, || false)
-    })
+    fetch_tool_bundle_cancellable(bundle, architecture, || false)
+}
+
+pub fn fetch_tool_bundle_cancellable(
+    bundle: &UtilityBundle,
+    architecture: Option<UtilityArchitecture>,
+    cancelled: impl Fn() -> bool,
+) -> Result<Value> {
+    ensure!(!cancelled(), "Tool download cancelled");
+    let report = fetch_bundle_at(bundle, architecture, &cache_dir()?, |url, limit| {
+        crate::https::get(url, limit, &cancelled)
+    })?;
+    ensure!(!cancelled(), "Tool download cancelled");
+    Ok(report)
 }
 
 fn fetch_bundle_at(

@@ -114,7 +114,7 @@ fn sftp_opened_tool(trace: &std::path::Path) -> bool {
         .any(|line| line.starts_with("OPEN ") && line.ends_with("/rg"))
 }
 
-fn tool_sha256(bytes: &[u8]) -> String {
+pub(super) fn tool_sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -1007,6 +1007,27 @@ fn approved_login(source: Source, local: &std::path::Path) -> SshOptions {
         .prepare_profile_connection(&local.join("profiles.json"))
         .unwrap();
     restored
+}
+
+#[cfg(feature = "ui-smoke")]
+pub(super) async fn seed_catalog_tool_for_reference(
+    pane: &Session,
+    local: &std::path::Path,
+    remote: &std::path::Path,
+) -> String {
+    probe_response(remote, "x86_64", "/", "/usr/bin:/.local/bin");
+    fs::write(remote.join("posix-rename-version"), "1").unwrap();
+    save_login_tools(local, "catalog-seed.json", 1, &["rg"]);
+    let mut bundle = UtilityBundle::load(&local.join("catalog-seed.json")).unwrap();
+    bundle.name = w11term::sftp::builtin_tool_bundle("rg").unwrap().name;
+    let operation = || Operation::PreviewToolBundle {
+        bundle: bundle.clone(),
+    };
+    let plan = guarded_job(pane, None, operation()).await.unwrap();
+    let installed = guarded_job(pane, None, apply(operation(), &plan))
+        .await
+        .unwrap();
+    installed["bundle_sha256"].as_str().unwrap().into()
 }
 
 #[cfg(feature = "ui-smoke")]

@@ -2838,6 +2838,72 @@ async fn native_command_reference_applies_reviewed_ssh_dotfiles() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "reviews a pinned command on the active SSH pane and repairs its missing launcher"]
+async fn native_command_reference_installs_a_selected_catalog_tool() {
+    use w11term::sftp::{UtilityArchitecture, builtin_tool_bundle};
+
+    let (Source::Ssh(ssh), remote, _, server) = fixture_connections(false, 2).await else {
+        unreachable!()
+    };
+    let state = tempfile::tempdir().unwrap();
+    let pane = Session::start(Source::Ssh(ssh.clone()));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pane.ssh_connection_generation().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let root = remote.path();
+    let id = super::utilities::seed_catalog_tool_for_reference(&pane, state.path(), root).await;
+    drop(pane);
+    let bin = root.join(".local/bin");
+    fs::remove_file(bin.join("rg")).unwrap();
+    let conflict = bin.join("jq");
+    fs::write(&conflict, "operator-owned command").unwrap();
+    let mut catalog = builtin_tool_bundle("jq").unwrap();
+    let pin = catalog
+        .tools
+        .remove(0)
+        .builds
+        .into_iter()
+        .find(|build| build.architecture == UtilityArchitecture::X86_64)
+        .unwrap()
+        .sha256;
+    fs::write(
+        state.path().join("catalog-tool-fixture.json"),
+        serde_json::to_vec(&json!({"conflict": conflict, "pin": pin})).unwrap(),
+    )
+    .unwrap();
+
+    let store = root.join(format!(".local/share/w11term/tools/{}", catalog.name));
+    let original = fs::read(store.join("versions").join(&id).join("rg")).unwrap();
+    drive_mixed_gui("install-command-tool-ui.ps1", &ssh, state.path());
+    let launcher = fs::read_to_string(bin.join("rg")).unwrap();
+    assert!(launcher.ends_with("/linux-essentials/current/rg\n"));
+    let selector = fs::read_to_string(store.join("current")).unwrap();
+    let version = selector.lines().nth(1).unwrap();
+    if std::env::var("W11TERM_TEST_LIVE_CATALOG_DOWNLOAD").as_deref() == Ok("1") {
+        assert!(version.starts_with("./versions/"));
+        let active = store.join(version);
+        assert_eq!(fs::read(active.join("rg")).unwrap(), original);
+        assert_eq!(
+            super::utilities::tool_sha256(&fs::read(active.join("jq")).unwrap()),
+            pin
+        );
+        assert!(
+            fs::read_to_string(&conflict)
+                .unwrap()
+                .ends_with("/linux-essentials/current/jq\n")
+        );
+    } else {
+        assert_eq!(version, format!("versions/{id}"));
+        assert!(!conflict.exists());
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "looks up offline TLDR and installed SSH tool pages and inserts an edited example without submitting it"]
 async fn native_command_reference_follows_powershell_and_ssh() {
     let transports = Arc::new(AtomicUsize::new(0));

@@ -1,16 +1,20 @@
 use super::*;
 use serde::Deserialize;
 use std::path::PathBuf;
-use w11term::sftp::UtilityBundle;
+use w11term::sftp::{
+    UtilityArchitecture, UtilityBundle, UtilityDownload, builtin_tool_bundle, builtin_tool_names,
+    fetch_tool_bundle_cancellable,
+};
 
 mod history;
 mod path_repair;
 
 pub enum Action {
-    Open(ToolPane),
+    Open(ToolPane, Option<String>),
     Browse,
     Picked(Arc<()>, Result<Option<PathBuf>, String>),
     Preview,
+    Download,
     Previewed(Arc<()>, Result<Box<Review>, String>),
     Apply,
     Applied(Arc<()>, Result<Installation, String>),
@@ -33,11 +37,13 @@ pub struct Review {
     managed_directory_plan: Directory,
     bin_matches_active: bool,
     supports_atomic_replace: bool,
+    #[serde(default)]
+    automatic_sync_paused: bool,
 }
 
 #[derive(Deserialize)]
 struct Host {
-    architecture: String,
+    architecture: UtilityArchitecture,
     home: String,
 }
 
@@ -60,11 +66,22 @@ struct Tool {
     earlier_executable: Option<String>,
     selected_build: Option<usize>,
     builds: Vec<Build>,
+    retained: Option<Retained>,
 }
 
 #[derive(Deserialize)]
 struct Build {
+    architecture: UtilityArchitecture,
+    status: String,
+    release: Option<String>,
+    sha256: String,
+    download: Option<UtilityDownload>,
     reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Retained {
+    sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -72,12 +89,15 @@ pub struct Installation {
     bundle: String,
     changed: bool,
     launchers_created: usize,
+    #[serde(default)]
+    automatic_sync_paused: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Work {
     Browse,
     Preview,
+    Download,
     Apply,
     PathReview,
     PathApply,
@@ -89,10 +109,25 @@ impl Work {
     }
 }
 
+#[derive(Clone)]
+enum BundleSource {
+    Manifest(Option<PathBuf>),
+    BuiltIn(String),
+}
+
+impl BundleSource {
+    fn command(&self) -> Option<&str> {
+        match self {
+            Self::BuiltIn(name) => Some(name),
+            Self::Manifest(_) => None,
+        }
+    }
+}
+
 pub(super) struct Installer {
     target: ToolPane,
     account: String,
-    manifest: Option<PathBuf>,
+    source: BundleSource,
     review: Option<Box<Review>>,
     pending: Option<(Arc<()>, Work)>,
     status: Option<String>,
@@ -133,6 +168,7 @@ impl Installer {
             return history.view(&self.account, active == Some(self.target), ctx);
         }
         let available = active == Some(self.target) && self.pending.is_none();
+        let command = self.source.command();
         let applying = self
             .pending
             .as_ref()
@@ -146,7 +182,12 @@ impl Installer {
         let mut fields = vec![
             KeyedView::new(
                 "heading",
-                TextBlock::new().text("Install SSH tools").font_size(18.0),
+                TextBlock::new()
+                    .text(command.map_or_else(
+                        || "Install SSH tools".into(),
+                        |name| format!("Install {name}"),
+                    ))
+                    .font_size(18.0),
             ),
             KeyedView::new(
                 "account",
@@ -207,39 +248,45 @@ impl Installer {
                 ));
             }
         }
-        fields.extend([
-            KeyedView::new(
-                "history",
-                button("Bundle versions", available, || {
-                    Action::History(history::Action::Open)
-                }),
-            ),
-            KeyedView::new(
-                "manifest",
-                TextBlock::new()
-                    .automation_id("ssh-tool-install-manifest")
-                    .text(self.manifest.as_deref().map_or_else(
-                        || "Choose a bundle manifest".into(),
-                        |path| path.display().to_string(),
-                    ))
-                    .text_wrapping(TextWrapping::Wrap),
-            ),
-            KeyedView::new(
-                "choose-and-review",
-                StackPanel::new().spacing(8.0).children((
-                    button("Browse for tool bundle", available, || Action::Browse),
-                    button(
-                        "Review bundle",
-                        available && self.manifest.is_some(),
-                        || Action::Preview,
-                    ),
-                )),
-            ),
-        ]);
+        fields.push(KeyedView::new(
+            "history",
+            button("Bundle versions", available, || {
+                Action::History(history::Action::Open)
+            }),
+        ));
+        if let BundleSource::Manifest(manifest) = &self.source {
+            fields.extend([
+                KeyedView::new(
+                    "manifest",
+                    TextBlock::new()
+                        .automation_id("ssh-tool-install-manifest")
+                        .text(manifest.as_deref().map_or_else(
+                            || "Choose a bundle manifest".into(),
+                            |path| path.display().to_string(),
+                        ))
+                        .text_wrapping(TextWrapping::Wrap),
+                ),
+                KeyedView::new(
+                    "choose-and-review",
+                    StackPanel::new().spacing(8.0).children((
+                        button("Browse for tool bundle", available, || Action::Browse),
+                        button("Review bundle", available && manifest.is_some(), || {
+                            Action::Preview
+                        }),
+                    )),
+                ),
+            ]);
+        } else {
+            fields.push(KeyedView::new(
+                "review-command",
+                button("Review tool again", available, || Action::Preview),
+            ));
+        }
         let status = if let Some((_, work)) = &self.pending {
             Some(match work {
                 Work::Browse => "Choosing a manifest…",
                 Work::Preview => "Reviewing tool bundle…",
+                Work::Download => "Downloading and verifying the pinned Linux build…",
                 Work::Apply => "Installing reviewed tool bundle…",
                 Work::PathReview => "Reviewing tool PATH…",
                 Work::PathApply => "Updating shell startup files…",
@@ -258,16 +305,27 @@ impl Installer {
             ));
         }
         if let Some(review) = &self.review {
-            review.describe(&mut fields);
+            let download = command.and_then(|name| review.downloadable(name));
+            review.describe(&mut fields, command, download);
+            if download.is_some() {
+                fields.push(KeyedView::new(
+                    "download-build",
+                    button("Download pinned Linux build", available, || {
+                        Action::Download
+                    }),
+                ));
+            }
         }
+        let install = command.map_or_else(
+            || "Install reviewed bundle".into(),
+            |name| format!("Install reviewed {name}"),
+        );
         fields.push(KeyedView::new(
             "install-actions",
             StackPanel::new().spacing(8.0).children((
-                button(
-                    "Install reviewed bundle",
-                    available && self.token().is_some(),
-                    || Action::Apply,
-                ),
+                button(&install, available && self.token().is_some(), || {
+                    Action::Apply
+                }),
                 button("Back to command reference", !applying, || Action::Close),
             )),
         ));
@@ -278,7 +336,34 @@ impl Installer {
 }
 
 impl Review {
-    fn describe(&self, fields: &mut Vec<KeyedView>) {
+    fn downloadable(&self, name: &str) -> Option<&Build> {
+        if self.ready
+            || self.current.conflict
+            || !self.bin_matches_active
+            || self.bin_directory_plan.blocked_at.is_some()
+            || self.managed_directory_plan.blocked_at.is_some()
+            || (self.current.version.is_some() && !self.supports_atomic_replace)
+            || self.tools.iter().any(|tool| tool.launcher == "conflict")
+        {
+            return None;
+        }
+        let tool = self.tools.iter().find(|tool| tool.name == name)?;
+        if tool.retained.is_some() || tool.selected_build.is_some() {
+            return None;
+        }
+        tool.builds.iter().find(|build| {
+            build.architecture == self.host.architecture
+                && build.status == "invalid"
+                && build.download.is_some()
+        })
+    }
+
+    fn describe(
+        &self,
+        fields: &mut Vec<KeyedView>,
+        command: Option<&str>,
+        download: Option<&Build>,
+    ) {
         let detail = |key: &str, text: String| {
             KeyedView::new(
                 key.to_owned(),
@@ -287,11 +372,15 @@ impl Review {
                     .text_wrapping(TextWrapping::Wrap),
             )
         };
+        let architecture = match self.host.architecture {
+            UtilityArchitecture::X86_64 => "x86_64",
+            UtilityArchitecture::Aarch64 => "aarch64",
+        };
         fields.push(detail(
             "destination",
             format!(
                 "{} · Linux {} · Home {}\nLaunchers will be in {}",
-                self.bundle, self.host.architecture, self.host.home, self.bin_directory
+                self.bundle, architecture, self.host.home, self.bin_directory
             ),
         ));
         let path_status = match self.path_status.as_str() {
@@ -302,10 +391,22 @@ impl Review {
             _ => "Launcher directory is missing from the probed PATH",
         };
         fields.push(detail("path", path_status.to_owned()));
-        if !self.ready {
+        if let Some(build) = download {
+            fields.push(detail(
+                "awaiting-build",
+                format!("Download the pinned {architecture} build to continue"),
+            ));
+            fields.push(detail("download-pin", format!("SHA-256 {}", build.sha256)));
+        } else if !self.ready {
             fields.push(detail(
                 "blocked",
                 "Resolve the conflicts before installing".into(),
+            ));
+        }
+        if self.automatic_sync_paused {
+            fields.push(detail(
+                "sync-hold",
+                "Automatic sync will be paused for this bundle after installation.".into(),
             ));
         }
         for (key, directory) in [
@@ -330,13 +431,29 @@ impl Review {
         for tool in &self.tools {
             let mut text = match tool.launcher.as_str() {
                 "conflict" => format!("{} · Existing entry at {}", tool.name, tool.destination),
+                "managed" if tool.retained.is_some() => {
+                    format!("{} · Keep {}", tool.name, tool.destination)
+                }
                 "managed" => format!("{} · Reuse {}", tool.name, tool.destination),
                 _ => format!("{} · Create {}", tool.name, tool.destination),
             };
             if let Some(path) = &tool.earlier_executable {
                 text.push_str(&format!("\nEarlier executable in PATH is {path}"));
             }
-            if tool.selected_build.is_none() {
+            if let Some(retained) = &tool.retained {
+                text.push_str(&format!(
+                    "\nKeep installed binary · SHA-256 {}",
+                    retained.sha256
+                ));
+            } else if let Some(build) = tool.selected_build.and_then(|index| tool.builds.get(index))
+            {
+                if command == Some(tool.name.as_str()) {
+                    if let Some(release) = &build.release {
+                        text.push_str(&format!("\n{release}"));
+                    }
+                    text.push_str(&format!("\nSHA-256 {}", build.sha256));
+                }
+            } else if download.is_none() || command != Some(tool.name.as_str()) {
                 let reason = tool
                     .builds
                     .iter()
@@ -362,33 +479,50 @@ impl TerminalApp {
         let current = self
             .reference_tool_target()
             .map(|(target, session)| (target, session.input.clone()));
-        if let Action::Open(target) = action {
-            if current.as_ref().is_none_or(|(pane, _)| *pane != target)
-                || !self.command_reference.open
-                || self.command_reference.subpanel_open()
-            {
-                return;
+        let action = match action {
+            Action::Open(target, command) => {
+                if current.as_ref().is_none_or(|(pane, _)| *pane != target)
+                    || !self.command_reference.open
+                    || self.command_reference.subpanel_open()
+                    || command
+                        .as_ref()
+                        .is_some_and(|name| !builtin_tool_names().contains(name))
+                {
+                    return;
+                }
+                let Some(Page::Terminal(live)) = self.tabs.active().map(|tab| &tab.page) else {
+                    return;
+                };
+                let Source::Ssh(ssh) = &live.source else {
+                    return;
+                };
+                let source = command.map_or_else(
+                    || {
+                        BundleSource::Manifest(
+                            ssh.tool_bundle.as_ref().map(|tools| tools.bundle.clone()),
+                        )
+                    },
+                    BundleSource::BuiltIn,
+                );
+                let review_now = source.command().is_some();
+                self.command_reference.draft = None;
+                self.command_reference.tool_install = Some(Installer {
+                    target,
+                    account: format!("{}@{}:{}", ssh.user, ssh.host, ssh.port),
+                    source,
+                    review: None,
+                    pending: None,
+                    status: None,
+                    history: None,
+                    path_review: None,
+                });
+                if !review_now {
+                    return;
+                }
+                Action::Preview
             }
-            let Some(Page::Terminal(live)) = self.tabs.active().map(|tab| &tab.page) else {
-                return;
-            };
-            let Source::Ssh(ssh) = &live.source else {
-                return;
-            };
-            let manifest = ssh.tool_bundle.as_ref().map(|tools| tools.bundle.clone());
-            self.command_reference.draft = None;
-            self.command_reference.tool_install = Some(Installer {
-                target,
-                account: format!("{}@{}:{}", ssh.user, ssh.host, ssh.port),
-                manifest,
-                review: None,
-                pending: None,
-                status: None,
-                history: None,
-                path_review: None,
-            });
-            return;
-        }
+            action => action,
+        };
 
         let owner = self.keyboard.hwnd().map(|window| window.0 as usize);
         let catalog_path = self.store.path().to_path_buf();
@@ -401,7 +535,7 @@ impl TerminalApp {
         }
         let target = installer.target;
         match action {
-            Action::Open(_) => unreachable!("opening handled above"),
+            Action::Open(..) => unreachable!("opening handled above"),
             Action::History(_) => unreachable!("history handled above"),
             Action::Path(_) => unreachable!("PATH repair handled above"),
             Action::Close => {
@@ -420,8 +554,11 @@ impl TerminalApp {
                 {
                     return;
                 }
+                let BundleSource::Manifest(manifest) = &installer.source else {
+                    return;
+                };
                 let Some(owner) = owner else { return };
-                let path = installer.manifest.clone().unwrap_or(catalog_path);
+                let path = manifest.clone().unwrap_or(catalog_path);
                 let ticket = installer.begin(Work::Browse);
                 let rejected = message(Action::Picked(
                     ticket.clone(),
@@ -444,24 +581,40 @@ impl TerminalApp {
                 }
                 match result {
                     Ok(Some(path)) => {
-                        installer.manifest = Some(path);
+                        installer.source = BundleSource::Manifest(Some(path));
                         installer.review = None;
                     }
                     Ok(None) => (),
                     Err(error) => installer.status = Some(error),
                 }
             }
-            Action::Preview | Action::Apply => {
+            Action::Preview | Action::Download | Action::Apply => {
                 let Some((_, input)) = current.filter(|(pane, _)| *pane == target) else {
                     return;
                 };
                 if installer.pending.is_some() {
                     return;
                 }
-                let Some(path) = installer.manifest.clone() else {
+                let source = installer.source.clone();
+                if matches!(source, BundleSource::Manifest(None)) {
                     return;
+                }
+                let work = match action {
+                    Action::Apply => Work::Apply,
+                    Action::Download => Work::Download,
+                    _ => Work::Preview,
                 };
-                let apply = matches!(action, Action::Apply);
+                let download = if work == Work::Download {
+                    let Some(build) = installer.review.as_ref().and_then(|review| {
+                        source.command().and_then(|name| review.downloadable(name))
+                    }) else {
+                        return;
+                    };
+                    Some(build.architecture)
+                } else {
+                    None
+                };
+                let apply = work == Work::Apply;
                 let token = if apply {
                     let Some(token) = installer.token() else {
                         return;
@@ -470,8 +623,10 @@ impl TerminalApp {
                 } else {
                     None
                 };
-                installer.review = None;
-                let ticket = installer.begin(if apply { Work::Apply } else { Work::Preview });
+                if work != Work::Download {
+                    installer.review = None;
+                }
+                let ticket = installer.begin(work);
                 let rejected = if apply {
                     message(Action::Applied(
                         ticket.clone(),
@@ -486,15 +641,46 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |scope| {
                         let result = (|| -> Result<serde_json::Value, String> {
-                            let bundle = UtilityBundle::load(&path)
-                                .map_err(|error| format!("Reading the tool bundle: {error:#}"))?;
+                            let operation = match source {
+                                BundleSource::Manifest(Some(path)) => {
+                                    let bundle = UtilityBundle::load(&path).map_err(|error| {
+                                        format!("Reading the tool bundle: {error:#}")
+                                    })?;
+                                    match token {
+                                        Some(review) => {
+                                            Operation::ApplyToolBundle { bundle, review }
+                                        }
+                                        None => Operation::PreviewToolBundle { bundle },
+                                    }
+                                }
+                                BundleSource::BuiltIn(name) => {
+                                    let bundle = builtin_tool_bundle(&name).map_err(|error| {
+                                        format!("Reading the built-in command: {error:#}")
+                                    })?;
+                                    if let Some(architecture) = download {
+                                        fetch_tool_bundle_cancellable(
+                                            &bundle,
+                                            Some(architecture),
+                                            || scope.is_cancelled(),
+                                        )
+                                        .map_err(
+                                            |error| {
+                                                format!("Downloading the pinned build: {error:#}")
+                                            },
+                                        )?;
+                                    }
+                                    Operation::AddToToolBundle {
+                                        bundle,
+                                        review: token,
+                                    }
+                                }
+                                BundleSource::Manifest(None) => {
+                                    unreachable!("a manifest is selected")
+                                }
+                            };
                             if scope.is_cancelled() {
                                 return Err("Tool bundle operation cancelled".into());
                             }
-                            let operation = match token {
-                                Some(review) => Operation::ApplyToolBundle { bundle, review },
-                                None => Operation::PreviewToolBundle { bundle },
-                            };
                             let timeout = Duration::from_secs(if apply { 600 } else { 30 });
                             run_pane_sftp_job(input, target, operation, timeout, None)
                         })();
@@ -508,7 +694,9 @@ impl TerminalApp {
                 );
             }
             Action::Previewed(ticket, result) => {
-                if installer.finish(&ticket, Work::Preview) {
+                if installer.finish(&ticket, Work::Preview)
+                    || installer.finish(&ticket, Work::Download)
+                {
                     match result {
                         Ok(review) => installer.review = Some(review),
                         Err(error) => installer.status = Some(error),
@@ -520,7 +708,19 @@ impl TerminalApp {
                     installer.status = Some(match result {
                         Ok(installation) => {
                             panel.tools = None;
-                            if installation.changed || installation.launchers_created != 0 {
+                            let changed =
+                                installation.changed || installation.launchers_created != 0;
+                            if let Some(name) = installer.source.command() {
+                                let mut status = if changed {
+                                    format!("Installed {name}")
+                                } else {
+                                    format!("{name} is already installed")
+                                };
+                                if installation.automatic_sync_paused {
+                                    status.push_str("\nAutomatic bundle sync is paused.");
+                                }
+                                status
+                            } else if changed {
                                 format!("Installed tool bundle {}", installation.bundle)
                             } else {
                                 format!("Tool bundle {} is already active", installation.bundle)

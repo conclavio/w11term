@@ -294,7 +294,7 @@ impl Panel {
                     Button::new()
                         .on_click(ctx.callback(move |_| {
                             Message::CommandReference(Action::ToolInstall(
-                                tool_install::Action::Open(target),
+                                tool_install::Action::Open(target, None),
                             ))
                         }))
                         .content("Install SSH tools"),
@@ -383,6 +383,24 @@ impl Panel {
                         .text_wrapping(TextWrapping::Wrap),
                 ),
             ]);
+        }
+        if let (Some(target), Some(key), Some(_)) = (tool_pane, selected, page)
+            && matches!(key.platform, LINUX | COMMON)
+            && w11term::sftp::builtin_tool_names().contains(&key.name)
+        {
+            let name = key.name.clone();
+            let label = format!("Review installing {name}");
+            pieces.push(KeyedView::new(
+                "install-command",
+                Button::new()
+                    .on_click(ctx.callback(move |_| {
+                        Message::CommandReference(Action::ToolInstall(tool_install::Action::Open(
+                            target,
+                            Some(name.clone()),
+                        )))
+                    }))
+                    .content(label),
+            ));
         }
         if let Some(Ok(installed)) = lookup.and_then(|lookup| lookup.result.as_ref()) {
             let command = match selected {

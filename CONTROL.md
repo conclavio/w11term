@@ -1403,6 +1403,8 @@ The preview uses the pane's verified SSH connection. A read-only SSH exec probe 
 
 From a connected SSH pane, open **More → Command reference → Install SSH tools**. Choose a Windows manifest or use the bundle from the pane's profile. Select **Review bundle** to see the resolved home, architecture, launcher paths, PATH status, and any blocking conflicts. **Install reviewed bundle** applies that review on the same connection. The installation runs alongside the SSH shell and uses the manual SFTP deadline.
 
+From the manual for a built-in Linux tool such as `jq` or `rg`, choose **Review installing jq** or the corresponding action for that tool. The review shows the SSH account, launcher, retained tools, and the pinned build for the host's architecture. Choose **Download pinned Linux build** if the Windows cache needs the executable, then confirm **Install reviewed jq**. The install adds the command to the shared built-in bundle and preserves its active binaries. A new release pauses that bundle's automatic updates until you resume them from **Bundle versions**.
+
 Open **Bundle versions** to see the releases still stored under the SSH account, with the active version marked. Choose an earlier release and select **Review rollback** to verify its binaries and see its commands and launcher paths. **Restore reviewed version** switches to that release and pauses automatic updates for the bundle. Launchers for commands absent from the restored release become dormant.
 
 Review the destinations, PATH status, and selected builds. When the report has `ready: true`, pass its `review` token back to the same pane. The commands below use the default JSON response from `w11term-cli`.
