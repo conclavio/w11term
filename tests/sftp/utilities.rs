@@ -2,7 +2,8 @@ use super::*;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use w11term::sftp::{
-    Operation, UtilityArchitecture, UtilityBuild, UtilityBundle, UtilityDownload, UtilityTool,
+    InstalledToolPath, Operation, UtilityArchitecture, UtilityBuild, UtilityBundle,
+    UtilityDownload, UtilityTool,
 };
 use w11term::{
     options::{ToolPath, ToolSync},
@@ -593,15 +594,20 @@ async fn installed_tool_path_requires_a_review_of_the_active_release_and_startup
         .unwrap();
     assert_eq!(installed["path_status"], "missing");
     let id = installed["bundle_sha256"].as_str().unwrap();
-    let setup = |shell, review| Operation::ReviewInstalledToolPath {
-        bundle: bundle.name.clone(),
-        bundle_sha256: id.to_owned(),
-        path: ToolPath {
-            shell,
-            zdotdir: None,
-        },
-        review,
-    };
+    let path_change =
+        |shell, zdotdir: Option<&str>, remove, review| Operation::ReviewInstalledToolPath {
+            installed: InstalledToolPath {
+                bundle: bundle.name.clone(),
+                bundle_sha256: id.to_owned(),
+                path: ToolPath {
+                    shell,
+                    zdotdir: zdotdir.map(str::to_owned),
+                },
+                remove,
+            },
+            review,
+        };
+    let setup = |shell, review| path_change(shell, None, false, review);
     let bash = DotfileShell::Bash;
     let generation = pane.ssh_connection_generation().unwrap();
     let error = guarded_job(&pane, None, setup(bash, None))
@@ -689,15 +695,7 @@ async fn installed_tool_path_requires_a_review_of_the_active_release_and_startup
     );
     let zdotdir = remote.join("config/zsh");
     fs::create_dir_all(&zdotdir).unwrap();
-    let zsh = |review| Operation::ReviewInstalledToolPath {
-        bundle: bundle.name.clone(),
-        bundle_sha256: id.to_owned(),
-        path: ToolPath {
-            shell: DotfileShell::Zsh,
-            zdotdir: Some("config/zsh".into()),
-        },
-        review,
-    };
+    let zsh = |review| path_change(DotfileShell::Zsh, Some("config/zsh"), false, review);
     let zsh_plan = guarded_job(&pane, Some(generation), zsh(None))
         .await
         .unwrap();
@@ -714,6 +712,93 @@ async fn installed_tool_path_requires_a_review_of_the_active_release_and_startup
     );
     assert!(!remote.join(".zshrc").exists());
     assert_eq!(fs::read_to_string(&rc).unwrap(), content);
+
+    let remove = |review| path_change(bash, None, true, review);
+    let profile = remote.join(".profile");
+    let profile_before = fs::read_to_string(&profile).unwrap();
+    let higher_priority = remote.join(".bash_profile");
+    fs::write(&higher_priority, "# added login file\n").unwrap();
+    let edited = content.replace("export PATH ;;", "export PATH; echo retained ;;");
+    fs::write(&rc, &edited).unwrap();
+    let blocked = guarded_job(&pane, Some(generation), remove(None))
+        .await
+        .unwrap();
+    assert_eq!(blocked["ready"], false);
+    assert!(blocked["blocked"].as_str().unwrap().contains(".bashrc"));
+    assert!(blocked["review"].is_null());
+    assert_eq!(fs::read_to_string(&rc).unwrap(), edited);
+    assert_eq!(fs::read_to_string(&profile).unwrap(), profile_before);
+    fs::write(&rc, content.replace('\n', "\r\n")).unwrap();
+
+    let removal = guarded_job(&pane, Some(generation), remove(None))
+        .await
+        .unwrap();
+    assert_eq!(removal["remove"], true);
+    assert_eq!(removal["ready"], true);
+    assert_eq!(removal["files"][2]["path"], "/.profile");
+    assert_eq!(removal["files"][2]["action"], "remove-hook");
+    assert_eq!(removal["files"][2]["replaced_hook"], profile_before);
+    let prior_token = removal["review"].as_str().unwrap().to_owned();
+    let cross_action = guarded_job(
+        &pane,
+        Some(generation),
+        setup(bash, Some(prior_token.clone())),
+    )
+    .await
+    .unwrap_err();
+    assert!(cross_action.contains("review is stale"), "{cross_action}");
+
+    let updated = format!(
+        "{}# outside the block\r\n",
+        fs::read_to_string(&rc).unwrap()
+    );
+    fs::write(&rc, &updated).unwrap();
+    let stale = guarded_job(&pane, Some(generation), remove(Some(prior_token)))
+        .await
+        .unwrap_err();
+    assert!(stale.contains("review is stale"), "{stale}");
+    assert_eq!(fs::read_to_string(&rc).unwrap(), updated);
+    assert_eq!(fs::read_to_string(&profile).unwrap(), profile_before);
+
+    fs::write(&launcher, "operator-owned launcher").unwrap();
+    let removal = guarded_job(&pane, Some(generation), remove(None))
+        .await
+        .unwrap();
+    let token = removal["review"].as_str().unwrap().to_owned();
+    guarded_job(&pane, Some(generation), remove(Some(token)))
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(&rc).unwrap(),
+        "# edited after preview\r\n# outside the block\r\n"
+    );
+    assert_eq!(fs::read_to_string(&profile).unwrap(), "");
+    assert_eq!(
+        fs::read_to_string(&higher_priority).unwrap(),
+        "# added login file\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&launcher).unwrap(),
+        "operator-owned launcher"
+    );
+    assert_eq!(fs::read_to_string(&selector).unwrap(), active);
+    let removed = guarded_job(&pane, Some(generation), remove(None))
+        .await
+        .unwrap();
+    assert_eq!(removed["ready"], false);
+    assert!(removed["review"].is_null());
+    assert!(removed["blocked"].is_null());
+
+    let remove_zsh = |review| path_change(DotfileShell::Zsh, Some("config/zsh"), true, review);
+    let zsh_removal = guarded_job(&pane, Some(generation), remove_zsh(None))
+        .await
+        .unwrap();
+    let zsh_token = zsh_removal["review"].as_str().unwrap().to_owned();
+    guarded_job(&pane, Some(generation), remove_zsh(Some(zsh_token)))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(zdotdir.join(".zshrc")).unwrap(), "");
+    assert!(!remote.join(".zshrc").exists());
     server.abort();
 }
 

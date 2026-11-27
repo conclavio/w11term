@@ -2875,9 +2875,10 @@ async fn native_command_reference_installs_a_selected_catalog_tool() {
         .sha256;
     fs::write(
         state.path().join("catalog-tool-fixture.json"),
-        serde_json::to_vec(
-            &json!({"conflict": conflict, "pin": pin, "startup": startup, "login": login}),
-        )
+        serde_json::to_vec(&json!({
+            "conflict": conflict, "pin": pin, "startup": startup, "login": login,
+            "probe": root.join("utility-probe-response"),
+        }))
         .unwrap(),
     )
     .unwrap();
@@ -2890,21 +2891,11 @@ async fn native_command_reference_installs_a_selected_catalog_tool() {
     assert!(profiles["profiles"]["palette-ssh"]["tool_bundle"].is_null());
     let launcher = fs::read_to_string(bin.join("rg")).unwrap();
     assert!(launcher.ends_with("/linux-essentials/current/rg\n"));
-    assert!(
-        fs::read_to_string(&startup)
-            .unwrap()
-            .starts_with("# keep the user's startup files\n")
+    assert_eq!(
+        fs::read_to_string(&startup).unwrap(),
+        "# keep the user's startup files\n# added after setup\n"
     );
-    assert!(
-        fs::read_to_string(&startup)
-            .unwrap()
-            .contains("PATH=\"${PATH:+$PATH:}$HOME/.local/bin\"")
-    );
-    assert!(
-        fs::read_to_string(&login)
-            .unwrap()
-            .contains("$HOME/.local/bin")
-    );
+    assert_eq!(fs::read_to_string(&login).unwrap(), "");
     let selector = fs::read_to_string(store.join("current")).unwrap();
     let version = selector.lines().nth(1).unwrap();
     if std::env::var("W11TERM_TEST_LIVE_CATALOG_DOWNLOAD").as_deref() == Ok("1") {

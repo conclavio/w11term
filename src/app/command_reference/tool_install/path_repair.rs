@@ -1,7 +1,7 @@
 use super::*;
 use w11term::{
     options::ToolPath,
-    sftp::{DotfileShell, validate_zdotdir},
+    sftp::{DotfileShell, InstalledToolPath, validate_zdotdir},
 };
 
 pub enum Action {
@@ -9,9 +9,10 @@ pub enum Action {
     Shell(Option<usize>),
     Zdotdir(String),
     Preview,
+    PreviewRemoval,
     Apply,
     Reviewed(Arc<()>, Result<Box<Review>, String>),
-    Applied(Arc<()>, Result<(), String>),
+    Applied(Arc<()>, bool, Result<(), String>),
     Back,
 }
 
@@ -34,16 +35,19 @@ impl Setup {
         }
     }
 
-    fn operation(&self, review: Option<String>) -> Result<Operation, String> {
+    fn operation(&self, remove: bool, review: Option<String>) -> Result<Operation, String> {
         let path = self.zdotdir.trim();
         let zdotdir = (self.shell == DotfileShell::Zsh && !path.is_empty()).then_some(path);
         validate_zdotdir(self.shell, zdotdir).map_err(|error| format!("{error:#}"))?;
         Ok(Operation::ReviewInstalledToolPath {
-            bundle: self.bundle.clone(),
-            bundle_sha256: self.sha256.clone(),
-            path: ToolPath {
-                shell: self.shell,
-                zdotdir: zdotdir.map(str::to_owned),
+            installed: InstalledToolPath {
+                bundle: self.bundle.clone(),
+                bundle_sha256: self.sha256.clone(),
+                path: ToolPath {
+                    shell: self.shell,
+                    zdotdir: zdotdir.map(str::to_owned),
+                },
+                remove,
             },
             review,
         })
@@ -66,7 +70,7 @@ impl Setup {
             KeyedView::new(
                 "title",
                 TextBlock::new()
-                    .text("Set up PATH for new shells")
+                    .text("Manage PATH for new shells")
                     .font_size(18.0),
             ),
             detail("account".into(), installer.account.clone()),
@@ -95,6 +99,10 @@ impl Setup {
             "preview",
             click("Review PATH setup", ready, || Action::Preview),
         ));
+        fields.push(KeyedView::new(
+            "review-removal",
+            click("Review PATH removal", ready, || Action::PreviewRemoval),
+        ));
         let mut footer = Vec::with_capacity(2);
         if let Some(review) = &installer.path_review {
             review.describe(&mut fields, true);
@@ -102,7 +110,11 @@ impl Setup {
                 footer.push(KeyedView::new(
                     "apply",
                     click(
-                        "Apply reviewed PATH setup",
+                        if review.remove {
+                            "Remove reviewed PATH blocks"
+                        } else {
+                            "Apply reviewed PATH setup"
+                        },
                         ready && review.review.is_some(),
                         || Action::Apply,
                     ),
@@ -165,6 +177,8 @@ pub struct Review {
     blocked: Option<String>,
     pub(super) ready: bool,
     pub(super) review: Option<String>,
+    #[serde(default)]
+    remove: bool,
 }
 
 #[derive(Deserialize)]
@@ -200,6 +214,8 @@ impl Review {
                 "create" => "Create",
                 "append-hook" => "Append managed block to",
                 "replace-hook" => "Replace managed block in",
+                "remove-hook" => "Remove managed block from",
+                "unchanged" if self.remove => "No managed block in",
                 "unchanged" => "Already current",
                 _ => "Blocked",
             };
@@ -210,7 +226,11 @@ impl Review {
             if let Some(old) = &file.replaced_hook {
                 fields.push(detail(
                     format!("path-before-{index}"),
-                    format!("Existing managed block\n{old}"),
+                    if self.remove {
+                        format!("Block to remove\n{old}")
+                    } else {
+                        format!("Existing managed block\n{old}")
+                    },
                 ));
             }
             if matches!(
@@ -226,6 +246,10 @@ impl Review {
         }
         let status = if let Some(blocked) = &self.blocked {
             blocked.as_str()
+        } else if self.remove && self.ready {
+            "Profiles with managed PATH enabled can add this directory again on connect."
+        } else if self.remove {
+            "There are no matching managed PATH blocks to remove."
         } else if self.ready && setup {
             "The launcher directory will be appended to PATH for new shells."
         } else if self.ready {
@@ -295,7 +319,7 @@ impl TerminalApp {
                     installer.status = None;
                 }
             }
-            Action::Preview | Action::Apply => {
+            Action::Preview | Action::PreviewRemoval | Action::Apply => {
                 let Some((_, input, repairable)) = current else {
                     return;
                 };
@@ -303,6 +327,12 @@ impl TerminalApp {
                     return;
                 }
                 let apply = matches!(action, Action::Apply);
+                let remove = matches!(action, Action::PreviewRemoval)
+                    || (apply
+                        && installer
+                            .path_review
+                            .as_ref()
+                            .is_some_and(|review| review.remove));
                 let review = if apply {
                     let Some(token) = installer
                         .path_review
@@ -318,14 +348,14 @@ impl TerminalApp {
                 };
                 let operation =
                     if let Some(setup) = installer.path_setup.as_ref().filter(|setup| setup.open) {
-                        match setup.operation(review) {
+                        match setup.operation(remove, review) {
                             Ok(operation) => operation,
                             Err(error) => {
                                 installer.status = Some(error);
                                 return;
                             }
                         }
-                    } else if repairable {
+                    } else if repairable && !remove {
                         Operation::ReviewToolPath { review }
                     } else {
                         return;
@@ -339,6 +369,7 @@ impl TerminalApp {
                 let rejected = result_message(
                     ticket.clone(),
                     apply,
+                    remove,
                     Err("PATH review worker unavailable".into()),
                 );
                 ctx.spawn_background_with_rejection(
@@ -350,7 +381,7 @@ impl TerminalApp {
                             Duration::from_secs(30),
                             None,
                         );
-                        result_message(ticket, apply, result)
+                        result_message(ticket, apply, remove, result)
                     },
                     rejected,
                 );
@@ -361,8 +392,11 @@ impl TerminalApp {
                     Err(error) => installer.status = Some(error),
                 }
             }
-            Action::Applied(ticket, result) if installer.finish(&ticket, Work::PathApply) => {
+            Action::Applied(ticket, remove, result)
+                if installer.finish(&ticket, Work::PathApply) =>
+            {
                 installer.status = Some(match result {
+                    Ok(()) if remove => "Managed PATH blocks removed for new shells".into(),
                     Ok(())
                         if installer
                             .path_setup
@@ -387,10 +421,11 @@ fn path_message(action: Action) -> Message {
 fn result_message(
     ticket: Arc<()>,
     apply: bool,
+    remove: bool,
     result: Result<serde_json::Value, String>,
 ) -> Message {
     path_message(if apply {
-        Action::Applied(ticket, result.map(|_| ()))
+        Action::Applied(ticket, remove, result.map(|_| ()))
     } else {
         Action::Reviewed(ticket, decode(result))
     })

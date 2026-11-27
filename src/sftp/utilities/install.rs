@@ -308,6 +308,7 @@ impl Engine {
         home: &str,
         name: &str,
         id: &str,
+        require_launchers: bool,
     ) -> Result<String> {
         let store = managed_tool_store(home, name)?;
         let managed = self
@@ -321,6 +322,10 @@ impl Engine {
         let release = self
             .utility_release_manifest(&store, name, None, id)
             .await?;
+        if !require_launchers {
+            self.check_selector(&store, &selector).await?;
+            return Ok(release.bin_directory);
+        }
         let bin = self
             .utility_directories(home, &release.bin_directory)
             .await?;

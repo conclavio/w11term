@@ -281,6 +281,14 @@ pub enum CopyDestination {
     },
 }
 
+#[derive(Debug)]
+pub struct InstalledToolPath {
+    pub bundle: String,
+    pub bundle_sha256: String,
+    pub path: crate::options::ToolPath,
+    pub remove: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Operation {
@@ -293,9 +301,7 @@ pub enum Operation {
     },
     #[serde(skip)]
     ReviewInstalledToolPath {
-        bundle: String,
-        bundle_sha256: String,
-        path: crate::options::ToolPath,
+        installed: InstalledToolPath,
         review: Option<String>,
     },
     PreviewToolBundle {
@@ -1623,21 +1629,9 @@ impl Engine {
                 self.review_tool_path(session, settings, review.as_deref(), stage)
                     .await?
             }
-            ReviewInstalledToolPath {
-                bundle,
-                bundle_sha256,
-                path,
-                review,
-            } => {
-                self.review_installed_tool_path(
-                    session,
-                    &bundle,
-                    &bundle_sha256,
-                    &path,
-                    review.as_deref(),
-                    stage,
-                )
-                .await?
+            ReviewInstalledToolPath { installed, review } => {
+                self.review_installed_tool_path(session, installed, review.as_deref(), stage)
+                    .await?
             }
             PreviewToolBundle { bundle } => self.preview_utility_bundle(session, bundle).await?,
             ApplyToolBundle { bundle, review } => {

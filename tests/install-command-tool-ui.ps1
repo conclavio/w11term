@@ -50,7 +50,7 @@ try {
     if (Find-Element 'Download pinned Linux build' $button) { throw 'A retained executable was offered a replacement download' }
     Click 'Install reviewed rg'
     $null = Wait-Until 'reviewed rg launcher repaired' { Find-Element 'Installed rg' }
-    Click 'Set up PATH for new shells'
+    Click 'Manage PATH for new shells'
     Click 'Review PATH setup'
     $null = Wait-Until 'review explains the startup edits for a manual install' {
         (Find-Element "Append managed block to${dot}/.bashrc") -and (Find-Element "Create${dot}/.profile") -and
@@ -70,6 +70,46 @@ try {
     Wait-Focus $pane
     Click 'Apply reviewed PATH setup'
     $null = Wait-Until 'manual PATH setup completed' { Find-Element 'Managed PATH added for new shells' }
+    $startupWithPath = [IO.File]::ReadAllText($fixture.startup)
+    $loginWithPath = [IO.File]::ReadAllText($fixture.login)
+    if (!$startupWithPath.Contains('PATH="${PATH:+$PATH:}$HOME/.local/bin"') -or !$loginWithPath.Contains('$HOME/.local/bin')) {
+        throw 'PATH setup did not append the managed launcher directory'
+    }
+    Click 'Back to tool installer'
+    Click 'Back to command reference'
+
+    $probe = [IO.File]::ReadAllText($fixture.probe)
+    [IO.File]::WriteAllText($fixture.probe, $probe.Replace("/usr/bin`n", "/usr/bin:/.local/bin`n"))
+    Lookup 'rg'
+    Click 'Review installing rg'
+    $null = Wait-Until 'installed tool in PATH still offers management' {
+        (Find-Element 'Launcher directory is in the probed PATH') -and
+            (Find-Element 'Manage PATH for new shells' $button)
+    }
+    Click 'Manage PATH for new shells'
+    [IO.File]::AppendAllText($fixture.startup, "# added after setup`n")
+    Click 'Review PATH removal'
+    $null = Wait-Until 'review identifies both managed blocks to remove' {
+        (Find-Element "Remove managed block from${dot}/.bashrc") -and
+            (Find-Element "Remove managed block from${dot}/.profile") -and
+            (Get-NativeTextLabels | Where-Object { $_.StartsWith('Block to remove') }) -and
+            (Find-Element 'Remove reviewed PATH blocks' $button).Current.IsEnabled
+    }
+    if ([IO.File]::ReadAllText($fixture.startup) -cne ($startupWithPath + "# added after setup`n") -or
+        [IO.File]::ReadAllText($fixture.login) -cne $loginWithPath) {
+        throw 'Removal review changed a startup file before confirmation'
+    }
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'another pane cannot confirm the PATH removal' {
+        $remove = Find-Element 'Remove reviewed PATH blocks' $button
+        $remove -and !$remove.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$pane")
+    Wait-Focus $pane
+    Click 'Remove reviewed PATH blocks'
+    $null = Wait-Until 'managed PATH removal completed' { Find-Element 'Managed PATH blocks removed for new shells' }
+    [IO.File]::WriteAllText($fixture.probe, $probe)
     Click 'Back to tool installer'
     Click 'Back to command reference'
 

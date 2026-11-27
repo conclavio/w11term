@@ -9,6 +9,7 @@ const DISABLED: &str = "disabled\n";
 // Startup hooks only load fragments when the first line is a bundle digest.
 const AUTOMATIC: &str = "automatic\n";
 const MANUAL: &str = "manual\n";
+const BASH_LOGIN_FILES: [&str; 3] = [".bash_profile", ".bash_login", ".profile"];
 const BEGIN: &str = "# >>> w11term dotfiles >>>";
 const END: &str = "# <<< w11term dotfiles <<<";
 const MAX_FRAGMENT_BYTES: usize = 16 * 1024;
@@ -851,7 +852,7 @@ impl Engine {
         let (login, login_original) = match shell {
             DotfileShell::Bash => {
                 let mut selected = (startup(".profile"), None);
-                for name in [".bash_profile", ".bash_login", ".profile"] {
+                for name in BASH_LOGIN_FILES {
                     let path = startup(name);
                     if let Some(contents) = self.dotfile_text(&path).await? {
                         selected = (path, Some(contents));

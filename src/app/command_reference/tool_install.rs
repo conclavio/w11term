@@ -88,7 +88,6 @@ struct Retained {
 pub struct Installation {
     bundle: String,
     bundle_sha256: String,
-    path_status: String,
     changed: bool,
     launchers_created: usize,
     #[serde(default)]
@@ -313,7 +312,7 @@ impl Installer {
         if self.path_setup.is_some() {
             fields.push(KeyedView::new(
                 "setup-tool-path",
-                button("Set up PATH for new shells", available, || {
+                button("Manage PATH for new shells", available, || {
                     Action::Path(path_repair::Action::OpenSetup)
                 }),
             ));
@@ -715,7 +714,22 @@ impl TerminalApp {
                     || installer.finish(&ticket, Work::Download)
                 {
                     match result {
-                        Ok(review) => installer.review = Some(review),
+                        Ok(review) => {
+                            if let Some(command) = installer.source.command()
+                                && let Some(id) = &review.current.version
+                                && !review.current.conflict
+                                && review
+                                    .tools
+                                    .iter()
+                                    .any(|tool| tool.name == command && tool.retained.is_some())
+                            {
+                                installer.path_setup = Some(path_repair::Setup::new(
+                                    review.bundle.clone(),
+                                    id.clone(),
+                                ));
+                            }
+                            installer.review = Some(review);
+                        }
                         Err(error) => installer.status = Some(error),
                     }
                 }
@@ -725,12 +739,10 @@ impl TerminalApp {
                     installer.status = Some(match result {
                         Ok(installation) => {
                             panel.tools = None;
-                            if installation.path_status == "missing" {
-                                installer.path_setup = Some(path_repair::Setup::new(
-                                    installation.bundle.clone(),
-                                    installation.bundle_sha256,
-                                ));
-                            }
+                            installer.path_setup = Some(path_repair::Setup::new(
+                                installation.bundle.clone(),
+                                installation.bundle_sha256,
+                            ));
                             let changed =
                                 installation.changed || installation.launchers_created != 0;
                             if let Some(name) = installer.source.command() {
