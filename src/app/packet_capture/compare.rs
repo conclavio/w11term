@@ -48,6 +48,8 @@ pub enum Change {
     TimelineExpanded(bool),
     TimelineInterval(usize),
     OpenTimelineInterval(usize, usize),
+    CompareElapsed(usize),
+    CompareWholeCaptures,
     LimitElapsedInterval(bool),
     Open {
         list: u64,
@@ -60,6 +62,7 @@ pub enum Change {
 
 pub(super) struct Comparison {
     model: Arc<PacketCaptureComparison>,
+    elapsed_model: Option<(usize, Arc<PacketCaptureComparison>)>,
     paths: [PathBuf; 2],
     revision: Arc<()>,
     conversation_view: ConversationView,
@@ -79,6 +82,7 @@ impl Comparison {
     pub(super) fn new(model: Arc<PacketCaptureComparison>, paths: [PathBuf; 2]) -> Self {
         Self {
             model,
+            elapsed_model: None,
             paths,
             revision: Arc::new(()),
             conversation_view: ConversationView::Ip,
@@ -123,14 +127,15 @@ impl Comparison {
     }
 
     fn row_groups(&self) -> [&[PacketConversationChange]; 2] {
+        let model = self.visible_model();
         match self.conversation_view {
             ConversationView::Ip => [
-                &self.model.conversation_changes,
-                &self.model.rate_only_changes.ip_conversations,
+                &model.conversation_changes,
+                &model.rate_only_changes.ip_conversations,
             ],
             ConversationView::Transport => [
-                &self.model.transport_changes,
-                &self.model.rate_only_changes.transport_conversations,
+                &model.transport_changes,
+                &model.rate_only_changes.transport_conversations,
             ],
         }
     }
@@ -154,7 +159,49 @@ impl Comparison {
         self.list_generation = self.list_generation.wrapping_add(1);
     }
 
+    fn visible_model(&self) -> &Arc<PacketCaptureComparison> {
+        self.elapsed_model
+            .as_ref()
+            .map_or(&self.model, |(_, model)| model)
+    }
+
+    pub(super) fn elapsed_request(
+        &self,
+        revision: &Arc<()>,
+        index: usize,
+    ) -> Option<([PathBuf; 2], Range<i128>, Arc<PacketCaptureComparison>)> {
+        if !Arc::ptr_eq(revision, &self.revision)
+            || !self.timeline_expanded
+            || self.selected_timeline_interval() != Some(index)
+        {
+            return None;
+        }
+        let timeline = self.model.timeline.as_ref()?;
+        timeline.before_origin_unix_ns?;
+        timeline.after_origin_unix_ns?;
+        Some((
+            self.paths.clone(),
+            timeline.offset_interval(index)?,
+            self.model.clone(),
+        ))
+    }
+
+    pub(super) fn install_elapsed(
+        &mut self,
+        revision: &Arc<()>,
+        index: usize,
+        model: Arc<PacketCaptureComparison>,
+    ) {
+        if Arc::ptr_eq(revision, &self.revision) {
+            self.elapsed_model = Some((index, model));
+            self.apply_filter();
+        }
+    }
+
     fn elapsed_scope(&self) -> Option<usize> {
+        if let Some((index, _)) = &self.elapsed_model {
+            return Some(*index);
+        }
         if self.limit_elapsed_interval {
             self.selected_timeline_interval()
         } else {
@@ -163,6 +210,13 @@ impl Comparison {
     }
 
     fn source_interval(&self, source: usize, elapsed: usize) -> Option<Range<i128>> {
+        if let Some((index, model)) = &self.elapsed_model
+            && *index == elapsed
+        {
+            let window = model.window.as_ref()?;
+            let side = *[&window.before, &window.after].get(source)?;
+            return Some(side.start_unix_ns..side.end_unix_ns);
+        }
         self.model
             .timeline
             .as_ref()?
@@ -170,7 +224,7 @@ impl Comparison {
     }
 
     pub(super) fn export_model(&self, revision: &Arc<()>) -> Option<Arc<PacketCaptureComparison>> {
-        Arc::ptr_eq(revision, &self.revision).then(|| Arc::clone(&self.model))
+        Arc::ptr_eq(revision, &self.revision).then(|| Arc::clone(self.visible_model()))
     }
 
     pub(super) fn update(
@@ -205,6 +259,9 @@ impl Comparison {
             Change::Source(source) if source < self.paths.len() => self.source = source,
             Change::ProtocolsExpanded(expanded) => self.protocols_expanded = expanded,
             Change::TimelineExpanded(expanded) => self.timeline_expanded = expanded,
+            Change::CompareWholeCaptures if self.elapsed_model.take().is_some() => {
+                self.apply_filter();
+            }
             Change::LimitElapsedInterval(limit)
                 if !limit || self.selected_timeline_interval().is_some() =>
             {
@@ -266,7 +323,7 @@ impl Comparison {
         export_idle: bool,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
-        let model = &self.model;
+        let model = self.visible_model();
         let view = self.conversation_view;
         let category = view.category();
         let conversation_count = self.row_count();
@@ -295,9 +352,34 @@ impl Comparison {
         if let Some(status) = status {
             fields.push(text("status", status));
         }
-        for (side, capture) in [("Before", &model.before), ("After", &model.after)] {
+        if let Some(window) = &model.window {
+            let label = timeline::interval_label(window.start_offset_ns..window.end_offset_ns);
+            fields.extend([
+                text(
+                    "elapsed-scope",
+                    format!("Comparing elapsed interval · {label}"),
+                ),
+                KeyedView::new(
+                    "compare-whole-captures",
+                    Button::new()
+                        .is_enabled(idle)
+                        .on_click(action(Change::CompareWholeCaptures))
+                        .content("Compare whole captures"),
+                ),
+            ]);
+        }
+        for (index, (side, capture)) in [("Before", &model.before), ("After", &model.after)]
+            .into_iter()
+            .enumerate()
+        {
             let span = capture.timestamp_span_ns.map_or_else(
-                || "No usable timestamps".into(),
+                || {
+                    if model.window.is_some() {
+                        "No observed packets in interval".into()
+                    } else {
+                        "No usable timestamps".into()
+                    }
+                },
                 |ns| format!("Timestamp span {} s", seconds_text(ns)),
             );
             let mut details = vec![
@@ -328,6 +410,17 @@ impl Comparison {
                     ),
                 ),
             ];
+            if let Some(window) = &model.window {
+                let coverage = [&window.before, &window.after][index];
+                details.push(text(
+                    "source-coverage",
+                    format!(
+                        "{} · {} untimestamped packets in source",
+                        coverage.coverage_label(),
+                        coverage.untimestamped_packets
+                    ),
+                ));
+            }
             if view == ConversationView::Transport {
                 details.push(text(
                     "transport-coverage",
@@ -356,17 +449,17 @@ impl Comparison {
         } else {
             fields.push(text(
                 "total-delta",
-                "Capture deltas unavailable for a partial scan",
+                if model.window.is_some() {
+                    "Capture deltas unavailable for incomplete interval coverage"
+                } else {
+                    "Capture deltas unavailable for a partial scan"
+                },
             ));
         }
         fields.push(KeyedView::new(
             "average-rates",
             StackPanel::new().spacing(3.0).keyed_children(
-                std::iter::once(text(
-                    "heading",
-                    "Average rates over each recorded timestamp span",
-                ))
-                .chain(
+                std::iter::once(text("heading", model.average_rates_label())).chain(
                     model
                         .average_rates
                         .report_lines()
@@ -586,7 +679,9 @@ impl Comparison {
                         })),
                 ),
             ]);
-            if let Some(label) = self.selected_timeline_label() {
+            if self.elapsed_model.is_none()
+                && let Some(label) = self.selected_timeline_label()
+            {
                 let revision = Arc::clone(&self.revision);
                 fields.push(KeyedView::new(
                     "elapsed-conversation-scope",

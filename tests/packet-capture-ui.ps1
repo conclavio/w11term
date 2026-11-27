@@ -534,6 +534,38 @@ try {
             '(frame.time >= "1970-01-01T00:00:01.262144000Z" && frame.time < "1970-01-01T00:00:01.524288000Z")'
         [IO.File]::Exists($filterPath) -and [IO.File]::ReadAllText($filterPath) -ceq $expected
     }
+    $expander = Open-PacketSection 'comparison-packet-timeline'
+    $intervals = Wait-CaptureCombo 'Compared timeline intervals'
+    $intervals.SetFocus()
+    $intervals.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    $interval = Wait-Until 'an interval with one packet on the Before side is selectable' {
+        Find-Element '+0.786432 to +1.048576 s' ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $interval.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'the timeline selected the requested interval' {
+        Find-Element "Before interval${dot}1 packets${dot}38 captured bytes"
+    }
+    Click 'Compare selected interval'
+    $null = Wait-Until 'the comparison counts only packets within the selected interval' {
+        (Find-Element "Comparing elapsed interval${dot}+0.786432 to +1.048576 s") -and
+        (Find-Element "Capture change${dot}-1 packets${dot}-38 captured bytes${dot}+0 truncated") -and
+        (Find-Element 'Average rates over the selected elapsed interval') -and
+        (Find-Element 'IP conversation changes 1')
+    }
+    $scopedBase = Join-Path $State 'elapsed comparison'
+    Save-PacketComparison $scopedBase -Json
+    $scopedPath = "$scopedBase.json"
+    $null = Wait-Until 'the elapsed comparison export was published' { [IO.File]::Exists($scopedPath) }
+    $cliScopedPath = Join-Path $State 'elapsed cli.json'
+    $null = & $Cli compare-packet-captures $conversationCapture $slowerCapture --elapsed-ns '786432000:1048576000' --output-file $cliScopedPath
+    if ($LASTEXITCODE -ne 0 -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($scopedPath)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliScopedPath))) {
+        throw 'The elapsed comparison export differs from the CLI'
+    }
+    Click 'Compare whole captures'
+    $null = Wait-Until 'the full comparison returns without choosing the files again' {
+        (Find-Element 'IP conversation changes 3') -and !(Find-Element 'Compare whole captures' $button)
+    }
     Click 'Back to capture'
     Select-Capture $partialCapture $compareCaptureLabel 'Choose after packet capture'
     $null = Wait-Until 'partial comparison preserves the issue and withholds capture deltas' {

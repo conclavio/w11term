@@ -110,6 +110,33 @@ impl Comparison {
                         })
                     })),
             ));
+            let can_compare =
+                timeline.before_origin_unix_ns.is_some() && timeline.after_origin_unix_ns.is_some();
+            let revision = Arc::clone(&self.revision);
+            fields.push(KeyedView::new(
+                "compare-elapsed",
+                Button::new()
+                    .is_enabled(
+                        idle && can_compare
+                            && self
+                                .elapsed_model
+                                .as_ref()
+                                .is_none_or(|(index, _)| *index != selected),
+                    )
+                    .on_click(ctx.callback(move |_| {
+                        message(Action::Comparison(
+                            revision.clone(),
+                            Change::CompareElapsed(selected),
+                        ))
+                    }))
+                    .content("Compare selected interval"),
+            ));
+            if !can_compare {
+                fields.push(text(
+                    "compare-elapsed-unavailable",
+                    "Both captures need timestamped records to compare an elapsed interval.",
+                ));
+            }
             for (side, label) in SIDE_LABELS.into_iter().enumerate() {
                 let observation = timeline.buckets[selected].observation(side);
                 let detail = observation.map_or_else(
@@ -167,7 +194,7 @@ impl Comparison {
     }
 }
 
-fn interval_label(interval: Range<i128>) -> String {
+pub(super) fn interval_label(interval: Range<i128>) -> String {
     format!(
         "{} to {} s",
         signed_seconds(interval.start),

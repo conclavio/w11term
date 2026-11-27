@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::{
     collections::BTreeSet,
     io::{Read, Seek},
+    ops::Range,
 };
 
 mod conversations;
@@ -32,6 +33,34 @@ pub struct Summary {
     pub conversations: Conversations,
     pub ip_protocols: IpProtocols,
     pub transport_conversations: TransportConversations,
+    pub(super) window: Option<WindowScan>,
+}
+
+pub(super) struct WindowScan {
+    offsets: Range<i128>,
+    stats: PacketStats,
+    pub origin: Option<i128>,
+}
+
+impl WindowScan {
+    fn includes(&mut self, captured: u32, original: u32, timestamp: Option<i128>) -> bool {
+        self.stats.record(captured, original, timestamp);
+        timestamp.is_some_and(|timestamp| {
+            self.offsets
+                .contains(&(timestamp - *self.origin.get_or_insert(timestamp)))
+        })
+    }
+
+    pub fn untimestamped_packets(&self) -> u32 {
+        self.stats.packets - self.stats.timestamped_packets
+    }
+
+    pub fn span_covers(&self, start: i128, end: i128) -> bool {
+        self.stats
+            .earliest
+            .is_some_and(|earliest| earliest <= start)
+            && self.stats.latest.is_some_and(|latest| end - 1 <= latest)
+    }
 }
 
 #[derive(Default)]
@@ -76,8 +105,20 @@ pub struct PacketStats {
 }
 
 impl Summary {
-    pub(super) fn scan(file: &mut (impl Read + Seek), bytes: u64, format: &Format) -> Self {
-        let mut summary = Self::default();
+    pub(super) fn scan(
+        file: &mut (impl Read + Seek),
+        bytes: u64,
+        format: &Format,
+        offsets: Option<Range<i128>>,
+    ) -> Self {
+        let mut summary = Self {
+            window: offsets.map(|offsets| WindowScan {
+                offsets,
+                stats: PacketStats::default(),
+                origin: None,
+            }),
+            ..Self::default()
+        };
         let mut conversations = ConversationScans::default();
         let result = file
             .rewind()
@@ -117,10 +158,12 @@ impl Summary {
         };
         let mut remaining = bytes - 24;
         let mut prefix = [0; ip::PREFIX_BYTES];
+        let mut records = 0;
         while remaining > 0 {
-            check_record_limit(self.stats.packets)?;
+            check_record_limit(records)?;
             let ([seconds, fraction, captured, original], kept) =
                 format.read_packet(file, &mut remaining, &mut prefix)?;
+            records += 1;
             let timestamp = (fraction < fraction_limit).then(|| {
                 i128::from(seconds) * i128::from(NANOS_PER_SECOND)
                     + i128::from(fraction)
@@ -152,11 +195,18 @@ impl Summary {
         decoded: Option<ip::Packet>,
         conversations: &mut ConversationScans,
     ) {
+        if let Some(window) = &mut self.window
+            && !window.includes(captured, original, timestamp)
+        {
+            return;
+        }
         self.stats.record(captured, original, timestamp);
         self.interfaces[interface]
             .stats
             .record(captured, original, timestamp);
-        if let Some(timestamp) = timestamp {
+        if let Some(timestamp) = timestamp
+            && self.window.is_none()
+        {
             self.timeline
                 .get_or_insert_with(Timeline::default)
                 .record(timestamp, captured);
@@ -212,7 +262,7 @@ mod tests {
     type Encode32 = fn(u32) -> [u8; 4];
 
     fn scan(bytes: &[u8], format: Format) -> Summary {
-        Summary::scan(&mut Cursor::new(bytes), bytes.len() as u64, &format)
+        Summary::scan(&mut Cursor::new(bytes), bytes.len() as u64, &format, None)
     }
 
     #[test]

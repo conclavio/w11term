@@ -71,6 +71,7 @@ pub enum Outcome {
         baseline: Option<Arc<LocalPacketCapture>>,
         paths: [PathBuf; 2],
     },
+    ComparedElapsed(Arc<()>, usize, Arc<PacketCaptureComparison>),
     Wireshark(PathBuf),
     Opened,
 }
@@ -1330,6 +1331,20 @@ impl TerminalApp {
                     );
                 }
             }
+            Action::Comparison(revision, compare::Change::CompareElapsed(index)) => {
+                let Some((paths, interval, model)) = panel
+                    .comparison
+                    .as_ref()
+                    .and_then(|comparison| comparison.elapsed_request(&revision, index))
+                else {
+                    return;
+                };
+                let ticket = panel.begin("Comparing the selected elapsed interval…");
+                work(ctx, ticket, move || {
+                    let comparison = Arc::new(model.rescan_elapsed(paths, interval)?);
+                    Ok(Some(Outcome::ComparedElapsed(revision, index, comparison)))
+                });
+            }
             Action::Comparison(revision, change) => {
                 if let Some((capture, filter)) = panel
                     .comparison
@@ -1649,6 +1664,11 @@ impl TerminalApp {
             Ok(Some(Outcome::Wireshark(path))) => {
                 panel.status = Some(format!("Wireshark executable {}", path.display()));
                 panel.wireshark = Some(path);
+            }
+            Ok(Some(Outcome::ComparedElapsed(revision, index, model))) => {
+                if let Some(comparison) = &mut panel.comparison {
+                    comparison.install_elapsed(&revision, index, model);
+                }
             }
             Ok(Some(Outcome::Opened)) => panel.status = Some("Opened capture in Wireshark".into()),
             Ok(_) => (),

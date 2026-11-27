@@ -1535,6 +1535,8 @@ In the comparison, select a changed IP or transport pair, choose **Before captur
 
 Turn on **Limit to elapsed interval** to apply the selected interval from **Elapsed packet timeline** to the conversation. The same elapsed bounds are translated to the chosen file's clock. The checkbox remains active when the timeline is collapsed. A capture without timestamped records cannot open with the interval applied. Clear the checkbox to open the whole conversation. The interval affects Wireshark only, and the comparison and its exports still cover both files in full.
 
+Choose **Compare selected interval** in **Elapsed packet timeline** to recompute the report for that interval. Counts, protocol and conversation changes, and exports use only timestamped packets reached by the scan at or after the start and before the end. Rates divide by the selected interval's width. A side needs a complete scan, timestamps on every source packet, and a recorded span that covers the interval for rates and signed changes. A scoped conversation opens in Wireshark at the report's interval. **Compare whole captures** restores the full report. The equivalent CLI option is `compare-packet-captures BEFORE AFTER --elapsed-ns START:END`, using signed integer nanosecond offsets from each file's first timestamped record. JSON includes both offsets, both absolute ranges, and timestamp coverage in `window`.
+
 ```powershell
 $summary = & $ctl inspect-packet-capture '.\loopback.pcap' | ConvertFrom-Json
 $summary.packets

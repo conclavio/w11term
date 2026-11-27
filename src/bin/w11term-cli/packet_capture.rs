@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::BTreeMap,
     io::Write,
+    ops::Range,
     path::{self, Path, PathBuf},
 };
 use w11term::control::{PacketCaptureOptions, Reply, Request};
@@ -22,36 +23,46 @@ pub(super) const INSPECT_VERB: &str = "inspect-packet-capture";
 pub(super) const INSPECT_HELP: &str =
     "w11term-cli inspect-packet-capture FILE [--output-file PATH]";
 pub(super) const COMPARE_VERB: &str = "compare-packet-captures";
-pub(super) const COMPARE_HELP: &str =
-    "w11term-cli compare-packet-captures BEFORE AFTER [--format json|text] [--output-file PATH]";
+pub(super) const COMPARE_HELP: &str = concat!(
+    "w11term-cli compare-packet-captures BEFORE AFTER [--elapsed-ns START:END] ",
+    "[--format json|text] [--output-file PATH]",
+);
 
 pub(super) fn inspect_file(args: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut args = args.iter();
     let path = args
         .next()
         .context("provide the local PCAP or PCAPNG file")?;
-    let (_, output_file) = report_options(INSPECT_VERB, args)?;
+    let options = report_options(INSPECT_VERB, args)?;
     let capture = LocalPacketCapture::open(path::absolute(path)?)
         .with_context(|| format!("Inspecting packet capture {path}"))?;
-    offline::write_report(stdout, output_file, |output| capture.write_json(output))
+    offline::write_report(stdout, options.output_file, |output| {
+        capture.write_json(output)
+    })
 }
 
 pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut args = args.iter();
     let before = args.next().context("provide the before capture file")?;
     let after = args.next().context("provide the after capture file")?;
-    let (format, output_file) = report_options(COMPARE_VERB, args)?;
-    let text = match format {
+    let options = report_options(COMPARE_VERB, args)?;
+    let text = match options.format {
         None | Some("json") => false,
         Some("text") => true,
         Some(_) => bail!("--format requires json or text"),
     };
-    let before = LocalPacketCapture::open(path::absolute(before)?)
-        .with_context(|| format!("Opening before capture {before}"))?;
-    let after = LocalPacketCapture::open(path::absolute(after)?)
-        .with_context(|| format!("Opening after capture {after}"))?;
-    let comparison = PacketCaptureComparison::new(&before, &after);
-    offline::write_report(stdout, output_file, |output| {
+    let paths = [path::absolute(before)?, path::absolute(after)?];
+    let comparison = if let Some(elapsed) = options.elapsed_ns {
+        PacketCaptureComparison::compare_elapsed(paths, parse_elapsed(elapsed)?)?
+    } else {
+        let [before_path, after_path] = paths;
+        let before = LocalPacketCapture::open(before_path)
+            .with_context(|| format!("Opening before capture {before}"))?;
+        let after = LocalPacketCapture::open(after_path)
+            .with_context(|| format!("Opening after capture {after}"))?;
+        PacketCaptureComparison::new(&before, &after)
+    };
+    offline::write_report(stdout, options.output_file, |output| {
         if text {
             comparison.write_report(output)
         } else {
@@ -60,16 +71,33 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
     })
 }
 
+fn parse_elapsed(value: &str) -> Result<Range<i128>> {
+    let (start, end) = value
+        .split_once(':')
+        .context("--elapsed-ns requires START:END")?;
+    Ok(start
+        .parse()
+        .context("Invalid elapsed start in nanoseconds")?
+        ..end.parse().context("Invalid elapsed end in nanoseconds")?)
+}
+
+#[derive(Default)]
+struct ReportOptions<'a> {
+    format: Option<&'a str>,
+    output_file: Option<&'a str>,
+    elapsed_ns: Option<&'a str>,
+}
+
 fn report_options<'a>(
     verb: &str,
     mut args: impl Iterator<Item = &'a String>,
-) -> Result<(Option<&'a str>, Option<&'a str>)> {
-    let mut format = None;
-    let mut output_file = None;
+) -> Result<ReportOptions<'a>> {
+    let mut options = ReportOptions::default();
     while let Some(flag) = args.next() {
         let target = match flag.as_str() {
-            "--format" if verb == COMPARE_VERB => &mut format,
-            "--output-file" => &mut output_file,
+            "--format" if verb == COMPARE_VERB => &mut options.format,
+            "--elapsed-ns" if verb == COMPARE_VERB => &mut options.elapsed_ns,
+            "--output-file" => &mut options.output_file,
             _ => bail!("unknown option {flag} for {verb}"),
         };
         ensure!(target.is_none(), "specify {flag} only once");
@@ -79,7 +107,7 @@ fn report_options<'a>(
                 .as_str(),
         );
     }
-    Ok((format, output_file))
+    Ok(options)
 }
 
 pub(super) fn parse(

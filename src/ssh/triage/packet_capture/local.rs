@@ -4,9 +4,11 @@ use serde::Serialize;
 use std::{
     borrow::Cow,
     collections::BTreeSet,
-    fs::File,
+    fs::{File, Metadata},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    ops::Range,
     path::PathBuf,
+    time::SystemTime,
 };
 
 mod compare;
@@ -23,6 +25,22 @@ pub struct LocalCapture {
     pub bytes: u64,
     format: Format,
     pub summary: Summary,
+    source_stamp: SourceStamp,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SourceStamp {
+    bytes: u64,
+    modified: Option<SystemTime>,
+}
+
+impl From<&Metadata> for SourceStamp {
+    fn from(metadata: &Metadata) -> Self {
+        Self {
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -101,19 +119,44 @@ impl From<&PacketStats> for StatsReport {
 
 impl LocalCapture {
     pub fn open(path: PathBuf) -> Result<Self> {
+        Self::scan(path, None, None)
+    }
+
+    fn scan(
+        path: PathBuf,
+        offsets: Option<Range<i128>>,
+        expected: Option<SourceStamp>,
+    ) -> Result<Self> {
         ensure!(path.is_absolute(), "Choose an absolute capture file path");
         let file = File::open(&path).context("Opening the capture file")?;
         let metadata = file.metadata().context("Reading capture file metadata")?;
         ensure!(metadata.is_file(), "Choose a capture file");
+        let source_stamp = SourceStamp::from(&metadata);
+        ensure!(
+            expected.is_none_or(|expected| expected == source_stamp),
+            "The capture file changed. Reopen the comparison before choosing an elapsed interval."
+        );
         let bytes = metadata.len();
         let mut file = BufReader::with_capacity(64 * 1024, file);
         let format = read_format(&mut file, bytes)?;
-        let summary = Summary::scan(&mut file, bytes, &format);
+        let scoped = offsets.is_some();
+        let summary = Summary::scan(&mut file, bytes, &format, offsets);
+        if scoped {
+            let metadata = file
+                .get_ref()
+                .metadata()
+                .context("Checking capture file metadata")?;
+            ensure!(
+                source_stamp == SourceStamp::from(&metadata),
+                "The capture file changed while comparing the elapsed interval"
+            );
+        }
         Ok(Self {
             path,
             bytes,
             format,
             summary,
+            source_stamp,
         })
     }
 

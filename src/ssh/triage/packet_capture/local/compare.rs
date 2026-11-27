@@ -1,5 +1,6 @@
-use super::{LocalCapture, ip_protocol_label, summary::Traffic};
+use super::{LocalCapture, SourceStamp, ip_protocol_label, summary::Traffic};
 use crate::prompts::sanitize_single_line;
+use anyhow::{Context, Result, ensure};
 use serde::{Serialize, Serializer};
 use std::{
     cmp::Reverse,
@@ -8,14 +9,18 @@ use std::{
     io::{self, BufWriter, Write},
     net::{IpAddr, SocketAddr},
     num::NonZeroU128,
+    ops::Range,
+    path::PathBuf,
 };
 
 mod protocols;
 mod rates;
 mod timeline;
+mod window;
 use protocols::{ProtocolChange, TcpFlagComparison};
 use rates::AverageRateComparison;
 use timeline::TimelineComparison;
+use window::ComparedWindow;
 
 #[derive(Serialize)]
 pub struct CaptureComparison {
@@ -25,11 +30,15 @@ pub struct CaptureComparison {
     pub totals_delta: Option<CountsDelta>,
     pub average_rates: AverageRateComparison,
     pub timeline: Option<TimelineComparison>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<ComparedWindow>,
     pub protocol_changes: Vec<ProtocolChange>,
     pub tcp_flag_comparison: Option<TcpFlagComparison>,
     pub conversation_changes: Vec<ConversationChange>,
     pub transport_changes: Vec<ConversationChange>,
     pub rate_only_changes: RateOnlyChanges,
+    #[serde(skip)]
+    source_stamps: [SourceStamp; 2],
 }
 
 #[derive(Serialize)]
@@ -132,9 +141,46 @@ impl TrafficDelta {
 
 impl CaptureComparison {
     pub fn new(before: &LocalCapture, after: &LocalCapture) -> Self {
-        let sources = [before, after];
+        Self::from_scans([before, after], None)
+    }
+
+    pub fn compare_elapsed(paths: [PathBuf; 2], offsets: Range<i128>) -> Result<Self> {
+        Self::scan_elapsed(paths, offsets, [None; 2])
+    }
+
+    pub fn rescan_elapsed(&self, paths: [PathBuf; 2], offsets: Range<i128>) -> Result<Self> {
+        Self::scan_elapsed(paths, offsets, self.source_stamps.map(Some))
+    }
+
+    fn scan_elapsed(
+        paths: [PathBuf; 2],
+        offsets: Range<i128>,
+        stamps: [Option<SourceStamp>; 2],
+    ) -> Result<Self> {
+        ensure!(
+            offsets.start < offsets.end,
+            "Choose a nonempty elapsed interval"
+        );
+        let [before_path, after_path] = paths;
+        let before = LocalCapture::scan(before_path, Some(offsets.clone()), stamps[0])
+            .context("Scanning the before capture")?;
+        let after = LocalCapture::scan(after_path, Some(offsets.clone()), stamps[1])
+            .context("Scanning the after capture")?;
+        let sources = [&before, &after];
+        let window = ComparedWindow::new(sources, offsets)?;
+        Ok(Self::from_scans(sources, Some(window)))
+    }
+
+    fn from_scans(sources: [&LocalCapture; 2], window: Option<ComparedWindow>) -> Self {
         let [before, after] = sources.map(CaptureSide::from);
-        let complete = before.complete && after.complete;
+        let sides = [&before, &after];
+        let scan_complete = sides.map(|side| side.complete);
+        let comparable = window.as_ref().map_or(scan_complete, |window| {
+            [&window.before, &window.after]
+                .map(|side| side.span_covers_window && side.untimestamped_packets == 0)
+        });
+        let comparable = std::array::from_fn(|i| scan_complete[i] && comparable[i]);
+        let complete = comparable == [true; 2];
         let (protocol_changes, tcp_flag_comparison) = protocols::compare(
             &sources[0].summary.ip_protocols,
             &sources[1].summary.ip_protocols,
@@ -149,8 +195,15 @@ impl CaptureComparison {
             truncated_packets: i64::from(after.truncated_packets)
                 - i64::from(before.truncated_packets),
         });
-        let sides = [&before, &after];
-        let rate_spans = sides.map(CaptureSide::average_rate_span);
+        let rate_spans = window.as_ref().map_or_else(
+            || sides.map(CaptureSide::average_rate_span),
+            |window| {
+                comparable.map(|covered| {
+                    NonZeroU128::new(window.end_offset_ns.abs_diff(window.start_offset_ns))
+                        .filter(|_| covered)
+                })
+            },
+        );
         let average_rates = AverageRateComparison::new(
             sides.map(|side| {
                 Some(Traffic {
@@ -175,7 +228,7 @@ impl CaptureComparison {
                     )
                 })
             }),
-            sides.map(|side| side.complete && side.untracked_packets == 0),
+            std::array::from_fn(|i| comparable[i] && sides[i].untracked_packets == 0),
             complete,
             rate_spans,
         );
@@ -195,12 +248,13 @@ impl CaptureComparison {
                     )
                 })
             }),
-            sides.map(|side| side.has_port_coverage() && side.transport_untracked_packets == 0),
-            sides.into_iter().all(CaptureSide::has_port_coverage),
-            sides.map(|side| {
-                side.average_rate_span()
-                    .filter(|_| side.has_port_coverage())
+            std::array::from_fn(|i| {
+                comparable[i]
+                    && sides[i].has_port_coverage()
+                    && sides[i].transport_untracked_packets == 0
             }),
+            complete && sides.into_iter().all(CaptureSide::has_port_coverage),
+            std::array::from_fn(|i| rate_spans[i].filter(|_| sides[i].has_port_coverage())),
         );
         Self {
             schema_version: 1,
@@ -209,6 +263,7 @@ impl CaptureComparison {
             totals_delta,
             average_rates,
             timeline,
+            window,
             protocol_changes,
             tcp_flag_comparison,
             conversation_changes,
@@ -217,6 +272,7 @@ impl CaptureComparison {
                 ip_conversations: ip_rate_only,
                 transport_conversations: transport_rate_only,
             },
+            source_stamps: sources.map(|source| source.source_stamp),
         }
     }
 
@@ -230,13 +286,37 @@ impl CaptureComparison {
     pub fn write_report(&self, output: impl Write) -> io::Result<()> {
         let mut output = BufWriter::new(output);
         writeln!(output, "Packet capture comparison")?;
-        for (role, side) in [("Before", &self.before), ("After", &self.after)] {
+        if let Some(window) = &self.window {
+            writeln!(
+                output,
+                "Elapsed interval · {:+} to {:+} ns",
+                window.start_offset_ns, window.end_offset_ns
+            )?;
+        }
+        for (index, (role, side)) in [("Before", &self.before), ("After", &self.after)]
+            .into_iter()
+            .enumerate()
+        {
             writeln!(
                 output,
                 "\n{role} · {} · {}",
                 sanitize_single_line(&side.file_name, usize::MAX),
                 side.format
             )?;
+            if let Some(window) = &self.window {
+                let side = [&window.before, &window.after][index];
+                writeln!(
+                    output,
+                    "Unix interval · {} to {} ns",
+                    side.start_unix_ns, side.end_unix_ns
+                )?;
+                writeln!(
+                    output,
+                    "{} · {} untimestamped packets in source",
+                    side.coverage_label(),
+                    side.untimestamped_packets
+                )?;
+            }
             writeln!(
                 output,
                 "Packets {} · {} captured bytes · {} truncated",
@@ -248,6 +328,8 @@ impl CaptureComparison {
                     "Timestamp span {span} ns · {} of {} packets timestamped",
                     side.timestamped_packets, side.packets
                 )?;
+            } else if self.window.is_some() {
+                writeln!(output, "No observed packets in interval")?;
             } else {
                 writeln!(output, "No usable timestamps")?;
             }
@@ -282,10 +364,15 @@ impl CaptureComparison {
                 "\nCapture change · {:+} packets · {:+} captured bytes · {:+} truncated",
                 delta.packets, delta.captured_bytes, delta.truncated_packets
             )?;
+        } else if self.window.is_some() {
+            writeln!(
+                output,
+                "\nCapture deltas unavailable for incomplete interval coverage"
+            )?;
         } else {
             writeln!(output, "\nCapture deltas unavailable for a partial scan")?;
         }
-        writeln!(output, "\nAverage rates over each recorded timestamp span")?;
+        writeln!(output, "\n{}", self.average_rates_label())?;
         for line in self.average_rates.report_lines() {
             writeln!(output, "{line}")?;
         }
@@ -330,6 +417,14 @@ impl CaptureComparison {
             }
         }
         output.flush()
+    }
+
+    pub fn average_rates_label(&self) -> &'static str {
+        if self.window.is_some() {
+            "Average rates over the selected elapsed interval"
+        } else {
+            "Average rates over each recorded timestamp span"
+        }
     }
 }
 

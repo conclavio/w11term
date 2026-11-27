@@ -545,6 +545,94 @@ fn compares_average_rates_over_the_full_window_and_reports_rate_only_conversatio
 }
 
 #[test]
+fn compares_only_packets_in_the_half_open_elapsed_window() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = "baseline.pcap";
+    let after = "current.pcap";
+    let udp = raw_transport_packet(17, 1012, false);
+    let tcp = raw_transport_packet(6, 1012, false);
+    let other = raw_transport_packet(17, 64200, false);
+    fs::write(
+        root.join(before),
+        raw_capture_at([(11, 0, &other), (12, 0, &udp), (13, 0, &other)]),
+    )
+    .unwrap();
+    let mut frames = vec![
+        (21, 5, &other),
+        (22, 5, &udp),
+        (22, 10, &tcp),
+        (23, 5, &other),
+    ];
+    fs::write(root.join(after), raw_capture_at(frames.iter().copied())).unwrap();
+    let options = ["--elapsed-ns", "1000000000:2000000000"];
+    let report_for = |options: &[&str]| {
+        let output = compare(root, before, after, options);
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let report = report_for(&options);
+    assert_eq!(report["window"]["start_offset_ns"], "1000000000");
+    assert_eq!(report["window"]["end_offset_ns"], "2000000000");
+    assert_eq!(report["window"]["before"]["start_unix_ns"], "12000000000");
+    assert_eq!(report["window"]["before"]["end_unix_ns"], "13000000000");
+    assert_eq!(report["window"]["after"]["start_unix_ns"], "22000005000");
+    assert_eq!(report["window"]["after"]["span_covers_window"], true);
+    assert_eq!(report["before"]["packets"], 1);
+    assert_eq!(report["after"]["packets"], 2);
+    assert_eq!(report["totals_delta"]["packets"], 1);
+    assert_eq!(
+        report["average_rates"]["after"]["captured_bytes_per_second"],
+        68.0
+    );
+    assert_eq!(report["protocol_changes"][0]["number"], 6);
+    let changes = report["transport_changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["protocol"], 6);
+    assert_eq!(changes[0]["a"], "192.0.2.1:1012");
+    assert_eq!(changes[0]["delta"]["captured_bytes"], 40);
+    assert_eq!(
+        changes[0]["average_rates"]["before"]["packets_per_second"],
+        0.0
+    );
+
+    let text = compare(
+        root,
+        before,
+        after,
+        &["--elapsed-ns", "1000000000:2000000000", "--format", "text"],
+    );
+    assert!(text.status.success(), "{text:?}");
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("Elapsed interval · +1000000000 to +2000000000 ns"));
+    assert!(text.contains("Average rates over the selected elapsed interval"));
+
+    let uncovered = report_for(&["--elapsed-ns", "1000000000:3000000000"]);
+    assert_eq!(uncovered["window"]["after"]["span_covers_window"], false);
+    assert!(uncovered["totals_delta"].is_null());
+    assert!(uncovered["transport_changes"][0]["delta"].is_null());
+
+    frames.push((24, 1_000_000, &tcp));
+    fs::write(root.join(after), raw_capture_at(frames)).unwrap();
+    let untimed = report_for(&options);
+    assert_eq!(untimed["window"]["after"]["untimestamped_packets"], 1);
+    assert_eq!(untimed["after"]["packets"], 2);
+    assert!(untimed["totals_delta"].is_null());
+    assert!(untimed["average_rates"]["after"].is_null());
+    assert!(untimed["transport_changes"][0]["delta"].is_null());
+    for range in [
+        "1:1",
+        "1",
+        "1:2:3",
+        "0:170141183460469231731687303715884105727",
+    ] {
+        let invalid = compare(root, before, after, &["--elapsed-ns", range]);
+        assert!(!invalid.status.success(), "{range}: {invalid:?}");
+        assert!(invalid.stdout.is_empty());
+    }
+}
+
+#[test]
 fn tracking_limit_keeps_observed_transport_deltas_but_cannot_prove_missing_pairs() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
