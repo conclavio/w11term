@@ -3,6 +3,8 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use w11term::diagnostic_history::Kind as ArtifactKind;
 use w11term::ssh::{CaptureStop, TriagePlan, TriageReport, TriageResource, TriageSampleStatus};
+pub(super) use w11term::triage_comparison::display_output;
+use w11term::triage_comparison::status_label;
 
 pub(super) const LABEL: &str = "Linux performance triage";
 mod compare;
@@ -91,32 +93,6 @@ fn endpoint(plan: &TriagePlan) -> String {
         "{}@{}:{}\nHost key {}",
         plan.user, plan.host, plan.port, plan.host_key_fingerprint
     )
-}
-
-fn status_label(status: TriageSampleStatus) -> &'static str {
-    match status {
-        TriageSampleStatus::Ok => "OK",
-        TriageSampleStatus::Missing => "Utility missing",
-        TriageSampleStatus::TimedOut => "Timed out",
-        TriageSampleStatus::Incomplete => "Incomplete",
-        TriageSampleStatus::OutputLimit => "Output limit",
-        TriageSampleStatus::PermissionDenied => "Permission denied",
-        TriageSampleStatus::Failed => "Failed",
-    }
-}
-
-pub(super) fn display_output(text: &str) -> String {
-    let mut display = String::with_capacity(text.len());
-    for c in text.chars() {
-        if (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
-            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        {
-            display.extend(c.escape_default());
-        } else {
-            display.push(c);
-        }
-    }
-    display
 }
 
 impl Panel {
@@ -733,7 +709,7 @@ impl TerminalApp {
             }
             Action::BackFromComparison if panel.pending.is_none() => panel.comparison = None,
             Action::ExportComparison if panel.pending.is_none() => {
-                if let Some(comparison) = panel.comparison.clone() {
+                if let Some(comparison) = panel.comparison.as_ref().map(|view| view.model.clone()) {
                     self.begin_text_export(
                         text_export::Subject::TriageComparison,
                         move |output| comparison.write_report(output),
@@ -876,10 +852,10 @@ impl TerminalApp {
                         install_baseline,
                     })) => {
                         if install_baseline {
-                            let (report, path) = comparison.before_source();
+                            let (report, path) = comparison.model.before_source();
                             panel.load_report(report, path, None);
                         }
-                        let path = comparison.after_path().map(std::path::Path::to_owned);
+                        let path = comparison.model.after_path().map(std::path::Path::to_owned);
                         panel.comparison = Some(*comparison);
                         if let Some(path) = path {
                             self.remember_diagnostic(ArtifactKind::TriageReport, [path], ctx);

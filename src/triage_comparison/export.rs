@@ -1,8 +1,8 @@
-use super::{Comparison, SIDES, check_status, coverage_summary, display_output, same_target};
+use super::{Comparison, SIDES, check_status, coverage_summary, display_output};
 use std::io::{self, BufWriter, Write};
 
 impl Comparison {
-    pub(in crate::app::triage) fn write_report(&self, output: impl Write) -> io::Result<()> {
+    pub fn write_report(&self, output: impl Write) -> io::Result<()> {
         let mut output = BufWriter::new(output);
         writeln!(output, "Linux performance triage comparison")?;
         for (side, label) in SIDES.into_iter().enumerate() {
@@ -13,7 +13,7 @@ impl Comparison {
                 coverage_summary(&self.reports[side]),
             )?;
         }
-        let endpoint = if same_target(&self.reports[0].target, &self.reports[1].target) {
+        let endpoint = if self.same_endpoint() {
             "Same recorded SSH endpoint"
         } else {
             "Different recorded SSH endpoints"

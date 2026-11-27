@@ -1,6 +1,6 @@
 use super::{Collection, Sample, SampleStatus};
 use serde::Serialize;
-use std::rc::Rc;
+use std::{fmt, rc::Rc};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -45,8 +45,10 @@ pub struct Finding {
     measurement: Option<Measurement>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum Unit {
+    #[serde(rename = "percentage_points")]
     Percent,
     Tasks,
     Mebibytes,
@@ -54,6 +56,33 @@ enum Unit {
     Queue,
     Milliseconds,
     EventsPerSecond,
+}
+
+impl Unit {
+    fn delta_format(self) -> (&'static str, usize) {
+        match self {
+            Self::Percent => (" pp", 1),
+            Self::Tasks => (" tasks", 0),
+            Self::Mebibytes => (" MiB", 0),
+            Self::KibibytesPerSecond => (" KiB/s", 2),
+            Self::Queue => ("", 2),
+            Self::Milliseconds => (" ms", 2),
+            Self::EventsPerSecond => ("/s", 2),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+pub struct Delta {
+    amount: f64,
+    unit: Unit,
+}
+
+impl fmt::Display for Delta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (suffix, precision) = self.unit.delta_format();
+        write!(f, "{:+.precision$}{suffix}", self.amount)
+    }
 }
 
 struct Measurement {
@@ -80,6 +109,11 @@ impl Measurement {
 impl Finding {
     /// Compare quantities extracted by the same probe and recipe.
     pub fn change_from(&self, before: &Self, same_target: bool) -> Option<String> {
+        self.delta_from(before, same_target)
+            .map(|delta| delta.to_string())
+    }
+
+    pub(crate) fn delta_from(&self, before: &Self, same_target: bool) -> Option<Delta> {
         if self.label != before.label || self.sample_id != before.sample_id {
             return None;
         }
@@ -91,18 +125,11 @@ impl Finding {
         {
             return None;
         }
-        let difference = after.amount - before.amount;
-        let (unit, precision) = match after.unit {
-            Unit::Percent => (" pp", 1),
-            Unit::Tasks => (" tasks", 0),
-            Unit::Mebibytes => (" MiB", 0),
-            Unit::KibibytesPerSecond => (" KiB/s", 2),
-            Unit::Queue => ("", 2),
-            Unit::Milliseconds => (" ms", 2),
-            Unit::EventsPerSecond => ("/s", 2),
-        };
+        let amount = after.amount - before.amount;
+        let unit = after.unit;
+        let (_, precision) = unit.delta_format();
         let threshold = 0.5 * 10_f64.powi(-(precision as i32));
-        (difference.abs() >= threshold).then(|| format!("{difference:+.precision$}{unit}"))
+        (amount.is_finite() && amount.abs() >= threshold).then_some(Delta { amount, unit })
     }
 }
 

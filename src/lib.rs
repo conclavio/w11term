@@ -36,6 +36,7 @@ pub mod tabs;
 pub mod terminal;
 pub mod text_layout;
 pub mod transcript;
+pub mod triage_comparison;
 pub mod wav;
 pub mod windows_appearance;
 mod windows_dirs;

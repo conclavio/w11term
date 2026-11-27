@@ -1,4 +1,4 @@
-use super::{cpu_profile, syscall_capture};
+use super::{cpu_profile, syscall_capture, triage};
 use anyhow::{Context, Result};
 use std::{
     io::{self, Write},
@@ -17,6 +17,7 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
             syscall_capture::COMPARE_HELP,
             syscall_capture::compare_files,
         ),
+        triage::COMPARE_VERB => (triage::COMPARE_HELP, triage::compare_files),
         _ => return None,
     };
     if args == ["--help"] || args == ["-h"] {

@@ -12,7 +12,7 @@ pub(crate) mod cpu_profile;
 mod findings;
 pub(crate) mod packet_capture;
 pub(crate) mod syscall_capture;
-pub use findings::{Finding, Resource};
+pub use findings::{Delta, Finding, Resource};
 
 pub(crate) const DEADLINE: Duration = Duration::from_secs(60);
 const STREAM_BYTES: usize = 16 * 1024;

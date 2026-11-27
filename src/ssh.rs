@@ -38,7 +38,7 @@ pub use triage::packet_capture::{
 };
 pub use triage::syscall_capture::{Capture as SyscallCapture, Plan as SyscallCapturePlan};
 pub use triage::{
-    Finding as TriageFinding, Plan as TriagePlan, Report as TriageReport,
+    Delta as TriageDelta, Finding as TriageFinding, Plan as TriagePlan, Report as TriageReport,
     Resource as TriageResource, SampleStatus as TriageSampleStatus, Target as TriageTarget,
 };
 

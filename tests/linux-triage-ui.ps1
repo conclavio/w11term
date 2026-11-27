@@ -173,6 +173,12 @@ try {
         $export.Contains($saved.target.host_key_fingerprint)) {
         throw "The export did not preserve the paired changes and source evidence. $export"
     }
+    $cliOutput = Join-Path $State 'offline triage comparison.txt'
+    $null = & $Cli compare-linux-triage $report $afterReport --format text --output-file $cliOutput
+    if ($LASTEXITCODE -ne 0 -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliOutput)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($comparisonReport))) {
+        throw 'CLI triage comparison differs from the viewer export for the same reports'
+    }
     Click ('Review comparison with OpenRouter' + [char]0x2026)
     $null = Wait-Until 'comparison remains open beside the paired review preview' {
         $field = Find-Element 'OpenRouter request preview' ([System.Windows.Automation.ControlType]::Edit)

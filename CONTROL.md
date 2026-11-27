@@ -1536,6 +1536,16 @@ Choose **Compare reports** to use the displayed report as **Before** and open a 
 
 Choose **Export comparison…** to save a new text file with all changes, both source names and coverage summaries, and the stored stdout and stderr text for each changed check. Output keeps its source line numbers so you can trace an observation back to either report. The file records whether the SSH endpoints match and uses only the report filenames from disk.
 
+Run `compare-linux-triage` with the before and after report paths to compare offline from a script. The default schema-version-1 JSON includes coverage, check and observation changes, signed numeric deltas with units when the inputs support them, and both source outputs for each changed check. Use `--format text` for the same report the viewer exports.
+
+```powershell
+$comparison = & $ctl compare-linux-triage '.\before.json' '.\after.json' | ConvertFrom-Json
+$comparison.changes
+& $ctl compare-linux-triage '.\before.json' '.\after.json' --format text --output-file '.\comparison.txt'
+```
+
+With `--output-file`, the command saves a new file and returns its path at `result.path`. Errors return a nonzero exit code and a JSON reply on stderr. The command requires no GUI or SSH connection.
+
 Review the verified SSH endpoint, fixed sample commands and limits, then pass the reviewed connection generation when collecting. Choose a new Windows file for the report.
 
 ```powershell

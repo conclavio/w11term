@@ -21,6 +21,8 @@ mod sftp_args;
 mod syscall_capture;
 #[path = "w11term-cli/tool_bundles.rs"]
 mod tool_bundles;
+#[path = "w11term-cli/triage.rs"]
+mod triage;
 
 const HELP: &str = "w11term-cli [--pid PID] list\nw11term-cli [--pid PID] list-windows\nw11term-cli [--pid PID] list-tabs --window ID\nw11term-cli [--pid PID] reorder-tabs --window ID --tab ID [--tab ID ...]\nw11term-cli [--pid PID] rename-tab --window ID --tab ID (--name NAME | --reset)\nw11term-cli [--pid PID] rename-pane --pane ID (--name NAME | --reset)\nw11term-cli [--pid PID] pin-tab --window ID --tab ID (--on | --off)\nw11term-cli [--pid PID] set-tab-color --window ID --tab ID (--color NAME | --reset)\nw11term-cli [--pid PID] list-profiles\nw11term-cli [--pid PID] list-workspaces\nw11term-cli [--pid PID] get-workspace --name NAME [--window ID]\nw11term-cli [--pid PID] rename-workspace --name OLD --to NEW\nw11term-cli [--pid PID] repair-workspace --window ID --name NAME --replace OLD NEW [--replace OLD NEW ...]\nw11term-cli [--pid PID] save-workspace --window ID --name NAME\nw11term-cli [--pid PID] open-workspace (--window ID [--activate] | --new-window) --name NAME\nw11term-cli [--pid PID] send-text --pane ID --no-paste [--connection-generation N] [TEXT | --base64 BASE64 | --file PATH | --stdin]\nw11term-cli [--pid PID] get-text --pane ID\nw11term-cli [--pid PID] screenshot --pane ID PATH\nw11term-cli instances\n\nTEXT is literal UTF-8 (no escape interpretation). Use --base64/--file/--stdin for arbitrary bytes.\nControl commands without --pid require exactly one live instance. No command starts a GUI or changes focus.";
 
@@ -297,6 +299,7 @@ async fn main() -> ExitCode {
         println!(
             "\nw11term-cli [--pid PID] preview-linux-triage --pane ID\nw11term-cli [--pid PID] linux-triage --pane ID --connection-generation N --output-file PATH"
         );
+        println!("{}", triage::COMPARE_HELP);
         println!("\n{}\n{}", cpu_profile::HELP, cpu_profile::COMPARE_HELP);
         println!("\n{}", packet_capture::HELP);
         println!(
