@@ -1,3 +1,4 @@
+use crate::saved_reference_pages::valid_page_name as valid_name;
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -5,36 +6,35 @@ use std::{
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
 };
-use w11term::saved_reference_pages::valid_page_name as valid_name;
 
-const BUNDLED: &[u8] = include_bytes!("../../../assets/command-reference/tldr-pages.en.zip");
-pub(super) const MAX_ARCHIVE: usize = 16 * 1024 * 1024;
-pub(super) const MAX_PAGE: usize = 64 * 1024;
+const BUNDLED: &[u8] = include_bytes!("../assets/command-reference/tldr-pages.en.zip");
+pub const MAX_ARCHIVE: usize = 16 * 1024 * 1024;
+pub const MAX_PAGE: usize = 64 * 1024;
 const MAX_CONTENT: usize = 32 * 1024 * 1024;
 const MAX_PAGES: usize = 20_000;
 const MAX_RELATED: usize = 12;
 const TOOL_PAGES: &[(&str, &str)] = &[
     (
         "diskwatch",
-        include_str!("../../../assets/command-reference/linux/diskwatch.md"),
+        include_str!("../assets/command-reference/linux/diskwatch.md"),
     ),
     (
         "mdd",
-        include_str!("../../../assets/command-reference/linux/mdd.md"),
+        include_str!("../assets/command-reference/linux/mdd.md"),
     ),
     (
         "netwatch",
-        include_str!("../../../assets/command-reference/linux/netwatch.md"),
+        include_str!("../assets/command-reference/linux/netwatch.md"),
     ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct Platform(pub &'static str, pub &'static str);
+pub struct Platform(pub &'static str, pub &'static str);
 
-pub(super) const COMMON: Platform = Platform("common", "Common");
-pub(super) const LINUX: Platform = Platform("linux", "Linux");
-pub(super) const WINDOWS: Platform = Platform("windows", "Windows");
-pub(super) const PLATFORMS: &[Platform] = &[
+pub const COMMON: Platform = Platform("common", "Common");
+pub const LINUX: Platform = Platform("linux", "Linux");
+pub const WINDOWS: Platform = Platform("windows", "Windows");
+pub const PLATFORMS: &[Platform] = &[
     COMMON,
     LINUX,
     WINDOWS,
@@ -50,25 +50,25 @@ pub(super) const PLATFORMS: &[Platform] = &[
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Key {
-    pub(super) platform: Platform,
-    pub(super) name: String,
+    pub platform: Platform,
+    pub name: String,
 }
 
 #[derive(Debug)]
-pub(super) struct Example {
+pub struct Example {
     pub description: String,
     pub command: String,
 }
 
 #[derive(Debug)]
-pub(super) enum PageSource {
+pub enum PageSource {
     Tldr,
     BuiltIn,
     Custom,
 }
 
 impl PageSource {
-    pub(super) fn label(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             Self::Tldr => "tldr-pages (CC BY 4.0)",
             Self::BuiltIn => "w11term manual",
@@ -78,7 +78,7 @@ impl PageSource {
 }
 
 #[derive(Debug)]
-pub(super) struct Page {
+pub struct Page {
     pub title: String,
     pub description: String,
     pub link: Option<String>,
@@ -89,7 +89,7 @@ pub(super) struct Page {
 }
 
 impl Page {
-    pub(super) fn parse(text: &str, source: PageSource) -> Option<Self> {
+    pub fn parse(text: &str, source: PageSource) -> Option<Self> {
         let mut lines = text.trim_start_matches('\u{feff}').lines().map(str::trim);
         let title = lines.find(|line| !line.is_empty())?.strip_prefix("# ")?;
         let mut description = Vec::new();
@@ -102,9 +102,7 @@ impl Page {
                 if let Some(url) = quote
                     .strip_prefix("More information: <")
                     .and_then(|quote| quote.trim_end_matches('.').strip_suffix('>'))
-                    .filter(|url| {
-                        url.starts_with("https://") && w11term::interaction::safe_url(url)
-                    })
+                    .filter(|url| url.starts_with("https://") && crate::interaction::safe_url(url))
                 {
                     link = Some(url.to_owned());
                 } else if let Some(names) = related_names(quote)
@@ -196,11 +194,11 @@ fn keywords(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-pub(super) fn insertable(text: &str) -> bool {
+pub fn insertable(text: &str) -> bool {
     !text.trim().is_empty() && text.len() <= 4096 && !text.chars().any(char::is_control)
 }
 
-pub(super) fn query(text: &str) -> String {
+pub fn query(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
         .join("-")
@@ -208,20 +206,20 @@ pub(super) fn query(text: &str) -> String {
 }
 
 #[derive(Debug)]
-pub(super) struct Catalog {
+pub struct Catalog {
     pages: BTreeMap<Key, Page>,
 }
 
 impl Catalog {
-    pub(super) fn page(&self, key: &Key) -> Option<&Page> {
+    pub fn page(&self, key: &Key) -> Option<&Page> {
         self.pages.get(key)
     }
 
-    pub(super) fn set_private_page(&mut self, key: Key, page: Page) {
+    pub fn set_private_page(&mut self, key: Key, page: Page) {
         self.pages.insert(key, page);
     }
 
-    pub(super) fn remove_private_page(&mut self, key: &Key) {
+    pub fn remove_private_page(&mut self, key: &Key) {
         if self
             .pages
             .get(key)
@@ -231,7 +229,7 @@ impl Catalog {
         }
     }
 
-    pub(super) fn exact(&self, text: &str, preferred: Platform) -> Option<Key> {
+    pub fn exact(&self, text: &str, preferred: Platform) -> Option<Key> {
         let name = query(text);
         [preferred, COMMON]
             .into_iter()
@@ -353,7 +351,7 @@ impl Catalog {
         }
     }
 
-    pub(super) fn search(&self, text: &str, preferred: Platform) -> Vec<(&Key, &Page)> {
+    pub fn search(&self, text: &str, preferred: Platform) -> Vec<(&Key, &Page)> {
         let task = text.to_lowercase();
         let mut terms: Vec<_> = keywords(&task).collect();
         terms.sort_unstable();
@@ -408,7 +406,7 @@ impl Catalog {
     }
 }
 
-pub(super) fn read_page(file: impl Read) -> Result<String> {
+pub fn read_page(file: impl Read) -> Result<String> {
     let mut text = String::new();
     file.take(MAX_PAGE as u64 + 1).read_to_string(&mut text)?;
     ensure!(
@@ -420,15 +418,15 @@ pub(super) fn read_page(file: impl Read) -> Result<String> {
 
 #[derive(Debug)]
 pub struct Loaded {
-    pub(super) catalog: Catalog,
-    pub(super) status: String,
+    pub catalog: Catalog,
+    pub status: String,
 }
 
-pub(super) fn directory() -> Result<PathBuf> {
-    Ok(w11term::keys::data_dir()?.join("command-reference"))
+pub fn directory() -> Result<PathBuf> {
+    Ok(crate::keys::data_dir()?.join("command-reference"))
 }
 
-pub(super) fn load() -> Result<Loaded> {
+pub fn load() -> Result<Loaded> {
     let directory = directory()?;
     let (catalog, status) = match File::open(directory.join("tldr-pages.en.zip")) {
         Ok(file) => {
@@ -458,7 +456,7 @@ pub(super) fn load() -> Result<Loaded> {
     Ok(with_local_pages(catalog, status, &directory))
 }
 
-pub(super) fn update(bytes: Vec<u8>) -> Result<Loaded> {
+pub fn update(bytes: Vec<u8>) -> Result<Loaded> {
     update_at(&directory()?, &bytes)
 }
 
@@ -593,7 +591,7 @@ mod tests {
             directory.path(),
         )
         .catalog;
-        for name in w11term::sftp::builtin_tool_names() {
+        for name in crate::sftp::builtin_tool_names() {
             let key = catalog
                 .exact(name, LINUX)
                 .unwrap_or_else(|| panic!("missing page for {name}"));

@@ -1,6 +1,7 @@
 pub mod appearance;
 pub mod assets;
 pub mod clipboard;
+pub mod command_reference;
 pub mod conpty;
 pub mod control;
 pub mod copy_mode;

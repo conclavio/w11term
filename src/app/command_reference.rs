@@ -1,12 +1,12 @@
 use super::*;
 use catalog::{COMMON, Key, LINUX, Loaded, PLATFORMS, PageSource, Platform, WINDOWS};
 use std::collections::VecDeque;
+use w11term::command_reference as catalog;
 use w11term::events::{
     DotfileSyncReport, ToolBundleSyncReport, ToolBundleSyncStatus, ToolPathSyncStatus,
 };
 use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 
-mod catalog;
 mod command_line;
 mod dotfiles;
 mod download;

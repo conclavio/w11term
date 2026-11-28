@@ -9,6 +9,8 @@ use std::{
 use w11term::control::{self, Reply, Request};
 #[path = "w11term-cli/automation.rs"]
 mod automation;
+#[path = "w11term-cli/command_reference.rs"]
+mod command_reference;
 #[path = "w11term-cli/cpu_profile.rs"]
 mod cpu_profile;
 #[path = "w11term-cli/diagnostics.rs"]
@@ -336,6 +338,7 @@ async fn main() -> ExitCode {
             syscall_capture::COMPARE_HELP
         );
         println!("\n{}", diagnostics::HELP);
+        println!("\n{}", command_reference::HELP);
         return ExitCode::SUCCESS;
     }
     if args == ["fetch-tool-bundle", "--help"] || args == ["fetch-tool-bundle", "-h"] {

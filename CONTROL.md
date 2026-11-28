@@ -1,6 +1,6 @@
 # External control
 
-Build both executables with `cargo build --release --bins`. `w11term.exe` is the GUI and `w11term-cli.exe` is its console companion. The CLI connects to an existing instance, writes JSON to stdout, and exits with code 1 on errors. Commands use one reply, while `follow-ssh-group-output` emits JSON Lines.
+Build both executables with `cargo build --release --bins`. `w11term.exe` is the GUI and `w11term-cli.exe` is its console companion. Control commands connect to an existing instance, write JSON to stdout, and exit with code 1 on errors. Commands use one reply, while `follow-ssh-group-output` emits JSON Lines.
 
 Launch directly into a remote session with a known cell box:
 
@@ -197,6 +197,17 @@ its working directory and requires `--overwrite` to replace an existing file.
 The parent directory must exist. The file is published atomically after capture.
 Exports over 32 MiB and captures during a pending synchronized update return
 an error. A retry after the update captures the newly committed text.
+
+## Offline command reference
+
+`command-reference QUERY` reads the bundled or cached catalog and private pages without connecting to a w11term instance. Exact lookup prefers the selected platform and falls back to Common. The default platform is Windows. Pass `--search` to match partial command names or task descriptions.
+
+`--format text` shows the manual and its examples, or a short list for a search. The default JSON includes `schema_version`, `query`, `preferred_platform`, `catalog_status`, and `matches`. Each match includes the command name, title, platform, source, description, documentation URL when present, related commands, and examples. A missing exact manual exits with code 1. A search without matches returns an empty array.
+
+```powershell
+.\target\release\w11term-cli.exe command-reference 'git checkout' --platform linux --format text
+.\target\release\w11term-cli.exe command-reference 'comparative benchmark' --platform linux --search
+```
 
 ## Pipe protocol, version 1
 

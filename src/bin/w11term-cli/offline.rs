@@ -1,4 +1,4 @@
-use super::{cpu_profile, packet_capture, syscall_capture, triage};
+use super::{command_reference, cpu_profile, packet_capture, syscall_capture, triage};
 use anyhow::{Context, Result};
 use std::{
     io::{self, Write},
@@ -12,6 +12,7 @@ type OfflineCommand = fn(&[String], &mut dyn Write) -> Result<()>;
 pub(super) fn run(args: &[String]) -> Option<ExitCode> {
     let (verb, args) = args.split_first()?;
     let (help, command): (&str, OfflineCommand) = match verb.as_str() {
+        command_reference::VERB => (command_reference::HELP, command_reference::lookup),
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
         syscall_capture::INSPECT_VERB => (
             syscall_capture::INSPECT_HELP,

@@ -386,6 +386,8 @@ Look up a manual directly from a result in **Find command history…**. The manu
 
 Follow a **See also** link to another offline manual. Links prefer the chosen platform and fall back to Common. **Back to previous manual** restores the previous page and search result.
 
+Use `w11term-cli command-reference` for exact offline lookup or ranked task search from a shell. It reads the same bundled or cached pages and private overrides as the side panel. [CLI examples](../CONTROL.md#offline-command-reference)
+
 **Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
 
 ## Managed SSH utilities

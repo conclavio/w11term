@@ -75,6 +75,8 @@ Open **More → Command reference** to browse short manuals beside the terminal.
 
 Follow **See also** links to open related manuals offline. **Back to previous manual** restores the previous page, search query, and selected match.
 
+Use `w11term-cli command-reference "git checkout" --platform linux --format text` to read a manual offline from a shell. Add `--search` for task or partial-name matches. [Offline command reference](CONTROL.md#offline-command-reference)
+
 In a connected SSH pane, **Installed SSH tools** lists active commands from w11term-managed bundles on that host. Choose a command to open its exact Linux or common page and see the managed bundle name and selectable launcher path. **Install SSH tools** shows the last login sync result and any PATH conflict. Use it to review and apply a manifest or open **Bundle versions** to review and restore a retained release on the same pane. Select **Installed SSH tools** again after a bundle update or rollback to recheck the remote launchers.
 
 Use **Settings → Edit profile → SSH tools** to sync an approved bundle of Linux utilities before login or reconnect. The profile can append its launcher directory to Bash or Zsh's `PATH`. The control CLI can preview, install, and roll back bundles on an existing SSH connection. [SSH tool bundle setup](CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
