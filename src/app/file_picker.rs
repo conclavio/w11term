@@ -31,6 +31,7 @@ pub(super) enum Purpose {
         current: PathBuf,
         suggestion: String,
     },
+    SaveDotfileRolloutReceipt(PathBuf),
     ToolBundle(PathBuf),
     ToolExecutable(PathBuf),
     SaveToolBundle {
@@ -693,6 +694,22 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 options &= !FOS_OVERWRITEPROMPT;
                 options |= FOS_NOTESTFILECREATE | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 if let Some(folder) = current.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
+            Purpose::SaveDotfileRolloutReceipt(candidate) => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                dialog.SetTitle(w!("Save dotfile rollout receipt"))?;
+                dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                    pszName: w!("JSON files"),
+                    pszSpec: w!("*.json"),
+                }])?;
+                dialog.SetFileName(w!("dotfile-rollout.json"))?;
+                dialog.SetDefaultExtension(w!("json"))?;
+                options &= !FOS_OVERWRITEPROMPT;
+                options |= FOS_NOTESTFILECREATE | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if let Some(folder) = candidate.parent() {
                     local_folder(&dialog, folder);
                 }
                 None

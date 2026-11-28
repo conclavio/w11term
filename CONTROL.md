@@ -1420,9 +1420,12 @@ In the Windows editor, select the revision under **SSH dotfiles** and choose **R
 
 While the Windows rollout result is open, **Review rollback** lists the bundle paths and pins the rollback would restore. **Apply reviewed rollback** restores the batch together. Each selected approval must still match the completed rollout. If a bundle changes after the rollback preview, review it again before confirming.
 
-To keep a CLI rollout reversible, save the JSON reply from the successful apply. `rollback-dotfiles-profiles` previews the previous bundle paths and pins for the profiles that rollout changed. It uses the catalog recorded in the reply and rejects the whole batch if any of those approvals have since changed. The preview reports whether each previous bundle is available and whether it matches its saved pin. Rollback restores the prior approvals even if a previous bundle is missing. Login sync checks the restored approval and bundle when a new SSH session opens.
+Choose **Save rollout receipt** in the Windows result to keep a JSON file you can use after closing the editor. The receipt includes the local catalog and bundle paths and the profile names and approval metadata. For a CLI rollout, save the JSON reply from the successful apply for the same purpose.
+
+`rollback-dotfiles-profiles` accepts either receipt and previews the previous bundle paths and pins for the profiles that rollout changed. It uses the catalog recorded in the reply and rejects the whole batch if any of those approvals have since changed. The preview reports whether each previous bundle is available and whether it matches its saved pin. Rollback restores the prior approvals even if a previous bundle is missing. Login sync checks the restored approval and bundle when a new SSH session opens.
 
 ```powershell
+# For a Windows rollout, use the saved receipt and skip the first line.
 & $ctl @rollout --review $preview.result.review | Set-Content -Encoding utf8 '.\rollout-reply.json'
 $rollback = & $ctl rollback-dotfiles-profiles '.\rollout-reply.json' | ConvertFrom-Json
 $rollback.result.profiles

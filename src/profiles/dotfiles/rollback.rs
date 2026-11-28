@@ -210,6 +210,26 @@ pub fn rollback_dotfile_rollout(
 }
 
 impl DotfileRolloutReport {
+    /// Save the same successful reply that the CLI accepts for a reviewed rollback.
+    pub fn save_rollback_receipt(&self, path: &Path) -> Result<()> {
+        ensure!(
+            self.applied,
+            "Apply the dotfile rollout before saving its receipt"
+        );
+        ensure!(
+            self.changed_profiles > 0,
+            "The rollout did not change any profiles"
+        );
+        let reply = crate::control::Reply::from_result(Ok(serde_json::to_value(self)?));
+        let mut json = serde_json::to_string(&reply)?;
+        json.push('\n');
+        ensure!(
+            json.len() <= MAX_RECEIPT_BYTES,
+            "Rollout receipt exceeds 1 MiB"
+        );
+        crate::transcript::save(path, &json, false)
+    }
+
     pub fn rollback(&self, review: Option<&str>) -> Result<DotfileRollbackReport> {
         let receipt = Receipt {
             profiles_path: self.profiles_path.clone(),

@@ -1,6 +1,7 @@
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 . (Join-Path $PSScriptRoot 'support/mixed-tab-layout.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $menu = [System.Windows.Automation.ControlType]::MenuItem
 $edit = [System.Windows.Automation.ControlType]::Edit
@@ -9,6 +10,7 @@ $on = [System.Windows.Automation.ToggleState]::On
 $off = [System.Windows.Automation.ToggleState]::Off
 $candidate = Join-Path $State 'revision.json'
 $previous = Join-Path $State 'previous.json'
+$receipt = Join-Path $State 'Approved rollout.json'
 $oldCatalog = [IO.File]::ReadAllText($profiles)
 $oldCandidate = [IO.File]::ReadAllText($candidate)
 $oldBundle = [IO.File]::ReadAllText($previous)
@@ -80,6 +82,35 @@ try {
             $saved.Other.dotfiles.bundle -ceq 'previous.json'
     }
     $rolledOut = [IO.File]::ReadAllText($profiles)
+    Click 'Save rollout receipt'
+    $dialog = Wait-OwnedDialog 'Save dotfile rollout receipt'
+    $null = Wait-Until 'cancel the receipt picker' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Control 'Save rollout receipt'
+    if ([IO.File]::Exists((Join-Path $State 'dotfile-rollout.json'))) { throw 'Canceled picker wrote a receipt' }
+
+    Click 'Save rollout receipt'
+    $dialog = Wait-OwnedDialog 'Save dotfile rollout receipt'
+    $null = Wait-Until 'enter a draft receipt filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, "$receipt.draft") }
+    $null = Wait-Until 'choose the receipt filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, $receipt) }
+    $null = Wait-Until 'save the receipt' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'receipt is published and its destination is shown' {
+        if ([IO.File]::Exists($receipt)) {
+            $prefix = 'Saved rollout receipt ' + [char]0xb7 + ' '
+            Get-NativeTextLabels | Where-Object {
+                $_.StartsWith($prefix) -and [FixtureDialog]::SameFile($receipt, $_.Substring($prefix.Length))
+            }
+        }
+    }
+    $preview = & $Cli rollback-dotfiles-profiles $receipt | ConvertFrom-Json
+    $east = $preview.result.profiles | Where-Object profile -eq 'East'
+    $west = $preview.result.profiles | Where-Object profile -eq 'West'
+    if (!$preview.ok -or $preview.result.applied -or $preview.result.changed_profiles -ne 2 -or
+        $east.restore.bundle_sha256 -cne $oldPin -or $east.restore_status -cne 'matches-pin' -or
+        $west.restore_status -cne 'bundle-unavailable') {
+        throw 'The exported receipt did not produce the expected CLI rollback review'
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $rolledOut) { throw 'Receipt export or preview changed the catalog' }
+
     Click 'Review rollback'
     $null = Wait-Until 'the rollback preview shows the old pin and unavailable Fish bundle' {
         (Find-Element "Restore pin $oldPin") -and

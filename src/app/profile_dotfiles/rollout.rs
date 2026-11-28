@@ -18,6 +18,8 @@ pub enum Action {
     Back(Arc<()>),
     Apply(Arc<()>),
     Completed(Arc<()>, Result<Arc<ReviewedRollout>, String>),
+    SaveReceipt(Arc<()>),
+    ReceiptSaved(Arc<()>, Result<Option<PathBuf>, String>),
     ReviewRollback(Arc<()>),
     ApplyRollback(Arc<()>),
     RollbackCompleted(Arc<()>, Result<Arc<DotfileRollbackReport>, String>),
@@ -32,6 +34,7 @@ enum Work {
     Reviewed(Arc<ReviewedRollout>),
     Applying,
     Applied(Arc<ReviewedRollout>),
+    SavingReceipt(Arc<ReviewedRollout>),
     Rollback {
         applied: Arc<ReviewedRollout>,
         state: Undo,
@@ -55,6 +58,7 @@ pub(super) struct Panel {
     query: String,
     work: Work,
     error: Option<String>,
+    saved_receipt: Option<PathBuf>,
 }
 
 pub struct ReviewedRollout {
@@ -102,6 +106,7 @@ impl Panel {
             query: String::new(),
             work: Work::Loading,
             error: None,
+            saved_receipt: None,
         }
     }
 
@@ -175,6 +180,44 @@ impl Panel {
         );
     }
 
+    fn save_receipt(
+        &mut self,
+        id: TabId,
+        owner: usize,
+        applied: Arc<ReviewedRollout>,
+        ctx: &ComponentContext<TerminalApp>,
+    ) {
+        self.work = Work::SavingReceipt(applied.clone());
+        self.error = None;
+        let ticket = self.ticket.clone();
+        let purpose =
+            file_picker::Purpose::SaveDotfileRolloutReceipt(applied.report.candidate_path.clone());
+        let rejected = message(
+            id,
+            Action::ReceiptSaved(
+                ticket.clone(),
+                Err("Rollout receipt save unavailable".into()),
+            ),
+        );
+        ctx.spawn_background_with_rejection(
+            move |cancel| {
+                let result = (|| {
+                    let Some(file) = file_picker::pick(owner, purpose)? else {
+                        return Ok(None);
+                    };
+                    if cancel.is_cancelled() {
+                        return Ok(None);
+                    }
+                    applied.report.save_rollback_receipt(&file.path)?;
+                    Ok::<_, anyhow::Error>(Some(file.path))
+                })()
+                .map_err(|error| format!("{error:#}"));
+                message(id, Action::ReceiptSaved(ticket, result))
+            },
+            rejected,
+        );
+    }
+
     pub(super) fn view(&self, id: TabId, ctx: &ViewContext<TerminalApp>) -> View {
         let send = |action: Action| ctx.callback(move |_| message(id, action.clone()));
         let mut fields = vec![
@@ -185,6 +228,7 @@ impl Panel {
             Work::Loading => fields.push(label("status", "Reading saved SSH profiles…")),
             Work::Reviewing => fields.push(label("status", "Checking the selected profiles…")),
             Work::Applying => fields.push(label("status", "Saving the reviewed rollout…")),
+            Work::SavingReceipt(_) => fields.push(label("status", "Saving rollout receipt…")),
             Work::Applied(applied) => {
                 fields.push(label(
                     "status",
@@ -199,6 +243,18 @@ impl Panel {
                         .on_click(send(Action::ReviewRollback(self.ticket.clone())))
                         .content("Review rollback"),
                 ));
+                fields.push(KeyedView::new(
+                    "save-receipt",
+                    Button::new()
+                        .on_click(send(Action::SaveReceipt(self.ticket.clone())))
+                        .content("Save rollout receipt"),
+                ));
+                if let Some(path) = &self.saved_receipt {
+                    fields.push(label(
+                        "receipt",
+                        format!("Saved rollout receipt · {}", path.display()),
+                    ));
+                }
             }
             Work::Rollback { state, .. } => match state {
                 Undo::Reviewing => {
@@ -401,6 +457,7 @@ impl Panel {
                 .is_enabled(!matches!(
                     self.work,
                     Work::Applying
+                        | Work::SavingReceipt(_)
                         | Work::Rollback {
                             state: Undo::Applying,
                             ..
@@ -440,6 +497,7 @@ impl TerminalApp {
         ctx: &ComponentContext<Self>,
     ) {
         let catalog = self.store.path().to_owned();
+        let owner = self.keyboard.hwnd();
         let Some(Page::NewProfile(draft)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) else {
             return;
         };
@@ -489,6 +547,8 @@ impl TerminalApp {
             | Action::Back(ticket)
             | Action::Apply(ticket)
             | Action::Completed(ticket, _)
+            | Action::SaveReceipt(ticket)
+            | Action::ReceiptSaved(ticket, _)
             | Action::ReviewRollback(ticket)
             | Action::ApplyRollback(ticket)
             | Action::RollbackCompleted(ticket, _)
@@ -567,6 +627,23 @@ impl TerminalApp {
                     }
                 }
             }
+            Action::SaveReceipt(_) => {
+                if let Work::Applied(applied) = &panel.work
+                    && let Some(owner) = owner
+                {
+                    panel.save_receipt(id, owner.0 as usize, applied.clone(), ctx);
+                }
+            }
+            Action::ReceiptSaved(_, result) => {
+                if let Work::SavingReceipt(applied) = &panel.work {
+                    panel.work = Work::Applied(applied.clone());
+                    match result {
+                        Ok(Some(path)) => panel.saved_receipt = Some(path),
+                        Ok(None) => {}
+                        Err(error) => panel.error = Some(error),
+                    }
+                }
+            }
             Action::ReviewRollback(_) => {
                 if let Work::Applied(applied) = &panel.work {
                     panel.request_rollback(id, applied.clone(), None, ctx);
@@ -620,6 +697,7 @@ impl TerminalApp {
                 if !matches!(
                     panel.work,
                     Work::Applying
+                        | Work::SavingReceipt(_)
                         | Work::Rollback {
                             state: Undo::Applying,
                             ..
