@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::Mutex;
 use tokio::{sync::mpsc, task::JoinSet};
-use w11term::sftp::{DEFAULT_TIMEOUT, GroupDownloadFolder, Job, Operation, TransferCancel};
+use w11term::sftp::{GroupDownloadFolder, Job, Operation, TRANSFER_TIMEOUT, TransferCancel};
 
 const PARALLEL_HOSTS: usize = 4;
 const CANCELLED_BEFORE_START: Outcome = Outcome::Cancelled {
@@ -212,7 +212,7 @@ impl Batch {
         let job = Job {
             expected_generation: Some(generation),
             operation,
-            deadline: tokio::time::Instant::now() + Duration::from_secs(DEFAULT_TIMEOUT),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(TRANSFER_TIMEOUT),
             reply,
             progress: Some(w11term::sftp::JobProgress::Transfer(progress)),
             cancel: Some(self.cancel.clone()),

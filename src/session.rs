@@ -1621,12 +1621,15 @@ async fn run(
                         Ok(())
                     }
                     Some(Command::Key { key, modifiers, down,repeat }) => {
-                        scroll_offset = 0;
+                        // Bare modifiers and key releases send nothing, so they keep the scrolled view.
+                        if is_demo || terminal::encode_key_input(&terminal, key, modifiers, down, repeat, &Default::default())
+                            .map_or(true, |wire| !wire.is_empty()) { scroll_offset = 0; }
                         if is_demo && down { demo_key(&mut terminal, key, modifiers); Ok(()) }
                         else { terminal::send_key_event(&mut terminal, &writer, key, modifiers, down,repeat) }
                     }
                     Some(Command::DetailedKey {key,details,modifiers,down,repeat}) => {
-                        scroll_offset=0;
+                        if is_demo || terminal::encode_key_input(&terminal, key, modifiers, down, repeat, &details)
+                            .map_or(true, |wire| !wire.is_empty()) { scroll_offset = 0; }
                         if is_demo && down { if let Some(text)=details.text { scroll_offset = presentation.advance(&mut terminal,text,scroll_offset,&status,total_bytes); } else { demo_key(&mut terminal,key,modifiers); } Ok(()) }
                         else { terminal::send_key_event_detailed(&mut terminal,&writer,key,modifiers,down,repeat,&details) }
                     }

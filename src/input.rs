@@ -2115,7 +2115,23 @@ impl State {
                             ..Default::default()
                         });
                     }
-                    (self.shortcut)(Shortcut::ClearSelection);
+                    // A bare modifier or lock key types nothing: keep the selection so
+                    // Ctrl+C can copy it and Shift+click can extend it.
+                    if !matches!(
+                        key,
+                        KeyCode::LeftShift
+                            | KeyCode::RightShift
+                            | KeyCode::LeftControl
+                            | KeyCode::RightControl
+                            | KeyCode::LeftAlt
+                            | KeyCode::RightAlt
+                            | KeyCode::LeftWindows
+                            | KeyCode::RightWindows
+                            | KeyCode::CapsLock
+                            | KeyCode::NumLock
+                    ) {
+                        (self.shortcut)(Shortcut::ClearSelection);
+                    }
                     let mirrored = emit_key(
                         sender,
                         &self.broadcast,

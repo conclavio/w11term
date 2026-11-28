@@ -198,3 +198,7 @@ The original MIT license is preserved in `LICENSE.md`.
 - Xterm resource 4 supports modifyOtherKeys levels 0 through 3 and the
   formatOtherKeys switch. CSI and DECRQSS report the negotiated settings.
   The legacy encoder continues to handle keys outside the negotiated class.
+
+- Sixel decoding has a total pixel-column work budget of 256 passes per
+  band, at most 134,217,728 steps. When it runs out, decoding stops and the
+  rows decoded so far are shown.

@@ -247,15 +247,20 @@ impl Windows {
         self.profiles = latest;
         Ok(())
     }
-    pub fn restore(&self, name: &str) -> Result<()> {
+    /// Apply the profile's saved placement; `false` means the window was left alone.
+    pub fn restore(&self, name: &str) -> Result<bool> {
         if self.fullscreen() {
-            return Ok(());
+            return Ok(false);
         }
         let Some(p) = self.profiles.get(name) else {
-            return Ok(());
+            return Ok(false);
         };
         let hwnd = self.scope.hwnd().context("window is not ready")?;
         unsafe {
+            // A maximized window keeps its state when another profile's tab is selected.
+            if IsZoomed(hwnd).as_bool() {
+                return Ok(false);
+            }
             let desired = RECT {
                 left: p.x,
                 top: p.y,
@@ -285,7 +290,7 @@ impl Windows {
             // Restore size/position without activating the application.
             SetWindowPlacement(hwnd, &placement)?;
         }
-        Ok(())
+        Ok(true)
     }
     pub fn toggle(&mut self) -> Result<()> {
         let hwnd = self.scope.hwnd().context("window is not ready")?;

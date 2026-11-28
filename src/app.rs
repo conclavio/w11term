@@ -3469,7 +3469,7 @@ impl TerminalApp {
             if windows.fullscreen() {
                 return;
             }
-            if windows.restore(name).is_ok()
+            if matches!(windows.restore(name), Ok(true))
                 && matches!(self.tabs.active().map(|tab| &tab.page), Some(Page::Terminal(tab))
                     if tab.pane_font_size.get().is_none())
                 && let Some(placement) = windows.profiles.get(name)

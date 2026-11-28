@@ -48,10 +48,24 @@ const CERTIFICATE_KEYS: &[Algorithm] = &[
     },
 ];
 
-pub(super) fn preferred(trust_host_ca: bool) -> Preferred {
+/// `recorded` lists the key algorithms known_hosts already holds for the host;
+/// they are requested first, as OpenSSH does, keeping the default order otherwise.
+pub(super) fn preferred(trust_host_ca: bool, recorded: &[Algorithm]) -> Preferred {
+    let defaults = Preferred::default();
+    let is_recorded = |offered: &Algorithm| {
+        recorded.iter().any(|known| {
+            known == offered
+                || (matches!(known, Algorithm::Rsa { .. })
+                    && matches!(offered, Algorithm::Rsa { .. }))
+        })
+    };
+    let mut key = defaults.key.to_vec();
+    // A stable sort keeps russh's order within each group.
+    key.sort_by_key(|offered| !is_recorded(offered));
     Preferred {
         host_key_certificates: Cow::Borrowed(if trust_host_ca { CERTIFICATE_KEYS } else { &[] }),
-        ..Preferred::default()
+        key: Cow::Owned(key),
+        ..defaults
     }
 }
 
@@ -123,13 +137,27 @@ mod tests {
     }
 
     #[test]
+    fn recorded_host_key_algorithms_are_requested_first() {
+        let defaults = Preferred::default();
+        let ecdsa = Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        };
+        let reordered = preferred(false, std::slice::from_ref(&ecdsa));
+        assert_eq!(reordered.key.first(), Some(&ecdsa));
+        assert_eq!(reordered.key.len(), defaults.key.len());
+        let rest: Vec<_> = reordered.key.iter().filter(|key| **key != ecdsa).collect();
+        let expected: Vec<_> = defaults.key.iter().filter(|key| **key != ecdsa).collect();
+        assert_eq!(rest, expected);
+    }
+
+    #[test]
     fn only_ca_endpoints_negotiate_host_certificates_and_keep_the_bare_key_order() {
         let defaults = Preferred::default();
-        let plain = preferred(false);
+        let plain = preferred(false, &[]);
         assert!(plain.host_key_certificates.is_empty());
         assert_eq!(plain.key, defaults.key);
 
-        let ca = preferred(true);
+        let ca = preferred(true, &[]);
         assert_eq!(ca.key, defaults.key);
         let certificates: Vec<_> = ca
             .host_key_certificates

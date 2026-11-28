@@ -138,7 +138,9 @@ impl Appearance {
     }
 
     pub fn path() -> Result<PathBuf> {
-        if let Some(path) = std::env::var_os("W11TERM_SETTINGS_PATH") {
+        if let Some(path) = std::env::var_os("W11TERM_SETTINGS_PATH")
+            && crate::keys::environment_overrides_allowed()?
+        {
             return std::path::absolute(path).context("Resolving settings path");
         }
         Ok(crate::keys::data_dir()?.join("settings.json"))

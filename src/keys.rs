@@ -24,8 +24,19 @@ pub struct DeviceKey {
     pub fingerprint: String,
     pub device: String,
 }
+/// Whether `W11TERM_DATA_DIR` and `W11TERM_SETTINGS_PATH` may redirect storage.
+///
+/// A Medium-integrity process can plant per-user environment variables that an
+/// elevated instance inherits, so production builds ignore the overrides at High
+/// integrity and keep the pinned elevated directory. Test builds keep them for
+/// isolation on elevated CI runners.
+pub(crate) fn environment_overrides_allowed() -> Result<bool> {
+    Ok(cfg!(any(test, feature = "ui-smoke")) || !crate::control::security::is_elevated()?)
+}
 pub fn data_dir() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("W11TERM_DATA_DIR") {
+    if let Some(path) = std::env::var_os("W11TERM_DATA_DIR")
+        && environment_overrides_allowed()?
+    {
         return Ok(std::path::absolute(path)?);
     }
     if crate::control::security::is_elevated()? {

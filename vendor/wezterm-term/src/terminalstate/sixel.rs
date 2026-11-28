@@ -56,16 +56,18 @@ impl TerminalState {
 
         // Bound total pixel-column work across the entire graphic so repeated
         // `Repeat` + `CarriageReturn` loops cannot multiply into billions of writes.
+        // Encoders paint each band once per colour, so allow a full 256-colour
+        // palette per band; the rows decoded before the budget runs out are kept.
         let bands = (height as u64).saturating_add(5) / 6;
         let mut remaining_work = (width as u64)
             .saturating_mul(bands)
-            .saturating_mul(16)
-            .clamp(65_536, 16_777_216);
+            .saturating_mul(256)
+            .clamp(65_536, 134_217_728);
 
-        for d in &sixel.data {
+        'decode: for d in &sixel.data {
             if remaining_work == 0 {
-                log::error!("Aborting sixel decode after exceeding work budget");
-                return;
+                log::error!("Stopping sixel decode after exceeding work budget");
+                break 'decode;
             }
             match d {
                 SixelData::Data(d) => {
@@ -91,8 +93,8 @@ impl TerminalState {
                             x = x.saturating_add(1);
                         }
                         if (steps as u32) < count {
-                            log::error!("Aborting sixel decode after exceeding work budget");
-                            return;
+                            log::error!("Stopping sixel decode after exceeding work budget");
+                            break 'decode;
                         }
                     }
                 }

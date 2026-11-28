@@ -13,9 +13,9 @@ use w11term::profiles::BookmarkPeer;
 pub use w11term::sftp::TransferId;
 use w11term::sftp::{
     CopyDestination, DEFAULT_TIMEOUT, EntryKind, FilenameMatch, FolderInventory, Job, JobProgress,
-    Operation, SearchProgress, TransferBatchProgress, TransferCancel, TransferOperation,
-    TransferOutcome, TransferPhase, TransferProgress, image_preview_name, normalize_sha256,
-    validate_download_name,
+    Operation, SearchProgress, TRANSFER_TIMEOUT, TransferBatchProgress, TransferCancel,
+    TransferOperation, TransferOutcome, TransferPhase, TransferProgress, image_preview_name,
+    normalize_sha256, validate_download_name,
 };
 
 mod bookmarks;
@@ -2794,7 +2794,13 @@ impl FileDrawer {
                     transfer.as_ref().map(|active| active.cancel.clone())
                 },
                 deadline: tokio::time::Instant::now()
-                    + Duration::from_secs(if move_picker { 30 } else { DEFAULT_TIMEOUT }),
+                    + Duration::from_secs(if move_picker {
+                        30
+                    } else if transfer.is_some() {
+                        TRANSFER_TIMEOUT
+                    } else {
+                        DEFAULT_TIMEOUT
+                    }),
                 reply: tx,
             }))
             .map_err(|_| anyhow!("SSH session has closed"))?;
