@@ -3,9 +3,11 @@ use super::{
     RECORD_KIB, RUNNER, Recording, SSH_MARGIN_SECONDS, STACKS_KIB, SUPERVISOR, Target, fold, quote,
     report, transfer_seconds, validate_sampling,
 };
+use crate::ssh::triage::capture_job::{Kind, validate_job};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -62,7 +64,7 @@ impl CpuLaunchOptions {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct CpuLaunchPlan {
     pub connection_generation: u64,
     pub host: String,
@@ -75,6 +77,9 @@ pub struct CpuLaunchPlan {
     pub deadline_seconds: u64,
     pub max_recording_bytes: usize,
     pub max_stack_output_bytes: usize,
+    #[serde(skip)]
+    identity: String,
+    pub review_id: String,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -96,7 +101,10 @@ impl std::fmt::Display for CpuWorkloadOutcome {
 }
 
 impl Target {
-    pub fn preview_cpu_launch_blocking(self, options: CpuLaunchOptions) -> Result<CpuLaunchPlan> {
+    pub fn preview_cpu_launch_blocking(
+        mut self,
+        options: CpuLaunchOptions,
+    ) -> Result<CpuLaunchPlan> {
         crate::ssh::NETWORK.block_on(self.preview_cpu_launch(options))
     }
 
@@ -142,7 +150,10 @@ impl Target {
             .save(path)
     }
 
-    async fn preview_cpu_launch(mut self, options: CpuLaunchOptions) -> Result<CpuLaunchPlan> {
+    pub(crate) async fn preview_cpu_launch(
+        &mut self,
+        options: CpuLaunchOptions,
+    ) -> Result<CpuLaunchPlan> {
         let (stdout, _) = self
             .run_diagnostic(
                 "Linux command profile review",
@@ -151,22 +162,61 @@ impl Target {
                 REVIEW_BYTES,
             )
             .await?;
-        let (directory, program, remainder) = command_header(&stdout)?;
+        let (resolved, remainder) = command_header(&stdout)?;
         ensure!(remainder.is_empty(), "Unexpected CPU command review output");
         let (host, user, port, fingerprint) = self.link.verified_endpoint();
-        Ok(CpuLaunchPlan {
+        let mut plan = CpuLaunchPlan {
             connection_generation: self.generation,
             host: host.into(),
             user: user.into(),
             port,
             host_key_fingerprint: fingerprint.into(),
-            program,
-            directory,
+            program: resolved.program,
+            directory: resolved.directory,
             deadline_seconds: options.worker_seconds() + SSH_MARGIN_SECONDS,
             options,
             max_recording_bytes: RECORD_KIB * 1024,
             max_stack_output_bytes: STACKS_KIB * 1024,
-        })
+            identity: resolved.identity,
+            review_id: String::new(),
+        };
+        let mut digest = Sha256::new_with_prefix(serde_json::to_vec(&plan)?);
+        digest.update(plan.identity.as_bytes());
+        plan.review_id = crate::sftp::digest_hex(digest);
+        Ok(plan)
+    }
+
+    pub(crate) async fn capture_reviewed_cpu_launch(
+        mut self,
+        pane: u64,
+        options: CpuLaunchOptions,
+        review_id: &str,
+        job: &str,
+        perf_data: Option<PathBuf>,
+    ) -> Result<Recording> {
+        let job = validate_job(job)?;
+        let review_id = crate::sftp::normalize_sha256(review_id)?;
+        let link = self.link.clone();
+        let stop = CaptureStop::default();
+        let _active =
+            link.capture_jobs()
+                .register(Kind::CpuCommands, self.generation, pane, job, &stop)?;
+        let plan = self.preview_cpu_launch(options).await?;
+        ensure!(
+            plan.review_id == review_id,
+            "The reviewed executable, directory, or capture settings changed. Review the command again."
+        );
+        ensure!(
+            !stop.is_requested(),
+            "CPU command capture stopped before launch"
+        );
+        self.capture_cpu_launch(&plan, perf_data, Some(&stop)).await
+    }
+
+    pub(crate) fn stop_cpu_command_capture(&self, pane: u64, job: &str) -> Result<()> {
+        self.link
+            .capture_jobs()
+            .stop(Kind::CpuCommands, self.generation, pane, validate_job(job)?)
     }
 
     async fn capture_cpu_launch(
@@ -188,20 +238,23 @@ impl Target {
                 stop,
             )
             .await?;
-        let (directory, program, remainder) = command_header(&stdout)?;
+        let (resolved, remainder) = command_header(&stdout)?;
         ensure!(
-            directory == plan.directory && program == plan.program,
+            resolved.directory == plan.directory
+                && resolved.program == plan.program
+                && resolved.identity == plan.identity,
             "The Linux command profile target changed"
         );
         let (outcome, stacks) = workload_result(remainder)?;
         let stacks = stacks
             .strip_suffix(END_MARKER)
             .context("The CPU profile response is incomplete")?;
-        let root = program
+        let root = resolved
+            .program
             .rsplit('/')
             .next()
             .filter(|name| !name.is_empty())
-            .unwrap_or(&program);
+            .unwrap_or(&resolved.program);
         let stderr = String::from_utf8_lossy(&stderr);
         let folded = fold(&String::from_utf8_lossy(stacks), None, root)
             .with_context(|| {
@@ -231,17 +284,18 @@ impl Target {
 
 fn command(options: &CpuLaunchOptions, plan: Option<&CpuLaunchPlan>, raw: bool) -> Result<String> {
     options.validate()?;
-    let (mode, deadline, directory, program) = match plan {
+    let (mode, deadline, directory, program, identity) = match plan {
         Some(plan) => (
             if raw { "launch-raw" } else { "launch" },
             options.worker_seconds() + transfer_seconds(raw),
             plan.directory.as_str(),
             plan.program.as_str(),
+            plan.identity.as_str(),
         ),
-        None => ("inspect", PROBE_SECONDS, "", ""),
+        None => ("inspect", PROBE_SECONDS, "", "", ""),
     };
     let mut command = format!(
-        "/bin/sh -c {} w11term-cpu-profile {} {deadline} {mode} {} {} {} {} {RECORD_KIB} {STACKS_KIB} {} {} {} {}",
+        "/bin/sh -c {} w11term-cpu-profile {} {deadline} {mode} {} {} {} {} {RECORD_KIB} {STACKS_KIB} {} {} {} {} {}",
         quote(SUPERVISOR),
         quote(WORKER),
         quote(RUNNER),
@@ -252,6 +306,7 @@ fn command(options: &CpuLaunchOptions, plan: Option<&CpuLaunchPlan>, raw: bool) 
         quote(&options.program),
         quote(directory),
         quote(program),
+        quote(identity),
     );
     for argument in &options.arguments {
         command.push(' ');
@@ -264,16 +319,25 @@ fn command(options: &CpuLaunchOptions, plan: Option<&CpuLaunchPlan>, raw: bool) 
     Ok(command)
 }
 
-fn command_header(bytes: &[u8]) -> Result<(String, String, &[u8])> {
+struct ResolvedCommand {
+    directory: String,
+    program: String,
+    identity: String,
+}
+
+fn command_header(bytes: &[u8]) -> Result<(ResolvedCommand, &[u8])> {
     let end = bytes
         .iter()
         .position(|&byte| byte == b'\n')
         .filter(|&end| end < REVIEW_BYTES)
         .context("Missing CPU command profile header")?;
-    let (directory, program) = std::str::from_utf8(&bytes[..end])?
-        .strip_prefix("w11term-cpu-launch-v1\t")
-        .and_then(|text| text.split_once('\t'))
+    let header = std::str::from_utf8(&bytes[..end])?
+        .strip_prefix("w11term-cpu-launch-v2\t")
         .context("Invalid CPU command profile header")?;
+    let fields: Vec<_> = header.split('\t').collect();
+    let [directory, program, identity] = fields.as_slice() else {
+        anyhow::bail!("Invalid CPU command profile header");
+    };
     let path = |value| -> Result<String> {
         let path = String::from_utf8(STANDARD.decode(value)?)?;
         ensure!(
@@ -282,7 +346,19 @@ fn command_header(bytes: &[u8]) -> Result<(String, String, &[u8])> {
         );
         Ok(path)
     };
-    Ok((path(directory)?, path(program)?, &bytes[end + 1..]))
+    let identity = String::from_utf8(STANDARD.decode(identity)?)?;
+    ensure!(
+        !identity.is_empty() && identity.len() <= 160 && !identity.chars().any(char::is_control),
+        "Invalid CPU command executable identity"
+    );
+    Ok((
+        ResolvedCommand {
+            directory: path(directory)?,
+            program: path(program)?,
+            identity,
+        },
+        &bytes[end + 1..],
+    ))
 }
 
 fn workload_result(bytes: &[u8]) -> Result<(CpuWorkloadOutcome, &[u8])> {

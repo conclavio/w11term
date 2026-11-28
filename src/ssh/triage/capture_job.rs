@@ -7,6 +7,7 @@ use tokio::sync::watch;
 pub enum Kind {
     Packets,
     Syscalls,
+    CpuCommands,
 }
 
 impl Kind {
@@ -14,6 +15,7 @@ impl Kind {
         match self {
             Self::Packets => "packet capture",
             Self::Syscalls => "syscall capture",
+            Self::CpuCommands => "CPU command capture",
         }
     }
 }

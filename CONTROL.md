@@ -2020,6 +2020,18 @@ $plan
 
 Add `--report-file PATH` to save the same capture report from the CLI. The reply returns `result.report_path` on success or `result.report_error` if the profile was saved and the report could not be written.
 
+To script a command capture, use `preview-cpu-command` with its executable, literal arguments, directory, and sampling settings. The preview resolves the executable and directory and returns a review ID and connection generation. Use the same options for `capture-cpu-command`. It checks that review again before starting the workload, including the identity of the executable at the resolved path.
+
+```powershell
+$command = @('--pane', $pane, '--program', '/usr/bin/python3', '--arg', '-c', '--arg', 'sum(i*i for i in range(10000000))', '--seconds', 5)
+$plan = (& $ctl --pid 12345 preview-cpu-command @command | ConvertFrom-Json).result.plan
+$plan
+$job = [guid]::NewGuid().ToString('N')
+& $ctl --pid 12345 capture-cpu-command @command --connection-generation $plan.connection_generation --review-id $plan.review_id --job-id $job --output-file '.\command.folded' --perf-data '.\command.perf.data' --report-file '.\command.folded.json'
+```
+
+To finish early from a second CLI invocation, run `stop-cpu-command --pane ID --connection-generation N --job-id HEX` with the same pane, generation, and job ID. The capture invocation returns the folded profile and any requested artifacts when collected samples are available. Its `result.summary.workload` records the command exit status, time limit, or requested stop.
+
 The defaults are 10 seconds, 99 Hz, and frame pointers. Choose 1–30 seconds, 1–199 Hz, or `dwarf` for DWARF unwinding with an 8 KiB stack snapshot. The remote Linux host needs `perf`, Bash, GNU coreutils, and permission to sample the process. w11term samples user-space CPU activity on the selected process and checks that its start time matches before and after recording. It runs under the signed-in SSH account. [perf record](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-record.txt) · [Linux perf permissions](https://docs.kernel.org/admin-guide/perf-security.html)
 
 The capture uses a sibling SSH exec channel, with up to 32 MiB for the temporary recording and 4 MiB for the `perf script` output. The worker has a deadline and its private files are removed at completion. w11term folds the captured stacks into a new Windows file and reports the sample count, unresolved frames, and any diagnostics printed by perf, including lost-sample warnings when reported. [perf script](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-script.txt)

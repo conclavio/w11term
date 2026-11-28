@@ -1,13 +1,17 @@
-use super::offline;
+use super::{
+    diagnostics::{CaptureFlags, read_capture_flags},
+    offline,
+};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::BTreeMap,
     io::Write,
+    num::NonZeroU64,
     path::{self, PathBuf},
     sync::Arc,
 };
 use w11term::{
-    control::{CpuCallGraph, CpuProfileOptions, Reply, Request},
+    control::{CpuCallGraph, CpuLaunchOptions, CpuProfileOptions, Reply, Request},
     cpu_profile::{
         Comparison, Profile,
         flame_graph::{Differential, ProfileSide},
@@ -20,7 +24,12 @@ pub(super) const HELP: &str = concat!(
     "[--seconds N] [--frequency HZ] [--call-graph fp|dwarf]\n",
     "w11term-cli [--pid PID] capture-cpu-profile --pane ID --target-pid PID ",
     "[--seconds N] [--frequency HZ] [--call-graph fp|dwarf] ",
-    "--connection-generation N --process-start-ticks N --output-file PATH [--perf-data PATH] [--report-file PATH]",
+    "--connection-generation N --process-start-ticks N --output-file PATH [--perf-data PATH] [--report-file PATH]\n",
+    "w11term-cli [--pid PID] preview-cpu-command --pane ID --program PROGRAM [COMMAND OPTIONS]\n",
+    "w11term-cli [--pid PID] capture-cpu-command --pane ID --program PROGRAM [COMMAND OPTIONS] ",
+    "--connection-generation N --review-id ID --job-id HEX --output-file PATH [--perf-data PATH] [--report-file PATH]\n",
+    "w11term-cli [--pid PID] stop-cpu-command --pane ID --connection-generation N --job-id HEX\n",
+    "COMMAND OPTIONS: [--arg ARG ...] [--directory PATH] [--seconds N] [--frequency HZ] [--call-graph fp|dwarf]",
 );
 
 pub(super) const COMPARE_VERB: &str = "compare-cpu-profiles";
@@ -169,42 +178,18 @@ pub(super) fn parse(
             "specify {flag} only once"
         );
     }
-    let pane_arg = flags
-        .remove("--pane")
-        .map(|arg| arg.parse())
-        .transpose()
-        .context("--pane requires an integer")?;
-    ensure!(
-        pane.is_none() || pane_arg.is_none(),
-        "specify --pane only once"
-    );
-    let pane = pane
-        .or(pane_arg)
-        .filter(|pane| *pane > 0)
-        .context("provide a positive --pane ID")?;
+    let pane = capture_pane(&mut flags, pane)?;
+    let target_pid = flags
+        .remove("--target-pid")
+        .context("provide --target-pid from the remote Linux host")?
+        .parse()
+        .context("--target-pid requires a positive Linux PID")?;
+    let (seconds, frequency, call_graph) = sampling(&mut flags)?;
     let options = CpuProfileOptions {
-        target_pid: flags
-            .remove("--target-pid")
-            .context("provide --target-pid from the remote Linux host")?
-            .parse()
-            .context("--target-pid requires a positive Linux PID")?,
-        seconds: flags
-            .remove("--seconds")
-            .map(|arg| arg.parse())
-            .transpose()
-            .context("--seconds requires an integer from 1 to 30")?
-            .unwrap_or(CpuProfileOptions::DEFAULT_SECONDS),
-        frequency: flags
-            .remove("--frequency")
-            .map(|arg| arg.parse())
-            .transpose()
-            .context("--frequency requires an integer from 1 to 199")?
-            .unwrap_or(CpuProfileOptions::DEFAULT_FREQUENCY),
-        call_graph: match flags.remove("--call-graph").as_deref() {
-            None | Some("fp") => CpuCallGraph::Fp,
-            Some("dwarf") => CpuCallGraph::Dwarf,
-            Some(_) => bail!("--call-graph requires fp or dwarf"),
-        },
+        target_pid,
+        seconds,
+        frequency,
+        call_graph,
     }
     .validate()?;
     if verb == "preview-cpu-profile" {
@@ -239,12 +224,186 @@ pub(super) fn parse(
     })
 }
 
+pub(super) fn parse_command(
+    verb: &str,
+    args: impl Iterator<Item = String>,
+    pane: Option<u64>,
+) -> Result<Request> {
+    let preview = verb == "preview-cpu-command";
+    let stop = verb == "stop-cpu-command";
+    let CaptureFlags {
+        mut flags,
+        arguments,
+    } = read_capture_flags(verb, args, |flag| {
+        flag == "--pane"
+            || !preview && matches!(flag, "--connection-generation" | "--job-id")
+            || !preview
+                && !stop
+                && matches!(
+                    flag,
+                    "--review-id" | "--output-file" | "--perf-data" | "--report-file"
+                )
+            || !stop
+                && matches!(
+                    flag,
+                    "--program"
+                        | "--arg"
+                        | "--directory"
+                        | "--seconds"
+                        | "--frequency"
+                        | "--call-graph"
+                )
+    })?;
+    let pane = capture_pane(&mut flags, pane)?;
+    if stop {
+        let (connection_generation, job_id) = command_job(&mut flags)?;
+        return Ok(Request::StopCpuCommand {
+            pane,
+            connection_generation,
+            job_id,
+        });
+    }
+    let (seconds, frequency, call_graph) = sampling(&mut flags)?;
+    let options = CpuLaunchOptions {
+        program: flags.remove("--program").context("provide --program")?,
+        arguments,
+        directory: flags.remove("--directory").unwrap_or_default(),
+        seconds,
+        frequency,
+        call_graph,
+    };
+    options.validate()?;
+    if preview {
+        return Ok(Request::PreviewCpuCommand { pane, options });
+    }
+    let (connection_generation, job_id) = command_job(&mut flags)?;
+    Ok(Request::CaptureCpuCommand {
+        pane,
+        options,
+        connection_generation,
+        job_id,
+        review_id: flags
+            .remove("--review-id")
+            .context("provide --review-id from preview-cpu-command")?,
+        output_file: path::absolute(
+            flags
+                .remove("--output-file")
+                .context("provide --output-file for the folded CPU profile")?,
+        )?,
+        perf_data_file: flags
+            .remove("--perf-data")
+            .map(path::absolute)
+            .transpose()?,
+        report_file: flags
+            .remove("--report-file")
+            .map(path::absolute)
+            .transpose()?,
+    })
+}
+
+fn capture_pane(flags: &mut BTreeMap<String, String>, pane: Option<u64>) -> Result<u64> {
+    let explicit = flags
+        .remove("--pane")
+        .map(|arg| arg.parse())
+        .transpose()
+        .context("--pane requires an integer")?;
+    ensure!(
+        pane.is_none() || explicit.is_none(),
+        "specify --pane only once"
+    );
+    pane.or(explicit)
+        .filter(|pane| *pane > 0)
+        .context("provide a positive --pane ID")
+}
+
+fn sampling(flags: &mut BTreeMap<String, String>) -> Result<(u8, u8, CpuCallGraph)> {
+    let seconds = flags
+        .remove("--seconds")
+        .map(|arg| arg.parse())
+        .transpose()
+        .context("--seconds requires an integer from 1 to 30")?
+        .unwrap_or(CpuProfileOptions::DEFAULT_SECONDS);
+    let frequency = flags
+        .remove("--frequency")
+        .map(|arg| arg.parse())
+        .transpose()
+        .context("--frequency requires an integer from 1 to 199")?
+        .unwrap_or(CpuProfileOptions::DEFAULT_FREQUENCY);
+    let call_graph = match flags.remove("--call-graph").as_deref() {
+        None | Some("fp") => CpuCallGraph::Fp,
+        Some("dwarf") => CpuCallGraph::Dwarf,
+        Some(_) => bail!("--call-graph requires fp or dwarf"),
+    };
+    Ok((seconds, frequency, call_graph))
+}
+
+fn command_job(flags: &mut BTreeMap<String, String>) -> Result<(NonZeroU64, String)> {
+    let generation = flags
+        .remove("--connection-generation")
+        .context("provide --connection-generation from preview-cpu-command")?
+        .parse()
+        .context("--connection-generation requires a positive integer")?;
+    let job = flags.remove("--job-id").context("provide --job-id")?;
+    Ok((generation, job))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn invoke(verb: &str, args: &[&str]) -> Result<Request> {
         parse(verb, args.iter().map(|arg| arg.to_string()), Some(7))
+    }
+
+    #[test]
+    fn command_capture_and_stop_require_their_binding_fields() {
+        let parse = |verb, args: &[&str]| {
+            parse_command(verb, args.iter().map(|arg| arg.to_string()), Some(7))
+        };
+        let error = |result: Result<Request>, expected: &str| {
+            let Err(error) = result else {
+                panic!("expected an invalid command request");
+            };
+            assert!(error.to_string().contains(expected), "{error:#}");
+        };
+        error(
+            parse(
+                "preview-cpu-command",
+                &["--program", "worker", "--job-id", "unneeded"],
+            ),
+            "Unsupported option --job-id",
+        );
+        error(
+            parse(
+                "preview-cpu-command",
+                &["--program", "worker", "--directory", "relative"],
+            ),
+            "absolute Linux path",
+        );
+        error(
+            parse("capture-cpu-command", &["--program", "worker"]),
+            "provide --connection-generation",
+        );
+        error(
+            parse(
+                "capture-cpu-command",
+                &[
+                    "--program",
+                    "worker",
+                    "--connection-generation",
+                    "2",
+                    "--job-id",
+                    "job",
+                    "--output-file",
+                    "cpu.folded",
+                ],
+            ),
+            "provide --review-id",
+        );
+        error(
+            parse("stop-cpu-command", &["--connection-generation", "2"]),
+            "provide --job-id",
+        );
     }
 
     #[test]

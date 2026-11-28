@@ -12,7 +12,8 @@ shift 9
 program=$1
 expected_directory=$2
 expected_program=$3
-shift 3
+expected_identity=$4
+shift 4
 
 fail() {
     printf '%s\n' "$1" >&2
@@ -27,12 +28,16 @@ case "$program" in
     *) program=$(type -P -- "$program") || fail 'The executable is not on the SSH diagnostic PATH.' ;;
 esac
 [[ -f $program && -x $program ]] || fail 'The reviewed program is not executable.'
+identity=$(LC_ALL=C stat -Lc '%d:%i:%s:%y:%z:%f' -- "$program") \
+    || fail 'The executable identity is unavailable.'
 
 emit_command() {
-    printf 'w11term-cpu-launch-v1\t'
+    printf 'w11term-cpu-launch-v2\t'
     printf '%s' "$directory" | base64 -w 0
     printf '\t'
     printf '%s' "$program" | base64 -w 0
+    printf '\t'
+    printf '%s' "$identity" | base64 -w 0
     printf '\n'
 }
 
@@ -42,8 +47,8 @@ if [[ $mode == inspect ]]; then
     exit 0
 fi
 
-[[ $directory == "$expected_directory" && $program == "$expected_program" ]] \
-    || fail 'The command path or working directory changed. Review the command again.'
+[[ $directory == "$expected_directory" && $program == "$expected_program" && $identity == "$expected_identity" ]] \
+    || fail 'The executable or working directory changed. Review the command again.'
 
 # Cap the profiler's file size without reducing the workload's inherited limits.
 workload_file_limit=$(ulimit -Sf)

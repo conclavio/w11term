@@ -32,6 +32,7 @@ struct Peer {
 }
 
 const PERF_DATA_FIXTURE: &[u8] = b"PERFILE2\0\xff\r\nraw perf fixture\0";
+static CONTROL_PIPE_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SYSCALL_FIXTURE: &[u8] =
     b"720 1700000000.000001 openat(AT_FDCWD, \"missing\", O_RDONLY) = -1 ENOENT (No such file or directory) <0.000002>\n";
 // Classic little-endian pcap, one captured packet with a four-byte payload.
@@ -457,27 +458,30 @@ impl server::Handler for Peer {
         }
         if let Ok(command) = std::str::from_utf8(command)
             && command.starts_with("/bin/sh -c '# w11term-cpu-profile-v1")
-            && command.contains("w11term-cpu-launch-v1")
+            && command.contains("w11term-cpu-launch-v2")
         {
             use base64::{Engine as _, engine::general_purpose::STANDARD};
             let directory = "/tmp/work space";
             let program = "/tmp/work space/cpu worker";
+            let identity = fs::read_to_string(self.root.join("profile-launch-identity"))
+                .unwrap_or_else(|_| "fixture-executable-identity".into());
             let mut reply = format!(
-                "w11term-cpu-launch-v1\t{}\t{}\n",
+                "w11term-cpu-launch-v2\t{}\t{}\t{}\n",
                 STANDARD.encode(directory),
                 STANDARD.encode(program),
+                STANDARD.encode(&identity),
             );
             let argv = r#"'one arg' 'it'\''s $literal' '' '--child'"#;
-            let matches_target = |resolved_dir: &str, resolved_program: &str| {
+            let matches_target = |resolved_dir: &str, resolved_program: &str, resolved_id: &str| {
                 [73, 79].into_iter().any(|frequency| {
                     command.ends_with(&format!(
-                        " 2 {frequency} fp 32768 4096 '{directory}' './cpu worker' '{resolved_dir}' '{resolved_program}' {argv}"
+                        " 2 {frequency} fp 32768 4096 '{directory}' './cpu worker' '{resolved_dir}' '{resolved_program}' '{resolved_id}' {argv}"
                     ))
                 })
             };
             fs::write(self.root.join("profile-launch-wire"), command)?;
             s.channel_success(c)?;
-            if matches_target(directory, program) {
+            if matches_target(directory, program, &identity) {
                 fs::write(self.root.join("profile-launched"), [])?;
                 let raw = command.contains(" 74 launch-raw ");
                 let outcome = if self.root.join("profile-wait-for-stop").is_file() {
@@ -498,7 +502,7 @@ impl server::Handler for Peer {
                     s.data(c, perf_data_header().into_bytes())?;
                     s.data(c, PERF_DATA_FIXTURE.to_vec())?;
                 }
-            } else if !matches_target("", "") {
+            } else if !matches_target("", "", "") {
                 let tail = command.chars().rev().take(200).collect::<Vec<_>>();
                 let tail: String = tail.into_iter().rev().collect();
                 s.extended_data(
@@ -2665,6 +2669,184 @@ async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scripted_cpu_command_revalidates_review_and_saves_after_a_scoped_stop() {
+    let _pipe = CONTROL_PIPE_FIXTURE.lock().await;
+    let (pane, _, remote, _, server) = fixture(false).await;
+    let local = tempfile::tempdir().unwrap();
+    let discovery = tempfile::tempdir().unwrap();
+    let _control = control::Server::start_in_directory(
+        registry(&pane),
+        |_, _, _| anyhow::bail!("unused"),
+        discovery.path().into(),
+    )
+    .unwrap();
+    let invoke = |verb: &'static str, arguments: Vec<String>| {
+        let local = local.path().to_owned();
+        tokio::task::spawn_blocking(move || {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+                .current_dir(local)
+                .args([
+                    "--pid",
+                    &std::process::id().to_string(),
+                    verb,
+                    "--pane",
+                    "1",
+                ])
+                .args(arguments)
+                .output()
+                .unwrap();
+            let reply: control::Reply =
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                    panic!("Decoding {verb} reply: {error}. {output:?}");
+                });
+            assert_eq!(output.status.success(), reply.ok, "{output:?}");
+            reply
+        })
+    };
+    let options = |frequency: &str| {
+        [
+            "--program",
+            "./cpu worker",
+            "--directory",
+            "/tmp/work space",
+            "--seconds",
+            "2",
+            "--frequency",
+            frequency,
+            "--arg",
+            "one arg",
+            "--arg",
+            "it's $literal",
+            "--arg",
+            "",
+            "--arg",
+            "--child",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    };
+    let preview = invoke("preview-cpu-command", options("73")).await.unwrap();
+    assert!(preview.ok, "{:?}", preview.error);
+    let plan = &preview.result.unwrap()["plan"];
+    assert_eq!(plan["program"], "/tmp/work space/cpu worker");
+    assert_eq!(
+        plan["options"]["arguments"],
+        json!(["one arg", "it's $literal", "", "--child"])
+    );
+    assert!(plan.get("identity").is_none());
+    let generation = plan["connection_generation"].as_u64().unwrap().to_string();
+    let review_id = plan["review_id"].as_str().unwrap();
+    let job = "1234567890abcdef1234567890abcdef";
+    let bound = |job| {
+        [
+            "--connection-generation",
+            generation.as_str(),
+            "--job-id",
+            job,
+        ]
+        .map(str::to_owned)
+    };
+    let capture = |frequency, report| {
+        let mut args = options(frequency);
+        args.extend(bound(job));
+        args.extend(
+            [
+                "--review-id",
+                review_id,
+                "--output-file",
+                "command stacks.folded",
+                "--perf-data",
+                "command raw.perf.data",
+                "--report-file",
+                report,
+            ]
+            .map(str::to_owned),
+        );
+        invoke("capture-cpu-command", args)
+    };
+    let marker = remote.path().join("profile-launched");
+    assert!(!marker.exists(), "preview ran the workload");
+    let duplicate = capture("73", "COMMAND RAW.PERF.DATA").await.unwrap();
+    assert!(!duplicate.ok);
+    assert!(duplicate.error.unwrap().contains("different destinations"));
+    let edited = capture("79", "command report.json").await.unwrap();
+    assert!(!edited.ok);
+    assert!(edited.error.unwrap().contains("Review the command again"));
+    let identity = remote.path().join("profile-launch-identity");
+    fs::write(&identity, "replacement-executable").unwrap();
+    let replaced = capture("73", "command report.json").await.unwrap();
+    assert!(!replaced.ok);
+    assert!(replaced.error.unwrap().contains("Review the command again"));
+    assert!(!marker.exists(), "an invalid review ran the workload");
+    fs::remove_file(identity).unwrap();
+    fs::write(remote.path().join("profile-wait-for-stop"), []).unwrap();
+
+    let running = capture("73", "command report.json");
+    let stopping = async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let wrong = invoke(
+            "stop-cpu-command",
+            bound("00000000000000000000000000000000").to_vec(),
+        )
+        .await
+        .unwrap();
+        assert!(!wrong.ok);
+        assert!(
+            wrong
+                .error
+                .unwrap()
+                .contains("No matching running CPU command capture")
+        );
+        let stop = invoke("stop-cpu-command", bound(job).to_vec())
+            .await
+            .unwrap();
+        assert!(stop.ok, "{:?}", stop.error);
+        assert_eq!(stop.result.unwrap()["stop_requested"], true);
+    };
+    let (recorded, ()) = tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::join!(running, stopping)
+    })
+    .await
+    .expect("CLI CPU capture and stop timed out");
+    let recorded = recorded.unwrap();
+    assert!(recorded.ok, "{:?}", recorded.error);
+    let result = recorded.result.unwrap();
+    assert_eq!(result["job_id"], job);
+    assert_eq!(result["summary"]["workload"]["status"], "stopped");
+    let folded = local.path().join("command stacks.folded");
+    let raw = local.path().join("command raw.perf.data");
+    let report = local.path().join("command report.json");
+    assert_eq!(result["report_path"], json!(report));
+    assert_eq!(
+        fs::read_to_string(&folded).unwrap(),
+        "cpu worker;child 1\ncpu worker;main 1\n"
+    );
+    assert_eq!(fs::read(&raw).unwrap(), PERF_DATA_FIXTURE);
+    let proof = w11term::ssh::verify_cpu_profile_report(&folded, &report, Some(&raw)).unwrap();
+    let w11term::ssh::CpuProfileReportTarget::Command {
+        program, options, ..
+    } = proof.reviewed.target
+    else {
+        panic!("expected command provenance");
+    };
+    assert_eq!(program, "/tmp/work space/cpu worker");
+    assert_eq!(options.frequency, 73);
+    assert_eq!(
+        options.arguments,
+        ["one arg", "it's $literal", "", "--child"]
+    );
+    assert!(
+        !invoke("stop-cpu-command", bound(job).to_vec())
+            .await
+            .unwrap()
+            .ok
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cpu_profile_raw_export_keeps_valid_recording_when_folding_fails() {
     let (pane, _, remote, opens, server) = fixture(false).await;
     let local = tempfile::tempdir().unwrap();
@@ -3843,6 +4025,7 @@ async fn recorder_events_and_wait_for_text_share_the_terminal_output() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transfers_handles_and_rejected_subsystem_without_reconnect() {
+    let _pipe = CONTROL_PIPE_FIXTURE.lock().await;
     tokio::time::timeout(Duration::from_secs(30),async {
         let (session,_,root,opens,server)=fixture(false).await;
         let panes=registry(&session);

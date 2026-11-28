@@ -73,9 +73,9 @@ def run(*args, **kwargs):
 
 def paths(stdout):
     header, rest = stdout.split(b"\n", 1)
-    marker, directory, program = header.split(b"\t")
-    assert marker == b"w11term-cpu-launch-v1"
-    return [base64.b64decode(value).decode() for value in (directory, program)], rest
+    marker, directory, program, identity = header.split(b"\t")
+    assert marker == b"w11term-cpu-launch-v2"
+    return [base64.b64decode(value).decode() for value in (directory, program, identity)], rest
 
 
 def assert_child_stopped(root):
@@ -99,14 +99,24 @@ def fixture():
             "PATH=/usr/sbin:", f"PATH={shlex.quote(str(root))}:/usr/sbin:", 1
         )
         argv = ["quote' and $(literal)", "", "-literal", "two\nlines"]
-        preview = run(supervisor, "inspect", root, "./cpu worker", ["", ""], argv, env=env)
+        preview = run(supervisor, "inspect", root, "./cpu worker", ["", "", ""], argv, env=env)
         assert preview.returncode == 0, preview.stderr
         reviewed, rest = paths(preview.stdout)
-        assert reviewed == [str(root), str(root / "./cpu worker")] and not rest
+        assert reviewed[:2] == [str(root), str(root / "./cpu worker")] and reviewed[2] and not rest
         assert not (root / "args.json").exists()
-        rejected = run(supervisor, "launch", root, "./cpu worker", [reviewed[0], "/wrong"], argv, env=env)
+        rejected = run(supervisor, "launch", root, "./cpu worker",
+                       [reviewed[0], "/wrong", reviewed[2]], argv, env=env)
         assert rejected.returncode != 0 and b"changed" in rejected.stderr
         assert not (root / "args.json").exists()
+        (root / "cpu worker").write_text(COMMAND + "\n")
+        replaced = run(supervisor, "launch", root, "./cpu worker", reviewed, argv, env=env)
+        assert replaced.returncode != 0 and b"changed" in replaced.stderr
+        assert not (root / "args.json").exists()
+        preview = run(supervisor, "inspect", root, "./cpu worker", ["", "", ""], argv, env=env)
+        assert preview.returncode == 0, preview.stderr
+        new_review, _ = paths(preview.stdout)
+        assert new_review[:2] == reviewed[:2] and new_review[2] != reviewed[2]
+        reviewed = new_review
 
         for status, values in ((b"exit\t124", argv), (b"timeout", ["delay"])):
             taken = run(supervisor, "launch", root, "./cpu worker", reviewed, values, env=env)
@@ -131,7 +141,8 @@ def fixture():
         recording, text = split_perf_data(stopped.stdout)
         assert recording == b"perf-data"
         actual, stacks = paths(text)
-        assert actual == reviewed and stacks.startswith(b"stopped\n")
+        assert actual == reviewed, (actual, reviewed)
+        assert stacks.startswith(b"stopped\n"), (stacks[:256], stopped.stderr)
         assert b"child (/tmp/cmd)" in stacks
         assert_child_stopped(root)
         assert not Path(record_directory.read_text()).exists()
@@ -158,7 +169,7 @@ int main(void) {
 """,
             check=True, timeout=10,
         )
-        preview = run(SUPERVISOR, "inspect", root, "./hotspot", ["", ""], [])
+        preview = run(SUPERVISOR, "inspect", root, "./hotspot", ["", "", ""], [])
         assert preview.returncode == 0, preview.stderr
         reviewed, _ = paths(preview.stdout)
         capture = stop_recording(
@@ -169,7 +180,8 @@ int main(void) {
         assert capture.returncode == 0, capture.stderr
         recording, text = split_perf_data(capture.stdout)
         actual, stacks = paths(text)
-        assert actual == reviewed and stacks.startswith(b"stopped\n")
+        assert actual == reviewed, (actual, reviewed)
+        assert stacks.startswith(b"stopped\n"), (stacks[:256], capture.stderr)
         assert b" launched_hotspot " in stacks, stacks[:2048]
         assert stacks.endswith(b"\nw11term-cpu-profile-end\n")
         raw_file = root / "launched.perf.data"
