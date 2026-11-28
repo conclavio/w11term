@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fs::File, io::Read, path::Path};
 
-pub(super) const MAX_BYTES: usize = 1024 * 1024;
+const MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
 struct Envelope<T> {
@@ -34,4 +34,24 @@ pub(super) fn read<T: DeserializeOwned>(path: &Path, operation: &str) -> Result<
     reply
         .result
         .with_context(|| format!("Choose the reply from an applied {operation} rollout"))
+}
+
+pub(super) fn check_catalog(recorded: &Path, current: &Path) -> Result<()> {
+    ensure!(
+        recorded == current
+            || matches!(
+                (recorded.canonicalize(), current.canonicalize()),
+                (Ok(recorded), Ok(current)) if recorded == current
+            ),
+        "This rollout receipt is for a different profile catalog"
+    );
+    Ok(())
+}
+
+pub(super) fn write(path: &Path, report: &impl Serialize) -> Result<()> {
+    let reply = crate::control::Reply::from_result(Ok(serde_json::to_value(report)?));
+    let mut json = serde_json::to_string(&reply)?;
+    json.push('\n');
+    ensure!(json.len() <= MAX_BYTES, "Rollout receipt exceeds 1 MiB");
+    crate::transcript::save(path, &json, false)
 }

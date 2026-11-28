@@ -182,12 +182,29 @@ pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) 
                             ctx.callback(move |_| Message::ToolProfileAudit(id, Action::Refresh)),
                         )
                         .content("Refresh audit"),
+                )),
+        ),
+        KeyedView::new(
+            "rollout-actions",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
                     Button::new()
                         .is_enabled(!loading)
                         .on_click(ctx.callback(move |_| {
                             Message::ToolProfileAudit(id, Action::Rollout(rollout::Action::Open))
                         }))
                         .content("Roll out tool manifest"),
+                    Button::new()
+                        .is_enabled(!loading)
+                        .on_click(ctx.callback(move |_| {
+                            Message::ToolProfileAudit(
+                                id,
+                                Action::Rollout(rollout::Action::OpenReceipt),
+                            )
+                        }))
+                        .content("Open tool rollout receipt…"),
                 )),
         ),
         KeyedView::new(

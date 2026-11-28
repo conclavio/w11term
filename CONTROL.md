@@ -1623,6 +1623,8 @@ Use `rollout-tool-profiles` to adopt one revised manifest in multiple saved SSH 
 
 In Windows, open **Settings → Profiles → Audit SSH tool profiles → Roll out tool manifest**. Pick the revision, check the profiles you want to update, and choose **Review selected tool rollout**. **Apply reviewed tool rollout** updates the reviewed selection.
 
+From the rollout result, choose **Review tool rollback** to see the manifest paths, pin policies, and file status for each profile. **Apply reviewed tool rollback** restores the previous approvals together. Choose **Save tool rollout receipt** to keep a receipt for later, then reopen it from **Open tool rollout receipt** in the audit. The Windows audit and CLI use the same receipt format. The audit opens receipts for its current profile catalog.
+
 ```powershell
 $rollout = @('rollout-tool-profiles', '--candidate', '.\Fleet revision.json', '--profile', 'East', '--profile', 'West')
 $preview = & $ctl @rollout | ConvertFrom-Json

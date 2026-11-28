@@ -4674,7 +4674,7 @@ fn native_tool_profile_audit_filters_refreshes_and_preserves_a_draft() {
 }
 
 #[test]
-#[ignore = "reviews and applies a tool manifest rollout to selected Windows profiles"]
+#[ignore = "reviews, applies and rolls back a tool manifest across selected Windows profiles"]
 fn native_tool_profile_rollout_preserves_the_open_profile_draft() {
     let state = tempfile::tempdir().unwrap();
     let root = state.path();

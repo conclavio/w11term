@@ -12,8 +12,13 @@ $off = [System.Windows.Automation.ToggleState]::Off
 $dot = ' ' + [char]0xb7 + ' '
 $candidate = Join-Path $State 'Fleet revision.json'
 $candidateBefore = [IO.File]::ReadAllText($candidate)
+$previous = Join-Path $State 'previous.json'
+$previousBefore = [IO.File]::ReadAllText($previous)
+$receipt = Join-Path $State 'Tool rollout receipt.json'
+$more = [char]0x2026
 $catalogBefore = [IO.File]::ReadAllText($profiles)
 $digest = [IO.File]::ReadAllText((Join-Path $State 'candidate-pin'))
+$previousPin = ($catalogBefore | ConvertFrom-Json).profiles.East.tool_bundle.manifest_sha256
 
 function Click([string]$Name, $Type = $button) {
     Invoke-Button (Wait-Until "enabled '$Name'" {
@@ -36,6 +41,23 @@ function Select-Manifest([string]$Path) {
         $command = 1
     } else { $command = 2 }
     $null = Wait-Until 'submit the tool manifest picker' { [FixtureDialog]::ClickButton($picker, $command) }
+}
+function Open-ToolReceipt([string]$Path) {
+    Click "Open tool rollout receipt$more"
+    $dialog = Wait-OwnedDialog 'Open SSH tool rollout receipt'
+    if ($Path) {
+        $null = Wait-Until 'enter the receipt path' { [FixtureDialog]::SetFilename($dialog, $Path, '') }
+        $command = 1
+    } else { $command = 2 }
+    $null = Wait-Until 'submit the receipt picker' { [FixtureDialog]::ClickButton($dialog, $command) }
+}
+function Wait-RollbackReview {
+    $null = Wait-Until 'the rollback preview shows both previous pin policies and current digests' {
+        (Find-Element "Restore pin SHA-256 $previousPin") -and
+            (Find-Element "Current manifest SHA-256 $digest") -and
+            (Find-Element 'Previous manifest matches its pin') -and
+            (Find-Element 'Follows the previous manifest file')
+    }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--demo','--profiles',('"' + $profiles + '"')) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -88,13 +110,44 @@ try {
         Find-Element 'Updated tool manifests in 2 saved SSH profiles.'
     }
     $saved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles
-    if ($saved.East.tool_bundle.bundle -cne $candidate -or $saved.East.tool_bundle.manifest_sha256 -cne $digest -or
-        $saved.West.tool_bundle.bundle -cne $candidate -or $saved.West.tool_bundle.manifest_sha256 -or
+    if (![FixtureDialog]::SameFile($candidate, $saved.East.tool_bundle.bundle) -or $saved.East.tool_bundle.manifest_sha256 -cne $digest -or
+        ![FixtureDialog]::SameFile($candidate, $saved.West.tool_bundle.bundle) -or $saved.West.tool_bundle.manifest_sha256 -or
         $saved.Other.tool_bundle.bundle -cne 'previous.json' -or
         $saved.Different.tool_bundle.bin_directory -cne '.local/other' -or
         $saved.East.tool_bundle.add_to_path.shell -cne 'bash') {
         throw 'The batch changed the wrong bindings or approval policies'
     }
+    $rolledOut = [IO.File]::ReadAllText($profiles)
+    Click 'Review tool rollback'
+    Wait-RollbackReview
+    [IO.File]::WriteAllText($previous, "$previousBefore`n")
+    Click 'Apply reviewed tool rollback'
+    $null = Wait-Until 'the rollback rejects a changed previous manifest' {
+        Find-Element 'The rollback manifests or approvals changed. Preview the rollback again.'
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $rolledOut) { throw 'A stale rollback changed the catalog' }
+    [IO.File]::WriteAllText($previous, $previousBefore)
+    Click 'Back to rollout result'
+    Click "Save tool rollout receipt$more"
+    $dialog = Wait-OwnedDialog 'Save SSH tool rollout receipt'
+    $null = Wait-Until 'enter an export filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, $receipt) }
+    $null = Wait-Until 'save the rollback receipt' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the exported receipt and destination are available' {
+        if ([IO.File]::Exists($receipt)) {
+            $prefix = "Saved rollout receipt$dot"
+            Get-NativeTextLabels | Where-Object {
+                $_.StartsWith($prefix) -and [FixtureDialog]::SameFile($receipt, $_.Substring($prefix.Length))
+            }
+        }
+    }
+    $preview = & $Cli rollback-tool-profiles $receipt | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or !$preview.ok -or $preview.result.applied -or
+        (($preview.result.profiles.profile) -join ',') -cne 'East,West' -or
+        (($preview.result.profiles.restore_status) -join ',') -cne 'matches-pin,follows-file') {
+        throw 'The exported receipt did not produce the expected CLI rollback review'
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $rolledOut) { throw 'Exporting or previewing a receipt changed profiles' }
+
     Click 'Close tool rollout'
     Click 'Edit SSH tools for East'
     $null = Wait-Until 'the existing draft retains its edit and receives the new manifest' {
@@ -104,10 +157,53 @@ try {
             [FixtureDialog]::SameFile($candidate, $field.GetCurrentPattern($value).Current.Value) -and
             $scrollback.GetCurrentPattern($value).Current.Value -ceq '8765'
     }
+    Open-Settings
+    Open-ToolReceipt
+    $null = Wait-Until 'canceling the receipt picker returns to the audit' { Find-Element 'Filter audited SSH profiles' $edit }
+    $otherCatalog = Join-Path $State 'other-profiles.json'
+    $otherReceipt = Join-Path $State 'Other rollout receipt.json'
+    [IO.File]::WriteAllText($otherCatalog, $rolledOut)
+    $otherReply = [IO.File]::ReadAllText($receipt) | ConvertFrom-Json
+    $otherReply.result.profiles_path = $otherCatalog
+    [IO.File]::WriteAllText($otherReceipt, ($otherReply | ConvertTo-Json -Depth 25))
+    Open-ToolReceipt $otherReceipt
+    $null = Wait-Until 'the audit rejects a receipt for a different profile catalog' {
+        Find-Element 'This rollout receipt is for a different profile catalog'
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $rolledOut -or [IO.File]::ReadAllText($otherCatalog) -cne $rolledOut) {
+        throw 'Opening a receipt for another catalog changed a catalog'
+    }
+    Click 'Close tool rollback'
+    Open-ToolReceipt $receipt
+    Wait-RollbackReview
+    if ([IO.File]::ReadAllText($profiles) -cne $rolledOut) { throw 'Reopening a receipt changed profiles' }
+    Click 'Apply reviewed tool rollback'
+    $null = Wait-Until 'the previous approvals were restored' {
+        Find-Element 'Restored tool manifests in 2 saved SSH profiles.'
+    }
+    $restored = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles
+    if (![FixtureDialog]::SameFile($previous, $restored.East.tool_bundle.bundle) -or
+        $restored.East.tool_bundle.manifest_sha256 -cne $previousPin -or
+        ![FixtureDialog]::SameFile($previous, $restored.West.tool_bundle.bundle) -or
+        $restored.West.tool_bundle.manifest_sha256 -or
+        $restored.Other.tool_bundle.bundle -cne 'previous.json' -or
+        $restored.Different.tool_bundle.bin_directory -cne '.local/other' -or
+        $restored.East.tool_bundle.add_to_path.shell -cne 'bash') {
+        throw 'Rollback restored the wrong bindings or approval policies'
+    }
+    Click 'Close tool rollback'
+    Click 'Edit SSH tools for East'
+    $null = Wait-Until 'the pending profile draft receives the restored approval and keeps the unrelated edit' {
+        $field = Find-Element 'Tool bundle manifest' $edit
+        $scrollback = Find-Element 'Scrollback lines' $edit
+        $field -and $scrollback -and
+            [FixtureDialog]::SameFile($previous, $field.GetCurrentPattern($value).Current.Value) -and
+            $scrollback.GetCurrentPattern($value).Current.Value -ceq '8765'
+    }
     Click 'Save profile changes'
-    $null = Wait-Until 'the open draft saves against the updated profile' {
+    $null = Wait-Until 'the open draft saves against the restored profile' {
         $savedEast = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.East
-        $savedEast.scrollback_lines -eq 8765 -and $savedEast.tool_bundle.manifest_sha256 -ceq $digest
+        $savedEast.scrollback_lines -eq 8765 -and $savedEast.tool_bundle.manifest_sha256 -ceq $previousPin
     }
 } finally {
     if ($app) { Close-FixtureApp $app }

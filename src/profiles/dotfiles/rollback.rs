@@ -185,14 +185,7 @@ impl ProfileStore {
         review: Option<&str>,
     ) -> Result<DotfileRollbackReport> {
         let receipt = Receipt::load(path)?;
-        if receipt.profiles_path != self.path() {
-            let recorded = receipt.profiles_path.canonicalize();
-            let current = self.path().canonicalize();
-            ensure!(
-                matches!((recorded, current), (Ok(recorded), Ok(current)) if recorded == current),
-                "This rollout receipt is for a different profile catalog"
-            );
-        }
+        receipt::check_catalog(&receipt.profiles_path, self.path())?;
         rollback(self, receipt, review)
     }
 }
@@ -208,14 +201,7 @@ impl DotfileRolloutReport {
             self.changed_profiles > 0,
             "The rollout did not change any profiles"
         );
-        let reply = crate::control::Reply::from_result(Ok(serde_json::to_value(self)?));
-        let mut json = serde_json::to_string(&reply)?;
-        json.push('\n');
-        ensure!(
-            json.len() <= receipt::MAX_BYTES,
-            "Rollout receipt exceeds 1 MiB"
-        );
-        crate::transcript::save(path, &json, false)
+        receipt::write(path, self)
     }
 
     pub fn rollback(&self, review: Option<&str>) -> Result<DotfileRollbackReport> {

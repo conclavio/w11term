@@ -1,19 +1,27 @@
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use w11term::{
     options::ToolSync,
-    profiles::{ToolManifestBaseline, ToolRolloutReport},
+    profiles::{ToolManifestBaseline, ToolRollbackReport, ToolRolloutReport},
 };
+
+mod rollback;
 
 #[derive(Clone)]
 pub enum Action {
     Open,
-    Picked(Arc<()>, Result<Option<Arc<Targets>>, String>),
+    OpenReceipt,
+    Picked(Arc<()>, Result<Option<Picked>, String>),
     Filter(Arc<()>, String),
     Select(Arc<()>, String, bool),
     Review(Arc<()>),
     Apply(Arc<()>),
     Completed(Arc<()>, Result<Arc<ToolRolloutReport>, String>),
+    SaveReceipt(Arc<()>),
+    ReceiptSaved(Arc<()>, Result<Option<PathBuf>, String>),
+    ReviewRollback(Arc<()>),
+    ApplyRollback(Arc<()>),
+    RollbackCompleted(Arc<()>, Result<Arc<ToolRollbackReport>, String>),
     Back(Arc<()>),
     Close(Arc<()>),
 }
@@ -23,13 +31,29 @@ pub struct Targets {
     profiles: Vec<(String, ToolSync)>,
 }
 
+#[derive(Clone)]
+pub enum Picked {
+    Manifest(Arc<Targets>),
+    Receipt(PathBuf),
+}
+
+#[derive(Clone, Copy)]
+enum Picker {
+    Manifest,
+    Receipt,
+}
+
 enum Work {
-    Picking,
+    Picking(Picker),
+    PickFailed(Picker),
     Choosing,
     Reviewing,
     Reviewed(Arc<ToolRolloutReport>),
     Applying,
-    Applied(usize),
+    Applied(Arc<ToolRolloutReport>),
+    SavingReceipt(Arc<ToolRolloutReport>),
+    Rollback(rollback::Source, rollback::Stage),
+    RolledBack(usize),
 }
 
 pub(super) struct Panel {
@@ -40,6 +64,7 @@ pub(super) struct Panel {
     work: Work,
     task: Option<ComponentTask>,
     error: Option<String>,
+    saved_receipt: Option<PathBuf>,
 }
 
 fn message(id: TabId, action: Action) -> Message {
@@ -49,7 +74,7 @@ fn message(id: TabId, action: Action) -> Message {
 impl Drop for Panel {
     fn drop(&mut self) {
         if let Some(task) = &self.task
-            && !matches!(self.work, Work::Applying)
+            && !self.applying()
         {
             task.cancel();
         }
@@ -57,10 +82,22 @@ impl Drop for Panel {
 }
 
 impl Panel {
+    fn applying(&self) -> bool {
+        matches!(
+            self.work,
+            Work::Applying | Work::Rollback(_, rollback::Stage::Applying)
+        )
+    }
+
+    fn can_close(&self) -> bool {
+        !self.applying() && !matches!(self.work, Work::Picking(_) | Work::SavingReceipt(_))
+    }
+
     fn pick(
         id: TabId,
         owner: usize,
         catalog: PathBuf,
+        picker: Picker,
         ctx: &ComponentContext<TerminalApp>,
     ) -> Self {
         let ticket = Arc::new(());
@@ -69,24 +106,33 @@ impl Panel {
             id,
             Action::Picked(
                 ticket.clone(),
-                Err("Tool manifest picker unavailable".into()),
+                Err("SSH tool rollout picker unavailable".into()),
             ),
         );
         let task = ctx.spawn_background_with_rejection(
             move |cancel| {
                 let picked = (|| -> anyhow::Result<_> {
-                    let purpose = file_picker::Purpose::ToolBundle(catalog.clone());
+                    let purpose = match picker {
+                        Picker::Manifest => file_picker::Purpose::ToolBundle(catalog.clone()),
+                        Picker::Receipt => rollback::receipt_picker(catalog.clone(), false),
+                    };
                     let Some(file) = file_picker::pick(owner, purpose)? else {
                         return Ok(None);
                     };
                     if cancel.is_cancelled() {
                         return Ok(None);
                     }
-                    let profiles = ProfileStore::new(catalog)?.tool_rollout_targets(&file.path)?;
-                    Ok(Some(Arc::new(Targets {
-                        candidate: file.path,
-                        profiles,
-                    })))
+                    match picker {
+                        Picker::Manifest => {
+                            let profiles =
+                                ProfileStore::new(catalog)?.tool_rollout_targets(&file.path)?;
+                            Ok(Some(Picked::Manifest(Arc::new(Targets {
+                                candidate: file.path,
+                                profiles,
+                            }))))
+                        }
+                        Picker::Receipt => Ok(Some(Picked::Receipt(file.path))),
+                    }
                 })()
                 .map_err(|error| format!("{error:#}"));
                 message(id, Action::Picked(request, picked))
@@ -98,9 +144,10 @@ impl Panel {
             targets: None,
             selected: BTreeSet::new(),
             filter: String::new(),
-            work: Work::Picking,
+            work: Work::Picking(picker),
             task: Some(task),
             error: None,
+            saved_receipt: None,
         }
     }
 
@@ -146,9 +193,13 @@ impl Panel {
         let send = |action: Action| ctx.callback(move |_| message(id, action.clone()));
         let mut fields = vec![KeyedView::new(
             "heading",
-            TextBlock::new()
-                .font_size(24.0)
-                .text("Roll out tool manifest"),
+            TextBlock::new().font_size(24.0).text(match self.work {
+                Work::Picking(Picker::Receipt)
+                | Work::PickFailed(Picker::Receipt)
+                | Work::Rollback(..)
+                | Work::RolledBack(_) => "Roll back tool manifest",
+                _ => "Roll out tool manifest",
+            }),
         )];
         if let Some(targets) = &self.targets {
             fields.push(note("candidate", targets.candidate.display().to_string()));
@@ -157,12 +208,53 @@ impl Panel {
             fields.push(note("error", error));
         }
         match &self.work {
-            Work::Picking => fields.push(note("status", "Choosing a tool manifest…")),
+            Work::Picking(Picker::Manifest) => {
+                fields.push(note("status", "Choosing a tool manifest…"))
+            }
+            Work::Picking(Picker::Receipt) => {
+                fields.push(note("status", "Choosing a tool rollout receipt…"))
+            }
+            Work::PickFailed(_) => {}
             Work::Reviewing => fields.push(note("status", "Checking selected tool approvals…")),
             Work::Applying => fields.push(note("status", "Saving the reviewed tool rollout…")),
-            Work::Applied(count) => fields.push(note(
+            Work::Applied(report) => {
+                fields.push(note(
+                    "status",
+                    format!(
+                        "Updated tool manifests in {} saved SSH profiles.",
+                        report.changed_profiles
+                    ),
+                ));
+                if let Some(path) = &self.saved_receipt {
+                    fields.push(note(
+                        "saved-receipt",
+                        format!("Saved rollout receipt · {}", path.display()),
+                    ));
+                }
+                fields.push(KeyedView::new(
+                    "applied-actions",
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(8.0)
+                        .children((
+                            Button::new()
+                                .on_click(send(Action::SaveReceipt(self.ticket.clone())))
+                                .content("Save tool rollout receipt…"),
+                            Button::new()
+                                .on_click(send(Action::ReviewRollback(self.ticket.clone())))
+                                .content("Review tool rollback"),
+                        )),
+                ));
+            }
+            Work::SavingReceipt(_) => {
+                fields.push(note("status", "Saving the tool rollout receipt…"))
+            }
+            Work::Rollback(source, stage) => {
+                rollback::describe(&mut fields, source, stage, &self.ticket, send);
+            }
+            Work::RolledBack(count) => fields.push(note(
                 "status",
-                format!("Updated tool manifests in {count} saved SSH profiles."),
+                format!("Restored tool manifests in {count} saved SSH profiles."),
             )),
             Work::Choosing => {
                 if let Some(targets) = &self.targets {
@@ -268,9 +360,20 @@ impl Panel {
         fields.push(KeyedView::new(
             "close",
             Button::new()
-                .is_enabled(!matches!(self.work, Work::Applying))
+                .is_enabled(self.can_close())
                 .on_click(send(Action::Close(self.ticket.clone())))
-                .content("Close tool rollout"),
+                .content(
+                    if matches!(
+                        self.work,
+                        Work::Rollback(..)
+                            | Work::RolledBack(_)
+                            | Work::PickFailed(Picker::Receipt)
+                    ) {
+                        "Close tool rollback"
+                    } else {
+                        "Close tool rollout"
+                    },
+                ),
         ));
         ScrollViewer::new().content(
             StackPanel::new()
@@ -340,7 +443,26 @@ impl TerminalApp {
         if let Action::Completed(_, Ok(report)) = &action
             && report.applied
         {
-            self.adopt_tool_rollout(report);
+            self.adopt_tool_bindings(report.profiles.iter().filter(|entry| entry.changed).map(
+                |entry| {
+                    let mut next = entry.previous.clone();
+                    next.bundle.clone_from(&report.candidate_path);
+                    next.manifest_sha256.clone_from(&entry.next_pin);
+                    (entry.profile.as_str(), &entry.previous, next)
+                },
+            ));
+            self.refresh_profiles();
+        }
+        if let Action::RollbackCompleted(_, Ok(report)) = &action
+            && report.applied
+        {
+            self.adopt_tool_bindings(report.profiles.iter().map(|entry| {
+                (
+                    entry.profile.as_str(),
+                    &entry.current,
+                    entry.restore.clone(),
+                )
+            }));
             self.refresh_profiles();
         }
         let owner = self.keyboard.hwnd().map(|window| window.0 as usize);
@@ -350,12 +472,17 @@ impl TerminalApp {
         else {
             return;
         };
-        if matches!(action, Action::Open) {
+        if matches!(action, Action::Open | Action::OpenReceipt) {
             if page.rollout.is_none()
                 && !matches!(page.state, State::Loading(..))
                 && let Some(owner) = owner
             {
-                page.rollout = Some(Box::new(Panel::pick(id, owner, catalog, ctx)));
+                let picker = if matches!(action, Action::OpenReceipt) {
+                    Picker::Receipt
+                } else {
+                    Picker::Manifest
+                };
+                page.rollout = Some(Box::new(Panel::pick(id, owner, catalog, picker, ctx)));
             }
             return;
         }
@@ -369,21 +496,43 @@ impl TerminalApp {
             | Action::Review(ticket)
             | Action::Apply(ticket)
             | Action::Completed(ticket, _)
+            | Action::SaveReceipt(ticket)
+            | Action::ReceiptSaved(ticket, _)
+            | Action::ReviewRollback(ticket)
+            | Action::ApplyRollback(ticket)
+            | Action::RollbackCompleted(ticket, _)
             | Action::Back(ticket)
             | Action::Close(ticket) => ticket,
-            Action::Open => unreachable!(),
+            Action::Open | Action::OpenReceipt => unreachable!(),
         };
         if !Arc::ptr_eq(&panel.ticket, request) {
             return;
         }
         match action {
-            Action::Picked(_, result) if matches!(panel.work, Work::Picking) => {
+            Action::Picked(_, result) => {
+                let Work::Picking(picker) = panel.work else {
+                    return;
+                };
                 panel.task = None;
-                panel.work = Work::Choosing;
                 match result {
-                    Ok(Some(targets)) => panel.targets = Some(targets),
+                    Ok(Some(Picked::Manifest(targets))) => {
+                        panel.targets = Some(targets);
+                        panel.work = Work::Choosing;
+                    }
+                    Ok(Some(Picked::Receipt(path))) => {
+                        panel.request_rollback(
+                            id,
+                            catalog,
+                            rollback::Source::Receipt(path),
+                            None,
+                            ctx,
+                        );
+                    }
                     Ok(None) => page.rollout = None,
-                    Err(error) => panel.error = Some(error),
+                    Err(error) => {
+                        panel.work = Work::PickFailed(picker);
+                        panel.error = Some(error);
+                    }
                 }
             }
             Action::Filter(_, filter) if matches!(panel.work, Work::Choosing) => {
@@ -413,7 +562,7 @@ impl TerminalApp {
             {
                 panel.task = None;
                 panel.work = match result {
-                    Ok(report) if report.applied => Work::Applied(report.changed_profiles),
+                    Ok(report) if report.applied => Work::Applied(report),
                     Ok(report) => Work::Reviewed(report),
                     Err(error) => {
                         panel.error = Some(error);
@@ -424,8 +573,77 @@ impl TerminalApp {
             Action::Back(_) if matches!(panel.work, Work::Reviewed(_)) => {
                 panel.work = Work::Choosing
             }
-            Action::Close(_) if !matches!(panel.work, Work::Applying) => {
-                if matches!(panel.work, Work::Applied(_)) {
+            Action::Back(_) => {
+                if let Work::Rollback(
+                    rollback::Source::Applied(report),
+                    rollback::Stage::Ready | rollback::Stage::Reviewed(_),
+                ) = &panel.work
+                {
+                    panel.work = Work::Applied(report.clone());
+                    panel.error = None;
+                }
+            }
+            Action::SaveReceipt(_) => {
+                if let Work::Applied(report) = &panel.work
+                    && let Some(owner) = owner
+                {
+                    panel.save_receipt(id, owner, report.clone(), ctx);
+                }
+            }
+            Action::ReceiptSaved(_, result) => {
+                let Work::SavingReceipt(report) = &panel.work else {
+                    return;
+                };
+                panel.task = None;
+                panel.work = Work::Applied(report.clone());
+                match result {
+                    Ok(Some(path)) => panel.saved_receipt = Some(path),
+                    Ok(None) => {}
+                    Err(error) => panel.error = Some(error),
+                }
+            }
+            Action::ReviewRollback(_) => {
+                let source = match &panel.work {
+                    Work::Applied(report) => rollback::Source::Applied(report.clone()),
+                    Work::Rollback(source, rollback::Stage::Ready) => source.clone(),
+                    _ => return,
+                };
+                panel.request_rollback(id, catalog, source, None, ctx);
+            }
+            Action::ApplyRollback(_) => {
+                if let Work::Rollback(source, rollback::Stage::Reviewed(report)) = &panel.work {
+                    panel.request_rollback(
+                        id,
+                        catalog,
+                        source.clone(),
+                        Some(report.review.clone()),
+                        ctx,
+                    );
+                }
+            }
+            Action::RollbackCompleted(_, result) => {
+                let Work::Rollback(source, rollback::Stage::Reviewing | rollback::Stage::Applying) =
+                    &panel.work
+                else {
+                    return;
+                };
+                panel.task = None;
+                panel.work = match result {
+                    Ok(report) if report.applied => Work::RolledBack(report.changed_profiles),
+                    Ok(report) => Work::Rollback(source.clone(), rollback::Stage::Reviewed(report)),
+                    Err(error) => {
+                        panel.error = Some(error);
+                        Work::Rollback(source.clone(), rollback::Stage::Ready)
+                    }
+                };
+            }
+            Action::Close(_) if panel.can_close() => {
+                if matches!(
+                    panel.work,
+                    Work::Applied(_)
+                        | Work::Rollback(rollback::Source::Applied(_), _)
+                        | Work::RolledBack(_)
+                ) {
                     page.state = load(catalog, id, page.checks, ctx);
                 }
                 page.rollout = None;
@@ -434,7 +652,13 @@ impl TerminalApp {
         }
     }
 
-    fn adopt_tool_rollout(&mut self, report: &ToolRolloutReport) {
+    fn adopt_tool_bindings<'a>(
+        &mut self,
+        bindings: impl Iterator<Item = (&'a str, &'a ToolSync, ToolSync)>,
+    ) {
+        let bindings: BTreeMap<_, _> = bindings
+            .map(|(name, before, after)| (name, (before, after)))
+            .collect();
         let ids: Vec<_> = self.tabs.entries().iter().map(|tab| tab.id).collect();
         let base_path = self.store.path().parent().unwrap_or(Path::new("."));
         for id in ids {
@@ -445,28 +669,19 @@ impl TerminalApp {
             let Some(base) = draft.origin.editing() else {
                 continue;
             };
-            let Some(entry) = report
-                .profiles
-                .iter()
-                .find(|entry| entry.changed && entry.profile == base.name)
-            else {
+            let Some(&(before, ref after)) = bindings.get(base.name.as_str()) else {
                 continue;
             };
-            if base.options.tool_bundle.as_deref() != Some(&entry.previous) {
+            if base.options.tool_bundle.as_deref() != Some(before) {
                 continue;
             }
-            let mut next = entry.previous.clone();
-            next.bundle = report.candidate_path.clone();
-            next.manifest_sha256 = entry.next_pin.clone();
             let mut expected = base.options.clone();
-            expected.tool_bundle = Some(Box::new(next.clone()));
+            expected.tool_bundle = Some(Box::new(after.clone()));
             let Ok((_, saved)) = self.store.inspect_catalog(&base.name) else {
                 continue;
             };
             if saved.options == expected {
-                draft
-                    .tool_bundle
-                    .adopt_rollout(&entry.previous, &next, base_path);
+                draft.tool_bundle.adopt_rollout(before, after, base_path);
                 draft.origin = DraftOrigin::Edit(saved);
             }
         }

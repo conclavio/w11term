@@ -1,5 +1,5 @@
 use super::{
-    Manifest,
+    Manifest, ToolRolloutReport,
     rollout::{approval, write_binding},
 };
 use crate::{
@@ -203,9 +203,69 @@ fn review_token(receipt: &Receipt, profiles: &[ToolRollbackProfile]) -> Result<S
 }
 
 pub fn rollback_tool_rollout(path: &Path, review: Option<&str>) -> Result<ToolRollbackReport> {
-    const STALE: &str = "The rollback manifests or approvals changed. Preview the rollback again.";
     let receipt = Receipt::load(path)?;
     let store = ProfileStore::new(receipt.profiles_path.clone())?;
+    rollback(&store, receipt, review)
+}
+
+impl ProfileStore {
+    /// Review or restore a tool rollout receipt for this catalog.
+    pub fn rollback_tool_receipt(
+        &self,
+        path: &Path,
+        review: Option<&str>,
+    ) -> Result<ToolRollbackReport> {
+        let receipt = Receipt::load(path)?;
+        receipt::check_catalog(&receipt.profiles_path, self.path())?;
+        rollback(self, receipt, review)
+    }
+}
+
+impl ToolRolloutReport {
+    /// Save a receipt that both the Windows audit and the CLI can open.
+    pub fn save_rollback_receipt(&self, path: &Path) -> Result<()> {
+        ensure!(
+            self.applied,
+            "Apply the SSH tool rollout before saving its receipt"
+        );
+        ensure!(
+            self.changed_profiles > 0,
+            "The rollout did not change any profiles"
+        );
+        receipt::write(path, self)
+    }
+
+    /// Review or restore this applied rollout without exporting a receipt.
+    pub fn rollback(&self, review: Option<&str>) -> Result<ToolRollbackReport> {
+        let receipt = Receipt {
+            profiles_path: self.profiles_path.clone(),
+            candidate_path: self.candidate_path.clone(),
+            candidate_manifest_sha256: self.candidate_manifest_sha256.clone(),
+            applied: self.applied,
+            changed_profiles: self.changed_profiles,
+            profiles: self
+                .profiles
+                .iter()
+                .map(|entry| ReceiptProfile {
+                    profile: entry.profile.clone(),
+                    previous: entry.previous.clone(),
+                    next_pin: entry.next_pin.clone(),
+                    changed: entry.changed,
+                })
+                .collect(),
+        }
+        .checked()?;
+        let store = ProfileStore::new(receipt.profiles_path.clone())?;
+        rollback(&store, receipt, review)
+    }
+}
+
+fn rollback(
+    store: &ProfileStore,
+    receipt: Receipt,
+    review: Option<&str>,
+) -> Result<ToolRollbackReport> {
+    const STALE: &str = "The rollback manifests or approvals changed. Preview the rollback again.";
     let rows = plan(&receipt, &store.load()?)?;
     let token = review_token(&receipt, &rows)?;
     if let Some(review) = review {

@@ -31,8 +31,11 @@ pub(super) enum Purpose {
         current: PathBuf,
         suggestion: String,
     },
-    SaveDotfileRolloutReceipt(PathBuf),
-    OpenDotfileRolloutReceipt(PathBuf),
+    RolloutReceipt {
+        current: PathBuf,
+        kind: RolloutReceiptKind,
+        save: bool,
+    },
     ToolBundle(PathBuf),
     ToolExecutable(PathBuf),
     SaveToolBundle {
@@ -96,6 +99,11 @@ pub(super) enum Purpose {
         path: PathBuf,
         export: bool,
     },
+}
+
+pub(super) enum RolloutReceiptKind {
+    Dotfiles,
+    Tools,
 }
 
 #[derive(Clone, Copy)]
@@ -273,7 +281,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::FlameGraph { export: false, .. }
                 | Purpose::SshConfig(_)
                 | Purpose::DotfilesBundle(_)
-                | Purpose::OpenDotfileRolloutReceipt(_)
+                | Purpose::RolloutReceipt { save: false, .. }
                 | Purpose::DotfileFragment(_)
                 | Purpose::PrivatePageMarkdown
                 | Purpose::ToolBundle(_)
@@ -700,14 +708,17 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::SaveDotfileRolloutReceipt(ref current)
-            | Purpose::OpenDotfileRolloutReceipt(ref current) => {
+            Purpose::RolloutReceipt {
+                ref current,
+                ref kind,
+                save,
+            } => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-                let save = matches!(purpose, Purpose::SaveDotfileRolloutReceipt(_));
-                dialog.SetTitle(if save {
-                    w!("Save dotfile rollout receipt")
-                } else {
-                    w!("Open dotfile rollout receipt")
+                dialog.SetTitle(match (kind, save) {
+                    (RolloutReceiptKind::Dotfiles, true) => w!("Save dotfile rollout receipt"),
+                    (RolloutReceiptKind::Dotfiles, false) => w!("Open dotfile rollout receipt"),
+                    (RolloutReceiptKind::Tools, true) => w!("Save SSH tool rollout receipt"),
+                    (RolloutReceiptKind::Tools, false) => w!("Open SSH tool rollout receipt"),
                 })?;
                 dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
                     pszName: w!("JSON files"),
@@ -715,7 +726,10 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }])?;
                 options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 if save {
-                    dialog.SetFileName(w!("dotfile-rollout.json"))?;
+                    dialog.SetFileName(match kind {
+                        RolloutReceiptKind::Dotfiles => w!("dotfile-rollout.json"),
+                        RolloutReceiptKind::Tools => w!("ssh-tool-rollout.json"),
+                    })?;
                     dialog.SetDefaultExtension(w!("json"))?;
                     options &= !FOS_OVERWRITEPROMPT;
                     options |= FOS_NOTESTFILECREATE;

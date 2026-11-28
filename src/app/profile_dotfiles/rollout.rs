@@ -208,8 +208,11 @@ impl Panel {
         self.work = Work::SavingReceipt(applied.clone());
         self.error = None;
         let ticket = self.ticket.clone();
-        let purpose =
-            file_picker::Purpose::SaveDotfileRolloutReceipt(applied.report.candidate_path.clone());
+        let purpose = file_picker::Purpose::RolloutReceipt {
+            current: applied.report.candidate_path.clone(),
+            kind: file_picker::RolloutReceiptKind::Dotfiles,
+            save: true,
+        };
         let rejected = message(
             id,
             Action::ReceiptSaved(
@@ -575,7 +578,11 @@ impl TerminalApp {
                         } else {
                             file_picker::pick(
                                 owner,
-                                file_picker::Purpose::OpenDotfileRolloutReceipt(catalog),
+                                file_picker::Purpose::RolloutReceipt {
+                                    current: catalog,
+                                    kind: file_picker::RolloutReceiptKind::Dotfiles,
+                                    save: false,
+                                },
                             )
                             .map(|file| file.map(|file| file.path))
                             .map_err(|error| format!("{error:#}"))
