@@ -3,6 +3,8 @@ use crate::app::openrouter_assistance::clip;
 use std::fmt::Write as _;
 use w11term::cpu_profile::{Change, Comparison, FilteredComparison};
 
+mod capture_context;
+
 const PAGE_SIZE: usize = 16;
 const REVIEW_OTHER_STACKS: usize = 10;
 
@@ -15,24 +17,48 @@ pub enum Action {
     Inspect(ProfileSide),
     Page(bool),
     Select(Arc<Comparison>, usize),
+    CaptureSettingsExpanded(bool),
+    VerifyReport(ProfileSide),
 }
 
 pub struct ViewState {
     pub query: String,
     pub results: FilteredComparison,
+    capture_context: capture_context::Context,
     page: usize,
     selected: Option<usize>,
 }
 
 impl ViewState {
-    pub fn new(before: Arc<Profile>, after: Arc<Profile>, paths: [PathBuf; 2]) -> Self {
-        let comparison = Arc::new(Comparison::new([before, after], paths));
+    pub(super) fn new(before: ProfileSource, after: ProfileSource) -> Self {
+        let capture_context = capture_context::Context::new([before.report, after.report]);
+        let comparison = Arc::new(Comparison::new(
+            [before.profile, after.profile],
+            [before.path, after.path],
+        ));
         let results = comparison.filter("");
         Self {
             query: String::new(),
             selected: results.indices().first().copied(),
             results,
+            capture_context,
             page: 0,
+        }
+    }
+
+    pub(super) fn capture_settings_expanded(&mut self, expanded: bool) {
+        self.capture_context.expanded = expanded;
+    }
+
+    pub(super) fn attach_report(
+        &mut self,
+        side: ProfileSide,
+        report: Arc<CpuProfileCaptureReport>,
+    ) -> &'static str {
+        self.capture_context.reports[side.index()] = Some(report);
+        match side {
+            ProfileSide::Before => "Before capture report verified",
+            ProfileSide::After => "After capture report verified",
         }
     }
 
@@ -153,6 +179,7 @@ impl ViewState {
             ),
             text("compare-before", source(comparison, 0)),
             text("compare-after", source(comparison, 1)),
+            self.capture_context.view(idle, ctx),
             KeyedView::new(
                 "compare-export",
                 Button::new()
@@ -325,6 +352,55 @@ impl ViewState {
     }
 }
 
+impl TerminalApp {
+    pub(super) fn choose_cpu_comparison_report(
+        &mut self,
+        side: ProfileSide,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let panel = &mut self.flame_graph;
+        if !panel.open {
+            return;
+        }
+        let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
+            return;
+        };
+        let Some(view) = &panel.comparison else {
+            return;
+        };
+        let comparison = view.results.comparison();
+        let profile = comparison.profiles()[side.index()].clone();
+        let folded = comparison.paths()[side.index()].clone();
+        let picker = file_picker::Purpose::CaptureReport {
+            capture: folded.clone(),
+            kind: file_picker::CaptureReportKind::CpuProfile,
+            save: false,
+        };
+        let ticket = panel.begin("Choosing a CPU profile report…");
+        let rejected = message(super::Action::Finished(
+            ticket.clone(),
+            Err("CPU comparison report worker unavailable".into()),
+        ));
+        ctx.spawn_background_with_rejection(
+            move |scope| {
+                let result = (|| -> anyhow::Result<_> {
+                    let Some(file) = file_picker::pick(owner, picker)? else {
+                        return Ok(None);
+                    };
+                    if scope.is_cancelled() {
+                        return Ok(None);
+                    }
+                    let report = report::verify_for_profile(&profile, &folded, &file.path)?;
+                    Ok(Some(Outcome::ComparisonReport(side, report)))
+                })()
+                .map_err(|error| format!("{error:#}"));
+                message(super::Action::Finished(ticket, result))
+            },
+            rejected,
+        );
+    }
+}
+
 fn change_detail(comparison: &Comparison, change: &Change) -> String {
     let count = |side| {
         let samples = change.counts()[side];
@@ -382,13 +458,16 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
+    fn parsed(input: &str, path: &str) -> ProfileSource {
+        ProfileSource {
+            profile: Arc::new(Profile::parse(input).unwrap()),
+            path: path.into(),
+            report: None,
+        }
+    }
+
     fn compare(before: &str, after: &str) -> ViewState {
-        let parse = |input| Arc::new(Profile::parse(input).unwrap());
-        ViewState::new(
-            parse(before),
-            parse(after),
-            [PathBuf::new(), PathBuf::new()],
-        )
+        ViewState::new(parsed(before, ""), parsed(after, ""))
     }
 
     #[test]
@@ -416,9 +495,8 @@ mod tests {
             .collect();
         before.push_str("outside-filter 2\n");
         let mut state = ViewState::new(
-            Arc::new(Profile::parse(&before).unwrap()),
-            Arc::new(Profile::parse("new-stack 7").unwrap()),
-            ["folder/before.folded".into(), "folder/after.folded".into()],
+            parsed(&before, "folder/before.folded"),
+            parsed("new-stack 7", "folder/after.folded"),
         );
         state.filtered(state.results.comparison().filter("PARENT"));
         state.page(true);

@@ -79,7 +79,7 @@ fn validate_sampling(seconds: u8, frequency: u8) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CpuCallGraph {
     #[default]

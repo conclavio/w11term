@@ -1,6 +1,6 @@
 use super::{
-    Action as ViewerAction, Loaded, Outcome as ViewerOutcome, Panel, ProfileSource, capture,
-    message, text,
+    Action as ViewerAction, Loaded, Outcome as ViewerOutcome, Panel, Profile, ProfileSource,
+    capture, message, text,
 };
 use crate::app::*;
 use std::{path::Path, path::PathBuf};
@@ -43,14 +43,10 @@ impl Task {
                 Ok(Outcome::Saved)
             }
             Self::Verify(source) => {
-                let report = verify_cpu_profile_report(&source.path, &path, None)?;
-                anyhow::ensure!(
-                    source.profile.loaded_sha256() == Some(report.folded.sha256.as_str()),
-                    "The folded profile changed after it was opened. Reopen it before verifying the report."
-                );
+                let report = verify_for_profile(&source.profile, &source.path, &path)?;
                 Ok(Outcome::Verified(Verified {
                     path,
-                    report: Arc::new(report),
+                    report,
                     raw_path: None,
                     expanded: true,
                 }))
@@ -61,6 +57,23 @@ impl Task {
             }
         }
     }
+}
+
+pub(super) fn matches_profile(profile: &Profile, report: &CpuProfileCaptureReport) -> bool {
+    profile.loaded_sha256() == Some(report.folded.sha256.as_str())
+}
+
+pub(super) fn verify_for_profile(
+    profile: &Profile,
+    folded: &Path,
+    path: &Path,
+) -> anyhow::Result<Arc<CpuProfileCaptureReport>> {
+    let report = verify_cpu_profile_report(folded, path, None)?;
+    anyhow::ensure!(
+        matches_profile(profile, &report),
+        "The folded profile changed after it was opened. Reopen it before verifying the report."
+    );
+    Ok(Arc::new(report))
 }
 
 impl TerminalApp {
@@ -168,7 +181,7 @@ pub(super) fn finish(panel: &mut Panel, result: Outcome) {
     });
 }
 
-fn capture_report(loaded: &Loaded) -> Option<&Arc<CpuProfileCaptureReport>> {
+pub(super) fn capture_report(loaded: &Loaded) -> Option<&Arc<CpuProfileCaptureReport>> {
     loaded.capture.as_ref()?.summary.capture_report.as_ref()
 }
 
@@ -248,78 +261,11 @@ pub(super) fn fields(
 impl Verified {
     fn details(&self) -> Vec<KeyedView> {
         let report = &self.report;
-        let reviewed = &report.reviewed;
-        let mut fields = vec![
-            text("report", format!("Report · {}", display_path(&self.path))),
-            text(
-                "endpoint",
-                format!(
-                    "Recorded SSH {}@{}:{}",
-                    preview(&reviewed.user, 256),
-                    preview(&reviewed.host, 256),
-                    reviewed.port
-                ),
-            ),
-            text(
-                "host-key",
-                format!("Host key {}", preview(&reviewed.host_key_fingerprint, 256)),
-            ),
-        ];
-        let (seconds, frequency, call_graph) = match &reviewed.target {
-            CpuProfileReportTarget::Process {
-                process_name,
-                process_start_ticks,
-                options,
-            } => {
-                fields.push(text(
-                    "process",
-                    format!(
-                        "PID {} · {} · start ticks {process_start_ticks}",
-                        options.target_pid,
-                        preview(process_name, 256)
-                    ),
-                ));
-                (options.seconds, options.frequency, options.call_graph)
-            }
-            CpuProfileReportTarget::Command {
-                program,
-                directory,
-                options,
-            } => {
-                let arguments = serde_json::to_string(&options.arguments).unwrap_or_default();
-                fields.extend([
-                    text(
-                        "executable",
-                        format!("Executable {}", preview(program, 512)),
-                    ),
-                    text(
-                        "directory",
-                        format!("Working directory {}", preview(directory, 512)),
-                    ),
-                    text(
-                        "arguments",
-                        format!("Arguments {}", preview(&arguments, 4096)),
-                    ),
-                ]);
-                (options.seconds, options.frequency, options.call_graph)
-            }
-        };
-        let unwind = match call_graph {
-            CpuCallGraph::Fp => "Frame pointers",
-            CpuCallGraph::Dwarf => "DWARF",
-        };
-        fields.push(text(
-            "sampling",
-            format!(
-                "{seconds} seconds · {frequency} Hz · {unwind} · {}",
-                preview(&reviewed.event, 64),
-            ),
-        ));
-        if let Some(workload) = &report.workload {
-            fields.push(text("outcome", workload.to_string()));
-        } else if report.stopped_by_user {
-            fields.push(text("outcome", "Stopped by request"));
-        }
+        let mut fields = vec![text(
+            "report",
+            format!("Report · {}", display_path(&self.path)),
+        )];
+        fields.extend(capture_fields(report));
         fields.extend([
             text(
                 "totals",
@@ -348,11 +294,113 @@ impl Verified {
                 "raw-hash",
                 format!("Raw SHA-256 {}", preview(&raw.sha256, 64)),
             ));
-        } else if reviewed.raw_perf_data_requested {
+        } else if report.reviewed.raw_perf_data_requested {
             fields.push(text("raw", "Raw recording was requested"));
         }
         fields
     }
+}
+
+pub(super) struct Sampling<'a> {
+    pub seconds: u8,
+    pub frequency: u8,
+    pub call_graph: CpuCallGraph,
+    pub event: &'a str,
+}
+
+impl<'a> Sampling<'a> {
+    pub(super) fn of(report: &'a CpuProfileCaptureReport) -> Self {
+        let (seconds, frequency, call_graph) = match &report.reviewed.target {
+            CpuProfileReportTarget::Process { options, .. } => {
+                (options.seconds, options.frequency, options.call_graph)
+            }
+            CpuProfileReportTarget::Command { options, .. } => {
+                (options.seconds, options.frequency, options.call_graph)
+            }
+        };
+        Self {
+            seconds,
+            frequency,
+            call_graph,
+            event: &report.reviewed.event,
+        }
+    }
+
+    fn label(&self) -> String {
+        let unwind = match self.call_graph {
+            CpuCallGraph::Fp => "Frame pointers",
+            CpuCallGraph::Dwarf => "DWARF",
+        };
+        format!(
+            "{} seconds · {} Hz · {unwind} · {}",
+            self.seconds,
+            self.frequency,
+            preview(self.event, 64),
+        )
+    }
+}
+
+pub(super) fn capture_fields(report: &CpuProfileCaptureReport) -> Vec<KeyedView> {
+    let reviewed = &report.reviewed;
+    let mut fields = vec![
+        text(
+            "endpoint",
+            format!(
+                "Recorded SSH {}@{}:{}",
+                preview(&reviewed.user, 256),
+                preview(&reviewed.host, 256),
+                reviewed.port
+            ),
+        ),
+        text(
+            "host-key",
+            format!("Host key {}", preview(&reviewed.host_key_fingerprint, 256)),
+        ),
+    ];
+    match &reviewed.target {
+        CpuProfileReportTarget::Process {
+            process_name,
+            process_start_ticks,
+            options,
+        } => {
+            fields.push(text(
+                "process",
+                format!(
+                    "PID {} · {} · start ticks {process_start_ticks}",
+                    options.target_pid,
+                    preview(process_name, 256)
+                ),
+            ));
+        }
+        CpuProfileReportTarget::Command {
+            program,
+            directory,
+            options,
+        } => {
+            let arguments = serde_json::to_string(&options.arguments).unwrap_or_default();
+            fields.extend([
+                text(
+                    "executable",
+                    format!("Executable {}", preview(program, 512)),
+                ),
+                text(
+                    "directory",
+                    format!("Working directory {}", preview(directory, 512)),
+                ),
+                text(
+                    "arguments",
+                    format!("Arguments {}", preview(&arguments, 4096)),
+                ),
+            ]);
+        }
+    }
+    fields.push(text("sampling", Sampling::of(report).label()));
+    if let Some(workload) = &report.workload {
+        fields.push(text("outcome", workload.to_string()));
+    } else if report.stopped_by_user {
+        fields.push(text("outcome", "Stopped by request"));
+    }
+    fields
 }
 
 fn display_path(path: &Path) -> String {
