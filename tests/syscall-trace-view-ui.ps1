@@ -11,6 +11,7 @@ $clockAfter = Join-Path $State 'clock trace.602'
 $working = Join-Path $State 'working diag.strace'
 $failing = Join-Path $State 'failing diag.strace'
 $openLabel = 'Open syscall trace' + [char]0x2026
+$swapLabel = 'Swap working and failing traces'
 $dot = ' ' + [char]0xb7 + ' '
 $times = [char]0xd7
 $combo = [System.Windows.Automation.ControlType]::ComboBox
@@ -400,6 +401,22 @@ try {
         $change.failing_evidence.sources[0].line -ne 4) {
         throw 'JSON export did not capture the applied filter and selected evidence pair'
     }
+    Click $swapLabel
+    $null = Wait-Until 'swap reverses the count and keeps the filter, draft, and anchor' {
+        $draft = Find-Element 'Filter syscall changes' $edit
+        (Find-Element "Working${dot}failing diag.strace") -and
+            (Find-Element "Failing${dot}working diag.strace") -and
+            (Find-Element "Working 1${dot}Failing 2${dot}Count delta +1") -and
+            (Find-Element "1 matching change row${dot}Page 1 of 1") -and
+            (Find-Element "Timing reference${dot}openat${dot}Working failing diag.strace line 2${dot}Failing working diag.strace line 2") -and
+            $draft -and $draft.GetCurrentPattern($value).Current.Value -ceq '/unapplied/draft'
+    }
+    Click $swapLabel
+    $null = Wait-Until 'swapping again restores the original roles and signs' {
+        (Find-Element "Working${dot}working diag.strace") -and
+            (Find-Element "Working 2${dot}Failing 1${dot}Count delta -1") -and
+            (Find-Element "Timing reference${dot}openat${dot}Working working diag.strace line 2${dot}Failing failing diag.strace line 2")
+    }
     Apply-ChangeFilter '/missing/filter/fixture'
     $null = Wait-Until 'a nonmatching filter clears stale comparison evidence' {
         (Find-Element 'No changes match the filter.') -and
@@ -425,6 +442,12 @@ try {
         (Find-TraceGroup 'Changed timing*close*/tmp/data*') -and
             (Find-Element 'Selected call duration delta +4.000 ms') -and
             !(Find-TraceGroup 'Changed count*read*')
+    }
+    Click $swapLabel
+    $null = Wait-Until 'swap retains timing-only visibility and reverses the duration delta' {
+        (Find-TraceGroup 'Changed timing*close*/tmp/data*') -and
+            (Find-Element 'Selected call duration delta -4.000 ms') -and
+            (Find-Element "1 matching change row${dot}Page 1 of 1")
     }
     if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($trace)) -cne $before) { throw 'The viewer changed the original trace' }
     Run-Palette 'Diagnostics overview'
@@ -463,9 +486,24 @@ try {
         $left -and $right -and $left.Contains('working diag.strace') -and
         $right.Contains('failing diag.strace') -and $right.Contains('ENOENT')
     }
+    Click $swapLabel
+    $null = Wait-Until 'saved comparison reverses the failed open and its duration' {
+        $left = Raw-Text $workingId
+        $right = Raw-Text $failingId
+        (Find-Element 'Selected call duration delta -10.000 ms') -and
+            $left -and $right -and $left.Contains('ENOENT') -and $right.Contains('3</tmp/settings>')
+    }
+    Open-Trace $working ('Choose another failing trace' + [char]0x2026)
+    $null = Wait-Until 'replacing the failing trace retains the swapped working trace' {
+        $left = Raw-Text $workingId
+        $right = Raw-Text $failingId
+        (Find-Element 'Selected call duration delta -10.000 ms') -and
+            $left -and $right -and $left.Contains('failing diag.strace') -and
+            $right.Contains('working diag.strace')
+    }
     Click 'Back to working trace'
-    $null = Wait-Until 'syscall viewer returns to the saved working trace' {
-        Find-TraceGroup '*PID 21*openat*"/tmp/settings"*OK*'
+    $null = Wait-Until 'syscall viewer returns to the swapped working trace' {
+        (Find-TraceGroup '*PID 77*openat*"/tmp/settings"*ENOENT*') -and !(Raw-Text $workingId)
     }
 } finally {
     Close-FixtureApp $app

@@ -13,6 +13,8 @@ const COMPARISON_LIMIT: &str =
 pub enum Action {
     Open(TabId),
     OpenRepeat(TabId),
+    Swap(TabId),
+    Swapped(TabId, Arc<()>, Result<SwappedRuns, &'static str>),
     Back(TabId),
     Ready(TabId, Arc<()>, Result<Option<Arc<Comparison>>, String>),
     Select(TabId, Arc<Comparison>, usize),
@@ -32,6 +34,19 @@ pub enum Action {
 pub struct AppliedFilter {
     query: String,
     matches: Vec<ComparisonMatch>,
+}
+
+impl AppliedFilter {
+    fn search(compare: &Comparison, query: String) -> Self {
+        let matches = compare.search(&query);
+        Self { query, matches }
+    }
+}
+
+pub struct SwappedRuns {
+    compare: Arc<Comparison>,
+    applied: Option<AppliedFilter>,
+    anchor: Option<ComparisonTimingAnchor>,
 }
 
 #[derive(Default)]
@@ -82,6 +97,30 @@ impl TerminalApp {
         match action {
             Action::Open(tab) => self.open_trace_comparison(tab, ctx),
             Action::OpenRepeat(tab) => self.open_repeat_trace_comparison(tab, ctx),
+            Action::Swap(tab) => self.swap_syscall_runs(tab, ctx),
+            Action::Swapped(tab, ticket, result) => {
+                if let Some(page) = self.syscall_page(tab)
+                    && page.finish(&ticket)
+                {
+                    match result {
+                        Ok(swapped) => {
+                            let state = &mut page.comparison;
+                            if state.anchor.is_some() && swapped.anchor.is_none() {
+                                page.status = Some(
+                                    "The timing reference is unavailable with the runs swapped."
+                                        .into(),
+                                );
+                            }
+                            state.compare = Some(swapped.compare);
+                            state.applied = swapped.applied;
+                            state.anchor = swapped.anchor;
+                            state.select(None);
+                            state.filter(false);
+                        }
+                        Err(error) => page.status = Some(error.into()),
+                    }
+                }
+            }
             Action::Ready(tab, ticket, result) => {
                 if let Some(AppTab {
                     page: Page::SyscallTrace(page),
@@ -127,8 +166,19 @@ impl TerminalApp {
                 }
             }
             Action::Back(tab) => {
-                if let Some(state) = self.comparison_input(tab) {
-                    state.open = false;
+                if let Some(page) = self.syscall_page(tab).filter(|page| page.pending.is_none())
+                    && let Some(working) = page.comparison.working().cloned()
+                {
+                    if page
+                        .loaded
+                        .as_ref()
+                        .is_some_and(|trace| Arc::ptr_eq(trace, &working))
+                    {
+                        page.comparison.open = false;
+                    } else {
+                        page.capture.activity = None;
+                        page.load(working);
+                    }
                 }
             }
             Action::Select(tab, comparison, index) => {
@@ -233,6 +283,58 @@ impl TerminalApp {
         (page.comparison.open && page.pending.is_none()).then_some(&mut page.comparison)
     }
 
+    fn swap_syscall_runs(&mut self, tab: TabId, ctx: &ComponentContext<Self>) {
+        if self.tabs.active_id() != Some(tab) {
+            return;
+        }
+        let Some(page) = self
+            .syscall_page(tab)
+            .filter(|page| page.comparison.open && page.pending.is_none())
+        else {
+            return;
+        };
+        let state = &page.comparison;
+        let Some(compare) = &state.compare else {
+            return;
+        };
+        let [working, failing] = compare.traces().clone();
+        let sources = state.anchor.and_then(|anchor| {
+            let source = |side: usize| {
+                let raw = compare.traces()[side].events()[anchor.event(side)]
+                    .originals()
+                    .next()?;
+                Some((raw.source_number(), raw.line))
+            };
+            Some([source(1)?, source(0)?])
+        });
+        let query = state.applied.as_ref().map(|filter| filter.query.clone());
+        let ticket = page.begin("Comparing syscall traces with the runs swapped…");
+        let rejected = message(Action::Swapped(
+            tab,
+            ticket.clone(),
+            Err("Trace comparison worker unavailable"),
+        ));
+        ctx.spawn_background_with_rejection(
+            move |scope| {
+                let result = if scope.is_cancelled() {
+                    Err("Swapping syscall traces was cancelled")
+                } else {
+                    let compare = Arc::new(Comparison::build(failing, working));
+                    let anchor =
+                        sources.and_then(|sources| compare.timing_anchor_for_sources(sources));
+                    let applied = query.map(|query| AppliedFilter::search(&compare, query));
+                    Ok(SwappedRuns {
+                        compare,
+                        applied,
+                        anchor,
+                    })
+                };
+                message(Action::Swapped(tab, ticket, result))
+            },
+            rejected,
+        );
+    }
+
     fn open_syscall_evidence(&mut self, tab: TabId, side: usize, ctx: &ComponentContext<Self>) {
         if self.tabs.active_id() != Some(tab) {
             return;
@@ -281,11 +383,10 @@ impl TerminalApp {
         ));
         ctx.spawn_background_with_rejection(
             move |_| {
-                let matches = compare.search(&query);
                 message(Action::Filtered(
                     tab,
                     ticket,
-                    Ok(AppliedFilter { query, matches }),
+                    Ok(AppliedFilter::search(&compare, query)),
                 ))
             },
             rejected,
@@ -299,7 +400,10 @@ impl TerminalApp {
         let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
             return;
         };
-        let Some(working) = self.syscall_page(tab).and_then(|page| page.loaded.clone()) else {
+        let Some(working) = self
+            .syscall_page(tab)
+            .and_then(|page| page.comparison.working().or(page.loaded.as_ref()).cloned())
+        else {
             return;
         };
         self.read_trace_comparison(tab, Input::Picker { working, owner }, ctx);
@@ -374,6 +478,13 @@ impl TerminalApp {
 }
 
 impl ViewState {
+    pub(super) fn working(&self) -> Option<&Arc<Trace>> {
+        self.compare
+            .as_ref()
+            .filter(|_| self.open)
+            .map(|compare| &compare.traces()[0])
+    }
+
     fn filter(&mut self, prefer_match: bool) {
         let Some(compare) = &self.compare else { return };
         let show = |&index: &usize| compare.row_visible(index, self.timing);
@@ -498,6 +609,11 @@ impl ViewState {
                         .is_enabled(idle)
                         .on_click(ctx.callback(move |_| message(Action::Open(tab))))
                         .content("Choose another failing trace…"),
+                    Button::new()
+                        .automation_name("Swap working and failing traces")
+                        .is_enabled(idle)
+                        .on_click(ctx.callback(move |_| message(Action::Swap(tab))))
+                        .content("Swap runs"),
                     CheckBox::new()
                         .is_enabled(idle)
                         .is_checked(self.timing)

@@ -1899,6 +1899,8 @@ Open the working capture and choose **Compare with failing trace…**. The compa
 
 Choose **Open working evidence** or **Open failing evidence** to open that run in a separate trace tab at the group and raw-record page containing the selected call. The viewer marks the call in its original records. Close the source tab to return to the comparison with its filter, timing reference, and selected evidence in place.
 
+Choose **Swap runs** to make the other trace the working baseline. The viewer realigns the loaded records, recalculates the deltas, and reapplies the active filter. It selects the first visible divergence and keeps your timing reference when the same calls still align. **Choose another failing trace…** and **Back to working trace** use the new baseline.
+
 Choose **Use selected pair as time zero** to measure from the selected calls. Earlier calls show negative offsets and later calls show positive offsets in their respective runs. A pair needs a reliable match, equal group counts, and usable times on both sides. For example, two epoch-timestamped calls in a run can be compared when its first record has no timestamp. The reference stays fixed while you change the selection, filter, or page. Choose **Use run starts** to reset it.
 
 Enter terms such as `openat ENOENT /tmp/settings` and choose **Apply change filter** to narrow the comparison by syscall, resource, executable, change type, or errno. Searches ignore case. All terms must match the change or its paired evidence. If an errno matches a call inside a repeated group, the viewer opens that pair of original records. Clear the field and apply again to restore all changes allowed by the timing setting.

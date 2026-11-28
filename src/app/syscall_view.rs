@@ -380,7 +380,7 @@ impl PageState {
         if self.capture.open {
             return self.capture.view(id, targets, header, idle, ctx);
         }
-        let Some(trace) = &self.loaded else {
+        let Some(trace) = self.comparison.working().or(self.loaded.as_ref()) else {
             header.push(KeyedView::new(
                 "empty",
                 TextBlock::new()
