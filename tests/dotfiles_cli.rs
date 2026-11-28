@@ -536,3 +536,145 @@ fn comparison_rejects_invalid_bundles_and_unavailable_shells() {
         assert!(error["error"].as_str().unwrap().contains(message));
     }
 }
+
+fn ssh_profile(shell: &str, bundle: &str, pin: Option<&str>) -> Value {
+    const KEY: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    json!({
+        "host": "fleet.example.test", "user": "dev", "port": 2022,
+        "host_key": KEY, "auth": "identity", "identity": "private-ssh-key",
+        "dotfiles": {
+            "bundle": bundle, "shell": shell, "bundle_sha256": pin,
+            "home": "/home/dev", "host": "fleet.example.test", "user": "dev", "port": 2022,
+            "fingerprint": KEY,
+        },
+    })
+}
+
+#[test]
+fn audits_shared_bundles_and_a_candidate_against_each_profiles_shell_pin() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let catalog_dir = root.join("profile data");
+    fs::create_dir(&catalog_dir).unwrap();
+    let current = json!({"version": 1, "environment": "export TEAM=ops\r\n", "bash": "PS1=new"});
+    let candidate = json!({"version": 1, "environment": "export TEAM=ops", "bash": "PS1=old"});
+    let bundle = "shared fragments.json";
+    fs::write(catalog_dir.join(bundle), current.to_string()).unwrap();
+    fs::write(root.join("candidate.json"), candidate.to_string()).unwrap();
+    let baseline = DotfileBundle::load(&root.join("candidate.json")).unwrap();
+    let bash_pin = baseline.content_version(DotfileShell::Bash).unwrap();
+    let zsh_pin = baseline.content_version(DotfileShell::Zsh).unwrap();
+    let catalog = json!({"profiles": {
+        "Follow Bash": ssh_profile("bash", bundle, None),
+        "Pinned Bash": ssh_profile("bash", bundle, Some(&bash_pin)),
+        "Pinned Zsh": ssh_profile("zsh", bundle, Some(&zsh_pin)),
+        "Missing": ssh_profile("bash", "removed.json", None),
+        "Fish": ssh_profile("fish", bundle, None),
+        "Local": {"backend": "local", "executable":"powershell.exe"},
+    }})
+    .to_string();
+    let path = "profile data/profiles.json";
+    fs::write(root.join(path), &catalog).unwrap();
+    let report = reply(cli(
+        root,
+        "audit-dotfiles-profiles",
+        &["--profiles", path, "--candidate", "candidate.json"],
+    ));
+    let rows = report["result"]["profiles"].as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    let row = |name: &str| rows.iter().find(|row| row["profile"] == name).unwrap();
+    assert_eq!(row("Follow Bash")["status"], "follows-file");
+    assert_eq!(row("Pinned Bash")["status"], "pin-mismatch");
+    assert_eq!(
+        row("Pinned Bash")["bundle_sha256"],
+        row("Follow Bash")["bundle_sha256"]
+    );
+    assert_eq!(
+        row("Pinned Bash")["candidate"]["comparison"],
+        "different-content"
+    );
+    assert_eq!(row("Pinned Bash")["candidate"]["matches_pin"], true);
+    assert_eq!(row("Pinned Bash")["candidate"]["bundle_sha256"], bash_pin);
+    assert_eq!(row("Pinned Zsh")["status"], "matches-pin");
+    assert_eq!(row("Pinned Zsh")["candidate"]["comparison"], "same-content");
+    assert_eq!(row("Fish")["status"], "bundle-error");
+    assert_eq!(row("Fish")["candidate"]["comparison"], "shell-unavailable");
+    assert_eq!(row("Missing")["status"], "bundle-error");
+    assert_eq!(
+        row("Missing")["candidate"]["comparison"],
+        "no-current-content"
+    );
+    assert_eq!(fs::read_to_string(root.join(path)).unwrap(), catalog);
+    assert!(Path::new(row("Pinned Bash")["bundle"].as_str().unwrap()).is_absolute());
+    assert!(!report.to_string().contains("PS1="));
+    assert!(!report.to_string().contains("private-ssh-key"));
+}
+
+#[test]
+fn audits_profile_settings_and_can_select_one_saved_ssh_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let path = "profiles.json";
+    let standard = ssh_profile("fish", "missing.json", None);
+    let mut missing_approval = standard.clone();
+    missing_approval.as_object_mut().unwrap().remove("dotfiles");
+    let mut durable = standard.clone();
+    durable["durable"] = json!(true);
+    let mut different_account = standard.clone();
+    different_account["dotfiles"]["user"] = json!("other");
+    let mut invalid_startup = standard.clone();
+    invalid_startup["dotfiles"]["fish_config_dir"] = json!("../fish");
+    fs::write(
+        root.join(path),
+        json!({"profiles": {
+            "Disabled": missing_approval, "Durable": durable,
+            "Wrong account": different_account, "Wrong startup": invalid_startup,
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let report = reply(cli(root, "audit-dotfiles-profiles", &["--profiles", path]));
+    let rows = report["result"]["profiles"].as_array().unwrap();
+    assert_eq!(rows[0]["status"], "disabled");
+    assert_eq!(rows[1]["status"], "not-run");
+    assert_eq!(rows[2]["status"], "invalid-settings");
+    assert!(
+        rows[2]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("different SSH account")
+    );
+    assert_eq!(rows[3]["status"], "invalid-settings");
+    assert!(
+        rows[3]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Fish configuration directory")
+    );
+    let selected = reply(cli(
+        root,
+        "audit-dotfiles-profiles",
+        &["--profiles", path, "--profile", "Durable"],
+    ));
+    assert_eq!(selected["result"]["profiles"], json!([rows[1]]));
+    let default_catalog = reply(
+        Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+            .current_dir(root)
+            .env_remove("LOCALAPPDATA")
+            .env("W11TERM_DATA_DIR", root)
+            .arg("audit-dotfiles-profiles")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(default_catalog, report);
+    for args in [
+        &["--profiles", "absent.json"][..],
+        &["--profiles", path, "--profile", "absent"],
+        &["--profiles", path, "--candidate", "absent.json"],
+    ] {
+        assert_eq!(
+            cli(root, "audit-dotfiles-profiles", args).status.code(),
+            Some(1)
+        );
+    }
+}

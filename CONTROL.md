@@ -1391,6 +1391,15 @@ Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell
 
 Use **Preview dotfile changes** to see the selected shell’s proposed digest and line changes. The preview compares with that shell’s currently approved local bundle when available. For a pinned approval, the old file must still match its pin. If the original cannot be verified, the preview shows the proposed fragments. Once you preview a bundle, approval checks that the selected shell still matches the previewed digest, even if you leave the pin checkbox clear.
 
+Use `audit-dotfiles-profiles` to check all saved SSH profiles offline. It uses the normal profile catalog and resolves bundle paths beside that catalog. Use `--profiles PATH` for a different catalog or `--profile NAME` for one saved SSH profile. Entries in `result.profiles` report `matches-pin`, `pin-mismatch`, `follows-file`, `bundle-error`, `invalid-settings`, `disabled`, or `not-run`. The last status covers durable and RustMUSH profiles, which use their own shell startup. The report checks local files and configuration. The authenticated account, remote home, and startup hooks are checked on the SSH connection.
+
+Add `--candidate BUNDLE` to compare a proposed revision with the local file for each configured direct SSH profile. The candidate comparison identifies equivalent content, changed content, unavailable shells, or a missing current baseline. `candidate.matches_pin` is true or false when the profile has a pin and the candidate supplies its shell. The audit returns digests and metadata and leaves profiles untouched.
+
+```powershell
+$audit = & $ctl audit-dotfiles-profiles --candidate '.\fleet-revision.json' | ConvertFrom-Json
+$audit.result.profiles | Where-Object status -eq 'pin-mismatch'
+```
+
 Select **Pin approved dotfile version** before approving to record the digest of the selected shell's environment and startup fragments. If the local bundle later produces a different digest, login sync skips the update and the SSH shell still opens. Approve and save the revised bundle to update the pin. Clear the checkbox, approve, and save to follow future edits to the local bundle. Existing approvals keep following the file until you pin them.
 
 The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. An optional `bundle_sha256` field stores the pin shown in the editor. Set `zdotdir` for a custom Zsh directory or `fish_config_dir` for a custom Fish directory under the approved home. If you move an existing configuration, review startup hook repair at the new location before resuming automatic updates.

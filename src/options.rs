@@ -742,7 +742,7 @@ fn default_port() -> u16 {
     22
 }
 
-fn default_profiles_path() -> Result<PathBuf> {
+pub fn default_profiles_path() -> Result<PathBuf> {
     Ok(crate::keys::data_dir()?.join("profiles.json"))
 }
 

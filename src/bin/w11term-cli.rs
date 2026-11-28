@@ -15,6 +15,8 @@ mod command_reference;
 mod cpu_profile;
 #[path = "w11term-cli/diagnostics.rs"]
 mod diagnostics;
+#[path = "w11term-cli/dotfile_profiles.rs"]
+mod dotfile_profiles;
 #[path = "w11term-cli/dotfiles.rs"]
 mod dotfiles;
 #[path = "w11term-cli/offline.rs"]
@@ -360,6 +362,7 @@ async fn main() -> ExitCode {
             dotfiles::INSPECT_HELP,
             dotfiles::COMPARE_HELP
         );
+        println!("{}", dotfile_profiles::HELP);
         println!("{}", command_reference::OPEN_HELP);
         return ExitCode::SUCCESS;
     }

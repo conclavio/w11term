@@ -1,4 +1,7 @@
-use super::{command_reference, cpu_profile, dotfiles, packet_capture, syscall_capture, triage};
+use super::{
+    command_reference, cpu_profile, dotfile_profiles, dotfiles, packet_capture, syscall_capture,
+    triage,
+};
 use anyhow::{Context, Result};
 use std::{
     io::{self, Write},
@@ -16,6 +19,7 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
         dotfiles::VERB => (dotfiles::HELP, dotfiles::save),
         dotfiles::INSPECT_VERB => (dotfiles::INSPECT_HELP, dotfiles::inspect),
         dotfiles::COMPARE_VERB => (dotfiles::COMPARE_HELP, dotfiles::compare),
+        dotfile_profiles::VERB => (dotfile_profiles::HELP, dotfile_profiles::audit),
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
         syscall_capture::INSPECT_VERB => (
             syscall_capture::INSPECT_HELP,
