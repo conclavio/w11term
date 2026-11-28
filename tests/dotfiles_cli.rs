@@ -1,14 +1,23 @@
 use serde_json::{Value, json};
 use std::{fs, path::Path, process::Command};
+use w11term::sftp::{DotfileBundle, DotfileShell};
 
-fn save(directory: &Path, args: &[&str]) -> std::process::Output {
+fn cli(directory: &Path, verb: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
         .current_dir(directory)
         .env_remove("LOCALAPPDATA")
-        .arg("save-dotfiles-bundle")
+        .arg(verb)
         .args(args)
         .output()
         .unwrap()
+}
+
+fn save(directory: &Path, args: &[&str]) -> std::process::Output {
+    cli(directory, "save-dotfiles-bundle", args)
+}
+
+fn inspect(directory: &Path, args: &[&str]) -> std::process::Output {
+    cli(directory, "inspect-dotfiles-bundle", args)
 }
 
 fn reply(output: std::process::Output) -> Value {
@@ -269,5 +278,119 @@ fn failed_import_leaves_no_bundle_or_partial_stdout() {
         let error: Value = serde_json::from_slice(&output.stderr).unwrap();
         assert!(error["error"].as_str().unwrap().contains(expected_error));
         assert!(!root.join("fleet.json").exists());
+    }
+}
+
+#[test]
+fn inspection_reports_profile_pin_digests_for_each_available_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let path = "team bundle.json";
+    fs::write(root.join(".profile"), "export EDITOR=vi\r\n").unwrap();
+    fs::write(root.join("config.fish"), "set -gx EDITOR vi\n").unwrap();
+    reply(save(
+        root,
+        &[
+            "--environment-file",
+            ".profile",
+            "--fish-file",
+            "config.fish",
+            "--output-file",
+            path,
+        ],
+    ));
+    let file = DotfileBundle::load(&root.join(path)).unwrap();
+    let report = reply(inspect(root, &[path]));
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["result"]["version"], 1);
+    let shells: Vec<_> = DotfileShell::ALL
+        .into_iter()
+        .map(|shell| json!({"shell": shell, "bundle_sha256": file.content_version(shell).unwrap()}))
+        .collect();
+    assert_eq!(report["result"]["shells"], Value::Array(shells));
+    assert!(!report.to_string().contains("EDITOR"));
+}
+
+#[test]
+fn pin_verification_uses_normalized_content_and_detects_drift_for_the_selected_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let path = "bundle.json";
+    let mut manifest = json!({
+        "version": 1,
+        "bash": "# original\n",
+        "fish": "# original fish",
+    });
+    fs::write(root.join(path), manifest.to_string()).unwrap();
+    let baseline = reply(inspect(root, &[path, "--shell", "bash"]));
+    let selected = baseline["result"]["shells"].as_array().unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0]["shell"], "bash");
+    let expected = selected[0]["bundle_sha256"].as_str().unwrap();
+    manifest["bash"] = json!("# original\r\n");
+    manifest["fish"] = json!("# fish changed");
+    fs::write(root.join(path), manifest.to_string()).unwrap();
+    let verify = || {
+        inspect(
+            root,
+            &[
+                path,
+                "--shell",
+                "bash",
+                "--sha256",
+                &expected.to_uppercase(),
+            ],
+        )
+    };
+    assert_eq!(reply(verify()), baseline);
+
+    manifest["bash"] = json!("# bash changed");
+    fs::write(root.join(path), manifest.to_string()).unwrap();
+    let drift = verify();
+    assert_eq!(drift.status.code(), Some(1), "{drift:?}");
+    assert!(drift.stdout.is_empty());
+    let error: Value = serde_json::from_slice(&drift.stderr).unwrap();
+    let error = error["error"].as_str().unwrap();
+    assert!(error.contains("Bash dotfiles digest mismatch"));
+    assert!(error.contains(expected));
+    assert!(!error.contains("# bash changed"));
+}
+
+#[test]
+fn inspection_rejects_an_invalid_bundle_or_unavailable_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let path = "bundle.json";
+    fs::write(root.join(path), "{\"version\":1,\"fish\":\"# fish\"}").unwrap();
+    let report = reply(inspect(root, &[path]));
+    assert_eq!(report["result"]["shells"].as_array().unwrap().len(), 1);
+    assert_eq!(report["result"]["shells"][0]["shell"], "fish");
+    for (args, message) in [
+        (
+            &[path, "--shell", "bash"][..],
+            "needs an environment or bash fragment",
+        ),
+        (&[path, "--sha256", "bad"], "--sha256 requires --shell"),
+        (
+            &[path, "--shell", "fish", "--sha256", "bad"],
+            "64 hexadecimal digits",
+        ),
+    ] {
+        let output = inspect(root, args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(error["error"].as_str().unwrap().contains(message));
+    }
+    for manifest in [
+        json!({"version": 1, "bash": "# bash", "fish": "nul\0byte"}),
+        json!({"version": 2, "bash": "# bash"}),
+        json!({"version": 1}),
+    ] {
+        fs::write(root.join(path), manifest.to_string()).unwrap();
+        assert_eq!(inspect(root, &[path]).status.code(), Some(1));
+        assert_eq!(
+            inspect(root, &[path, "--shell", "bash"]).status.code(),
+            Some(1)
+        );
     }
 }

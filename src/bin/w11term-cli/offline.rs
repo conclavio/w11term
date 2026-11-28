@@ -14,6 +14,7 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
     let (help, command): (&str, OfflineCommand) = match verb.as_str() {
         command_reference::VERB => (command_reference::HELP, command_reference::lookup),
         dotfiles::VERB => (dotfiles::HELP, dotfiles::save),
+        dotfiles::INSPECT_VERB => (dotfiles::INSPECT_HELP, dotfiles::inspect),
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
         syscall_capture::INSPECT_VERB => (
             syscall_capture::INSPECT_HELP,

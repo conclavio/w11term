@@ -211,9 +211,7 @@ impl DotfileBundle {
     pub fn validate(&self, shell: DotfileShell) -> Result<()> {
         self.validate_fragments()?;
         ensure!(
-            self.selected_fragments(shell)
-                .into_iter()
-                .any(|item| item.is_some()),
+            self.has_fragments_for(shell),
             "The bundle needs an environment or {} fragment",
             shell.name()
         );
@@ -222,8 +220,16 @@ impl DotfileBundle {
 
     pub fn content_version(&self, shell: DotfileShell) -> Result<String> {
         self.validate(shell)?;
-        let [environment, prompt] = self.fragments(shell);
-        Ok(bundle_id(&environment, &prompt))
+        Ok(self.content_sha256(shell))
+    }
+
+    pub fn content_versions(&self) -> Result<Vec<(DotfileShell, String)>> {
+        self.validate_for_editing()?;
+        Ok(DotfileShell::ALL
+            .into_iter()
+            .filter(|&shell| self.has_fragments_for(shell))
+            .map(|shell| (shell, self.content_sha256(shell)))
+            .collect())
     }
 
     pub fn verify_version(&self, shell: DotfileShell, sha256: &str) -> Result<()> {
@@ -314,6 +320,12 @@ impl DotfileBundle {
         ]
     }
 
+    fn has_fragments_for(&self, shell: DotfileShell) -> bool {
+        self.selected_fragments(shell)
+            .into_iter()
+            .any(|fragment| fragment.is_some())
+    }
+
     fn selected_fragments(&self, shell: DotfileShell) -> [Option<&str>; 2] {
         match shell {
             DotfileShell::Bash => [self.environment.as_deref(), self.bash.as_deref()],
@@ -324,6 +336,11 @@ impl DotfileBundle {
 
     fn fragments(&self, shell: DotfileShell) -> [String; 2] {
         self.selected_fragments(shell).map(payload)
+    }
+
+    fn content_sha256(&self, shell: DotfileShell) -> String {
+        let [environment, prompt] = self.fragments(shell);
+        bundle_id(&environment, &prompt)
     }
 
     pub fn validate_fragment(fragment: &str) -> Result<()> {

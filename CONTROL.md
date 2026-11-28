@@ -1368,6 +1368,14 @@ Pass `--from-bundle PATH` to start from an existing bundle. Imports append to it
 & $ctl save-dotfiles-bundle --fish-file '.\config.fish' --shell fish --setup full --from-bundle '.\fleet.json' --output-file '.\fleet-with-fish-setup.json'
 ```
 
+Use `inspect-dotfiles-bundle BUNDLE` to validate a local bundle and list its available shells and their `bundle_sha256` values in `result.shells`. These are the per-shell digests used for profile pins and retained remote versions. The reply contains no shell fragment text. Add `--shell bash|zsh|fish` to check one shell. With `--sha256 HEX` it exits with code 1 if that shell’s digest differs from the expected value.
+
+```powershell
+$before = & $ctl inspect-dotfiles-bundle '.\fleet.json' --shell bash | ConvertFrom-Json
+$digest = $before.result.shells[0].bundle_sha256
+& $ctl inspect-dotfiles-bundle '.\candidate.json' --shell bash --sha256 $digest
+```
+
 From the full text preview of an SSH file, **Use in dotfiles editor** brings a snapshot into the connected profile's draft. It opens a new bundle draft if there is no editor open for that profile. Choose the first and last lines and use **Append SSH lines** to select the destination fragment. Select lines outside existing w11term startup blocks. Saving creates a local bundle. Using the bundle on login still requires profile approval and saving.
 
 Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.

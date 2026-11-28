@@ -1,8 +1,10 @@
 use super::{offline, sftp_args::dotfile_shell};
 use anyhow::{Context, Result, bail, ensure};
+use serde_json::json;
 use std::{io::Write, path::Path};
 use w11term::{
-    sftp::{DotfileBundle, DotfileShell},
+    control::Reply,
+    sftp::{DotfileBundle, DotfileShell, normalize_sha256},
     shell_setup::{Mode, Setup},
 };
 
@@ -13,6 +15,9 @@ pub(super) const HELP: &str = concat!(
     "    [--fish-environment-file PATH] [--fish-file PATH] [--from-bundle PATH] [--output-file PATH]\n",
     "Provide a shell setup, one or more fragment files, or both. Fragment file options can be repeated."
 );
+pub(super) const INSPECT_VERB: &str = "inspect-dotfiles-bundle";
+pub(super) const INSPECT_HELP: &str =
+    "w11term-cli inspect-dotfiles-bundle BUNDLE [--shell bash|zsh|fish [--sha256 HEX]]";
 
 pub(super) fn save(args: &[String], output: &mut dyn Write) -> Result<()> {
     let mut shell = None;
@@ -117,4 +122,56 @@ pub(super) fn save(args: &[String], output: &mut dyn Write) -> Result<()> {
         serde_json::to_writer_pretty(&mut *writer, &bundle)?;
         writer.write_all(b"\n")
     })
+}
+
+pub(super) fn inspect(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let (path, options) = args
+        .split_first()
+        .context("Provide the dotfiles bundle path")?;
+    let mut shell = None;
+    let mut expected = None;
+    let mut options = options.iter();
+    while let Some(flag) = options.next() {
+        let target = match flag.as_str() {
+            "--shell" => &mut shell,
+            "--sha256" => &mut expected,
+            _ => bail!("unsupported dotfiles option {flag}"),
+        };
+        let value = options
+            .next()
+            .with_context(|| format!("{flag} requires a value"))?;
+        ensure!(
+            target.replace(value.as_str()).is_none(),
+            "specify {flag} only once"
+        );
+    }
+    ensure!(
+        expected.is_none() || shell.is_some(),
+        "--sha256 requires --shell"
+    );
+    let expected = expected.map(normalize_sha256).transpose()?;
+    let shell = shell.map(|shell| dotfile_shell(Some(shell))).transpose()?;
+    let bundle = DotfileBundle::load(Path::new(path))
+        .with_context(|| format!("Opening dotfiles bundle {path}"))?;
+    let versions = if let Some(shell) = shell {
+        let digest = bundle.content_version(shell)?;
+        if let Some(expected) = expected {
+            ensure!(
+                digest == expected,
+                "{} dotfiles digest mismatch. Expected {expected}, found {digest}",
+                shell.label()
+            );
+        }
+        vec![(shell, digest)]
+    } else {
+        bundle.content_versions()?
+    };
+    let shells: Vec<_> = versions
+        .into_iter()
+        .map(|(shell, digest)| json!({"shell": shell, "bundle_sha256": digest}))
+        .collect();
+    let reply = Reply::from_result(Ok(json!({"version": bundle.version, "shells": shells})));
+    serde_json::to_writer(&mut *output, &reply)?;
+    writeln!(output)?;
+    Ok(())
 }
