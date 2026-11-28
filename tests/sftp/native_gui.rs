@@ -69,6 +69,22 @@ fn native_saved_command_reference_pages_keep_their_platform_after_restart() {
     drive_gui("command-reference-saved-pages-ui.ps1", state.path());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens the exact source-platform manual beside a retained SSH command without writing to the shell"]
+async fn native_history_opens_the_source_platform_command_manual() {
+    run_palette_fixture(
+        "command-history-reference-ui.ps1",
+        b"",
+        Some(concat!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07custom-report report-argument\r\n",
+            "\x1b]133;C\x07report output\r\n\x1b]133;D;0\x07",
+            "\x1b]133;A\x07$ \x1b]133;B\x07sudo -n /usr/bin/git log -5 --review-token sample-word\r\n",
+            "\x1b]133;C\x07retained git output\r\n\x1b]133;D;0\x07history-reference-ready\r\n",
+        )),
+    )
+    .await;
+}
+
 #[test]
 #[ignore = "saves an offline manual example and recalls it in a real PowerShell pane"]
 fn native_reference_examples_save_offline_and_require_explicit_shell_submit() {

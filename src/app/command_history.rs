@@ -64,6 +64,7 @@ pub enum HistoryAction {
     ExportOutput((u64, u64)),
     ShowOutput((u64, u64)),
     OpenDirectory((u64, u64)),
+    LookUpManual((u64, u64)),
     Compare(CompareRequest),
     Insert((u64, u64)),
     BeginSave((u64, u64)),
@@ -893,6 +894,17 @@ impl TerminalApp {
                 }
                 return;
             }
+            HistoryAction::LookUpManual(target) => {
+                if page.selected == Some(target)
+                    && let Some(text) = selected_command(&frame, Some(target))
+                        .filter(|entry| page.search.includes(&frame, entry, page.status))
+                        .and_then(|entry| entry.command.as_deref())
+                    && let Some(lookup) = self.recorded_reference_query(pane, text)
+                {
+                    self.open_recorded_reference(lookup, ctx);
+                }
+                return;
+            }
             HistoryAction::SaveName(target, name) => {
                 if let Some(draft) = &mut page.save
                     && draft.target == target
@@ -1073,6 +1085,14 @@ impl TerminalApp {
         let save_target = page
             .selected
             .filter(|&target| saveable_command(&frame, target).is_some());
+        let manual_target = selected
+            .filter(|entry| {
+                entry
+                    .command
+                    .as_deref()
+                    .is_some_and(|text| self.recorded_reference_query(pane, text).is_some())
+            })
+            .map(|entry| (generation, entry.id));
         let insert_target = page.selected.filter(|_| {
             selected
                 .and_then(|entry| entry.command.as_deref())
@@ -1225,6 +1245,14 @@ impl TerminalApp {
                                 timing,
                                 directory,
                                 comparison,
+                                Button::new()
+                                    .is_enabled(manual_target.is_some())
+                                    .on_click(ctx.callback(move |_| {
+                                        manual_target.map_or(Message::ControlIdle, |target| {
+                                            action(HistoryAction::LookUpManual(target))
+                                        })
+                                    }))
+                                    .content("Look up command manual"),
                                 Button::new()
                                     .is_enabled(insert_target.is_some())
                                     .on_click(ctx.callback(move |_| {

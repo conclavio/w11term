@@ -370,6 +370,8 @@ Save an edited example to the shared **Saved commands** library from Command ref
 
 Fill named values and choose flag spellings in a manual example. A repeated placeholder uses one value across the command. Review the preview and apply it to the editable draft before saving or inserting the example.
 
+Look up a retained command from **Command history**. Use the source pane's platform and the longest matching command prefix so an invocation such as `git log -5` opens its subcommand manual beside the recorded output.
+
 **Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
 
 ## Managed SSH utilities

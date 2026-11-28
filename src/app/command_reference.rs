@@ -6,6 +6,7 @@ use w11term::events::{
 use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 
 mod catalog;
+mod command_line;
 mod dotfiles;
 mod download;
 mod example;
@@ -116,6 +117,7 @@ pub(super) struct Panel {
     cached: RefCell<Option<Search>>,
     selected: usize,
     draft: Option<example::Draft>,
+    recorded_lookup: Option<command_line::Lookup>,
     query_field: ElementRef<TextBox>,
     draft_field: ElementRef<TextBox>,
     draft_option: ElementRef<ComboBox>,
@@ -150,6 +152,7 @@ impl Panel {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.draft = None;
+        self.recorded_lookup = None;
         self.private_page = None;
         self.tool_install = None;
         self.tool_removal = None;
@@ -171,6 +174,7 @@ impl Panel {
         let text = text.chars().take(128).filter(|c| !c.is_control()).collect();
         if self.query != text {
             self.query = text;
+            self.recorded_lookup = None;
             self.mode = SearchMode::Search;
             self.selected = 0;
             self.draft = None;
@@ -178,6 +182,7 @@ impl Panel {
     }
 
     fn show_page(&mut self, key: Key, auto: Platform) {
+        self.recorded_lookup = None;
         self.set_query(key.name.clone());
         if self.platform.unwrap_or(auto) != key.platform {
             self.platform = Some(key.platform);
@@ -186,6 +191,22 @@ impl Panel {
         self.selected = 0;
         self.draft = None;
         self.focus = self.focus.wrapping_add(1);
+    }
+
+    fn resolve_recorded_lookup(&mut self) {
+        let Some(lookup) = self.recorded_lookup.take() else {
+            return;
+        };
+        let Some(key) = self
+            .library
+            .as_ref()
+            .and_then(|library| lookup.resolve(&library.catalog))
+        else {
+            return;
+        };
+        self.set_query(key.name.clone());
+        self.mode = SearchMode::Page(key);
+        self.selected = 0;
     }
 
     fn results(&self, platform: Platform) -> std::cell::Ref<'_, [Key]> {
@@ -658,6 +679,46 @@ impl Panel {
 }
 
 impl TerminalApp {
+    pub(super) fn recorded_reference_query(
+        &self,
+        pane: u64,
+        text: &str,
+    ) -> Option<command_line::Lookup> {
+        let Page::Terminal(tab) = &self.tabs.get(self.tab_for_pane(pane)?)?.page else {
+            return None;
+        };
+        command_line::Lookup::new(text, pane_platform(Some(&tab.source)))
+            .filter(|_| !self.command_reference.subpanel_open())
+    }
+
+    pub(super) fn open_recorded_reference(
+        &mut self,
+        lookup: command_line::Lookup,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.command_reference.subpanel_open() {
+            return;
+        }
+        self.set_diagnostics_drawer(None);
+        let panel = &mut self.command_reference;
+        let reload = !panel.open || panel.library.is_none();
+        panel.open = true;
+        panel.draft = None;
+        panel.saved_pages.close();
+        panel.platform = Some(lookup.platform());
+        panel.focus = panel.focus.wrapping_add(1);
+        panel.set_query(lookup.executable().to_owned());
+        panel.mode = SearchMode::PreferredExact;
+        panel.selected = 0;
+        panel.recorded_lookup = Some(lookup);
+        if reload {
+            panel.saved_pages.refresh(ctx);
+            self.start_reference_load(false, ctx);
+        } else if !panel.loading {
+            panel.resolve_recorded_lookup();
+        }
+    }
+
     fn reference_tool_target(&self) -> Option<(ToolPane, &Session)> {
         let Page::Terminal(live) = &self.tabs.active()?.page else {
             return None;
@@ -856,6 +917,7 @@ impl TerminalApp {
                 let was_open = panel.open;
                 panel.open = true;
                 panel.draft = None;
+                panel.recorded_lookup = None;
                 panel.focus = panel.focus.wrapping_add(1);
                 if let Some(text) = selected {
                     panel.set_query(text);
@@ -871,6 +933,7 @@ impl TerminalApp {
                 let platform = PLATFORMS.get(index.wrapping_sub(1)).copied();
                 if panel.platform != platform {
                     panel.platform = platform;
+                    panel.recorded_lookup = None;
                     panel.selected = 0;
                     panel.draft = None;
                     if matches!(panel.mode, SearchMode::Page(_)) {
@@ -937,6 +1000,7 @@ impl TerminalApp {
                         });
                     }
                 }
+                panel.resolve_recorded_lookup();
             }
         }
     }
