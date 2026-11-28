@@ -661,7 +661,7 @@ impl TerminalApp {
             }
             Action::Close if !installer.applying() => {
                 panel.dotfiles = None;
-                panel.focus = panel.focus.wrapping_add(1);
+                panel.request_focus();
             }
             _ => {}
         }

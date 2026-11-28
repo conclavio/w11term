@@ -263,7 +263,7 @@ impl TerminalApp {
             }
             Action::Back if removal.pending.is_none() => {
                 panel.tool_removal = None;
-                panel.focus = panel.focus.wrapping_add(1);
+                panel.request_focus();
             }
             _ => (),
         }

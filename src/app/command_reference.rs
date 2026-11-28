@@ -108,6 +108,14 @@ enum SearchMode {
     Page(Key),
 }
 
+type ControlReply = tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>;
+
+struct ControlLookup {
+    query: String,
+    platform: Platform,
+    reply: ControlReply,
+}
+
 #[derive(Default)]
 pub(super) struct Panel {
     pub(super) open: bool,
@@ -121,11 +129,12 @@ pub(super) struct Panel {
     selected: usize,
     draft: Option<example::Draft>,
     command_lookup: Option<command_line::Lookup>,
+    control_lookup: Option<ControlLookup>,
     related_history: VecDeque<related::Location>,
     query_field: ElementRef<TextBox>,
     draft_field: ElementRef<TextBox>,
     draft_option: ElementRef<ComboBox>,
-    focus: u64,
+    focus: Option<u64>,
     tools: Option<ToolLookup>,
     private_page: Option<private_page::Editor>,
     saved_pages: saved_pages::State,
@@ -154,6 +163,7 @@ fn pane_platform(source: Option<&Source>) -> Platform {
 
 impl Panel {
     pub(super) fn close(&mut self) {
+        self.cancel_control_lookup();
         self.open = false;
         self.draft = None;
         self.command_lookup = None;
@@ -188,7 +198,24 @@ impl Panel {
         true
     }
 
+    fn request_focus(&mut self) {
+        self.focus = Some(self.focus.unwrap_or_default().wrapping_add(1));
+    }
+
+    fn cancel_control_lookup(&mut self) {
+        if let Some(lookup) = self.control_lookup.take() {
+            let _ = lookup.reply.send(Err(
+                "Command reference changed before the manual opened".into()
+            ));
+        }
+    }
+
     fn show_page(&mut self, key: Key, auto: Platform) {
+        self.set_page(key, auto);
+        self.request_focus();
+    }
+
+    fn set_page(&mut self, key: Key, auto: Platform) {
         self.command_lookup = None;
         self.related_history.clear();
         self.set_query(key.name.clone());
@@ -198,7 +225,6 @@ impl Panel {
         self.mode = SearchMode::Page(key);
         self.selected = 0;
         self.draft = None;
-        self.focus = self.focus.wrapping_add(1);
     }
 
     fn resolve_command_lookup(&mut self) {
@@ -320,11 +346,14 @@ impl Panel {
         let option = draft
             .filter(|draft| draft.focus_option())
             .map(|_| self.draft_option.clone());
+        let focus_requested = self.focus.is_some();
         ctx.use_effect("focus command reference", self.focus, move || {
-            if let Some(option) = option {
-                let _ = option.request_focus();
-            } else {
-                let _ = target.request_focus();
+            if focus_requested {
+                if let Some(option) = option {
+                    let _ = option.request_focus();
+                } else {
+                    let _ = target.request_focus();
+                }
             }
             None
         });
@@ -738,13 +767,14 @@ impl TerminalApp {
         }
         self.set_diagnostics_drawer(None);
         let panel = &mut self.command_reference;
+        panel.cancel_control_lookup();
         let reload = !panel.open || panel.library.is_none();
         panel.open = true;
         panel.draft = None;
         panel.saved_pages.close();
         panel.related_history.clear();
         panel.platform = Some(lookup.platform());
-        panel.focus = panel.focus.wrapping_add(1);
+        panel.request_focus();
         panel.set_query(lookup.executable().to_owned());
         panel.mode = SearchMode::PreferredExact;
         panel.selected = 0;
@@ -755,6 +785,89 @@ impl TerminalApp {
         } else if !panel.loading {
             panel.resolve_command_lookup();
         }
+    }
+
+    pub(super) fn control_open_reference(
+        &mut self,
+        query: String,
+        platform: Option<Platform>,
+        reply: ControlReply,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if reply.is_closed() {
+            return;
+        }
+        let platform = platform.unwrap_or_else(|| self.reference_platform());
+        let panel = &mut self.command_reference;
+        if panel.subpanel_open() || panel.draft.is_some() {
+            let _ = reply.send(Err(
+                "Close the Command reference editor before opening a manual".into(),
+            ));
+        } else if panel
+            .control_lookup
+            .as_ref()
+            .is_some_and(|lookup| !lookup.reply.is_closed())
+        {
+            let _ = reply.send(Err("A Command reference lookup is already loading".into()));
+        } else if panel.open && panel.library.is_some() {
+            self.finish_control_reference(
+                ControlLookup {
+                    query,
+                    platform,
+                    reply,
+                },
+                ctx,
+            );
+        } else {
+            panel.control_lookup = Some(ControlLookup {
+                query,
+                platform,
+                reply,
+            });
+            self.start_reference_load(false, ctx);
+        }
+    }
+
+    fn finish_control_reference(&mut self, lookup: ControlLookup, ctx: &ComponentContext<Self>) {
+        if lookup.reply.is_closed() {
+            return;
+        }
+        let result = (|| -> anyhow::Result<serde_json::Value> {
+            let auto = self.reference_platform();
+            let panel = &self.command_reference;
+            anyhow::ensure!(
+                !panel.subpanel_open() && panel.draft.is_none(),
+                "Close the Command reference editor before opening a manual"
+            );
+            let key = panel
+                .library
+                .as_ref()
+                .and_then(|library| library.catalog.exact(&lookup.query, lookup.platform))
+                .with_context(|| {
+                    format!(
+                        "No offline manual for {:?} on {}",
+                        lookup.query, lookup.platform.1
+                    )
+                })?;
+            let result = serde_json::json!({
+                "window_id": self.registry.window_id(),
+                "command": key.name,
+                "platform": key.platform.0,
+            });
+            self.set_diagnostics_drawer(None);
+            let panel = &mut self.command_reference;
+            panel.saved_pages.close();
+            if !panel.open {
+                panel.open = true;
+                panel.saved_pages.refresh(ctx);
+            }
+            panel.focus = None;
+            panel.set_page(key, auto);
+            Ok(result)
+        })();
+        let _ = lookup
+            .reply
+            .send(result.map_err(|error| format!("{error:#}")));
     }
 
     fn reference_tool_target(&self) -> Option<(ToolPane, &Session)> {
@@ -952,11 +1065,12 @@ impl TerminalApp {
                 if panel.subpanel_open() {
                     return;
                 }
+                panel.cancel_control_lookup();
                 let was_open = panel.open;
                 panel.open = true;
                 panel.draft = None;
                 panel.command_lookup = None;
-                panel.focus = panel.focus.wrapping_add(1);
+                panel.request_focus();
                 if let Some(text) = selected {
                     panel.related_history.clear();
                     let lookup =
@@ -976,12 +1090,14 @@ impl TerminalApp {
             Action::Close => panel.close(),
             Action::Query(text) => {
                 if panel.set_query(text) {
+                    panel.cancel_control_lookup();
                     panel.related_history.clear();
                 }
             }
             Action::Platform(Some(index)) => {
                 let platform = PLATFORMS.get(index.wrapping_sub(1)).copied();
                 if panel.platform != platform {
+                    panel.cancel_control_lookup();
                     panel.platform = platform;
                     panel.command_lookup = None;
                     panel.related_history.clear();
@@ -1033,11 +1149,12 @@ impl TerminalApp {
                     panel.set_query(tool.name.clone());
                     panel.mode = SearchMode::PreferredExact;
                     panel.platform = None;
-                    panel.focus = panel.focus.wrapping_add(1);
+                    panel.request_focus();
                 }
             }
             Action::Loaded(result) => {
                 panel.loading = false;
+                let mut control_lookup = panel.control_lookup.take();
                 match result {
                     Ok(library) => {
                         panel.library = Some(library);
@@ -1046,6 +1163,9 @@ impl TerminalApp {
                         panel.draft = None;
                     }
                     Err(err) => {
+                        if let Some(lookup) = control_lookup.take() {
+                            let _ = lookup.reply.send(Err(err.clone()));
+                        }
                         panel.error = Some(if panel.library.is_some() {
                             format!("Keeping the current pages. {err}")
                         } else {
@@ -1054,6 +1174,9 @@ impl TerminalApp {
                     }
                 }
                 panel.resolve_command_lookup();
+                if let Some(lookup) = control_lookup {
+                    self.finish_control_reference(lookup, ctx);
+                }
             }
         }
     }

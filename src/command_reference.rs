@@ -48,6 +48,14 @@ pub const PLATFORMS: &[Platform] = &[
     Platform("sunos", "SunOS"),
 ];
 
+pub fn parse_platform(name: &str) -> Result<Platform> {
+    PLATFORMS
+        .iter()
+        .copied()
+        .find(|platform| platform.0.eq_ignore_ascii_case(name))
+        .with_context(|| format!("unknown command reference platform {name:?}"))
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Key {
     pub platform: Platform,

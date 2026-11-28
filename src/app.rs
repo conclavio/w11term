@@ -6975,6 +6975,13 @@ impl Component for TerminalApp {
             Message::Control(w11term::control::UiRequest::OpenDiagnostic { launch, reply }) => {
                 self.control_open_diagnostic(launch, reply, context);
             }
+            Message::Control(w11term::control::UiRequest::OpenCommandReference {
+                query,
+                platform,
+                reply,
+            }) => {
+                self.control_open_reference(query, platform, reply, context);
+            }
             Message::Control(w11term::control::UiRequest::TabAppearance {
                 tab_id,
                 change,

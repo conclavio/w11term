@@ -118,6 +118,6 @@ impl Panel {
         }
         self.command_lookup = None;
         self.draft = None;
-        self.focus = self.focus.wrapping_add(1);
+        self.request_focus();
     }
 }

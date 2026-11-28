@@ -209,6 +209,14 @@ an error. A retry after the update captures the newly committed text.
 .\target\release\w11term-cli.exe command-reference 'comparative benchmark' --platform linux --search
 ```
 
+`open-command-reference QUERY [--window ID] [--platform PLATFORM]` opens an exact manual in the side panel of a running instance. Use `list-windows` to find the target ID. With no `--window`, the request uses the instance's most recently active window. With no `--platform`, it prefers the target window's selected pane's platform, with a Common fallback. It keeps the active tab and desktop focus in place and sends no shell input. A missing manual or an open Command reference editor produces a failed reply.
+
+```powershell
+& $ctl --pid 12345 open-command-reference 'git checkout' --window 2 --platform linux
+```
+
+The pipe verb is `open-command-reference`. Its fields are `query` and optionally `window_id` and `platform`. The JSON result includes the resolved `window_id`, canonical `command`, and actual `platform`.
+
 ## Pipe protocol, version 1
 
 Each GUI owns `\\.\pipe\w11term-<pid>` and publishes `%LOCALAPPDATA%\w11term\instances\<pid>.json`:

@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State,
-      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames','CliTabAppearance','CliRepairWorkspace')][string]$FirstClose)
+      [Parameter(Mandatory)][ValidateSet('Origin','Destination','Existing','AllTabs','Context','Search','PaneSearch','TextSearch','PaneMove','PaneWindow','WindowName','WindowSearch','ProfileWindow','DuplicateWindow','WorkspaceWindow','ManageWorkspace','ReplaceWorkspace','CopyWorkspace','RepairWorkspace','CliWindows','CliCommandReference','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames','CliTabAppearance','CliRepairWorkspace')][string]$FirstClose)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
 . (Join-Path $PSScriptRoot 'support/tab-context.ps1')
@@ -1585,6 +1585,59 @@ function Test-ControlSaveWorkspace {
     Close-FixtureWindow $origin
 }
 
+function Test-ControlCommandReference {
+    $before = Control @('list-tabs','--window',"$($ssh.window_id)")
+    $local = Control @('open','--profile','Destination PowerShell','--new-window')
+    $child = Wait-DetachedWindow $origin
+    Expect-Text $local.pane 'PS '
+    Expect-Focus $child $local.pane 'PowerShell has focus before opening the SSH manual' -PrepareWindow
+
+    $remote = Control @('open-command-reference','fleet route','--window',"$($ssh.window_id)")
+    if ($remote.window_id -ne $ssh.window_id -or $remote.command -cne 'fleet-route' -or
+        $remote.platform -cne 'linux') {
+        throw "The background lookup picked the wrong manual: $($remote | ConvertTo-Json -Compress)"
+    }
+    $null = Wait-Until 'the private Linux manual is visible in the background window' {
+        Find-Here $origin 'Linux fleet runbook'
+    }
+    Expect-Focus $child $local.pane 'The background manual leaves the PowerShell window focused'
+    $after = Control @('list-tabs','--window',"$($ssh.window_id)")
+    if ((ConvertTo-Json -InputObject $after -Depth 12 -Compress) -cne
+        (ConvertTo-Json -InputObject $before -Depth 12 -Compress)) {
+        throw 'Opening the manual changed the selected SSH tab or its layout'
+    }
+
+    $default = Control @('open-command-reference','Get-ChildItem')
+    if ($default.window_id -ne $local.window_id -or $default.command -cne 'get-childitem' -or
+        $default.platform -cne 'windows') {
+        throw 'The default window lookup did not use the active PowerShell pane'
+    }
+    $field = Wait-Until 'the foreground manual search box' { Find-Here $child 'Search command reference' }
+    if ($field.Current.HasKeyboardFocus) { throw 'Opening the foreground manual focused the search box' }
+
+    $portable = Control @('open-command-reference','git checkout','--window',"$($local.window_id)",'--platform','linux')
+    if ($portable.window_id -ne $local.window_id -or $portable.command -cne 'git-checkout' -or
+        $portable.platform -cne 'common') {
+        throw 'The explicit Linux lookup did not fall back to the Common manual'
+    }
+    $missing = & $Cli --pid $app.Id open-command-reference 'no fixture manual' --window "$($local.window_id)" | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $missing.ok -or $missing.error -notlike 'No offline manual*') {
+        throw 'A missing manual did not return a failed JSON reply'
+    }
+    $badWindow = & $Cli --pid $app.Id open-command-reference 'git checkout' --window 999999 | ConvertFrom-Json
+    if ($LASTEXITCODE -eq 0 -or $badWindow.ok -or $badWindow.error -cne 'unknown window 999999') {
+        throw 'An unknown window did not return a failed JSON reply'
+    }
+    $null = Wait-Until 'the last successful lookup remains open' {
+        $field = Find-Here $child 'Search command reference'
+        $field -and $field.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value -ceq 'git-checkout'
+    }
+    Expect-Focus $child $local.pane 'The PowerShell pane keeps focus after opening the manual'
+    $null = Shell-State $local.pane 'manualKeyboard' $child -Init
+    Close-FixtureWindow $child
+    Close-FixtureWindow $origin
+}
+
 function Test-ControlWorkspace {
     $window = $origin
     $field = Open-ProfileWindowPicker $origin -FromPalette
@@ -2268,9 +2321,10 @@ try {
         }
         return
     }
-    if ($FirstClose -in @('CliWindows','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames','CliTabAppearance','CliRepairWorkspace')) {
+    if ($FirstClose -in @('CliWindows','CliCommandReference','CliWorkspace','CliWorkspaceWindow','CliProfiles','CliSplit','CliMove','CliPaneView','CliLayout','CliResizeSplit','CliSaveWorkspace','CliMoveTab','CliTabOrder','CliTerminalNames','CliTabAppearance','CliRepairWorkspace')) {
         switch ($FirstClose) {
             'CliWindows' { Test-ExplicitControlWindow }
+            'CliCommandReference' { Test-ControlCommandReference }
             'CliWorkspace' { Test-ControlWorkspace }
             'CliWorkspaceWindow' { Test-ControlWorkspaceWindow }
             'CliProfiles' { Test-ControlProfileWindows }

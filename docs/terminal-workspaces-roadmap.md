@@ -388,6 +388,8 @@ Follow a **See also** link to another offline manual. Links prefer the chosen pl
 
 Use `w11term-cli command-reference` for exact offline lookup or ranked task search from a shell. It reads the same bundled or cached pages and private overrides as the side panel. [CLI examples](../CONTROL.md#offline-command-reference)
 
+Use `open-command-reference` over the control pipe to open an offline manual in a chosen w11term window while you keep working in the foreground. The target pane supplies the preferred platform unless the request specifies one. [Control options](../CONTROL.md#offline-command-reference)
+
 **Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
 
 ## Managed SSH utilities

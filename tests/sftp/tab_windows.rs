@@ -131,6 +131,12 @@ async fn native_cli_opens_profiles_in_an_explicit_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens offline manuals in foreground and background windows without changing focus or sending terminal input"]
+async fn native_cli_opens_command_reference_without_taking_focus() {
+    run("CliCommandReference", b"").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "restores a saved SSH and PowerShell layout in a background native window through the CLI"]
 async fn native_cli_opens_a_saved_workspace_in_an_explicit_window() {
     run("CliWorkspace", b"targeted-workspace/original-workspace/").await;
@@ -228,6 +234,15 @@ async fn run(first_close: &str, expected_wire: &[u8]) {
     let state = tempfile::tempdir().unwrap();
     let data = state.path().join("data");
     fs::create_dir(&data).unwrap();
+    if first_close == "CliCommandReference" {
+        let pages = data.join("command-reference").join("pages").join("linux");
+        fs::create_dir_all(&pages).unwrap();
+        fs::write(
+            pages.join("fleet-route.md"),
+            "# Linux fleet runbook\n\n> Review the fleet routing table.\n\n- Show the table:\n\n`fleet-route --show`\n",
+        )
+        .unwrap();
+    }
     if matches!(first_close, "ProfileWindow" | "CliProfiles") {
         fs::write(
             data.join("windows.json"),

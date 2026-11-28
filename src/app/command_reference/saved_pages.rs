@@ -68,6 +68,7 @@ impl TerminalApp {
         let auto = self.reference_platform();
         self.set_diagnostics_drawer(None);
         let panel = &mut self.command_reference;
+        panel.cancel_control_lookup();
         panel.open = true;
         panel.library = Some(library);
         panel.error = None;

@@ -148,6 +148,17 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                 );
                 return Ok(Invocation::new(pid, diagnostics::parse(args)?));
             }
+            command_reference::OPEN_VERB if verb.is_none() => {
+                ensure!(
+                    pane.is_none()
+                        && payload.is_none()
+                        && path.is_none()
+                        && !no_paste
+                        && connection_generation.is_none(),
+                    "open-command-reference accepts --pid before the command"
+                );
+                return Ok(Invocation::new(pid, command_reference::parse_open(args)?));
+            }
             "preview-cpu-profile" | "capture-cpu-profile" if verb.is_none() => {
                 ensure!(
                     payload.is_none() && path.is_none() && !no_paste,
@@ -339,6 +350,7 @@ async fn main() -> ExitCode {
         );
         println!("\n{}", diagnostics::HELP);
         println!("\n{}", command_reference::HELP);
+        println!("{}", command_reference::OPEN_HELP);
         return ExitCode::SUCCESS;
     }
     if args == ["fetch-tool-bundle", "--help"] || args == ["fetch-tool-bundle", "-h"] {
@@ -347,6 +359,12 @@ async fn main() -> ExitCode {
     }
     if args == ["open-diagnostic", "--help"] || args == ["open-diagnostic", "-h"] {
         println!("{}", diagnostics::HELP);
+        return ExitCode::SUCCESS;
+    }
+    if args == [command_reference::OPEN_VERB, "--help"]
+        || args == [command_reference::OPEN_VERB, "-h"]
+    {
+        println!("{}", command_reference::OPEN_HELP);
         return ExitCode::SUCCESS;
     }
     if let Some(exit) = offline::run(&args) {
