@@ -1418,6 +1418,20 @@ Both steps use the normal profile catalog unless you supply `--profiles PATH`. T
 
 In the Windows editor, select the revision under **SSH dotfiles** and choose **Roll out to saved profiles**. Check the saved profiles you intend to update. **Review selected rollout profiles** shows their accounts, previous bundle paths and pins, proposed shell digests, and expandable environment and prompt line changes. If the baseline is missing or no longer matches its pin, the review shows the proposed lines. **Apply reviewed rollout** saves that selection with the same stale-input checks as the CLI.
 
+To keep a CLI rollout reversible, save the JSON reply from the successful apply. `rollback-dotfiles-profiles` previews the previous bundle paths and pins for the profiles that rollout changed. It uses the catalog recorded in the reply and rejects the whole batch if any of those approvals have since changed. The preview reports whether each previous bundle is available and whether it matches its saved pin. Rollback restores the prior approvals even if a previous bundle is missing. Login sync checks the restored approval and bundle when a new SSH session opens.
+
+```powershell
+& $ctl @rollout --review $preview.result.review | Set-Content -Encoding utf8 '.\rollout-reply.json'
+$rollback = & $ctl rollback-dotfiles-profiles '.\rollout-reply.json' | ConvertFrom-Json
+$rollback.result.profiles
+```
+
+After reviewing the restored approvals, apply the rollback with its own token.
+
+```powershell
+& $ctl rollback-dotfiles-profiles '.\rollout-reply.json' --review $rollback.result.review
+```
+
 Select **Pin approved dotfile version** before approving to record the digest of the selected shell's environment and startup fragments. If the local bundle later produces a different digest, login sync skips the update and the SSH shell still opens. Approve and save the revised bundle to update the pin. Clear the checkbox, approve, and save to follow future edits to the local bundle. Existing approvals keep following the file until you pin them.
 
 The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. An optional `bundle_sha256` field stores the pin shown in the editor. Set `zdotdir` for a custom Zsh directory or `fish_config_dir` for a custom Fish directory under the approved home. If you move an existing configuration, review startup hook repair at the new location before resuming automatic updates.

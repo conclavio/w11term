@@ -8,7 +8,7 @@ use std::{
 use w11term::{
     control::Reply,
     options::{SshOptions, default_profiles_path},
-    profiles::ProfileStore,
+    profiles::{ProfileStore, rollback_dotfile_rollout},
     sftp::{DotfileBundle, DotfileShell},
 };
 
@@ -16,6 +16,9 @@ pub(super) const VERB: &str = "audit-dotfiles-profiles";
 pub(super) const HELP: &str = "w11term-cli audit-dotfiles-profiles [--profiles CATALOG] [--profile NAME] [--candidate BUNDLE]";
 pub(super) const ROLLOUT_VERB: &str = "rollout-dotfiles-profiles";
 pub(super) const ROLLOUT_HELP: &str = "w11term-cli rollout-dotfiles-profiles --candidate BUNDLE --profile NAME [--profile NAME ...] [--profiles CATALOG] [--review TOKEN]";
+pub(super) const ROLLBACK_VERB: &str = "rollback-dotfiles-profiles";
+pub(super) const ROLLBACK_HELP: &str =
+    "w11term-cli rollback-dotfiles-profiles ROLLOUT-REPLY.json [--review TOKEN]";
 
 type Versions = Vec<(DotfileShell, String)>;
 type BundleCache = HashMap<PathBuf, Result<Versions, String>>;
@@ -108,6 +111,18 @@ pub(super) fn rollout(args: &[String], output: &mut dyn Write) -> Result<()> {
         &mut *output,
         &Reply::from_result(Ok(serde_json::to_value(result)?)),
     )?;
+    writeln!(output)?;
+    Ok(())
+}
+
+pub(super) fn rollback(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let (path, review) = match args {
+        [path] => (path, None),
+        [path, flag, token] if flag == "--review" => (path, Some(token.as_str())),
+        _ => bail!("Provide the saved rollout reply and optionally --review TOKEN"),
+    };
+    let reply = Reply::from_result(Ok(rollback_dotfile_rollout(Path::new(path), review)?));
+    serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;
     Ok(())
 }

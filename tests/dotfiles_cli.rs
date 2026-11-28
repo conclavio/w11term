@@ -690,6 +690,14 @@ fn rollout(root: &Path, args: &[&str]) -> std::process::Output {
     cli(root, "rollout-dotfiles-profiles", &options)
 }
 
+fn rollback(root: &Path, review: Option<&str>) -> std::process::Output {
+    let mut args = vec!["rollout-reply.json"];
+    if let Some(review) = review {
+        args.extend(["--review", review]);
+    }
+    cli(root, "rollback-dotfiles-profiles", &args)
+}
+
 #[test]
 fn reviewed_rollout_updates_only_named_approvals_and_retains_pin_policy() {
     let directory = tempfile::tempdir().unwrap();
@@ -781,6 +789,39 @@ fn reviewed_rollout_updates_only_named_approvals_and_retains_pin_policy() {
         ],
     ));
     assert_eq!(fs::read_to_string(&catalog).unwrap(), after);
+
+    fs::write(
+        root.join("rollout-reply.json"),
+        format!("\u{feff}{applied}"),
+    )
+    .unwrap();
+    let undo = reply(rollback(root, None));
+    assert_eq!(undo["result"]["applied"], false);
+    assert_eq!(
+        undo["result"]["profiles"][0]["restore_status"],
+        "matches-pin"
+    );
+    assert_eq!(
+        undo["result"]["profiles"][1]["restore_status"],
+        "follows-file"
+    );
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), after);
+    let undo_token = undo["result"]["review"].as_str().unwrap();
+    let receipt = reply(rollback(root, Some(undo_token)));
+    assert_eq!(receipt["result"]["applied"], true);
+    assert_eq!(receipt["result"]["changed_profiles"], 2);
+    let mut restored = original.clone();
+    restored["profiles"]["East"]["dotfiles"]["bundle"] =
+        undo["result"]["profiles"][0]["restore"]["bundle"].clone();
+    restored["profiles"]["West"]["dotfiles"]["bundle"] =
+        undo["result"]["profiles"][1]["restore"]["bundle"].clone();
+    let after_undo = fs::read_to_string(&catalog).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&after_undo).unwrap(),
+        restored
+    );
+    assert_eq!(rollback(root, Some(undo_token)).status.code(), Some(1));
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), after_undo);
 }
 
 #[test]
@@ -854,4 +895,69 @@ fn rollout_rejects_stale_inputs_ineligible_profiles_and_concurrent_writers() {
     assert_eq!(busy.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&busy.stderr).contains("Another window is updating profiles"));
     assert_eq!(fs::read_to_string(&catalog).unwrap(), original.to_string());
+}
+
+#[test]
+fn rollback_checks_the_applied_receipt_approvals_and_reviewed_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let catalog = root.join("profiles.json");
+    let original = root.join("previous.json");
+    let receipt = root.join("rollout-reply.json");
+    let old = br#"{"version":1,"bash":"PS1=old"}"#;
+    let revision = br#"{"version":1,"bash":"PS1=revision"}"#;
+    fs::write(
+        &catalog,
+        json!({"profiles": {
+            "East": ssh_profile("bash", "previous.json", None),
+            "West": ssh_profile("bash", "missing.json", None),
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(&original, old).unwrap();
+    fs::write(root.join("revision.json"), revision).unwrap();
+    let rollout_preview = reply(rollout(root, &["--profile", "East", "--profile", "West"]));
+    fs::write(&receipt, rollout_preview.to_string()).unwrap();
+    let rejected = rollback(root, None);
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("applied dotfile rollout"));
+    let rollout_token = rollout_preview["result"]["review"].as_str().unwrap();
+    let applied = reply(rollout(
+        root,
+        &[
+            "--profile",
+            "East",
+            "--profile",
+            "West",
+            "--review",
+            rollout_token,
+        ],
+    ));
+    fs::write(&receipt, applied.to_string()).unwrap();
+    let rolled_out_catalog = fs::read_to_string(&catalog).unwrap();
+
+    let preview = reply(rollback(root, None));
+    assert_eq!(
+        preview["result"]["profiles"][1]["restore_status"],
+        "bundle-unavailable"
+    );
+    let token = preview["result"]["review"].as_str().unwrap();
+    fs::write(&original, br#"{"version":1,"bash":"PS1=changed"}"#).unwrap();
+    let changed = rollback(root, Some(token));
+    assert_eq!(changed.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("Preview the rollback again"));
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), rolled_out_catalog);
+
+    fs::write(&original, old).unwrap();
+    let mut edited: Value = serde_json::from_str(&rolled_out_catalog).unwrap();
+    edited["profiles"]["West"]["dotfiles"]["home"] = json!("/home/other");
+    fs::write(&catalog, edited.to_string()).unwrap();
+    let stale = rollback(root, Some(token));
+    assert_eq!(stale.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&stale.stderr)
+            .contains("West no longer matches the applied rollout")
+    );
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), edited.to_string());
 }

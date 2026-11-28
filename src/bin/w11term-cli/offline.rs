@@ -23,6 +23,9 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
         dotfile_profiles::ROLLOUT_VERB => {
             (dotfile_profiles::ROLLOUT_HELP, dotfile_profiles::rollout)
         }
+        dotfile_profiles::ROLLBACK_VERB => {
+            (dotfile_profiles::ROLLBACK_HELP, dotfile_profiles::rollback)
+        }
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
         syscall_capture::INSPECT_VERB => (
             syscall_capture::INSPECT_HELP,

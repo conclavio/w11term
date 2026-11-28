@@ -5,13 +5,16 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+mod rollback;
+pub use rollback::rollback_dotfile_rollout;
 
 #[derive(Serialize)]
 struct Rollout<'a> {
@@ -164,18 +167,33 @@ impl<'a> Rollout<'a> {
 
     fn apply(&self, profiles: &mut Map<String, Value>) -> Result<()> {
         for entry in self.profiles.iter().filter(|entry| entry.changed) {
-            let dotfiles = profiles
-                .get_mut(&entry.profile)
-                .and_then(|profile| profile.get_mut("dotfiles"))
-                .and_then(Value::as_object_mut)
-                .context("The reviewed dotfiles approval is missing")?;
-            dotfiles.insert("bundle".into(), serde_json::to_value(self.candidate)?);
-            if let Some(pin) = &entry.next_pin {
-                dotfiles.insert("bundle_sha256".into(), json!(pin));
-            }
+            write_binding(
+                profiles,
+                &entry.profile,
+                self.candidate,
+                entry.next_pin.as_deref(),
+            )?;
         }
         Ok(())
     }
+}
+
+fn write_binding(
+    profiles: &mut Map<String, Value>,
+    name: &str,
+    path: &Path,
+    pin: Option<&str>,
+) -> Result<()> {
+    let dotfiles = profiles
+        .get_mut(name)
+        .and_then(|profile| profile.get_mut("dotfiles"))
+        .and_then(Value::as_object_mut)
+        .context("The reviewed dotfiles approval is missing")?;
+    dotfiles.insert("bundle".into(), serde_json::to_value(path)?);
+    if let Some(pin) = pin {
+        dotfiles.insert("bundle_sha256".into(), pin.into());
+    }
+    Ok(())
 }
 
 impl ProfileStore {
