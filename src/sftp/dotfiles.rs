@@ -222,22 +222,46 @@ impl DotfileBundle {
         crate::transcript::save(path, &contents, false)
     }
 
+    pub fn append_fragment_from_file(path: &Path, existing: &str) -> Result<String> {
+        use std::io::Read;
+        // Each LF can have a CR prefix, and a UTF-8 file may begin with a BOM.
+        const MAX_FILE_BYTES: usize = 2 * MAX_FRAGMENT_BYTES + 3;
+        ensure!(
+            std::fs::metadata(path)?.is_file(),
+            "Choose a regular shell fragment file"
+        );
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take((MAX_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= MAX_FILE_BYTES,
+            "Shell fragment file is too large"
+        );
+        let imported = std::str::from_utf8(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes))
+            .context("Shell fragment files must use UTF-8")?
+            .replace("\r\n", "\n");
+        ensure!(
+            !imported.is_empty(),
+            "The selected shell fragment file is empty"
+        );
+        validate_fragment(&imported)?;
+        let mut appended = existing.to_owned();
+        if !appended.is_empty() && !appended.ends_with('\n') {
+            appended.push('\n');
+        }
+        appended.push_str(&imported);
+        validate_fragment(&appended)?;
+        Ok(appended)
+    }
+
     fn validate_fragments(&self) -> Result<()> {
         ensure!(self.version == 1, "Unsupported dotfiles bundle version");
         for fragment in [&self.environment, &self.bash, &self.zsh]
             .into_iter()
             .flatten()
         {
-            ensure!(
-                fragment.len() <= MAX_FRAGMENT_BYTES
-                    && !fragment.contains('\0')
-                    && !fragment.starts_with('\u{feff}'),
-                "Dotfile fragments must be at most 16 KiB of UTF-8 without NUL or a BOM"
-            );
-            ensure!(
-                !fragment.replace("\r\n", "\n").contains('\r'),
-                "Dotfile fragments must use LF or CRLF line endings"
-            );
+            validate_fragment(fragment)?;
         }
         Ok(())
     }
@@ -255,6 +279,20 @@ impl DotfileBundle {
             payload(self.prompt(shell)),
         ]
     }
+}
+
+fn validate_fragment(fragment: &str) -> Result<()> {
+    ensure!(
+        fragment.len() <= MAX_FRAGMENT_BYTES
+            && !fragment.contains('\0')
+            && !fragment.starts_with('\u{feff}'),
+        "Dotfile fragments must be at most 16 KiB of UTF-8 without NUL or a BOM"
+    );
+    ensure!(
+        !fragment.replace("\r\n", "\n").contains('\r'),
+        "Dotfile fragments must use LF or CRLF line endings"
+    );
+    Ok(())
 }
 
 pub fn validate_zdotdir(shell: DotfileShell, zdotdir: Option<&str>) -> Result<()> {
@@ -992,6 +1030,42 @@ fn remote_parent(path: &str) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_utf8_shell_fragments_on_a_new_line_without_changing_the_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".bashrc");
+        let source = "\u{feff}alias café='ls -lh'\r\n# Keep trailing spaces  \r\n";
+        std::fs::write(&path, source).unwrap();
+        assert_eq!(
+            DotfileBundle::append_fragment_from_file(&path, "export EDITOR=vi").unwrap(),
+            "export EDITOR=vi\nalias café='ls -lh'\n# Keep trailing spaces  \n"
+        );
+        assert_eq!(
+            DotfileBundle::append_fragment_from_file(&path, "export EDITOR=vi\n").unwrap(),
+            "export EDITOR=vi\nalias café='ls -lh'\n# Keep trailing spaces  \n"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
+    #[test]
+    fn rejects_invalid_or_oversized_imports_and_caps_the_combined_fragment() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".profile");
+        for invalid in [b"".as_slice(), b"a\0b", b"\xff\xfe", b"a\rb"] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(DotfileBundle::append_fragment_from_file(&path, "").is_err());
+        }
+        assert!(DotfileBundle::append_fragment_from_file(directory.path(), "").is_err());
+
+        let source = "\r\n".repeat(MAX_FRAGMENT_BYTES);
+        std::fs::write(&path, format!("\u{feff}{source}")).unwrap();
+        let imported = DotfileBundle::append_fragment_from_file(&path, "").unwrap();
+        assert_eq!(imported, "\n".repeat(MAX_FRAGMENT_BYTES));
+        assert!(DotfileBundle::append_fragment_from_file(&path, "# local").is_err());
+        std::fs::write(&path, format!("\u{feff}{source}\n")).unwrap();
+        assert!(DotfileBundle::append_fragment_from_file(&path, "").is_err());
+    }
 
     #[test]
     fn saves_new_shell_bundles_without_replacing_the_source() {

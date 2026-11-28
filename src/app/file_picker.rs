@@ -24,6 +24,7 @@ pub(super) enum Purpose {
     CompareLocalFolder,
     SshConfig(PathBuf),
     DotfilesBundle(PathBuf),
+    DotfileFragment(PathBuf),
     SaveDotfilesBundle {
         current: PathBuf,
         suggestion: String,
@@ -261,6 +262,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::FlameGraph { export: false, .. }
                 | Purpose::SshConfig(_)
                 | Purpose::DotfilesBundle(_)
+                | Purpose::DotfileFragment(_)
                 | Purpose::ToolBundle(_)
                 | Purpose::ToolExecutable(_)
                 | Purpose::OpenSshHostList
@@ -583,6 +585,14 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 } else {
                     w!("Choose dotfiles bundle")
                 })?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if let Some(folder) = current.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
+            Purpose::DotfileFragment(current) => {
+                dialog.SetTitle(w!("Choose a shell fragment file"))?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 if let Some(folder) = current.parent() {
                     local_folder(&dialog, folder);

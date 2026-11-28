@@ -1,5 +1,17 @@
 use super::*;
 use anyhow::Context;
+use std::cell::OnceCell;
+
+const FRAGMENTS: [&str; 3] = [
+    "Shared environment fragment",
+    "Bash startup fragment",
+    "Zsh startup fragment",
+];
+const IMPORT_ITEMS: [&str; 3] = [
+    "Append to shared environment",
+    "Append to Bash fragment",
+    "Append to Zsh fragment",
+];
 
 #[derive(Clone)]
 pub enum Action {
@@ -7,6 +19,8 @@ pub enum Action {
     Revise,
     Loaded(Arc<()>, Result<Box<DotfileBundle>, String>),
     Text(Arc<()>, usize, String),
+    Import(Arc<()>, usize),
+    Imported(Arc<()>, Result<Option<String>, String>),
     Save(Arc<()>),
     Saved(Arc<()>, Result<Option<String>, String>),
     Cancel(Arc<()>),
@@ -16,6 +30,7 @@ pub enum Action {
 enum Phase {
     Loading,
     Ready,
+    Importing(usize),
     Saving,
 }
 
@@ -24,12 +39,21 @@ pub(super) struct Editor {
     ticket: Arc<()>,
     source: Option<PathBuf>,
     fragments: [Option<String>; 3],
+    import_menu: OnceCell<Menu>,
     phase: Phase,
     error: Option<String>,
 }
 
 fn message(id: TabId, action: Action) -> Message {
     Message::ProfileDotfiles(id, super::Action::Bundle(action))
+}
+
+fn editor_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r")
+}
+
+fn fragment_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 impl Editor {
@@ -43,6 +67,7 @@ impl Editor {
             ticket: Arc::new(()),
             source,
             fragments: Default::default(),
+            import_menu: OnceCell::new(),
             phase,
             error: None,
         }
@@ -50,15 +75,15 @@ impl Editor {
 
     fn load(&mut self, bundle: DotfileBundle) {
         self.fragments = [bundle.environment, bundle.bash, bundle.zsh]
-            .map(|text| text.map(|text| text.replace("\r\n", "\n").replace('\n', "\r")));
+            .map(|text| text.as_deref().map(editor_text));
         self.phase = Phase::Ready;
     }
 
     fn bundle(&self) -> DotfileBundle {
-        let [environment, bash, zsh] = self.fragments.each_ref().map(|text| {
-            text.as_ref()
-                .map(|text| text.replace("\r\n", "\n").replace('\r', "\n"))
-        });
+        let [environment, bash, zsh] = self
+            .fragments
+            .each_ref()
+            .map(|text| text.as_deref().map(fragment_text));
         DotfileBundle {
             version: 1,
             environment,
@@ -98,14 +123,29 @@ impl Editor {
             ));
         }
         if self.phase != Phase::Loading {
-            for (index, name) in [
-                "Shared environment fragment",
-                "Bash startup fragment",
-                "Zsh startup fragment",
-            ]
-            .into_iter()
-            .enumerate()
-            {
+            let menu = self.import_menu.get_or_init(|| {
+                let ticket = self.ticket.clone();
+                Menu::new(
+                    IMPORT_ITEMS.map(|name| MenuItem::item(name, name)),
+                    ctx.callback(move |name: String| {
+                        IMPORT_ITEMS
+                            .iter()
+                            .position(|item| *item == name)
+                            .map_or(Message::ControlIdle, |index| {
+                                message(id, Action::Import(ticket.clone(), index))
+                            })
+                    }),
+                )
+            });
+            views.push(KeyedView::new(
+                "bundle-editor-import",
+                Button::new()
+                    .automation_name("Import shell fragment")
+                    .is_enabled(self.phase == Phase::Ready)
+                    .content("Import shell fragment")
+                    .menu(menu.clone()),
+            ));
+            for (index, name) in FRAGMENTS.into_iter().enumerate() {
                 let ticket = self.ticket.clone();
                 let text = self.fragments[index].as_deref().unwrap_or_default();
                 views.push(KeyedView::new(
@@ -129,6 +169,7 @@ impl Editor {
         }
         if let Some(status) = self.error.as_deref().or(match self.phase {
             Phase::Loading => Some("Reading the selected dotfiles bundle…"),
+            Phase::Importing(_) => Some("Reading the selected shell fragment…"),
             Phase::Saving => Some("Saving the dotfiles bundle…"),
             _ => None,
         }) {
@@ -155,7 +196,7 @@ impl Editor {
                             "Save dotfiles bundle"
                         }),
                     Button::new()
-                        .is_enabled(self.phase != Phase::Saving)
+                        .is_enabled(matches!(self.phase, Phase::Loading | Phase::Ready))
                         .on_click(send(Action::Cancel(self.ticket.clone())))
                         .content("Cancel dotfiles editing"),
                 )),
@@ -221,6 +262,8 @@ impl super::Editor {
         let ticket = match &action {
             Action::Loaded(ticket, _)
             | Action::Text(ticket, ..)
+            | Action::Import(ticket, _)
+            | Action::Imported(ticket, _)
             | Action::Save(ticket)
             | Action::Saved(ticket, _)
             | Action::Cancel(ticket) => ticket,
@@ -242,6 +285,53 @@ impl super::Editor {
                 if fragment.as_deref().unwrap_or_default() != text {
                     *fragment = (!text.is_empty()).then_some(text);
                     editor.error = None;
+                }
+            }
+            Action::Import(ticket, index) if editor.phase == Phase::Ready => {
+                let Some(owner) = owner else { return };
+                let existing =
+                    fragment_text(editor.fragments[index].as_deref().unwrap_or_default());
+                let current = editor
+                    .source
+                    .as_deref()
+                    .unwrap_or(profile_catalog)
+                    .to_owned();
+                editor.phase = Phase::Importing(index);
+                editor.error = None;
+                let rejected = message(
+                    id,
+                    Action::Imported(ticket.clone(), Err("Fragment import unavailable".into())),
+                );
+                ctx.spawn_background_with_rejection(
+                    move |cancel| {
+                        let result = (|| {
+                            let Some(file) = file_picker::pick(
+                                owner,
+                                file_picker::Purpose::DotfileFragment(current),
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            if cancel.is_cancelled() {
+                                return Ok(None);
+                            }
+                            DotfileBundle::append_fragment_from_file(&file.path, &existing)
+                                .map(Some)
+                        })()
+                        .map_err(|error| format!("Importing shell fragment: {error:#}"));
+                        message(id, Action::Imported(ticket, result))
+                    },
+                    rejected,
+                );
+            }
+            Action::Imported(_, result) => {
+                if let Phase::Importing(index) = editor.phase {
+                    editor.phase = Phase::Ready;
+                    match result {
+                        Ok(Some(text)) => editor.fragments[index] = Some(editor_text(&text)),
+                        Ok(None) => {}
+                        Err(error) => editor.error = Some(error),
+                    }
                 }
             }
             Action::Save(ticket) if editor.phase == Phase::Ready => {
@@ -298,7 +388,9 @@ impl super::Editor {
                     Err(error) => editor.error = Some(error),
                 }
             }
-            Action::Cancel(_) if editor.phase != Phase::Saving => self.composer = None,
+            Action::Cancel(_) if matches!(editor.phase, Phase::Loading | Phase::Ready) => {
+                self.composer = None
+            }
             _ => {}
         }
     }
