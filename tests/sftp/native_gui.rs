@@ -27,7 +27,7 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "round-trips syscall settings and reports and opens a stopped native SSH trace"]
+#[ignore = "round-trips syscall settings and reports, then repeats a stopped native SSH trace"]
 async fn native_syscall_capture_reviews_stops_and_opens_the_verified_trace() {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, _, server) =
@@ -46,10 +46,9 @@ async fn native_syscall_capture_reviews_stops_and_opens_the_verified_trace() {
     let request = fs::read_to_string(started).unwrap();
     assert!(request.starts_with("capture 30 1048576 64 'all' '/home/test' '/bin/sh'"));
     assert!(request.ends_with("'one argument' '$literal' '--flag'"));
-    assert_eq!(
-        fs::read(state.path().join("stopped capture.strace")).unwrap(),
-        SYSCALL_FIXTURE
-    );
+    for name in ["stopped capture.strace", "Repeated capture.strace"] {
+        assert_eq!(fs::read(state.path().join(name)).unwrap(), SYSCALL_FIXTURE);
+    }
     assert!(remote.path().join("syscall-verified").is_file());
     assert_eq!(transports.load(Ordering::Relaxed), 1);
     server.abort();

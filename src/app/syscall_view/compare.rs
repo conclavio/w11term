@@ -68,7 +68,7 @@ impl TerminalApp {
         after: Vec<PathBuf>,
         ctx: &ComponentContext<Self>,
     ) {
-        let tab = self.new_saved_syscall_viewer(ctx);
+        let tab = self.new_syscall_viewer(Box::default(), ctx);
         self.read_trace_comparison(tab, Input::Saved { before, after }, ctx);
     }
 

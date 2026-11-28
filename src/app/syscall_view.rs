@@ -91,7 +91,7 @@ impl TerminalApp {
             }
             Action::Open(id) => self.open_syscall_trace(id, None, ctx),
             Action::OpenRecent(paths) => {
-                let tab = self.new_saved_syscall_viewer(ctx);
+                let tab = self.new_syscall_viewer(Box::default(), ctx);
                 self.open_syscall_trace(tab, Some(paths), ctx);
             }
             Action::Apply(id) => self.filter_syscall_trace(id, ctx),
@@ -183,11 +183,11 @@ impl TerminalApp {
         }
     }
 
-    fn new_saved_syscall_viewer(&mut self, ctx: &ComponentContext<Self>) -> TabId {
+    fn new_syscall_viewer(&mut self, page: Box<PageState>, ctx: &ComponentContext<Self>) -> TabId {
         self.set_diagnostics_drawer(None);
         let tab = self.tabs.insert(AppTab {
             label: LABEL.into(),
-            page: Page::SyscallTrace(Box::default()),
+            page: Page::SyscallTrace(page),
         });
         self.sync_selection(ctx);
         self.activate(ctx);

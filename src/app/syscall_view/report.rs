@@ -1,11 +1,13 @@
 use super::capture::text;
 use super::*;
+use w11term::control::SyscallOptions;
 use w11term::ssh::{SyscallCapture, SyscallCaptureReport, verify_syscall_capture_report};
 
 pub enum Action {
     Expanded(TabId, bool),
     Save(TabId),
     Verify(TabId),
+    Repeat(TabId),
     Finished(TabId, Arc<()>, Result<Option<Outcome>, String>),
 }
 
@@ -31,6 +33,21 @@ impl TerminalApp {
             }
             Action::Save(id) => self.choose_syscall_report(id, true, ctx),
             Action::Verify(id) => self.choose_syscall_report(id, false, ctx),
+            Action::Repeat(id) => {
+                if self.tabs.active_id() != Some(id) {
+                    return;
+                }
+                let options = self
+                    .syscall_page(id)
+                    .filter(|page| page.pending.is_none() && !page.capture.open)
+                    .and_then(|page| page.report.options().cloned());
+                if let Some(options) = options
+                    && let Err(error) = self.repeat_syscall_capture(options, ctx)
+                    && let Some(page) = self.syscall_page(id)
+                {
+                    page.status = Some(format!("{error:#}"));
+                }
+            }
             Action::Finished(id, ticket, result) => {
                 let Some(page) = self.syscall_page(id) else {
                     return;
@@ -122,6 +139,17 @@ impl TerminalApp {
 }
 
 impl ViewState {
+    fn options(&self) -> Option<&SyscallOptions> {
+        self.capture
+            .as_deref()
+            .map(SyscallCapture::options)
+            .or_else(|| {
+                self.verified
+                    .as_ref()
+                    .map(|(_, report)| &report.reviewed.options)
+            })
+    }
+
     pub(super) fn view(&self, id: TabId, idle: bool, ctx: &ViewContext<TerminalApp>) -> KeyedView {
         let mut buttons = Vec::new();
         if self.capture.is_some() {
@@ -140,6 +168,17 @@ impl ViewState {
                 .on_click(ctx.callback(move |_| send(super::Action::Report(Action::Verify(id)))))
                 .content("Verify capture report…"),
         ));
+        if self.options().is_some() {
+            buttons.push(KeyedView::new(
+                "repeat",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(
+                        ctx.callback(move |_| send(super::Action::Report(Action::Repeat(id)))),
+                    )
+                    .content("Repeat capture…"),
+            ));
+        }
         let mut fields = vec![KeyedView::new(
             "actions",
             StackPanel::new()

@@ -146,6 +146,12 @@ pub struct Capture {
     reviewed: Box<SyscallCaptureReportReview>,
 }
 
+impl Capture {
+    pub fn options(&self) -> &SyscallOptions {
+        &self.reviewed.options
+    }
+}
+
 impl Target {
     pub fn preview_syscall_capture_blocking(mut self, options: SyscallOptions) -> Result<Plan> {
         crate::ssh::NETWORK.block_on(self.preview_syscall_capture(options))

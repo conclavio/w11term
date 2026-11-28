@@ -214,19 +214,8 @@ impl TerminalApp {
             Action::Open(tab) => {
                 let targets = self.syscall_capture_targets();
                 if let Some(page) = self.syscall_page(tab).filter(|page| page.pending.is_none()) {
-                    let capture = &mut page.capture;
-                    capture.open = true;
+                    page.capture.open(&targets);
                     page.status = None;
-                    if !targets
-                        .iter()
-                        .any(|candidate| Some(candidate.source) == capture.source)
-                    {
-                        capture.source = match targets.as_slice() {
-                            [target] => Some(target.source),
-                            _ => None,
-                        };
-                        capture.review = None;
-                    }
                 }
             }
             Action::Back(tab) => {
@@ -344,6 +333,18 @@ impl TerminalApp {
                 }
             }
         }
+    }
+
+    pub(super) fn repeat_syscall_capture(
+        &mut self,
+        options: SyscallOptions,
+        ctx: &ComponentContext<Self>,
+    ) -> anyhow::Result<()> {
+        let mut page = Box::<PageState>::default();
+        page.capture.inputs = Inputs::from_options(options)?;
+        page.capture.open(&self.syscall_capture_targets());
+        self.new_syscall_viewer(page, ctx);
+        Ok(())
     }
 
     fn syscall_capture_input(&mut self, tab: TabId) -> Option<&mut PageState> {
@@ -557,6 +558,20 @@ pub(super) fn outcome_label(stop_reason: &str, exit_status: Option<u8>) -> Strin
 }
 
 impl ViewState {
+    fn open(&mut self, targets: &[Candidate]) {
+        self.open = true;
+        if !targets
+            .iter()
+            .any(|candidate| Some(candidate.source) == self.source)
+        {
+            self.source = match targets {
+                [target] => Some(target.source),
+                _ => None,
+            };
+            self.review = None;
+        }
+    }
+
     pub(super) fn offer(&mut self, source: Option<Connection>) {
         if !self.open && self.review.is_none() && source.is_some() {
             self.source = source;
