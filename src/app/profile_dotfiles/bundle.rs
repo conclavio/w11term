@@ -4,7 +4,6 @@ use anyhow::Context;
 use std::cell::OnceCell;
 
 mod remote_excerpt;
-mod shell_integration;
 
 const FRAGMENTS: [&str; 5] = [
     "Shared environment fragment",
@@ -142,7 +141,7 @@ impl Editor {
             DotfileShell::Fish => 4,
         };
         let existing = fragment_text(self.fragments[index].as_deref().unwrap_or_default());
-        self.status = Some(match shell_integration::insert(&existing, setup) {
+        self.status = Some(match setup.insert(&existing) {
             Ok(updated) if updated == existing => {
                 format!("{} already includes this setup.", FRAGMENTS[index])
             }

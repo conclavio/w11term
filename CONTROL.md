@@ -1359,6 +1359,12 @@ In either editor, **Import shell fragment** appends a local UTF-8 file to the se
 
 Use **Add shell setup** to append the bundled Bash, Zsh, or Fish setup after the existing startup fragment. Choose **Directory reporting only** when your prompt already emits semantic markers, or choose **Directory and prompt integration** to enable directory reporting, prompt navigation, command history, and completion alerts. The inserted code stays editable. Selecting another mode for the same shell replaces an intact generated block. Saving writes a new bundle that you can review and approve for SSH sync.
 
+Use `save-dotfiles-bundle --shell bash|zsh|fish --setup directory|full` to draft the same setup offline. Pass `--from-bundle PATH` to revise an existing bundle. The command uses LF line endings in the updated startup fragment and keeps the other fragments. With `--output-file PATH` it saves a new file and returns its absolute path. Omit that option to print the bundle JSON. Review the result before approving it for an account.
+
+```powershell
+& $ctl save-dotfiles-bundle --shell fish --setup full --from-bundle '.\fleet.json' --output-file '.\fleet-with-fish-setup.json'
+```
+
 From the full text preview of an SSH file, **Use in dotfiles editor** brings a snapshot into the connected profile's draft. It opens a new bundle draft if there is no editor open for that profile. Choose the first and last lines and use **Append SSH lines** to select the destination fragment. Select lines outside existing w11term startup blocks. Saving creates a local bundle. Using the bundle on login still requires profile approval and saving.
 
 Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.

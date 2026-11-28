@@ -5091,7 +5091,7 @@ impl TerminalApp {
             if live.session.is_direct_ssh_shell()
                 || matches!(&live.source, Source::Local(shell) if shell.wsl_distribution().is_some())
             {
-                items.extend(shell_setup::Setup::menu_items());
+                items.extend(shell_setup::menu_items());
             }
             items.push(self.rename_pane_item());
             if pane_colors::available(live) {
@@ -6401,7 +6401,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::CopyShellSetup(setup) => {
-                if let Err(error) = setup.copy() {
+                if let Err(error) = shell_setup::copy(setup) {
                     self.window_error = Some(format!("Couldn’t copy the shell setup. {error:#}"));
                 }
             }

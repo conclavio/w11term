@@ -28,6 +28,7 @@ pub mod saved_reference_pages;
 pub mod search;
 pub mod session;
 pub mod sftp;
+pub mod shell_setup;
 pub mod shortcuts;
 pub mod sound;
 pub mod ssh;

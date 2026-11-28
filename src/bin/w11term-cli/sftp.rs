@@ -68,7 +68,7 @@ destination. Single files can be replaced with --overwrite. Uploads can leave a 
 file or folder after interruption. Handles are pane-local\n\
 and expire after five idle minutes, timeout, or disconnect. Replies contain result.sftp.";
 
-fn dotfile_shell(value: Option<&str>) -> Result<DotfileShell> {
+pub(super) fn dotfile_shell(value: Option<&str>) -> Result<DotfileShell> {
     match value {
         Some("bash") => Ok(DotfileShell::Bash),
         Some("zsh") => Ok(DotfileShell::Zsh),

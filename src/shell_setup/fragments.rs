@@ -1,7 +1,7 @@
-use crate::app::shell_setup::Setup;
+use super::Setup;
+use crate::sftp::DotfileBundle;
 use anyhow::{Context, Result, ensure};
 use std::ops::Range;
-use w11term::sftp::DotfileBundle;
 
 const BEGIN: &str = "# >>> w11term shell setup >>>";
 const END: &str = "# <<< w11term shell setup <<<";

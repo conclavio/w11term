@@ -15,6 +15,8 @@ mod command_reference;
 mod cpu_profile;
 #[path = "w11term-cli/diagnostics.rs"]
 mod diagnostics;
+#[path = "w11term-cli/dotfiles.rs"]
+mod dotfiles;
 #[path = "w11term-cli/offline.rs"]
 mod offline;
 #[path = "w11term-cli/packet_capture.rs"]
@@ -352,6 +354,7 @@ async fn main() -> ExitCode {
         );
         println!("\n{}", diagnostics::HELP);
         println!("\n{}", command_reference::HELP);
+        println!("\n{}", dotfiles::HELP);
         println!("{}", command_reference::OPEN_HELP);
         return ExitCode::SUCCESS;
     }
