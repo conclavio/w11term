@@ -3,7 +3,8 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
 . (Join-Path $PSScriptRoot 'support/mixed-tab-layout.ps1')
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
-$menu = [System.Windows.Automation.ControlType]::MenuItem
+$tabItem = [System.Windows.Automation.ControlType]::TabItem
+$selection = [System.Windows.Automation.SelectionItemPattern]::Pattern
 $edit = [System.Windows.Automation.ControlType]::Edit
 $checkbox = [System.Windows.Automation.ControlType]::CheckBox
 $value = [System.Windows.Automation.ValuePattern]::Pattern
@@ -27,8 +28,17 @@ function Click([string]$Name, $Type = $button) {
     })
 }
 function Open-Settings {
-    Click 'Tab menu'
-    Click 'Settings' $menu
+    if (!(Find-Element 'Settings' $tabItem)) {
+        Invoke-Button (Get-NativeMenuAction 'Tab menu' 'Settings' -VisibleItem)
+    }
+    $null = Wait-Until 'the Settings tab is selected' {
+        $tab = Find-Element 'Settings' $tabItem
+        if ($tab) {
+            $selected = $tab.GetCurrentPattern($selection)
+            if ($selected.Current.IsSelected) { return $true }
+            $selected.Select()
+        }
+    }
 }
 function Text-Field([string]$Name) {
     (Wait-Until "field '$Name'" { Find-Element $Name $edit }).GetCurrentPattern($value)
@@ -97,6 +107,38 @@ try {
             (Find-Element "Changed builds${dot}rg")
     }
     if ([IO.File]::ReadAllText($profiles) -cne $catalogBefore) { throw 'The preview edited saved profiles' }
+    $prepare = 'Prepare candidate x86-64 downloads'
+    $null = Wait-Until 'the rollout checks both declared candidate architectures' {
+        (Find-Element "Candidate x86-64${dot}0 of 2 commands ready locally") -and
+            (Find-Element "Candidate ARM64${dot}0 of 2 commands ready locally") -and
+            (Find-Element $prepare $button)
+    }
+    if (Find-Element 'Prepare candidate ARM64 downloads' $button) {
+        throw 'A local-only candidate build offered a download'
+    }
+    [IO.File]::WriteAllText($candidate, "$candidateBefore`n")
+    Click $prepare
+    $null = Wait-Until 'preparation rejects a changed candidate' {
+        Find-Element 'The candidate manifest changed. Review the rollout again.'
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $catalogBefore) { throw 'Candidate preparation edited profiles' }
+    [IO.File]::WriteAllText($candidate, $candidateBefore)
+    Click 'Check candidate builds'
+    $null = Wait-Until 'the restored review again offers preparation' { Find-Element $prepare $button }
+    $cache = Join-Path $env:W11TERM_DATA_DIR 'tools/cache/v1'
+    $null = [IO.Directory]::CreateDirectory($cache)
+    $executablePin = ($candidateBefore | ConvertFrom-Json).tools[0].builds[0].sha256
+    [IO.File]::Copy((Join-Path $State 'candidate-executable'), (Join-Path $cache $executablePin))
+    Click $prepare
+    $null = Wait-Until 'preparation refreshes readiness before any rollout' {
+        (Find-Element "Candidate x86-64${dot}1 of 2 commands ready locally") -and
+            (Find-Element "Candidate ARM64${dot}0 of 2 commands ready locally") -and
+            !(Find-Element $prepare $button)
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $catalogBefore -or
+        [IO.File]::ReadAllText($candidate) -cne $candidateBefore) {
+        throw 'Checking the candidate or preparing a build changed the rollout inputs'
+    }
     [IO.File]::WriteAllText($candidate, "$candidateBefore`n")
     Click 'Apply reviewed tool rollout'
     $null = Wait-Until 'the apply rejects the stale candidate' {

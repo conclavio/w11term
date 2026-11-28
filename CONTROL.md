@@ -1633,6 +1633,8 @@ Use `rollout-tool-profiles` to adopt one revised manifest in multiple saved SSH 
 
 In Windows, open **Settings → Profiles → Audit SSH tool profiles → Roll out tool manifest**. Pick the revision, check the profiles you want to update, and choose **Review selected tool rollout**. **Apply reviewed tool rollout** updates the reviewed selection.
 
+The Windows review checks local files and cached executables for each architecture in the candidate manifest. Expand an architecture to see which commands have verified builds. When a pinned download needs preparation, choose **Prepare candidate x86-64 downloads** or **Prepare candidate ARM64 downloads** to fill the Windows cache and refresh the results. **Check candidate builds** refreshes the review after you repair a local file. The separate apply step saves the profile bindings.
+
 From the rollout result, choose **Review tool rollback** to see the manifest paths, pin policies, and file status for each profile. **Apply reviewed tool rollback** restores the previous approvals together. Choose **Save tool rollout receipt** to keep a receipt for later, then reopen it from **Open tool rollout receipt** in the audit. The Windows audit and CLI use the same receipt format. The audit opens receipts for its current profile catalog.
 
 ```powershell

@@ -5,6 +5,7 @@ use w11term::{
     profiles::{ToolManifestBaseline, ToolRollbackReport, ToolRolloutReport},
 };
 
+mod candidate;
 mod rollback;
 
 #[derive(Clone)]
@@ -15,6 +16,9 @@ pub enum Action {
     Filter(Arc<()>, String),
     Select(Arc<()>, String, bool),
     Review(Arc<()>),
+    CheckCandidate(Arc<()>),
+    PrepareCandidate(Arc<()>, UtilityArchitecture),
+    CandidateChecked(Arc<()>, Arc<()>, candidate::ChecksResult),
     Apply(Arc<()>),
     Completed(Arc<()>, Result<Arc<ToolRolloutReport>, String>),
     SaveReceipt(Arc<()>),
@@ -65,6 +69,7 @@ pub(super) struct Panel {
     task: Option<ComponentTask>,
     error: Option<String>,
     saved_receipt: Option<PathBuf>,
+    candidate_checks: candidate::Checks,
 }
 
 fn message(id: TabId, action: Action) -> Message {
@@ -148,6 +153,7 @@ impl Panel {
             task: Some(task),
             error: None,
             saved_receipt: None,
+            candidate_checks: candidate::Checks::default(),
         }
     }
 
@@ -166,6 +172,7 @@ impl Panel {
         } else {
             Work::Reviewing
         };
+        self.candidate_checks = candidate::Checks::default();
         self.error = None;
         let ticket = self.ticket.clone();
         let candidate = targets.candidate.clone();
@@ -339,6 +346,8 @@ impl Panel {
                         report.candidate_commands.join(", ")
                     ),
                 ));
+                self.candidate_checks
+                    .describe(&mut fields, &self.ticket, send);
                 fields.extend(report.profiles.iter().map(review_row));
                 fields.push(KeyedView::new(
                     "review-actions",
@@ -347,7 +356,9 @@ impl Panel {
                         .spacing(8.0)
                         .children((
                             Button::new()
-                                .is_enabled(report.changed_profiles > 0)
+                                .is_enabled(
+                                    report.changed_profiles > 0 && !self.candidate_checks.busy(),
+                                )
                                 .on_click(send(Action::Apply(self.ticket.clone())))
                                 .content("Apply reviewed tool rollout"),
                             Button::new()
@@ -494,6 +505,9 @@ impl TerminalApp {
             | Action::Filter(ticket, _)
             | Action::Select(ticket, ..)
             | Action::Review(ticket)
+            | Action::CheckCandidate(ticket)
+            | Action::PrepareCandidate(ticket, _)
+            | Action::CandidateChecked(ticket, ..)
             | Action::Apply(ticket)
             | Action::Completed(ticket, _)
             | Action::SaveReceipt(ticket)
@@ -553,9 +567,40 @@ impl TerminalApp {
             Action::Apply(_) => {
                 if let Work::Reviewed(report) = &panel.work
                     && report.changed_profiles > 0
+                    && !panel.candidate_checks.busy()
                 {
                     panel.request(id, catalog, Some(report.review.clone()), ctx);
                 }
+            }
+            Action::CheckCandidate(_) => {
+                if let Work::Reviewed(report) = &panel.work
+                    && !panel.candidate_checks.busy()
+                {
+                    panel.candidate_checks.start(
+                        id,
+                        panel.ticket.clone(),
+                        report.clone(),
+                        None,
+                        ctx,
+                    );
+                }
+            }
+            Action::PrepareCandidate(_, architecture) => {
+                if let Work::Reviewed(report) = &panel.work
+                    && !panel.candidate_checks.busy()
+                    && panel.candidate_checks.can_prepare(architecture)
+                {
+                    panel.candidate_checks.start(
+                        id,
+                        panel.ticket.clone(),
+                        report.clone(),
+                        Some(architecture),
+                        ctx,
+                    );
+                }
+            }
+            Action::CandidateChecked(_, ticket, result) => {
+                panel.candidate_checks.finish(&ticket, result);
             }
             Action::Completed(_, result)
                 if matches!(panel.work, Work::Reviewing | Work::Applying) =>
@@ -563,7 +608,16 @@ impl TerminalApp {
                 panel.task = None;
                 panel.work = match result {
                     Ok(report) if report.applied => Work::Applied(report),
-                    Ok(report) => Work::Reviewed(report),
+                    Ok(report) => {
+                        panel.candidate_checks.start(
+                            id,
+                            panel.ticket.clone(),
+                            report.clone(),
+                            None,
+                            ctx,
+                        );
+                        Work::Reviewed(report)
+                    }
                     Err(error) => {
                         panel.error = Some(error);
                         Work::Choosing
@@ -571,6 +625,7 @@ impl TerminalApp {
                 };
             }
             Action::Back(_) if matches!(panel.work, Work::Reviewed(_)) => {
+                panel.candidate_checks = candidate::Checks::default();
                 panel.work = Work::Choosing
             }
             Action::Back(_) => {

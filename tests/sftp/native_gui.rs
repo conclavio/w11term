@@ -4677,7 +4677,7 @@ fn native_tool_profile_audit_filters_refreshes_and_preserves_a_draft() {
 }
 
 #[test]
-#[ignore = "reviews, applies and rolls back a tool manifest across selected Windows profiles"]
+#[ignore = "verifies candidate builds and rolls out or restores tool manifests in Windows"]
 fn native_tool_profile_rollout_preserves_the_open_profile_draft() {
     let state = tempfile::tempdir().unwrap();
     let root = state.path();
@@ -4692,7 +4692,18 @@ fn native_tool_profile_rollout_preserves_the_open_profile_draft() {
             json!({"version": 1, "name": "fleet", "tools": tools}).to_string()
         };
     let before = manifest(&[("rg", 'a'), ("ncdu", 'c')]);
-    let next = manifest(&[("rg", 'b'), ("jq", 'd')]);
+    let cached_tool =
+        super::utilities::executable(w11term::sftp::UtilityArchitecture::X86_64, None);
+    let tool_pin = super::utilities::tool_sha256(&cached_tool);
+    fs::write(root.join("candidate-executable"), cached_tool).unwrap();
+    let mut next: serde_json::Value =
+        serde_json::from_str(&manifest(&[("rg", 'b'), ("jq", 'd')])).unwrap();
+    next["tools"][0]["builds"] = json!([
+        {"architecture": "x86_64", "sha256": tool_pin,
+         "download": {"format": "raw", "url": "https://tools.example.test/rg"}},
+        {"architecture": "aarch64", "path": "rg-arm64", "sha256": "e".repeat(64)},
+    ]);
+    let next = next.to_string();
     let previous_pin = super::utilities::tool_sha256(before.as_bytes());
     let next_pin = super::utilities::tool_sha256(next.as_bytes());
     fs::write(root.join("previous.json"), before).unwrap();

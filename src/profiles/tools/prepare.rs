@@ -1,7 +1,10 @@
-use super::{Manifest, ProfileStore, rollout::approval};
+use super::{Manifest, ProfileStore, ToolRolloutReport, rollout::approval};
 use crate::{
     options::SshOptions,
-    sftp::{UtilityArchitecture, UtilityBundle, fetch_tool_bundle, fetch_tool_bundle_cancellable},
+    sftp::{
+        ToolArchitectureAudit, UtilityArchitecture, UtilityBundle, fetch_tool_bundle,
+        fetch_tool_bundle_cancellable,
+    },
 };
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -50,9 +53,7 @@ impl ApprovedDownloads {
         architecture: Option<UtilityArchitecture>,
     ) -> Result<Self> {
         let settings = approval(options)?;
-        let Manifest {
-            mut bundle, digest, ..
-        } = Manifest::load(&settings.bundle)?;
+        let Manifest { bundle, digest, .. } = Manifest::load(&settings.bundle)?;
         ensure!(
             reviewed_digest.is_none_or(|review| review == digest)
                 && settings.manifest_pin()?.is_none_or(|pin| pin == digest),
@@ -63,19 +64,64 @@ impl ApprovedDownloads {
             }
         );
         settings.validate_manifest_destination(&bundle)?;
-        for tool in &mut bundle.tools {
-            tool.builds.retain(|build| {
-                build.download.is_some()
-                    && architecture.is_none_or(|architecture| build.architecture == architecture)
-            });
-        }
-        bundle.tools.retain(|tool| !tool.builds.is_empty());
+        let bundle = download_entries(bundle, architecture);
         let count = bundle.tools.iter().map(|tool| tool.builds.len()).sum();
         Ok(Self {
             bundle,
             digest,
             count,
         })
+    }
+}
+
+fn download_entries(
+    mut bundle: UtilityBundle,
+    architecture: Option<UtilityArchitecture>,
+) -> UtilityBundle {
+    for tool in &mut bundle.tools {
+        tool.builds.retain(|build| {
+            build.download.is_some()
+                && architecture.is_none_or(|architecture| build.architecture == architecture)
+        });
+    }
+    bundle.tools.retain(|tool| !tool.builds.is_empty());
+    bundle
+}
+
+impl ToolRolloutReport {
+    fn reviewed_candidate(&self) -> Result<UtilityBundle> {
+        let manifest = Manifest::load(&self.candidate_path)?;
+        ensure!(
+            manifest.digest == self.candidate_manifest_sha256,
+            "The candidate manifest changed. Review the rollout again."
+        );
+        Ok(manifest.bundle)
+    }
+
+    /// Check the reviewed candidate's local files and cached downloads without fetching.
+    pub fn verify_candidate_builds(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Vec<ToolArchitectureAudit>> {
+        ensure!(!cancelled(), "Candidate tool verification cancelled");
+        self.reviewed_candidate()?
+            .audit_executables(None, &cancelled)
+    }
+
+    /// Prepare one architecture from the reviewed candidate and refresh local readiness.
+    pub fn prepare_candidate_downloads(
+        &self,
+        architecture: UtilityArchitecture,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Vec<ToolArchitectureAudit>> {
+        ensure!(!cancelled(), "Candidate tool preparation cancelled");
+        let downloads = download_entries(self.reviewed_candidate()?, Some(architecture));
+        ensure!(
+            !downloads.tools.is_empty(),
+            "No pinned downloads match the selected architecture"
+        );
+        fetch_tool_bundle_cancellable(&downloads, None, &cancelled)?;
+        self.verify_candidate_builds(cancelled)
     }
 }
 
