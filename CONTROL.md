@@ -1577,6 +1577,8 @@ For scripts, use `preview-tool-bundle-prune NAME SHA256` followed by `prune-tool
 
 Open **Settings → Edit profile → SSH tools**. Browse for the bundle manifest and enter the remote SFTP home and verified SHA256 host-key fingerprint. A pinned profile fingerprint also works. Select **Manage Bash PATH**, **Manage Zsh PATH**, or **Manage Fish PATH** to append the launcher directory after the shell's existing PATH entries. Then select **Review tool bundle**, confirm the account and launcher directory, choose **Approve tool sync**, and save.
 
+The review lists the commands and their available architectures. Expand a command to see each build's local path or download URL, executable SHA-256, and archive member and SHA-256 when applicable.
+
 New approvals pin the exact manifest file by default. If the file changes, w11term skips tool and PATH sync and still opens the SSH shell. Review, approve, and save again to sync a revision. Choose **Follow changes to the tool manifest** before review to let this profile follow edits to the file. Existing approvals with no pin already follow the file.
 
 Profiles can store the same approval under `tool_bundle`. Paths to local manifests resolve beside the profile catalog. The approved `name` and `bin_directory` come from the manifest and bind later updates to that destination. Use `add_to_path.shell` with `bash`, `zsh`, or `fish`. For a custom startup directory, use `add_to_path.zdotdir` for Zsh or `add_to_path.fish_config_dir` for Fish.

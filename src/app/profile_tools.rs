@@ -3,12 +3,13 @@ use std::path::PathBuf;
 use w11term::{
     options::{ToolPath, ToolSync},
     sftp::{
-        DotfileShell, ToolBundlePreset, UtilityBundle, builtin_tool_names,
+        DotfileShell, ToolBundlePreset, UtilityBundle, UtilityTool, builtin_tool_names,
         prepare_builtin_tool_bundle, validate_dotfiles_home,
     },
 };
 
 mod local_bundle;
+mod review;
 
 const TITLE: &str = "SSH tools";
 const PATH_MODES: [&str; 4] = [
@@ -41,9 +42,14 @@ pub enum Action {
     StarterFinished(Arc<()>, Result<String, String>),
     Local(local_bundle::Action),
     Review,
-    Reviewed(Arc<()>, Result<Box<ToolSync>, String>),
+    Reviewed(Arc<()>, Result<Arc<ReviewedBundle>, String>),
     Approve,
     Disable,
+}
+
+pub struct ReviewedBundle {
+    approval: Box<ToolSync>,
+    tools: Vec<UtilityTool>,
 }
 
 #[derive(Clone, Default)]
@@ -57,7 +63,7 @@ pub(super) struct Editor {
     path_shell: Option<DotfileShell>,
     follow_manifest: bool,
     approved: Option<Box<ToolSync>>,
-    reviewed: Option<Box<ToolSync>>,
+    reviewed: Option<Arc<ReviewedBundle>>,
     work: Option<Arc<()>>,
     preset: ToolBundlePreset,
     starter: Option<(Arc<()>, ComponentTask)>,
@@ -190,8 +196,8 @@ impl Editor {
         };
         let reviewed = self
             .reviewed
-            .as_ref()
-            .filter(|settings| self.agrees(settings, draft, base));
+            .as_deref()
+            .filter(|review| self.agrees(&review.approval, draft, base));
         let approved = self
             .approved
             .as_ref()
@@ -200,7 +206,8 @@ impl Editor {
             "Preparing verified Linux builds for x86-64 and ARM64…".into()
         } else if let Some(feedback) = &self.feedback {
             feedback.clone()
-        } else if let Some(settings) = reviewed {
+        } else if let Some(review) = reviewed {
+            let settings = &review.approval;
             format!(
                 "{} → {}@{}:{} · {}/{}",
                 settings.name,
@@ -218,7 +225,7 @@ impl Editor {
             "Tool sync off".into()
         };
         let idle = self.work.is_none() && self.starter.is_none();
-        let pin_status = match (reviewed, approved) {
+        let pin_status = match (reviewed.map(|review| &review.approval), approved) {
             (Some(settings), _) => settings
                 .manifest_sha256
                 .as_ref()
@@ -420,6 +427,9 @@ impl Editor {
                     .text(pin_status)
                     .text_wrapping(TextWrapping::Wrap),
             ));
+        }
+        if let Some(review) = reviewed {
+            fields.extend(review.tools.iter().map(review::tool_view));
         }
         self.expander(
             id,
@@ -687,7 +697,10 @@ impl TerminalApp {
                                 settings.manifest_sha256 = (!follow_manifest).then_some(digest);
                                 settings.name = bundle.name;
                                 settings.bin_directory = bundle.bin_directory;
-                                settings
+                                Arc::new(ReviewedBundle {
+                                    approval: settings,
+                                    tools: bundle.tools,
+                                })
                             })
                             .map_err(|error| format!("{error:#}"));
                         Message::ProfileTools(id, Action::Reviewed(request, result))
@@ -723,18 +736,18 @@ impl TerminalApp {
                     return;
                 }
                 match result {
-                    Ok(scope) if draft.tool_bundle.agrees(&scope, draft, base) => {
-                        draft.tool_bundle.reviewed = Some(scope)
+                    Ok(review) if draft.tool_bundle.agrees(&review.approval, draft, base) => {
+                        draft.tool_bundle.reviewed = Some(review)
                     }
                     Ok(_) => (),
                     Err(error) => draft.tool_bundle.feedback = Some(error),
                 }
             }
             Action::Approve if draft.tool_bundle.starter.is_none() => {
-                if let Some(scope) = draft.tool_bundle.reviewed.take()
-                    && draft.tool_bundle.agrees(&scope, draft, base)
+                if let Some(review) = draft.tool_bundle.reviewed.take()
+                    && draft.tool_bundle.agrees(&review.approval, draft, base)
                 {
-                    draft.tool_bundle.approved = Some(scope);
+                    draft.tool_bundle.approved = Some(review.approval.clone());
                     draft.tool_bundle.feedback = None;
                     draft.saved = false;
                 }

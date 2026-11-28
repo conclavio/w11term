@@ -20,6 +20,7 @@ $combo = [System.Windows.Automation.ControlType]::ComboBox
 $edit = [System.Windows.Automation.ControlType]::Edit
 $item = [System.Windows.Automation.ControlType]::ListItem
 $value = [System.Windows.Automation.ValuePattern]::Pattern
+$dot = ' ' + [char]0xb7 + ' '
 $pickTitle = 'Choose SSH private key'
 $browseLabel = 'Browse for private key'
 
@@ -325,7 +326,22 @@ try {
     Set-NativeExpansion 'SSH tools' $true
     $toolName = 'Fleet tools.json'
     $toolBundle = Join-Path $State $toolName
-    [IO.File]::WriteAllText($toolBundle, ('{"version":1,"name":"portable","tools":[{"name":"rg","builds":[{"architecture":"x86_64","path":"rg","sha256":"' + ('a' * 64) + '"}]}]}'))
+    $archiveUrl = 'https://example.test/rg-arm64.tar.gz'
+    $archiveMember = 'rg/bin/rg'
+    $archivePin = 'c' * 64
+    $localToolPin = 'a' * 64
+    $downloadedToolPin = 'b' * 64
+    $manifest = @{
+        version = 1
+        name = 'portable'
+        tools = @(@{ name = 'rg'; builds = @(
+            @{ architecture = 'x86_64'; path = 'rg'; sha256 = $localToolPin },
+            @{ architecture = 'aarch64'; sha256 = $downloadedToolPin; download = @{
+                format = 'tar-gz'; url = $archiveUrl; member = $archiveMember; archive_sha256 = $archivePin
+            } }
+        ) })
+    }
+    [IO.File]::WriteAllText($toolBundle, ($manifest | ConvertTo-Json -Depth 10))
     Click 'Browse for tool bundle'
     $toolDialog = Wait-Until 'owned tool bundle picker' { Find-OwnedDialog 'Choose SSH tool bundle' }
     $null = Wait-Until 'enter the full tool manifest path' { [FixtureDialog]::SetFilename($toolDialog, $toolBundle, '') }
@@ -365,6 +381,16 @@ try {
     $null = Wait-Until 'tool bundle, launcher directory and manifest digest reviewed' {
         (Find-Element $review) -and (Find-Element "Reviewed manifest SHA-256 $manifestHash")
     }
+    $rgBuilds = "rg${dot}ARM64, x86-64"
+    Set-NativeExpansion $rgBuilds $true
+    $null = Wait-Until 'the review shows the local build and exact archive member' {
+        $texts = Get-NativeTextLabels
+        ($texts | Where-Object { $_.Contains((Join-Path $State 'rg')) -and
+            $_.Contains("Executable SHA-256 $localToolPin") }) -and
+        ($texts | Where-Object { $_.Contains($archiveUrl) -and
+            $_.Contains("Executable SHA-256 $downloadedToolPin") -and
+            $_.Contains("Archive member $archiveMember") -and $_.Contains("Archive SHA-256 $archivePin") })
+    }
     Click 'Approve tool sync'
     $null = Wait-Until 'tool sync approved with a pinned manifest' {
         (Find-Element 'Approved tool bundle: portable') -and (Find-Element "Pinned manifest SHA-256 $manifestHash")
@@ -380,6 +406,10 @@ try {
     }
     Select-NativeComboItem 'Tool bundle shell PATH' 'Manage Fish PATH'
     Set-Field 'Tool PATH Fish configuration directory' 'xdg settings/fish'
+    $null = Wait-Until 'changing the startup settings requires a fresh build review' {
+        $approve = Find-Element 'Approve tool sync' $button
+        $approve -and !$approve.Current.IsEnabled -and !(Get-NativeExpander $rgBuilds)
+    }
     Click 'Review tool bundle'
     $null = Wait-Until 'the Fish PATH approval has the same tool destination' { Find-Element $review }
     Click 'Approve tool sync'
@@ -477,7 +507,6 @@ try {
     Click 'Create bundle from local tools'
     Set-Field 'New bundle name' 'team-tools'
     Set-Field 'Linux command name' 'operator'
-    $dot = ' ' + [char]0xb7 + ' '
     foreach ($build in @(@('operator-x64', 'x86-64'), @('operator-arm','ARM64'))) {
         Pick-LinuxExecutable 'Add Linux executable' $build[0]
         $null = Wait-Until "detected $($build[1]) executable" { Find-Element "operator${dot}$($build[1])" }
@@ -537,6 +566,14 @@ try {
     }
     Click 'Review tool bundle'
     $null = Wait-Until 'new revision reviewed' { Find-Element $review }
+    Set-NativeExpansion "operator${dot}ARM64, x86-64" $true
+    $replacementPin = $revisionBundle.tools.builds[0].sha256
+    $retainedPin = $createdBundle.tools.builds[1].sha256
+    $null = Wait-Until 'the revision review shows the replacement and retained builds' {
+        $texts = Get-NativeTextLabels
+        ($texts | Where-Object { $_.Contains('operator-x64-next') -and $_.Contains("Executable SHA-256 $replacementPin") }) -and
+        ($texts | Where-Object { $_.Contains('operator-arm') -and $_.Contains("Executable SHA-256 $retainedPin") })
+    }
     Click 'Approve tool sync'
     Click 'Save profile changes'
     $null = Wait-Until 'revision approval saved' {
