@@ -1,4 +1,4 @@
-use super::offline::{profile_rollout, profile_store};
+use super::offline::{profile_rollout, profile_store, rollback_args};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -94,12 +94,8 @@ pub(super) fn rollout(args: &[String], output: &mut dyn Write) -> Result<()> {
 }
 
 pub(super) fn rollback(args: &[String], output: &mut dyn Write) -> Result<()> {
-    let (path, review) = match args {
-        [path] => (path, None),
-        [path, flag, token] if flag == "--review" => (path, Some(token.as_str())),
-        _ => bail!("Provide the saved rollout reply and optionally --review TOKEN"),
-    };
-    let report = rollback_dotfile_rollout(Path::new(path), review)?;
+    let (path, review) = rollback_args(args)?;
+    let report = rollback_dotfile_rollout(path, review)?;
     let reply = Reply::from_result(Ok(serde_json::to_value(report)?));
     serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;

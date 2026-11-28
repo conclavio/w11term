@@ -27,6 +27,128 @@ fn rollout(root: &Path, args: &[&str]) -> std::process::Output {
     cli(root, "rollout-tool-profiles", args)
 }
 
+#[test]
+fn rolls_back_a_saved_tool_receipt_after_review_and_preserves_other_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let old = fleet_manifest(&[("rg", 'a')]);
+    let next = fleet_manifest(&[("rg", 'b')]);
+    let previous_pin = sha256(&old).to_uppercase();
+    let old_path = root.join("previous.json");
+    let next_path = root.join("next.json");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&next_path, &next).unwrap();
+    fs::write(
+        root.join("wrong-scope.json"),
+        old.replace("\"fleet\"", "\"other\""),
+    )
+    .unwrap();
+    let catalog = root.join("fleet profiles.json");
+    let unrelated = root.join("profiles.json");
+    fs::write(&unrelated, br#"{"profiles":{}}"#).unwrap();
+    let original = json!({"profiles": {
+        "East": profile("previous.json", Some(&previous_pin)),
+        "West": profile("missing.json", None),
+        "Scope": profile("wrong-scope.json", None),
+        "Unchecked": profile("previous.json", Some(&previous_pin)),
+    }});
+    fs::write(&catalog, original.to_string()).unwrap();
+    let mut args = vec![
+        "--profiles",
+        "fleet profiles.json",
+        "--candidate",
+        "next.json",
+        "--profile",
+        "East",
+        "--profile",
+        "West",
+        "--profile",
+        "Scope",
+    ];
+    let receipt_name = "Tool rollout.json";
+    let receipt = root.join(receipt_name);
+    let undo = |args: &[&str]| cli(root, "rollback-tool-profiles", args);
+    let reject = |args: &[&str], expected: &str| {
+        let failed = undo(args);
+        assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+        assert!(failed.stdout.is_empty());
+        let reply: Value = serde_json::from_slice(&failed.stderr).unwrap();
+        assert!(
+            reply["error"].as_str().unwrap().contains(expected),
+            "{reply}"
+        );
+    };
+    let preview = rollout(root, &args);
+    assert!(preview.status.success(), "{preview:?}");
+    fs::write(&receipt, &preview.stdout).unwrap();
+    reject(&[receipt_name], "applied SSH tool rollout");
+    let preview = reply(preview);
+    args.extend(["--review", preview["review"].as_str().unwrap()]);
+    let applied = rollout(root, &args);
+    assert!(applied.status.success(), "{applied:?}");
+    let mut formatted = b"\xef\xbb\xbf".to_vec();
+    formatted.extend(&applied.stdout);
+    let rolled_out = fs::read_to_string(&catalog).unwrap();
+
+    let mut altered_receipt: Value = serde_json::from_slice(&applied.stdout).unwrap();
+    let entry = altered_receipt["result"]["profiles"][0].clone();
+    altered_receipt["result"]["profiles"]
+        .as_array_mut()
+        .unwrap()
+        .push(entry);
+    fs::write(&receipt, altered_receipt.to_string()).unwrap();
+    reject(&[receipt_name], "appears more than once");
+    let mut altered_receipt: Value = serde_json::from_slice(&applied.stdout).unwrap();
+    altered_receipt["result"]["profiles"][0]["next_pin"] = Value::Null;
+    fs::write(&receipt, altered_receipt.to_string()).unwrap();
+    reject(&[receipt_name], "pin policy or candidate pin");
+    fs::write(&receipt, formatted).unwrap();
+
+    let review = reply(undo(&[receipt_name]));
+    assert_eq!(review["applied"], false);
+    assert_eq!(review["profiles_path"], json!(catalog));
+    assert_eq!(review["changed_profiles"], 3);
+    let rows = review["profiles"].as_array().unwrap();
+    let row = |name: &str| rows.iter().find(|row| row["profile"] == name).unwrap();
+    assert_eq!(row("East")["restore_status"], "matches-pin");
+    assert_eq!(row("East")["current_manifest_sha256"], sha256(&next));
+    assert_eq!(row("East")["restored_manifest_sha256"], sha256(&old));
+    assert_eq!(row("West")["restore_status"], "manifest-unavailable");
+    assert_eq!(row("Scope")["restore_status"], "scope-mismatch");
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), rolled_out);
+
+    let apply = [receipt_name, "--review", review["review"].as_str().unwrap()];
+    fs::write(&old_path, format!("{old}\n")).unwrap();
+    reject(&apply, "Preview the rollback again");
+    fs::write(&old_path, &old).unwrap();
+    fs::write(&next_path, format!("{next}\n")).unwrap();
+    reject(&apply, "Preview the rollback again");
+    fs::write(&next_path, &next).unwrap();
+    let mut edited: Value = serde_json::from_str(&rolled_out).unwrap();
+    edited["profiles"]["West"]["tool_bundle"]["add_to_path"] = json!({"shell": "fish"});
+    let edited = edited.to_string();
+    fs::write(&catalog, &edited).unwrap();
+    reject(&apply, "no longer matches the applied rollout");
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), edited);
+    fs::write(&catalog, &rolled_out).unwrap();
+
+    assert_eq!(reply(undo(&apply))["applied"], true);
+    let mut expected = original;
+    for (name, path) in [
+        ("East", "previous.json"),
+        ("West", "missing.json"),
+        ("Scope", "wrong-scope.json"),
+    ] {
+        expected["profiles"][name]["tool_bundle"]["bundle"] = json!(root.join(path));
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&catalog).unwrap()).unwrap(),
+        expected
+    );
+    assert_eq!(fs::read(&unrelated).unwrap(), br#"{"profiles":{}}"#);
+    reject(&apply, "no longer matches the applied rollout");
+}
+
 fn reply(output: std::process::Output) -> Value {
     assert!(output.status.success(), "{output:?}");
     let body: Value = serde_json::from_slice(&output.stdout).unwrap();

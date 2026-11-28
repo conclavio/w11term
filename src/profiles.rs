@@ -18,12 +18,14 @@ mod folder_permissions;
 pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate, FolderMutationPermit};
 mod group_file;
 pub use group_file::{decode_group_file, encode_group_file, read_group_file, remap_group_profiles};
+mod receipt;
 mod sftp_searches;
 pub use sftp_searches::SavedSftpSearch;
 mod tools;
 pub use tools::{
     ToolManifestBaseline, ToolManifestChanges, ToolProfileAudit, ToolProfileAuditRow,
-    ToolProfileAuditStatus, ToolProfileBuildChecks, ToolRolloutProfile, ToolRolloutReport,
+    ToolProfileAuditStatus, ToolProfileBuildChecks, ToolRestoreStatus, ToolRollbackProfile,
+    ToolRollbackReport, ToolRolloutProfile, ToolRolloutReport, rollback_tool_rollout,
 };
 
 #[derive(Clone, Debug, PartialEq)]

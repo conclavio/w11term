@@ -5,7 +5,7 @@ use super::{
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     io::{self, Write},
-    path::{self, PathBuf},
+    path::{self, Path, PathBuf},
     process::ExitCode,
 };
 use w11term::{control::Reply, options::default_profiles_path, profiles::ProfileStore, transcript};
@@ -28,6 +28,7 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
         }
         tool_bundles::AUDIT_VERB => (tool_bundles::AUDIT_HELP, tool_bundles::audit),
         tool_bundles::ROLLOUT_VERB => (tool_bundles::ROLLOUT_HELP, tool_bundles::rollout),
+        tool_bundles::ROLLBACK_VERB => (tool_bundles::ROLLBACK_HELP, tool_bundles::rollback),
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
         syscall_capture::INSPECT_VERB => (
             syscall_capture::INSPECT_HELP,
@@ -126,6 +127,14 @@ pub(super) fn profile_rollout<'a>(
         candidate,
         review,
     })
+}
+
+pub(super) fn rollback_args(args: &[String]) -> Result<(&Path, Option<&str>)> {
+    match args {
+        [path] => Ok((Path::new(path), None)),
+        [path, flag, token] if flag == "--review" => Ok((Path::new(path), Some(token.as_str()))),
+        _ => bail!("Provide the saved rollout reply and optionally --review TOKEN"),
+    }
 }
 
 pub(super) fn write_report(

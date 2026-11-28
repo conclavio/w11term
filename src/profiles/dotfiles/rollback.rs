@@ -1,15 +1,6 @@
 use super::*;
+use crate::profiles::receipt;
 use serde::Deserialize;
-use std::{fs::File, io::Read};
-
-const MAX_RECEIPT_BYTES: usize = 1024 * 1024;
-
-#[derive(Deserialize)]
-struct Envelope {
-    version: u32,
-    ok: bool,
-    result: Option<Receipt>,
-}
 
 #[derive(Deserialize)]
 struct Receipt {
@@ -30,32 +21,7 @@ struct ReceiptProfile {
 
 impl Receipt {
     fn load(path: &Path) -> Result<Self> {
-        ensure!(
-            path.metadata()
-                .with_context(|| format!("Opening rollout receipt {}", path.display()))?
-                .is_file(),
-            "Choose a regular rollout receipt file"
-        );
-        let mut bytes = Vec::new();
-        File::open(path)
-            .with_context(|| format!("Opening rollout receipt {}", path.display()))?
-            .take((MAX_RECEIPT_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() <= MAX_RECEIPT_BYTES,
-            "Rollout receipt exceeds 1 MiB"
-        );
-        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
-        let receipt: Envelope =
-            serde_json::from_slice(bytes).context("Reading the dotfile rollout receipt")?;
-        ensure!(
-            receipt.version == crate::control::VERSION && receipt.ok,
-            "Choose a successful dotfile rollout reply"
-        );
-        receipt
-            .result
-            .context("Choose the reply from an applied dotfile rollout")?
-            .checked()
+        receipt::read::<Self>(path, "dotfile")?.checked()
     }
 
     fn checked(mut self) -> Result<Self> {
@@ -246,7 +212,7 @@ impl DotfileRolloutReport {
         let mut json = serde_json::to_string(&reply)?;
         json.push('\n');
         ensure!(
-            json.len() <= MAX_RECEIPT_BYTES,
+            json.len() <= receipt::MAX_BYTES,
             "Rollout receipt exceeds 1 MiB"
         );
         crate::transcript::save(path, &json, false)

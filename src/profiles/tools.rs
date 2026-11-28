@@ -10,7 +10,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod rollback;
 mod rollout;
+pub use rollback::{
+    ToolRestoreStatus, ToolRollbackProfile, ToolRollbackReport, rollback_tool_rollout,
+};
 pub use rollout::{
     ToolManifestBaseline, ToolManifestChanges, ToolRolloutProfile, ToolRolloutReport,
 };

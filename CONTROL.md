@@ -1627,10 +1627,18 @@ In Windows, open **Settings → Profiles → Audit SSH tool profiles → Roll ou
 $rollout = @('rollout-tool-profiles', '--candidate', '.\Fleet revision.json', '--profile', 'East', '--profile', 'West')
 $preview = & $ctl @rollout | ConvertFrom-Json
 $preview.result.profiles
-& $ctl @rollout --review $preview.result.review
+& $ctl @rollout --review $preview.result.review | Set-Content -Encoding utf8 '.\tool-rollout-reply.json'
 ```
 
 Use `--profiles CATALOG` to select another catalog. The apply step rechecks the candidate, readable baselines, and selected approvals before writing the entire batch. It changes the manifest bindings in the catalog. The revised tools sync when those profiles open a new ordinary SSH connection.
+
+To undo the batch, pass the saved apply reply to `rollback-tool-profiles`. It previews only the profiles the rollout changed and uses the catalog recorded in the receipt. The review lists the previous manifest and pin and shows whether the file is available, still matches its pin, and names the approved launcher destination. A reviewed rollback can restore a binding whose old file is missing. The command rejects the batch if a selected approval no longer matches the applied rollout or a reviewed manifest changes before confirmation.
+
+```powershell
+$undo = & $ctl rollback-tool-profiles '.\tool-rollout-reply.json' | ConvertFrom-Json
+$undo.result.profiles
+& $ctl rollback-tool-profiles '.\tool-rollout-reply.json' --review $undo.result.review
+```
 
 On an ordinary SSH connect or reconnect, w11term checks the verified endpoint and SFTP home, syncs the approved bundle, and then opens the shell. An unavailable or unconfirmed sync still allows login. The 20-second deadline covers the bundle and PATH work together. The `tool-bundle-sync` event reports the bundle outcome and, when configured, the PATH outcome. Bash and Zsh use the login and interactive startup files. Fish uses one block in the selected `config.fish` and retains the command order of the existing PATH list. An edited block requires a fresh review. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths. [Fish PATH variables](https://fishshell.com/docs/current/tutorial.html#path)
 

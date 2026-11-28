@@ -61,7 +61,7 @@ struct Plan<'a> {
     profiles: Vec<ToolRolloutProfile>,
 }
 
-fn approval(options: &SshOptions) -> Result<&ToolSync> {
+pub(super) fn approval(options: &SshOptions) -> Result<&ToolSync> {
     ensure!(
         !options.durable && !options.player.rustmush,
         "This profile uses its own shell startup"
@@ -149,18 +149,33 @@ impl<'a> Plan<'a> {
 
     fn apply(&self, entries: &mut Map<String, Value>) -> Result<()> {
         for entry in self.profiles.iter().filter(|entry| entry.changed) {
-            let approval = entries
-                .get_mut(&entry.profile)
-                .and_then(|profile| profile.get_mut("tool_bundle"))
-                .and_then(Value::as_object_mut)
-                .context("The reviewed SSH tool approval is missing")?;
-            approval.insert("bundle".into(), serde_json::to_value(self.candidate)?);
-            if let Some(pin) = &entry.next_pin {
-                approval.insert("manifest_sha256".into(), pin.clone().into());
-            }
+            write_binding(
+                entries,
+                &entry.profile,
+                self.candidate,
+                entry.next_pin.as_deref(),
+            )?;
         }
         Ok(())
     }
+}
+
+pub(super) fn write_binding(
+    entries: &mut Map<String, Value>,
+    profile: &str,
+    path: &Path,
+    pin: Option<&str>,
+) -> Result<()> {
+    let approval = entries
+        .get_mut(profile)
+        .and_then(|profile| profile.get_mut("tool_bundle"))
+        .and_then(Value::as_object_mut)
+        .context("The reviewed SSH tool approval is missing")?;
+    approval.insert("bundle".into(), serde_json::to_value(path)?);
+    if let Some(pin) = pin {
+        approval.insert("manifest_sha256".into(), pin.into());
+    }
+    Ok(())
 }
 
 fn compare(

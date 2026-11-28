@@ -1,9 +1,9 @@
-use super::offline::{profile_rollout, profile_store};
+use super::offline::{profile_rollout, profile_store, rollback_args};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{io::Write, path::Path};
 use w11term::control::Reply;
-use w11term::profiles::ToolProfileBuildChecks;
+use w11term::profiles::{ToolProfileBuildChecks, rollback_tool_rollout};
 use w11term::sftp::{
     ToolBundlePreset, UtilityArchitecture, UtilityBundle, export_builtin_tool_bundle,
     fetch_tool_bundle,
@@ -15,6 +15,9 @@ pub(super) const AUDIT_VERB: &str = "audit-tool-profiles";
 pub(super) const AUDIT_HELP: &str = "w11term-cli audit-tool-profiles [--profiles CATALOG] [--profile NAME] [--verify-builds [--architecture x86_64|aarch64]]";
 pub(super) const ROLLOUT_VERB: &str = "rollout-tool-profiles";
 pub(super) const ROLLOUT_HELP: &str = "w11term-cli rollout-tool-profiles --candidate MANIFEST --profile NAME [--profile NAME ...] [--profiles CATALOG] [--review TOKEN]";
+pub(super) const ROLLBACK_VERB: &str = "rollback-tool-profiles";
+pub(super) const ROLLBACK_HELP: &str =
+    "w11term-cli rollback-tool-profiles ROLLOUT-REPLY.json [--review TOKEN]";
 
 pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
     let mut catalog = None;
@@ -63,6 +66,15 @@ pub(super) fn rollout(args: &[String], output: &mut dyn Write) -> Result<()> {
     let result = args
         .store
         .rollout_tools(&args.profiles, &args.candidate, args.review)?;
+    let reply = Reply::from_result(Ok(serde_json::to_value(result)?));
+    serde_json::to_writer(&mut *output, &reply)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+pub(super) fn rollback(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let (path, review) = rollback_args(args)?;
+    let result = rollback_tool_rollout(path, review)?;
     let reply = Reply::from_result(Ok(serde_json::to_value(result)?));
     serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;
