@@ -1,4 +1,4 @@
-use super::offline::profile_store;
+use super::offline::{profile_rollout, profile_store};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{io::Write, path::Path};
@@ -13,6 +13,8 @@ pub const HELP: &str = "w11term-cli fetch-tool-bundle BUNDLE.json [--architectur
 w11term-cli fetch-tool-bundle --example NEW_BUNDLE.json [--preset essentials|admin | --tools rg,jq,mdd]";
 pub(super) const AUDIT_VERB: &str = "audit-tool-profiles";
 pub(super) const AUDIT_HELP: &str = "w11term-cli audit-tool-profiles [--profiles CATALOG] [--profile NAME] [--verify-builds [--architecture x86_64|aarch64]]";
+pub(super) const ROLLOUT_VERB: &str = "rollout-tool-profiles";
+pub(super) const ROLLOUT_HELP: &str = "w11term-cli rollout-tool-profiles --candidate MANIFEST --profile NAME [--profile NAME ...] [--profiles CATALOG] [--review TOKEN]";
 
 pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
     let mut catalog = None;
@@ -51,6 +53,17 @@ pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
     };
     let audit = profile_store(catalog)?.audit_tool_profiles(profile, checks)?;
     let reply = Reply::from_result(Ok(serde_json::to_value(audit)?));
+    serde_json::to_writer(&mut *output, &reply)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+pub(super) fn rollout(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let args = profile_rollout(args, "Choose a tool manifest with --candidate")?;
+    let result = args
+        .store
+        .rollout_tools(&args.profiles, &args.candidate, args.review)?;
+    let reply = Reply::from_result(Ok(serde_json::to_value(result)?));
     serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;
     Ok(())

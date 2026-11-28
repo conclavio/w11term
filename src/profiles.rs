@@ -22,7 +22,8 @@ mod sftp_searches;
 pub use sftp_searches::SavedSftpSearch;
 mod tools;
 pub use tools::{
-    ToolProfileAudit, ToolProfileAuditRow, ToolProfileAuditStatus, ToolProfileBuildChecks,
+    ToolManifestBaseline, ToolManifestChanges, ToolProfileAudit, ToolProfileAuditRow,
+    ToolProfileAuditStatus, ToolProfileBuildChecks, ToolRolloutProfile, ToolRolloutReport,
 };
 
 #[derive(Clone, Debug, PartialEq)]

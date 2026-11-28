@@ -10,13 +10,21 @@ const VERB: &str = "audit-tool-profiles";
 const KEY: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 fn audit(root: &Path, args: &[&str]) -> std::process::Output {
+    cli(root, VERB, args)
+}
+
+fn cli(root: &Path, verb: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
         .current_dir(root)
         .env("W11TERM_DATA_DIR", root)
-        .arg(VERB)
+        .arg(verb)
         .args(args)
         .output()
         .unwrap()
+}
+
+fn rollout(root: &Path, args: &[&str]) -> std::process::Output {
+    cli(root, "rollout-tool-profiles", args)
 }
 
 fn reply(output: std::process::Output) -> Value {
@@ -169,6 +177,219 @@ fn profile(bundle: &str, pin: Option<&str>) -> Value {
             "manifest_sha256": pin,
         },
     })
+}
+
+fn fleet_manifest(commands: &[(&str, char)]) -> String {
+    let tools: Vec<_> = commands
+        .iter()
+        .map(|(name, pin)| {
+            json!({"name": name, "builds": [{
+                "architecture": "x86_64", "path": name, "sha256": pin.to_string().repeat(64),
+            }]})
+        })
+        .collect();
+    json!({"version": 1, "name": "fleet", "tools": tools}).to_string()
+}
+
+#[test]
+fn reviewed_tool_rollout_updates_only_the_selected_manifest_bindings() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = fleet_manifest(&[("rg", 'a'), ("ncdu", 'c'), ("dust", 'e')]);
+    let candidate = fleet_manifest(&[("rg", 'b'), ("jq", 'd'), ("dust", 'e')]);
+    let before_pin = sha256(&before);
+    let next_pin = sha256(&candidate);
+    fs::write(root.join("current.json"), &before).unwrap();
+    fs::write(root.join("new tools.json"), &candidate).unwrap();
+    let mut east = profile("current.json", Some(&before_pin));
+    east["tool_bundle"]["add_to_path"] =
+        json!({"shell": "fish", "fish_config_dir": "settings/fish"});
+    east["future_field"] = json!({"unrelated": true});
+    let mut west = profile("current.json", None);
+    west["tool_bundle"]
+        .as_object_mut()
+        .unwrap()
+        .remove("manifest_sha256");
+    let original = json!({"profiles": {
+        "East": east, "West": west,
+        "Missing": profile("missing.json", Some(&before_pin)),
+        "Current": profile("new tools.json", Some(&next_pin.to_uppercase())),
+        "In place": profile("new tools.json", Some(&before_pin)),
+        "Untouched": profile("current.json", Some(&before_pin)),
+    }});
+    let catalog = root.join("profiles.json");
+    let original_text = original.to_string();
+    fs::write(&catalog, &original_text).unwrap();
+    let mut args = vec![
+        "--candidate",
+        "new tools.json",
+        "--profile",
+        "West",
+        "--profile",
+        "East",
+        "--profile",
+        "Missing",
+        "--profile",
+        "Current",
+        "--profile",
+        "In place",
+    ];
+    let preview = reply(rollout(root, &args));
+    assert_eq!(preview["applied"], false);
+    assert_eq!(preview["changed_profiles"], 4);
+    assert_eq!(preview["candidate_manifest_sha256"], next_pin);
+    assert_eq!(preview["candidate_commands"], json!(["rg", "jq", "dust"]));
+    let rows = preview["profiles"].as_array().unwrap();
+    let row = |name: &str| rows.iter().find(|row| row["profile"] == name).unwrap();
+    assert_eq!(row("East")["baseline"]["kind"], "pinned");
+    assert_eq!(row("West")["baseline"]["kind"], "follows-file");
+    assert_eq!(row("Missing")["baseline"]["kind"], "unavailable");
+    assert!(row("Missing")["changes"].is_null());
+    assert_eq!(row("In place")["baseline"]["kind"], "pin-mismatch");
+    assert_eq!(row("In place")["baseline"]["manifest_sha256"], next_pin);
+    assert_eq!(row("Current")["changed"], false);
+    assert_eq!(
+        row("East")["changes"],
+        json!({"added": ["jq"], "removed": ["ncdu"], "changed": ["rg"]})
+    );
+    assert_eq!(row("East")["next_pin"], next_pin);
+    assert!(row("West")["next_pin"].is_null());
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), original_text);
+
+    args.extend(["--review", preview["review"].as_str().unwrap()]);
+    let applied = reply(rollout(root, &args));
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["changed_profiles"], 4);
+    let mut expected = original;
+    for name in ["East", "West", "Missing", "In place"] {
+        expected["profiles"][name]["tool_bundle"]["bundle"] = json!(root.join("new tools.json"));
+    }
+    for name in ["East", "Missing", "In place"] {
+        expected["profiles"][name]["tool_bundle"]["manifest_sha256"] = json!(next_pin);
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(catalog).unwrap()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("current.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("new tools.json")).unwrap(),
+        candidate
+    );
+}
+
+#[test]
+fn tool_rollout_rejects_stale_reviews_and_requires_the_existing_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = fleet_manifest(&[("rg", 'a')]);
+    let revision = fleet_manifest(&[("rg", 'b')]);
+    fs::write(root.join("current.json"), &before).unwrap();
+    fs::write(root.join("next.json"), &revision).unwrap();
+    fs::write(
+        root.join("wrong.json"),
+        revision.replace("\"fleet\"", "\"other\""),
+    )
+    .unwrap();
+    let mut durable = profile("current.json", None);
+    durable["durable"] = json!(true);
+    let mut unapproved = profile("current.json", None);
+    unapproved.as_object_mut().unwrap().remove("tool_bundle");
+    let original = json!({"profiles": {
+        "East": profile("current.json", Some(&sha256(&before))), "West": profile("current.json", None),
+        "Durable": durable, "Unapproved": unapproved,
+    }});
+    let catalog = root.join("profiles.json");
+    let original_text = original.to_string();
+    fs::write(&catalog, &original_text).unwrap();
+    let args = [
+        "--candidate",
+        "next.json",
+        "--profile",
+        "West",
+        "--profile",
+        "East",
+    ];
+    let review = reply(rollout(root, &args));
+    let mut apply = args.to_vec();
+    apply.extend(["--review", review["review"].as_str().unwrap()]);
+    let reject = |args: &[&str], expected: &str| {
+        let failed = rollout(root, args);
+        assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+        let reply: Value = serde_json::from_slice(&failed.stderr).unwrap();
+        assert!(
+            reply["error"].as_str().unwrap().contains(expected),
+            "{reply}"
+        );
+        assert!(failed.stdout.is_empty());
+    };
+    fs::write(root.join("next.json"), format!("{revision}\n")).unwrap();
+    reject(&apply, "Preview the rollout again");
+    fs::write(root.join("next.json"), &revision).unwrap();
+    fs::write(root.join("current.json"), format!("{before}\n")).unwrap();
+    reject(&apply, "Preview the rollout again");
+    fs::write(root.join("current.json"), &before).unwrap();
+    let mut altered = original.clone();
+    altered["profiles"]["West"]["tool_bundle"]["home"] = json!("/home/new");
+    let altered = altered.to_string();
+    fs::write(&catalog, &altered).unwrap();
+    reject(&apply, "Preview the rollout again");
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), altered);
+    fs::write(&catalog, &original_text).unwrap();
+    reject(
+        &["--candidate", "wrong.json", "--profile", "East"],
+        "approved destination",
+    );
+    reject(
+        &["--candidate", "next.json", "--profile", "Durable"],
+        "own shell startup",
+    );
+    reject(
+        &["--candidate", "next.json", "--profile", "Unapproved"],
+        "no SSH tool approval",
+    );
+    reject(
+        &[
+            "--candidate",
+            "next.json",
+            "--profile",
+            "East",
+            "--profile",
+            "East",
+        ],
+        "only once",
+    );
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), original_text);
+
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| rollout(root, &apply));
+        let second = scope.spawn(|| rollout(root, &apply));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_ne!(first.status.success(), second.status.success());
+    let refused = if first.status.success() {
+        second
+    } else {
+        first
+    };
+    let failure: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    let message = failure["error"].as_str().unwrap();
+    assert!(
+        message.contains("Another window is updating profiles")
+            || message.contains("Preview the rollout again"),
+        "{failure}"
+    );
+    reject(&apply, "Preview the rollout again");
+    let final_catalog: Value = serde_json::from_slice(&fs::read(catalog).unwrap()).unwrap();
+    for name in ["East", "West"] {
+        assert_eq!(
+            final_catalog["profiles"][name]["tool_bundle"]["bundle"],
+            json!(root.join("next.json"))
+        );
+    }
 }
 
 #[test]

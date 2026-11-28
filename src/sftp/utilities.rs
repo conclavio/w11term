@@ -57,14 +57,14 @@ pub struct UtilityBundle {
     pub tools: Vec<UtilityTool>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UtilityTool {
     pub name: String,
     pub builds: Vec<UtilityBuild>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UtilityBuild {
     pub architecture: UtilityArchitecture,

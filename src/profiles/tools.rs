@@ -5,7 +5,15 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use serde::Serialize;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+
+mod rollout;
+pub use rollout::{
+    ToolManifestBaseline, ToolManifestChanges, ToolRolloutProfile, ToolRolloutReport,
+};
 
 #[derive(Serialize)]
 pub struct ToolProfileAudit {
@@ -56,6 +64,17 @@ struct Manifest {
     bundle: UtilityBundle,
     digest: String,
     build_checks: Option<Vec<ToolArchitectureAudit>>,
+}
+
+impl Manifest {
+    fn load(path: &Path) -> Result<Self> {
+        let (bundle, digest) = UtilityBundle::load_with_manifest_sha256(path)?;
+        Ok(Self {
+            bundle,
+            digest,
+            build_checks: None,
+        })
+    }
 }
 
 type ManifestCache = HashMap<PathBuf, Result<Manifest, String>>;
@@ -149,15 +168,10 @@ fn audit_profile(
             .err()
             .map(|error| format!("{error:#}"))
     });
-    let manifest = match manifests.entry(settings.bundle.clone()).or_insert_with(|| {
-        UtilityBundle::load_with_manifest_sha256(&settings.bundle)
-            .map(|(bundle, digest)| Manifest {
-                bundle,
-                digest,
-                build_checks: None,
-            })
-            .map_err(|error| format!("{error:#}"))
-    }) {
+    let manifest = match manifests
+        .entry(settings.bundle.clone())
+        .or_insert_with(|| Manifest::load(&settings.bundle).map_err(|error| format!("{error:#}")))
+    {
         Ok(manifest) => manifest,
         Err(error) => {
             row.status = ManifestError;

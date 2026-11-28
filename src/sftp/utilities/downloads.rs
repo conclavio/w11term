@@ -126,7 +126,7 @@ pub fn builtin_tool_bundle(name: &str) -> Result<UtilityBundle> {
     Ok(bundle)
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "format", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum UtilityDownload {
     Raw {

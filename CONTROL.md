@@ -1619,6 +1619,17 @@ $audit.result.profiles | Where-Object {
 }
 ```
 
+Use `rollout-tool-profiles` to adopt one revised manifest in multiple saved SSH profiles. Select each profile explicitly. Each must already approve the candidate's bundle name and launcher directory. The preview lists the candidate's SHA-256 and any detectable additions, removals, and build changes. A missing or changed baseline is marked separately. Pinned profiles receive the new manifest hash, and profiles that follow the file keep that setting.
+
+```powershell
+$rollout = @('rollout-tool-profiles', '--candidate', '.\Fleet revision.json', '--profile', 'East', '--profile', 'West')
+$preview = & $ctl @rollout | ConvertFrom-Json
+$preview.result.profiles
+& $ctl @rollout --review $preview.result.review
+```
+
+Use `--profiles CATALOG` to select another catalog. The apply step rechecks the candidate, readable baselines, and selected approvals before writing the entire batch. It changes the manifest bindings in the catalog. The revised tools sync when those profiles open a new ordinary SSH connection.
+
 On an ordinary SSH connect or reconnect, w11term checks the verified endpoint and SFTP home, syncs the approved bundle, and then opens the shell. An unavailable or unconfirmed sync still allows login. The 20-second deadline covers the bundle and PATH work together. The `tool-bundle-sync` event reports the bundle outcome and, when configured, the PATH outcome. Bash and Zsh use the login and interactive startup files. Fish uses one block in the selected `config.fish` and retains the command order of the existing PATH list. An edited block requires a fresh review. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths. [Fish PATH variables](https://fishshell.com/docs/current/tutorial.html#path)
 
 **More → Command reference** shows the last login sync for the selected SSH connection. Open **Install SSH tools** for the PATH result and any error detail. Manual installs and rollbacks show their own results in the installer and version history.

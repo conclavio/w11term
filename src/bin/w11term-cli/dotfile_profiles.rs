@@ -1,4 +1,4 @@
-use super::offline::profile_store;
+use super::offline::{profile_rollout, profile_store};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -81,33 +81,10 @@ pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
 }
 
 pub(super) fn rollout(args: &[String], output: &mut dyn Write) -> Result<()> {
-    let mut catalog = None;
-    let mut candidate = None;
-    let mut review = None;
-    let mut profiles = Vec::new();
-    let mut args = args.iter();
-    while let Some(flag) = args.next() {
-        let value = args
-            .next()
-            .with_context(|| format!("{flag} requires a value"))?;
-        let target = match flag.as_str() {
-            "--profiles" => &mut catalog,
-            "--candidate" => &mut candidate,
-            "--review" => &mut review,
-            "--profile" => {
-                profiles.push(value.clone());
-                continue;
-            }
-            _ => bail!("unsupported dotfiles rollout option {flag}"),
-        };
-        ensure!(
-            target.replace(value.as_str()).is_none(),
-            "specify {flag} only once"
-        );
-    }
-    let candidate =
-        path::absolute(candidate.context("Choose a dotfiles bundle with --candidate")?)?;
-    let result = profile_store(catalog)?.rollout_dotfiles(&profiles, &candidate, review)?;
+    let args = profile_rollout(args, "Choose a dotfiles bundle with --candidate")?;
+    let result = args
+        .store
+        .rollout_dotfiles(&args.profiles, &args.candidate, args.review)?;
     serde_json::to_writer(
         &mut *output,
         &Reply::from_result(Ok(serde_json::to_value(result)?)),
