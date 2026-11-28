@@ -18,20 +18,29 @@ pub(super) const HELP: &str = concat!(
 
 pub(super) const VERIFY_REPORT_VERB: &str = "verify-syscall-capture-report";
 pub(super) const VERIFY_REPORT_HELP: &str =
-    "w11term-cli verify-syscall-capture-report TRACE REPORT";
+    "w11term-cli verify-syscall-capture-report TRACE REPORT [--save-settings PATH]";
 
 pub(super) fn verify_report(args: &[String], stdout: &mut dyn Write) -> Result<()> {
-    let [trace, report] = args else {
-        bail!("provide the trace path and its report path")
-    };
-    let trace = path::absolute(trace)?;
-    let report = path::absolute(report)?;
-    let verified = verify_syscall_capture_report(&trace, &report)?;
-    let reply = Reply::from_result(Ok(serde_json::json!({
-        "capture_path": trace,
+    let offline::CaptureReportPaths {
+        capture,
+        report,
+        settings,
+    } = offline::CaptureReportPaths::parse(args)?;
+    let verified = verify_syscall_capture_report(&capture, &report)?;
+    if let Some(path) = &settings {
+        let contents = verified.reviewed.options.clone().settings_json()?;
+        w11term::transcript::save(path, &contents, false)
+            .context("Saving verified syscall capture settings")?;
+    }
+    let mut result = serde_json::json!({
+        "capture_path": capture,
         "report_path": report,
         "report": verified,
-    })));
+    });
+    if let Some(path) = settings {
+        result["settings_path"] = serde_json::json!(path);
+    }
+    let reply = Reply::from_result(Ok(result));
     serde_json::to_writer(&mut *stdout, &reply)?;
     writeln!(stdout)?;
     Ok(())

@@ -173,6 +173,30 @@ pub(super) fn rollback_args(args: &[String]) -> Result<(&Path, Option<&str>)> {
     }
 }
 
+pub(super) struct CaptureReportPaths {
+    pub capture: PathBuf,
+    pub report: PathBuf,
+    pub settings: Option<PathBuf>,
+}
+
+impl CaptureReportPaths {
+    pub(super) fn parse(args: &[String]) -> Result<Self> {
+        let [capture, report, rest @ ..] = args else {
+            bail!("Provide the capture and report paths");
+        };
+        let settings = match rest {
+            [] => None,
+            [flag, path] if flag == "--save-settings" => Some(path::absolute(path)?),
+            _ => bail!("After the two paths, use --save-settings PATH at most once"),
+        };
+        Ok(Self {
+            capture: path::absolute(capture)?,
+            report: path::absolute(report)?,
+            settings,
+        })
+    }
+}
+
 pub(super) fn write_report(
     stdout: &mut dyn Write,
     output_file: Option<&str>,

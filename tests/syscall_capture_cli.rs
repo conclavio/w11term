@@ -22,12 +22,12 @@ fn verifies_a_renamed_syscall_trace_and_rejects_mismatched_bytes() {
         "reviewed": {
             "host": "example.test", "user": "test", "port": 22, "host_key_fingerprint": "SHA256:fixture",
             "program": "/bin/true", "directory": "/tmp", "strace_arguments": ["--", "/bin/true"],
-            "options": {"program": "true", "arguments": [], "directory": "/tmp", "seconds": 15,
+            "options": {"program": "true", "arguments": ["$literal", "--"], "directory": "/tmp", "seconds": 15,
                         "max_mib": 1, "string_size": 128, "filter": "all"}
         }
     });
     let save = |value: &Value| fs::write(&report, serde_json::to_vec(value).unwrap()).unwrap();
-    let verify = || {
+    let verify = |extra: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
             .current_dir(root)
             .env_remove("LOCALAPPDATA")
@@ -36,11 +36,12 @@ fn verifies_a_renamed_syscall_trace_and_rejects_mismatched_bytes() {
                 "renamed trace.strace",
                 "capture report.json",
             ])
+            .args(extra)
             .output()
             .unwrap()
     };
-    let reject = |expected: &str| {
-        let output = verify();
+    let reject = |extra: &[&str], expected: &str| {
+        let output = verify(extra);
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert!(output.stdout.is_empty());
         let reply: Value = serde_json::from_slice(&output.stderr).unwrap();
@@ -50,7 +51,7 @@ fn verifies_a_renamed_syscall_trace_and_rejects_mismatched_bytes() {
         );
     };
     save(&recorded);
-    let result = verify();
+    let result = verify(&[]);
     assert!(result.status.success(), "{result:?}");
     let verified: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(verified["result"]["capture_path"], json!(trace));
@@ -61,25 +62,46 @@ fn verifies_a_renamed_syscall_trace_and_rejects_mismatched_bytes() {
         verified["result"]["report"]["reviewed"],
         recorded["reviewed"]
     );
+    assert!(verified["result"].get("settings_path").is_none());
+    let output = root.join("settings to rerun.json");
+    let export = ["--save-settings", "settings to rerun.json"];
+    let saved = verify(&export);
+    assert!(saved.status.success(), "{saved:?}");
+    let reply: Value = serde_json::from_slice(&saved.stdout).unwrap();
+    assert_eq!(reply["result"]["settings_path"], json!(output));
+    let settings = fs::read(&output).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&settings).unwrap(),
+        json!({"schema_version": 1, "options": recorded["reviewed"]["options"]})
+    );
+    let loaded = SyscallOptions::load_settings(&output).unwrap();
+    assert_eq!(loaded.program, "true");
+    assert_eq!(loaded.arguments, ["$literal", "--"]);
+    reject(&export, "Saving verified syscall capture settings");
+    assert_eq!(fs::read(&output).unwrap(), settings);
+    reject(&["--save-settings"], "use --save-settings PATH");
+    let invalid_output = root.join("invalid settings.json");
+    let invalid_export = ["--save-settings", "invalid settings.json"];
     fs::write(&trace, &recorded_trace[..recorded_trace.len() - 1]).unwrap();
-    reject("File byte count differs");
+    reject(&invalid_export, "File byte count differs");
     let mut edited = recorded_trace.to_vec();
     edited[0] ^= 1;
     fs::write(&trace, edited).unwrap();
-    reject("Trace SHA-256 differs");
+    reject(&invalid_export, "Trace SHA-256 differs");
+    assert!(!invalid_output.exists());
     recorded["schema_version"] = json!(2);
     save(&recorded);
-    reject("Unsupported syscall capture report version");
+    reject(&[], "Unsupported syscall capture report version");
     recorded["schema_version"] = json!(1);
     recorded["bytes"] = json!(2 * 1024 * 1024);
     save(&recorded);
-    reject("invalid byte count");
+    reject(&[], "invalid byte count");
     recorded["bytes"] = json!(recorded_trace.len());
     recorded["stop_reason"] = json!("stopped");
     save(&recorded);
-    reject("invalid capture outcome");
+    reject(&[], "invalid capture outcome");
     fs::write(report, vec![b' '; 256 * 1024 + 1]).unwrap();
-    reject("Syscall capture report exceeds 256 KiB");
+    reject(&[], "Syscall capture report exceeds 256 KiB");
 }
 
 #[test]

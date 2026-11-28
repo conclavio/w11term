@@ -1752,8 +1752,10 @@ Pass `--report-file '.\after.pcap.json'` to `capture-packets` to save the report
 Open the capture and choose **Verify capture report…**, or use `verify-packet-capture-report CAPTURE REPORT` from a shell. Either check compares the file's byte count and SHA-256 with the selected report and works offline. You can verify a moved or renamed capture. Windows shows the recorded host and host key, interface, filter, snap length, stop reason, and available drop and rotation counts after a match. The CLI returns the two absolute paths, byte count, digest, and the report's descriptive metadata in `result.details`. A digest-only report returns `details: null`. Invalid digests and mismatches return a nonzero exit code and a JSON error. The digest checks the capture file itself. The host, settings, and counters are the values recorded in the selected report.
 
 ```powershell
-& $ctl verify-packet-capture-report '.\after.pcap' '.\after.pcap.json'
+& $ctl verify-packet-capture-report '.\after.pcap' '.\after.pcap.json' --save-settings '.\packet settings.json'
 ```
+
+Use `--save-settings PATH` to write the recorded capture options to a new settings file after verification. The reply includes `result.settings_path`. Load the file in the Windows panel or pass it to `preview-packet-capture --settings PATH` for a fresh review.
 
 Choose **Open in Wireshark** after saving. w11term looks in the standard Windows Program Files folders. Use **Choose Wireshark executable…** for another installation. The saved capture stays available after you disconnect the SSH pane or close the packet capture panel.
 
@@ -1872,10 +1874,12 @@ The original PID-tagged trace includes per-call timing and decoded descriptor de
 Add `--report-file '.\working report.json'` to `capture-syscalls` to save a JSON report alongside the trace. It records the reviewed SSH endpoint, the resolved executable and working directory, the literal strace arguments, the stop reason, and the trace's byte count and SHA-256. The reply gives `result.report_path` on success. If the report cannot be written after capture, the trace is still available and `result.report_error` explains the report failure.
 
 ```powershell
-& $ctl verify-syscall-capture-report '.\working.strace' '.\working report.json'
+& $ctl verify-syscall-capture-report '.\working.strace' '.\working report.json' --save-settings '.\syscall settings.json'
 ```
 
 Verification works offline and accepts a renamed trace with matching bytes. The verified JSON includes the saved capture details at `result.report`.
+
+Use `--save-settings PATH` to write the original capture options to a new settings file and get its absolute path in `result.settings_path`. Load that file in the viewer or pass it to `preview-syscall-capture --settings-file PATH` for a fresh review.
 
 In the Windows syscall viewer, expand **Capture report** after a capture to save its report. Open a single trace file and choose **Verify capture report…** to check the file on disk and view the recorded command, limits, SSH endpoint, and outcome. The viewer accepts the same reports as the CLI.
 

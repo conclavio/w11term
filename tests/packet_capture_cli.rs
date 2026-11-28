@@ -145,7 +145,7 @@ fn verifies_renamed_captures_and_reports_distinct_size_and_checksum_mismatches()
     });
     let write_report =
         |value: &Value| fs::write(&report, serde_json::to_vec(value).unwrap()).unwrap();
-    let verify = || {
+    let verify = |extra: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
             .current_dir(root)
             .env_remove("LOCALAPPDATA")
@@ -154,11 +154,12 @@ fn verifies_renamed_captures_and_reports_distinct_size_and_checksum_mismatches()
                 "copied capture.pcap",
                 "capture report.json",
             ])
+            .args(extra)
             .output()
             .unwrap()
     };
-    let error = |expected: &str| {
-        let output = verify();
+    let error = |extra: &[&str], expected: &str| {
+        let output = verify(extra);
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert!(output.stdout.is_empty(), "{output:?}");
         let reply: Value = serde_json::from_slice(&output.stderr).unwrap();
@@ -170,7 +171,7 @@ fn verifies_renamed_captures_and_reports_distinct_size_and_checksum_mismatches()
     };
 
     write_report(&recorded);
-    let verified = verify();
+    let verified = verify(&[]);
     assert!(verified.status.success(), "{verified:?}");
     let reply: Value = serde_json::from_slice(&verified.stdout).unwrap();
     assert_eq!(reply["ok"], true);
@@ -179,26 +180,74 @@ fn verifies_renamed_captures_and_reports_distinct_size_and_checksum_mismatches()
     assert_eq!(reply["result"]["capture_path"], json!(capture));
     assert_eq!(reply["result"]["report_path"], json!(report));
     assert_eq!(reply["result"]["details"], Value::Null);
+    assert!(reply["result"].get("settings_path").is_none());
+
+    let output = root.join("settings to rerun.json");
+    let export = ["--save-settings", "settings to rerun.json"];
+    error(&export, "Packet capture report has no recorded settings");
+    assert!(!output.exists());
+
+    let options = json!({
+        "interface": "lo", "filter": "udp and dst port 4321", "snap_length": 192,
+        "seconds": 15, "max_mib": 1, "packet_limit": 3, "rotate_files": 2,
+        "scratch_directory": "/dev/shm", "require_tmpfs": true
+    });
+    recorded["packets"] = json!(1);
+    recorded["stop_reason"] = json!("stopped");
+    recorded["diagnostics"] = json!([]);
+    recorded["reviewed"] = json!({
+        "host": "test.example", "user": "test", "port": 22,
+        "host_key_fingerprint": "SHA256:fixture", "scratch_directory": "/dev/shm",
+        "scratch_filesystem": "tmpfs", "tcpdump_arguments": ["-i", "lo"],
+        "options": options
+    });
+    write_report(&recorded);
+
+    let saved = verify(&export);
+    assert!(saved.status.success(), "{saved:?}");
+    let reply: Value = serde_json::from_slice(&saved.stdout).unwrap();
+    assert_eq!(reply["result"]["settings_path"], json!(output));
+    let settings = fs::read(&output).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&settings).unwrap(),
+        json!({"schema_version": 1, "options": options})
+    );
+    error(&export, "Saving verified packet capture settings");
+    assert_eq!(fs::read(&output).unwrap(), settings);
+
+    let rejected = root.join("invalid settings.json");
+    let reject_export = ["--save-settings", "invalid settings.json"];
+    recorded["reviewed"]["options"]["seconds"] = json!(0);
+    write_report(&recorded);
+    assert!(verify(&[]).status.success());
+    error(
+        &reject_export,
+        "Packet capture duration must be 1..=60 seconds",
+    );
+    assert!(!rejected.exists());
+    recorded["reviewed"]["options"]["seconds"] = json!(15);
+    write_report(&recorded);
 
     fs::write(&capture, &original[..original.len() - 1]).unwrap();
-    error("File byte count differs");
+    error(&reject_export, "File byte count differs");
     let mut changed = original.clone();
     *changed.last_mut().unwrap() ^= 1;
     fs::write(&capture, changed).unwrap();
-    error("Capture SHA-256 differs");
+    error(&reject_export, "Capture SHA-256 differs");
+    assert!(!rejected.exists());
 
     recorded["schema_version"] = json!(2);
     write_report(&recorded);
-    error("Unsupported packet capture report version");
+    error(&[], "Unsupported packet capture report version");
     recorded["schema_version"] = json!(1);
     recorded["sha256"] = json!("bad digest");
     write_report(&recorded);
-    error("Invalid packet capture report SHA-256");
+    error(&[], "Invalid packet capture report SHA-256");
     recorded["bytes"] = json!(65 * 1024 * 1024);
     write_report(&recorded);
-    error("invalid byte count");
+    error(&[], "invalid byte count");
     fs::write(&report, vec![b' '; 256 * 1024 + 1]).unwrap();
-    error("Packet capture report exceeds 256 KiB");
+    error(&[], "Packet capture report exceeds 256 KiB");
 }
 
 #[test]

@@ -1170,7 +1170,8 @@ try {
         $report.reviewed.options.rotate_files -ne 2 -or $report.reviewed.scratch_filesystem -cne 'tmpfs') {
         throw 'The saved report does not describe the verified packet capture and its reviewed settings'
     }
-    $verified = & $Cli verify-packet-capture-report $destination $reportPath | ConvertFrom-Json
+    $reportSettings = Join-Path $State 'verified packet settings.json'
+    $verified = & $Cli verify-packet-capture-report $destination $reportPath --save-settings $reportSettings | ConvertFrom-Json
     $details = $verified.result.details
     if ($LASTEXITCODE -ne 0 -or !$verified.ok -or $verified.result.sha256 -cne $digest -or $verified.result.bytes -ne 64 -or
         $details.file_name -cne $report.file_name -or $details.stop_reason -cne 'stopped' -or
@@ -1178,6 +1179,10 @@ try {
         $details.rotation.overwritten_files -ne 1 -or $details.reviewed.host_key_fingerprint -cne $plan.host_key_fingerprint -or
         $details.reviewed.options.snap_length -ne 192 -or $details.reviewed.options.filter -cne 'udp and dst port 4321') {
         throw 'The CLI did not verify the Windows capture with the recorded report details'
+    }
+    if (![FixtureDialog]::SameFile($reportSettings, $verified.result.settings_path) -or
+        [IO.File]::ReadAllText($reportSettings) -cne [IO.File]::ReadAllText($settingsFile)) {
+        throw 'The verified packet report did not reproduce the original settings file'
     }
     Select-Capture $destination
     $null = Wait-Until 'the saved packet file reopens in offline inspection' {

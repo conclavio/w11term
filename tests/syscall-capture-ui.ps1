@@ -255,12 +255,17 @@ try {
         $notice = Find-TraceText $prefix
         $notice -and [FixtureDialog]::SameFile($captureReport, $notice.Current.Name.Substring($prefix.Length))
     }
-    $verified = & $Cli verify-syscall-capture-report $destination $captureReport | ConvertFrom-Json
+    $reportSettings = Join-Path $State 'verified syscall settings.json'
+    $verified = & $Cli verify-syscall-capture-report $destination $captureReport --save-settings $reportSettings | ConvertFrom-Json
     $report = $verified.result.report
     if ($LASTEXITCODE -ne 0 -or !$verified.ok -or $report.stop_reason -cne 'stopped' -or
         $report.reviewed.program -cne '/bin/sh' -or $report.reviewed.directory -cne '/home/test' -or
         $report.reviewed.options.string_size -ne 64) {
         throw 'The Windows report did not verify with the reviewed options in the CLI'
+    }
+    if (![FixtureDialog]::SameFile($reportSettings, $verified.result.settings_path) -or
+        [IO.File]::ReadAllText($reportSettings) -cne [IO.File]::ReadAllText($cliSettings)) {
+        throw 'The verified syscall report did not reproduce the original settings file'
     }
 
     [IO.File]::Copy($destination, $renamed)
