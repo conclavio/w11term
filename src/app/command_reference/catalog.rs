@@ -221,6 +221,16 @@ impl Catalog {
         self.pages.insert(key, page);
     }
 
+    pub(super) fn remove_private_page(&mut self, key: &Key) {
+        if self
+            .pages
+            .get(key)
+            .is_some_and(|page| matches!(page.source, PageSource::Custom))
+        {
+            self.pages.remove(key);
+        }
+    }
+
     pub(super) fn exact(&self, text: &str, preferred: Platform) -> Option<Key> {
         let name = query(text);
         [preferred, COMMON]

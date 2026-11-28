@@ -22,7 +22,16 @@ pub enum Action {
     Exported(Arc<()>, Result<Option<PathBuf>, String>),
     Save,
     Saved(Arc<()>, Result<String, String>),
+    ReviewRemoval,
+    CancelRemoval,
+    Remove,
+    Removed(Arc<()>, Result<Removal, String>),
     Cancel,
+}
+
+pub struct Removal {
+    archive: PathBuf,
+    library: Result<catalog::Loaded, String>,
 }
 
 pub struct Document {
@@ -35,6 +44,8 @@ enum Work {
     Import,
     Export,
     Save,
+    ReviewRemoval,
+    Remove,
 }
 
 pub(super) struct Editor {
@@ -97,6 +108,10 @@ impl Editor {
             Some(Work::Import) => Some("Loading Markdown draft…"),
             Some(Work::Export) => Some("Exporting Markdown draft…"),
             Some(Work::Save) => Some("Saving private page…"),
+            Some(Work::Remove) => Some("Archiving private page…"),
+            Some(Work::ReviewRemoval) => Some(
+                "The saved Markdown will be archived. Any unsaved changes will be discarded if you remove the page.",
+            ),
             None if self.document.is_none() && self.status.is_none() => {
                 Some("Loading private page…")
             }
@@ -110,37 +125,61 @@ impl Editor {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        if self.document.is_some() {
+        if self.work == Some(Work::ReviewRemoval) {
             fields.push(KeyedView::new(
-                "markdown-files",
+                "remove-review",
                 StackPanel::new().spacing(4.0).children((
                     Button::new()
-                        .is_enabled(self.ready())
-                        .on_click(ctx.callback(|_| message(Action::Import)))
-                        .content("Import Markdown…"),
+                        .on_click(ctx.callback(|_| message(Action::Remove)))
+                        .content("Remove private page"),
                     Button::new()
-                        .is_enabled(self.ready())
-                        .on_click(ctx.callback(|_| message(Action::Export)))
-                        .content("Export Markdown…"),
+                        .on_click(ctx.callback(|_| message(Action::CancelRemoval)))
+                        .content("Back to private page"),
                 )),
             ));
+        } else {
+            if let Some(document) = &self.document {
+                fields.push(KeyedView::new(
+                    "markdown-files",
+                    StackPanel::new().spacing(4.0).children((
+                        Button::new()
+                            .is_enabled(self.ready())
+                            .on_click(ctx.callback(|_| message(Action::Import)))
+                            .content("Import Markdown…"),
+                        Button::new()
+                            .is_enabled(self.ready())
+                            .on_click(ctx.callback(|_| message(Action::Export)))
+                            .content("Export Markdown…"),
+                    )),
+                ));
+                if document.original.is_some() {
+                    fields.push(KeyedView::new(
+                        "review-removal",
+                        Button::new()
+                            .style(ButtonStyle::Subtle)
+                            .is_enabled(self.ready())
+                            .on_click(ctx.callback(|_| message(Action::ReviewRemoval)))
+                            .content("Review private page removal…"),
+                    ));
+                }
+            }
+            fields.push(KeyedView::new(
+                "actions",
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        Button::new()
+                            .is_enabled(self.ready())
+                            .on_click(ctx.callback(|_| message(Action::Save)))
+                            .content("Save private page"),
+                        Button::new()
+                            .is_enabled(self.work.is_none())
+                            .on_click(ctx.callback(|_| message(Action::Cancel)))
+                            .content("Cancel private page edit"),
+                    )),
+            ));
         }
-        fields.push(KeyedView::new(
-            "actions",
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    Button::new()
-                        .is_enabled(self.ready())
-                        .on_click(ctx.callback(|_| message(Action::Save)))
-                        .content("Save private page"),
-                    Button::new()
-                        .is_enabled(self.work.is_none())
-                        .on_click(ctx.callback(|_| message(Action::Cancel)))
-                        .content("Cancel private page edit"),
-                )),
-        ));
         Border::new().padding(12.0).content(
             ScrollViewer::new().content(
                 StackPanel::new().spacing(8.0).keyed_children(
@@ -397,6 +436,100 @@ impl Panel {
                     }
                 }
             }
+            Action::ReviewRemoval => {
+                if let Some(editor) = self.private_page.as_mut().filter(|editor| editor.ready())
+                    && editor
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| document.original.is_some())
+                {
+                    editor.work = Some(Work::ReviewRemoval);
+                }
+            }
+            Action::CancelRemoval => {
+                if let Some(editor) = &mut self.private_page
+                    && editor.work == Some(Work::ReviewRemoval)
+                {
+                    editor.work = None;
+                }
+            }
+            Action::Remove => {
+                let Some(editor) = self
+                    .private_page
+                    .as_mut()
+                    .filter(|editor| editor.work == Some(Work::ReviewRemoval))
+                else {
+                    return;
+                };
+                let Some(original) = editor
+                    .document
+                    .as_ref()
+                    .and_then(|document| document.original.clone())
+                else {
+                    return;
+                };
+                let key = editor.key.clone();
+                let ticket = editor.ticket.clone();
+                editor.work = Some(Work::Remove);
+                let rejected = message(Action::Removed(
+                    ticket.clone(),
+                    Err("Private page archival unavailable".into()),
+                ));
+                ctx.spawn_background_with_rejection(
+                    move |_| {
+                        let result = catalog::directory()
+                            .and_then(|directory| archive_document(&directory, &key, &original))
+                            .map(|archive| Removal {
+                                archive,
+                                library: catalog::load().map_err(|error| format!("{error:#}")),
+                            })
+                            .map_err(|error| format!("{error:#}"));
+                        message(Action::Removed(ticket, result))
+                    },
+                    rejected,
+                );
+            }
+            Action::Removed(ticket, result) => {
+                let Some(editor) = self.private_page.as_mut().filter(|editor| {
+                    Arc::ptr_eq(&editor.ticket, &ticket) && editor.work == Some(Work::Remove)
+                }) else {
+                    return;
+                };
+                match result {
+                    Ok(removal) => {
+                        let key = editor.key.clone();
+                        let mut status =
+                            format!("Archived private Markdown to {}", removal.archive.display());
+                        match removal.library {
+                            Ok(library) => self.library = Some(library),
+                            Err(error) => {
+                                if let Some(library) = &mut self.library {
+                                    library.catalog.remove_private_page(&key);
+                                }
+                                status.push_str(&format!(
+                                    " Could not reload command reference pages. {error}"
+                                ));
+                            }
+                        }
+                        self.private_page = None;
+                        self.cached.replace(None);
+                        self.command_lookup = None;
+                        self.related_history.clear();
+                        self.set_query(key.name);
+                        if self.platform.unwrap_or(auto) != key.platform {
+                            self.platform = Some(key.platform);
+                        }
+                        self.mode = SearchMode::PreferredExact;
+                        self.selected = 0;
+                        self.focus = self.focus.wrapping_add(1);
+                        self.error = Some(status);
+                    }
+                    Err(error) => {
+                        editor.work = None;
+                        editor.status = Some(error);
+                    }
+                }
+            }
             Action::Cancel => {
                 if self
                     .private_page
@@ -536,15 +669,7 @@ fn save_document(
     parse_private_page(&text)?;
     let path = page_path(directory, key, true)?.expect("created private page folder");
     let parent = path.parent().expect("private page has a folder");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(parent.join(".private-pages.lock"))?;
-    lock.try_lock()
-        .context("Another window is saving private pages. Try again.")?;
+    let _lock = lock_private_pages(parent)?;
     let mut staged = tempfile::NamedTempFile::new_in(parent)?;
     staged.write_all(text.as_bytes())?;
     staged.as_file().sync_all()?;
@@ -563,6 +688,46 @@ fn save_document(
             .context("Creating the private page")?;
     }
     Ok(text)
+}
+
+fn lock_private_pages(parent: &Path) -> Result<File> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(parent.join(".private-pages.lock"))?;
+    lock.try_lock()
+        .context("Another window is editing private pages. Try again.")?;
+    Ok(lock)
+}
+
+fn archive_document(directory: &Path, key: &Key, original: &str) -> Result<PathBuf> {
+    let changed = "The private page changed on disk. Reopen the editor before removing it.";
+    let source = page_path(directory, key, false)?.context(changed)?;
+    let _lock = lock_private_pages(source.parent().expect("private page has a folder"))?;
+    let mut open = open_page(&source)?.context(changed)?;
+    ensure!(catalog::read_page(&mut open)? == original, "{changed}");
+
+    let archive = directory.join("removed-pages");
+    if let Err(error) = fs::create_dir(&archive) {
+        ensure!(
+            error.kind() == ErrorKind::AlreadyExists,
+            "Could not create the private manual archive: {error}"
+        );
+    }
+    let metadata = fs::symlink_metadata(&archive)?;
+    ensure!(
+        metadata.is_dir() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0,
+        "Choose a regular private manual archive folder"
+    );
+    let backup_folder = tempfile::Builder::new()
+        .prefix(&format!("{}-", key.platform.0))
+        .tempdir_in(archive)?;
+    let name = source.file_name().expect("private page has a filename");
+    fs::rename(&source, backup_folder.path().join(name)).context("Archiving the private page")?;
+    Ok(backup_folder.keep().join(name))
 }
 
 #[cfg(test)]
@@ -630,6 +795,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read_to_string(file).unwrap(), "# Reopened draft");
+    }
+
+    #[test]
+    fn archives_only_the_reviewed_version_and_keeps_each_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = directory.path();
+        let key = key("route-review");
+        save_document(catalog, &key, None, "# Reviewed").unwrap();
+        let path = page_path(catalog, &key, false).unwrap().unwrap();
+        let external = "# Updated manually\r\n\r\n> Keep these bytes.\r\n";
+        fs::write(&path, external).unwrap();
+        assert!(archive_document(catalog, &key, "# Reviewed").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        assert!(!catalog.join("removed-pages").exists());
+
+        let first = archive_document(catalog, &key, external).unwrap();
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&first).unwrap(), external);
+        save_document(catalog, &key, None, "# A newer page").unwrap();
+        let second = archive_document(catalog, &key, "# A newer page").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(first).unwrap(), external);
+        assert_eq!(fs::read_to_string(second).unwrap(), "# A newer page");
     }
 
     #[test]

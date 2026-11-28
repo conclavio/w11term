@@ -93,6 +93,8 @@ In the private page editor, choose **Import Markdown…** to load a UTF-8 manual
 
 Choose **Export Markdown…** in the editor to save a UTF-8 copy of the current draft to a separate file. The draft stays open and the library keeps its saved version.
 
+Choose **Review private page removal…** in an existing manual’s editor to archive its saved Markdown and reveal the bundled manual when available. Recover it by importing the archived file from the path shown in Command reference.
+
 From the command palette, choose **Find saved manual…** and search by page title, command name, or platform. Press Enter to open the selected manual beside the current pane, or Esc to leave the search.
 
 After editing an example, choose **Save as command…**, give it a name, and choose **Save to commands**. This works offline and without a writable terminal. The shared command library keeps the edited text for recall from the command palette or an SSH group. Inserting or sending a saved command takes a separate action.

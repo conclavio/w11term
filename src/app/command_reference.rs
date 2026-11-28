@@ -347,7 +347,8 @@ impl Panel {
                         .or_else(|| self.library.as_ref().map(|library| library.status.as_str()))
                         .unwrap_or("Command reference unavailable")
                 })
-                .text_wrapping(TextWrapping::Wrap),
+                .text_wrapping(TextWrapping::Wrap)
+                .is_text_selection_enabled(true),
         )];
         pieces.push(self.saved_pages.section(self.library.as_ref(), ctx));
         if let Some(target) = tool_pane {

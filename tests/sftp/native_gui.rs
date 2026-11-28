@@ -147,6 +147,17 @@ async fn native_private_manual_export_keeps_the_saved_manual_and_draft() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews private manual removal, protects an external edit and shows its bundled fallback"]
+async fn native_private_manual_removal_archives_and_restores_the_bundled_page() {
+    run_palette_fixture(
+        "remove-private-manual-ui.ps1",
+        b"",
+        Some("private-manual-removal-ready\r\n"),
+    )
+    .await;
+}
+
 #[test]
 #[ignore = "saves an offline manual example and recalls it in a real PowerShell pane"]
 fn native_reference_examples_save_offline_and_require_explicit_shell_submit() {
