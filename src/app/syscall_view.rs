@@ -5,6 +5,7 @@ use w11term::syscall_trace::{self as trace, Filter, Group, Raw, Trace};
 mod capture;
 mod compare;
 mod handles;
+mod report;
 mod summary;
 
 pub(super) const LABEL: &str = "Syscall trace viewer";
@@ -29,6 +30,7 @@ pub enum Action {
     Summary(summary::Action),
     Compare(compare::Action),
     Capture(capture::Action),
+    Report(report::Action),
 }
 
 #[derive(Default)]
@@ -46,6 +48,7 @@ pub(super) struct PageState {
     timing: summary::ViewState,
     comparison: compare::ViewState,
     capture: capture::ViewState,
+    report: report::ViewState,
 }
 
 impl TerminalApp {
@@ -175,6 +178,7 @@ impl TerminalApp {
             Action::Summary(action) => self.syscall_summary_action(action, ctx),
             Action::Compare(action) => self.syscall_compare_action(action, ctx),
             Action::Capture(action) => self.syscall_capture_action(action, ctx),
+            Action::Report(action) => self.syscall_report_action(action, ctx),
             Action::Show => (),
         }
     }
@@ -299,6 +303,7 @@ impl PageState {
         self.descriptors = Default::default();
         self.timing = Default::default();
         self.comparison = Default::default();
+        self.report = Default::default();
         self.capture.back();
         self.reset_position();
     }
@@ -405,6 +410,9 @@ impl PageState {
         }
         if self.comparison.open {
             return self.comparison.view(id, header, idle, ctx);
+        }
+        if trace.file_count() == 1 {
+            header.push(self.report.view(id, idle, ctx));
         }
         header.push(self.comparison.launch(id, idle, ctx));
         header.push(self.descriptors.switch(id, idle, ctx));

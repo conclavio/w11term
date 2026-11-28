@@ -1622,7 +1622,7 @@ impl TerminalApp {
             FileChoice::OpenSettings | FileChoice::SaveSettings => {
                 file_picker::Purpose::CaptureSettings {
                     current: initial.into(),
-                    kind: file_picker::CaptureSettingsKind::Packet,
+                    kind: file_picker::CaptureFileKind::Packet,
                     save: matches!(choice, FileChoice::SaveSettings),
                 }
             }
@@ -1680,7 +1680,11 @@ impl TerminalApp {
         let capture = capture.clone();
         let ticket = panel.begin("Choosing a packet capture report file…");
         work(ctx, ticket, move || {
-            let purpose = file_picker::Purpose::SavePacketCaptureReport(capture.path.clone());
+            let purpose = file_picker::Purpose::CaptureReport {
+                capture: capture.path.clone(),
+                kind: file_picker::CaptureFileKind::Packet,
+                save: true,
+            };
             let Some(file) = file_picker::pick(owner, purpose)? else {
                 return Ok(None);
             };
@@ -1699,7 +1703,11 @@ impl TerminalApp {
         panel.verified_report = None;
         let ticket = panel.begin("Choosing a packet capture report to verify…");
         work(ctx, ticket, move || {
-            let purpose = file_picker::Purpose::OpenPacketCaptureReport(capture.clone());
+            let purpose = file_picker::Purpose::CaptureReport {
+                capture: capture.clone(),
+                kind: file_picker::CaptureFileKind::Packet,
+                save: false,
+            };
             let Some(file) = file_picker::pick(owner, purpose)? else {
                 return Ok(None);
             };

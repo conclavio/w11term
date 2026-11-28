@@ -306,13 +306,15 @@ impl TerminalApp {
                     Ok(Some(Outcome::Saved(capture, trace))) => {
                         page.capture.review = None;
                         let summary = capture_summary(&capture, &trace);
+                        let path = capture.path.clone();
                         if let Ok(trace) = trace {
                             page.load(trace);
+                            page.report.capture = Some(Arc::new(capture));
                         }
                         page.status = Some(summary);
                         self.remember_diagnostic(
                             w11term::diagnostic_history::Kind::SyscallTrace,
-                            [capture.path],
+                            [path],
                             ctx,
                         );
                     }
@@ -383,7 +385,7 @@ impl TerminalApp {
         };
         let purpose = file_picker::Purpose::CaptureSettings {
             current: page.capture.settings_path.clone().unwrap_or(profile_path),
-            kind: file_picker::CaptureSettingsKind::Syscall,
+            kind: file_picker::CaptureFileKind::Syscall,
             save: saved_json.is_some(),
         };
         let ticket = page.begin("Choosing a syscall capture settings file…");
@@ -530,15 +532,7 @@ fn run(
 }
 
 fn capture_summary(capture: &SyscallCapture, trace: &Result<Arc<Trace>, String>) -> String {
-    let reason = match capture.stop_reason {
-        "stopped" => "Stopped by request".into(),
-        "time-limit" => "Time limit reached".into(),
-        "byte-budget" => "Byte budget reached. The final record may be incomplete.".into(),
-        _ => capture.command_exit_status.map_or_else(
-            || "Command completed".into(),
-            |code| format!("Command exit status {code}"),
-        ),
-    };
+    let reason = outcome_label(capture.stop_reason, capture.command_exit_status);
     let mut summary = format!(
         "Saved syscall trace\n{reason}\n{} bytes\n{}",
         capture.bytes,
@@ -548,6 +542,18 @@ fn capture_summary(capture: &SyscallCapture, trace: &Result<Arc<Trace>, String>)
         summary.push_str(&format!("\nOpening the saved trace: {error}"));
     }
     summary
+}
+
+pub(super) fn outcome_label(stop_reason: &str, exit_status: Option<u8>) -> String {
+    match stop_reason {
+        "stopped" => "Stopped by request".into(),
+        "time-limit" => "Time limit reached".into(),
+        "byte-budget" => "Byte budget reached. The final record may be incomplete.".into(),
+        _ => exit_status.map_or_else(
+            || "Command completed".into(),
+            |code| format!("Command exit status {code}"),
+        ),
+    }
 }
 
 impl ViewState {
@@ -813,7 +819,7 @@ impl ViewState {
     }
 }
 
-fn text(key: &str, value: impl Into<String>) -> KeyedView {
+pub(super) fn text(key: &str, value: impl Into<String>) -> KeyedView {
     KeyedView::new(
         key,
         TextBlock::new()

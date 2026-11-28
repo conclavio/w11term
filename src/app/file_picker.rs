@@ -83,11 +83,14 @@ pub(super) enum Purpose {
     OpenPacketCapture(PathBuf),
     ComparePacketCapture(PathBuf),
     SavePacketCapture(PathBuf),
-    SavePacketCaptureReport(PathBuf),
-    OpenPacketCaptureReport(PathBuf),
+    CaptureReport {
+        capture: PathBuf,
+        kind: CaptureFileKind,
+        save: bool,
+    },
     CaptureSettings {
         current: PathBuf,
-        kind: CaptureSettingsKind,
+        kind: CaptureFileKind,
         save: bool,
     },
     SavePacketExcerpt(PathBuf, &'static str),
@@ -109,7 +112,7 @@ pub(super) enum RolloutReceiptKind {
     Tools,
 }
 
-pub(super) enum CaptureSettingsKind {
+pub(super) enum CaptureFileKind {
     Packet,
     Syscall,
 }
@@ -281,7 +284,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::OpenTriageReport(_)
                 | Purpose::CompareTriageReport(_)
                 | Purpose::OpenPacketCapture(_)
-                | Purpose::OpenPacketCaptureReport(_)
+                | Purpose::CaptureReport { save: false, .. }
                 | Purpose::CaptureSettings { save: false, .. }
                 | Purpose::ComparePacketCapture(_)
                 | Purpose::WiresharkExecutable(_)
@@ -425,23 +428,23 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
                 dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
                     pszName: match kind {
-                        CaptureSettingsKind::Packet => w!("Packet capture settings"),
-                        CaptureSettingsKind::Syscall => w!("Syscall capture settings"),
+                        CaptureFileKind::Packet => w!("Packet capture settings"),
+                        CaptureFileKind::Syscall => w!("Syscall capture settings"),
                     },
                     pszSpec: w!("*.json"),
                 }])?;
                 options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 dialog.SetTitle(match (&kind, save) {
-                    (CaptureSettingsKind::Packet, true) => w!("Save packet capture settings"),
-                    (CaptureSettingsKind::Packet, false) => w!("Open packet capture settings"),
-                    (CaptureSettingsKind::Syscall, true) => w!("Save syscall capture settings"),
-                    (CaptureSettingsKind::Syscall, false) => w!("Open syscall capture settings"),
+                    (CaptureFileKind::Packet, true) => w!("Save packet capture settings"),
+                    (CaptureFileKind::Packet, false) => w!("Open packet capture settings"),
+                    (CaptureFileKind::Syscall, true) => w!("Save syscall capture settings"),
+                    (CaptureFileKind::Syscall, false) => w!("Open syscall capture settings"),
                 })?;
                 if save {
                     dialog.SetDefaultExtension(w!("json"))?;
                     dialog.SetFileName(match kind {
-                        CaptureSettingsKind::Packet => w!("packet-capture-settings.json"),
-                        CaptureSettingsKind::Syscall => w!("syscall-capture-settings.json"),
+                        CaptureFileKind::Packet => w!("packet-capture-settings.json"),
+                        CaptureFileKind::Syscall => w!("syscall-capture-settings.json"),
                     })?;
                     options &= !FOS_OVERWRITEPROMPT;
                     options |= FOS_NOTESTFILECREATE;
@@ -479,27 +482,38 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::SavePacketCaptureReport(path) | Purpose::OpenPacketCaptureReport(path) => {
+            Purpose::CaptureReport {
+                capture,
+                kind,
+                save,
+            } => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
                 options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
-                if clsid == FileOpenDialog {
-                    dialog.SetTitle(w!("Open packet capture report"))?;
-                    options |= FOS_FILEMUSTEXIST;
-                } else {
-                    dialog.SetTitle(w!("Save packet capture report"))?;
+                dialog.SetTitle(match (&kind, save) {
+                    (CaptureFileKind::Packet, true) => w!("Save packet capture report"),
+                    (CaptureFileKind::Packet, false) => w!("Open packet capture report"),
+                    (CaptureFileKind::Syscall, true) => w!("Save syscall capture report"),
+                    (CaptureFileKind::Syscall, false) => w!("Open syscall capture report"),
+                })?;
+                if save {
                     dialog.SetDefaultExtension(w!("json"))?;
                     options &= !FOS_OVERWRITEPROMPT;
                     options |= FOS_NOTESTFILECREATE;
+                } else {
+                    options |= FOS_FILEMUSTEXIST;
                 }
                 dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
-                    pszName: w!("Packet capture report"),
+                    pszName: match kind {
+                        CaptureFileKind::Packet => w!("Packet capture report"),
+                        CaptureFileKind::Syscall => w!("Syscall capture report"),
+                    },
                     pszSpec: w!("*.json"),
                 }])?;
-                let mut suggestion = path.file_name().unwrap_or_default().to_os_string();
+                let mut suggestion = capture.file_name().unwrap_or_default().to_os_string();
                 suggestion.push(".json");
                 let wide: Vec<_> = suggestion.encode_wide().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(wide.as_ptr()))?;
-                if let Some(folder) = path.parent() {
+                if let Some(folder) = capture.parent() {
                     local_folder(&dialog, folder);
                 }
                 None

@@ -10,6 +10,8 @@ $saveSettings = 'Save settings' + [char]0x2026
 $loadSettings = 'Load settings' + [char]0x2026
 $settingsFile = Join-Path $State 'Syscall capture settings.json'
 $cliSettings = Join-Path $State 'CLI trace settings.json'
+$captureReport = Join-Path $State 'Stopped capture report.json'
+$renamed = Join-Path $State 'Renamed saved trace.strace'
 $edit = [System.Windows.Automation.ControlType]::Edit
 $value = [System.Windows.Automation.ValuePattern]::Pattern
 $textType = [System.Windows.Automation.ControlType]::Text
@@ -59,6 +61,20 @@ function Choose-Settings([string]$Path, [switch]$Save) {
         else { [FixtureDialog]::SetFilename($dialog, $Path, '') }
     }
     $null = Wait-Until 'accept the settings filename' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+
+function Choose-Report([string]$Path, [string]$Trace, [switch]$Save) {
+    Set-NativeExpansion 'Syscall capture report' $true
+    $ellipsis = [char]0x2026
+    if ($Save) { Click "Save capture report$ellipsis" } else { Click "Verify capture report$ellipsis" }
+    $title = if ($Save) { 'Save syscall capture report' } else { 'Open syscall capture report' }
+    $dialog = Wait-OwnedDialog $title
+    $suggestion = [IO.Path]::GetFileName($Trace) + '.json'
+    $null = Wait-Until "enter the filename in '$title'" {
+        [FixtureDialog]::SetFilename($dialog, $Path, $suggestion) -or
+            [FixtureDialog]::SetCommonDialogFilename($dialog, $Path)
+    }
+    $null = Wait-Until 'accept the report filename' { [FixtureDialog]::ClickButton($dialog, 1) }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -191,6 +207,47 @@ try {
     Wait-Focus $local
     Run-Palette 'Diagnostics overview'
     Wait-DiagnosticArtifact 'Saved syscall trace' $destination 'Stopped by request'
+    Click 'Open Syscall capture activity'
+    Choose-Report $captureReport $destination -Save
+    $null = Wait-Until 'the new capture report is saved' {
+        $prefix = "Saved syscall capture report$dot"
+        $notice = Find-TraceText $prefix
+        $notice -and [FixtureDialog]::SameFile($captureReport, $notice.Current.Name.Substring($prefix.Length))
+    }
+    $verified = & $Cli verify-syscall-capture-report $destination $captureReport | ConvertFrom-Json
+    $report = $verified.result.report
+    if ($LASTEXITCODE -ne 0 -or !$verified.ok -or $report.stop_reason -cne 'stopped' -or
+        $report.reviewed.program -cne '/bin/sh' -or $report.reviewed.directory -cne '/home/test' -or
+        $report.reviewed.options.string_size -ne 64) {
+        throw 'The Windows report did not verify with the reviewed options in the CLI'
+    }
+
+    [IO.File]::Copy($destination, $renamed)
+    Click ('Open syscall trace' + [char]0x2026)
+    $dialog = Wait-OwnedDialog 'Open syscall trace'
+    $null = Wait-Until 'enter the renamed trace path' { [FixtureDialog]::SetFilename($dialog, $renamed, '') }
+    $null = Wait-Until 'open the renamed trace' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the renamed trace is open' { Find-TraceText 'Renamed saved trace.strace' }
+    Set-NativeExpansion 'Syscall capture report' $true
+    if (Find-Element ('Save capture report' + [char]0x2026) $button) {
+        throw 'An imported trace inherited report export from the original capture'
+    }
+    Choose-Report $captureReport $renamed
+    $null = Wait-Until 'the renamed trace matches the report and shows the recorded details' {
+        (Find-TraceText "Trace file matches report$dot") -and
+            (Find-Element 'Executable /bin/sh') -and
+            (Find-Element 'Working directory /home/test') -and
+            (Find-TraceText 'Recorded SSH ') -and
+            (Find-Element "SHA-256 $($report.sha256)")
+    }
+    $modified = [IO.File]::ReadAllBytes($renamed)
+    $modified[0] = [byte]($modified[0] -bxor 1)
+    [IO.File]::WriteAllBytes($renamed, $modified)
+    Choose-Report $captureReport $renamed
+    $null = Wait-Until 'a modified trace is rejected and clears the old verification' {
+        (Find-TraceText 'Trace SHA-256 differs from the syscall capture report') -and
+            !(Find-TraceText 'Recorded SSH ')
+    }
 } finally {
     Close-FixtureApp $app
 }
