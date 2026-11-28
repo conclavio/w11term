@@ -1621,6 +1621,8 @@ $audit.result.profiles | Where-Object {
 
 Use `rollout-tool-profiles` to adopt one revised manifest in multiple saved SSH profiles. Select each profile explicitly. Each must already approve the candidate's bundle name and launcher directory. The preview lists the candidate's SHA-256 and any detectable additions, removals, and build changes. A missing or changed baseline is marked separately. Pinned profiles receive the new manifest hash, and profiles that follow the file keep that setting.
 
+In Windows, open **Settings → Profiles → Audit SSH tool profiles → Roll out tool manifest**. Pick the revision, check the profiles you want to update, and choose **Review selected tool rollout**. **Apply reviewed tool rollout** updates the reviewed selection.
+
 ```powershell
 $rollout = @('rollout-tool-profiles', '--candidate', '.\Fleet revision.json', '--profile', 'East', '--profile', 'West')
 $preview = & $ctl @rollout | ConvertFrom-Json

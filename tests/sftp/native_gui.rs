@@ -4674,6 +4674,54 @@ fn native_tool_profile_audit_filters_refreshes_and_preserves_a_draft() {
 }
 
 #[test]
+#[ignore = "reviews and applies a tool manifest rollout to selected Windows profiles"]
+fn native_tool_profile_rollout_preserves_the_open_profile_draft() {
+    let state = tempfile::tempdir().unwrap();
+    let root = state.path();
+    let key = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let manifest =
+        |commands: &[(&str, char)]| {
+            let tools: Vec<_> = commands.iter().map(|(name, pin)| {
+            json!({"name": name, "builds": [{
+                "architecture": "x86_64", "path": name, "sha256": pin.to_string().repeat(64),
+            }]})
+        }).collect();
+            json!({"version": 1, "name": "fleet", "tools": tools}).to_string()
+        };
+    let before = manifest(&[("rg", 'a'), ("ncdu", 'c')]);
+    let next = manifest(&[("rg", 'b'), ("jq", 'd')]);
+    let previous_pin = super::utilities::tool_sha256(before.as_bytes());
+    let next_pin = super::utilities::tool_sha256(next.as_bytes());
+    fs::write(root.join("previous.json"), before).unwrap();
+    fs::write(root.join("Fleet revision.json"), next).unwrap();
+    fs::write(root.join("candidate-pin"), next_pin).unwrap();
+    let profile = |host: &str, pin: Option<&str>| {
+        json!({
+            "host": host, "user": "ops", "auth": "agent", "host_key": key,
+            "tool_bundle": {
+                "host": host, "user": "ops", "port": 22, "fingerprint": key, "home": "/home/ops",
+                "name": "fleet", "bin_directory": ".local/bin", "bundle": "previous.json",
+                "manifest_sha256": pin, "add_to_path": {"shell": "bash"},
+            },
+        })
+    };
+    let mut different = profile("different.example.test", None);
+    different["tool_bundle"]["bin_directory"] = json!(".local/other");
+    fs::write(
+        root.join("profiles.json"),
+        json!({"profiles": {
+            "East": profile("east.example.test", Some(&previous_pin)),
+            "West": profile("west.example.test", None),
+            "Other": profile("other.example.test", Some(&previous_pin)),
+            "Different": different,
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    drive_gui("tool-profile-rollout-ui.ps1", root);
+}
+
+#[test]
 #[ignore = "selects SSH key, dotfiles and tool bundles through native dialogs and saves a profile"]
 fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
     let state = tempfile::tempdir().unwrap();

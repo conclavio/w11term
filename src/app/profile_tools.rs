@@ -106,6 +106,26 @@ impl Editor {
         self.approved.clone()
     }
 
+    pub(super) fn adopt_rollout(&mut self, before: &ToolSync, after: &ToolSync, base: &Path) {
+        if self.approved.as_deref() != Some(before) {
+            return;
+        }
+        self.approved = Some(Box::new(after.clone()));
+        if base.join(self.bundle.trim()) == before.bundle
+            && self.starter.is_none()
+            && self.local.is_none()
+        {
+            if self.preset
+                == ToolBundlePreset::from_managed_path(&before.bundle).unwrap_or_default()
+            {
+                self.preset =
+                    ToolBundlePreset::from_managed_path(&after.bundle).unwrap_or_default();
+            }
+            self.bundle = after.bundle.to_string_lossy().into_owned();
+            self.edited();
+        }
+    }
+
     fn candidate(&self, draft: &ProfileDraft, base: &Path) -> anyhow::Result<ToolSync> {
         let (host, user, port) = parse_ssh_address(&draft.host, &draft.user, &draft.port)?;
         let fingerprint =

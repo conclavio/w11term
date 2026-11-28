@@ -74,6 +74,11 @@ fn approval(options: &SshOptions) -> Result<&ToolSync> {
     Ok(settings)
 }
 
+fn load_candidate(candidate: &Path) -> Result<Manifest> {
+    Manifest::load(candidate)
+        .with_context(|| format!("Reading candidate tool manifest {}", candidate.display()))
+}
+
 impl<'a> Plan<'a> {
     fn build(
         catalog: &'a Path,
@@ -81,8 +86,7 @@ impl<'a> Plan<'a> {
         selected: &BTreeSet<&str>,
         profiles: &BTreeMap<String, SshOptions>,
     ) -> Result<Self> {
-        let proposed = Manifest::load(candidate)
-            .with_context(|| format!("Reading candidate tool manifest {}", candidate.display()))?;
+        let proposed = load_candidate(candidate)?;
         let mut baselines = HashMap::new();
         let mut revisions = Vec::with_capacity(selected.len());
         for &name in selected {
@@ -218,6 +222,22 @@ fn changes(before: &UtilityBundle, proposed: &UtilityBundle) -> ToolManifestChan
 }
 
 impl ProfileStore {
+    pub fn tool_rollout_targets(&self, candidate: &Path) -> Result<Vec<(String, ToolSync)>> {
+        let candidate = load_candidate(candidate)?;
+        Ok(self
+            .load()?
+            .into_iter()
+            .filter_map(|(name, options)| {
+                let settings = approval(&options).ok()?;
+                (settings.manifest_pin().is_ok()
+                    && settings
+                        .validate_manifest_destination(&candidate.bundle)
+                        .is_ok())
+                .then(|| (name, settings.clone()))
+            })
+            .collect())
+    }
+
     pub fn rollout_tools(
         &self,
         profiles: &[String],

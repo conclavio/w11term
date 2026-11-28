@@ -8,6 +8,8 @@ use w11term::sftp::{
     ToolArchitectureAudit, ToolExecutableSource, ToolExecutableStatus, UtilityArchitecture,
 };
 
+mod rollout;
+
 const CHECKS: [(&str, ToolProfileBuildChecks); 4] = [
     ("Manifest approvals only", ToolProfileBuildChecks::Skip),
     (
@@ -32,6 +34,7 @@ pub enum Action {
     Filter(String),
     IssuesOnly(bool),
     Edit(String),
+    Rollout(rollout::Action),
     Back,
 }
 
@@ -40,6 +43,7 @@ pub(super) struct AuditPage {
     issues_only: bool,
     checks: ToolProfileBuildChecks,
     state: State,
+    rollout: Option<Box<rollout::Panel>>,
 }
 
 enum State {
@@ -89,6 +93,10 @@ impl TerminalApp {
         action: Action,
         ctx: &ComponentContext<Self>,
     ) {
+        if let Action::Rollout(action) = action {
+            self.tool_profile_rollout(id, action, ctx);
+            return;
+        }
         let Some(Page::Settings(current)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) else {
             return;
         };
@@ -99,12 +107,16 @@ impl TerminalApp {
                 issues_only: false,
                 checks,
                 state: load(self.store.path().to_owned(), id, checks, ctx),
+                rollout: None,
             }));
             return;
         }
         let Some(SettingsEditor::ToolProfileAudit(page)) = current else {
             return;
         };
+        if page.rollout.is_some() {
+            return;
+        }
         match action {
             Action::Refresh if !matches!(page.state, State::Loading(..)) => {
                 page.state = load(self.store.path().to_owned(), id, page.checks, ctx);
@@ -132,12 +144,19 @@ impl TerminalApp {
                 }
             }
             Action::Back => *current = None,
-            Action::Open | Action::Refresh | Action::SelectChecks(_) | Action::Loaded(..) => {}
+            Action::Open
+            | Action::Refresh
+            | Action::SelectChecks(_)
+            | Action::Loaded(..)
+            | Action::Rollout(_) => {}
         }
     }
 }
 
 pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) -> View {
+    if let Some(rollout) = &page.rollout {
+        return rollout.view(id, ctx);
+    }
     let loading = matches!(page.state, State::Loading(..));
     let mut fields = vec![
         KeyedView::new(
@@ -163,6 +182,12 @@ pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) 
                             ctx.callback(move |_| Message::ToolProfileAudit(id, Action::Refresh)),
                         )
                         .content("Refresh audit"),
+                    Button::new()
+                        .is_enabled(!loading)
+                        .on_click(ctx.callback(move |_| {
+                            Message::ToolProfileAudit(id, Action::Rollout(rollout::Action::Open))
+                        }))
+                        .content("Roll out tool manifest"),
                 )),
         ),
         KeyedView::new(
