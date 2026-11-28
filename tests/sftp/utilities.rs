@@ -1890,6 +1890,68 @@ fn connect_tools(options: &SshOptions) -> Session {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fish_tool_path_syncs_before_the_shell_and_repairs_only_its_block() {
+    let (source, remote, _, server) = fixture_connections(false, 3).await;
+    let root = remote.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(root, "x86_64", "/", "/usr/bin");
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("utility-shell-probe"), "fish").unwrap();
+    save_login_manifest(local.path(), 1);
+    let mut options = approved_login(source, local.path());
+    options.tool_bundle.as_mut().unwrap().add_to_path = Some(ToolPath {
+        shell: DotfileShell::Fish,
+        zdotdir: None,
+    });
+    let options: SshOptions =
+        serde_json::from_value(serde_json::to_value(options).unwrap()).unwrap();
+
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("updated")).await;
+    assert!(pane.frames.load().rows.iter().any(|row| {
+        let text = row.as_str();
+        text.contains("tools-at-shell:") && text.contains(":true")
+    }));
+    let config = root.join(".config/fish/config.fish");
+    let hook = fs::read_to_string(&config).unwrap();
+    assert!(hook.contains("builtin set -gx PATH"));
+    assert!(!root.join(".bashrc").exists());
+    assert!(!root.join(".profile").exists());
+    drop(pane);
+
+    let dotfiles = include_str!("../../src/sftp/dotfiles/startup.fish");
+    let edited = hook.replace("builtin set -gx PATH", "# edited PATH");
+    let combined =
+        |path_hook| format!("# user settings\n{dotfiles}{path_hook}# trailing settings\n");
+    fs::write(&config, combined(&edited)).unwrap();
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "current", Some("skipped")).await;
+    assert_eq!(fs::read_to_string(&config).unwrap(), combined(&edited));
+    let review = guarded_job(&pane, Some(1), Operation::ReviewToolPath { review: None })
+        .await
+        .unwrap();
+    assert_eq!(review["shell"], "fish");
+    assert_eq!(review["files"].as_array().unwrap().len(), 1);
+    assert_eq!(review["files"][0]["path"], "/.config/fish/config.fish");
+    assert_eq!(review["files"][0]["action"], "replace-hook");
+    guarded_job(
+        &pane,
+        Some(1),
+        Operation::ReviewToolPath {
+            review: Some(review["review"].as_str().unwrap().to_owned()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read_to_string(&config).unwrap(), combined(&hook));
+    drop(pane);
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "current", Some("current")).await;
+    assert_eq!(fs::read_to_string(&config).unwrap(), combined(&hook));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pausing_updates_keeps_the_same_release_until_updates_resume() {
     let (source, remote, _, server) = fixture_connections(false, 3).await;
     let root = remote.path();

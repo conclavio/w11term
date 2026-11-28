@@ -537,25 +537,9 @@ impl ToolSync {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolPath {
-    #[serde(deserialize_with = "deserialize_tool_path_shell")]
     pub shell: crate::sftp::DotfileShell,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zdotdir: Option<String>,
-}
-
-fn deserialize_tool_path_shell<'de, D>(
-    deserializer: D,
-) -> Result<crate::sftp::DotfileShell, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use crate::sftp::DotfileShell;
-    match DotfileShell::deserialize(deserializer)? {
-        shell @ (DotfileShell::Bash | DotfileShell::Zsh) => Ok(shell),
-        DotfileShell::Fish => Err(serde::de::Error::custom(
-            "Managed tool PATH changes require Bash or Zsh",
-        )),
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]

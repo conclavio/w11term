@@ -2994,6 +2994,7 @@ async fn native_command_reference_installs_a_selected_catalog_tool() {
         serde_json::to_vec(&json!({
             "conflict": conflict, "pin": pin, "startup": startup, "login": login,
             "probe": root.join("utility-probe-response"),
+            "fishStartup": root.join(".config/fish/config.fish"),
         }))
         .unwrap(),
     )

@@ -161,7 +161,7 @@ jobs:
           fi
       - name: Exercise directory reporting in interactive shells
         run: python3 tests/shell-directory.py
-      - name: Exercise SSH dotfile startup in Fish
+      - name: Exercise SSH dotfiles and managed tool PATH in Fish
         run: python3 tests/fish-dotfiles.py
       - name: Exercise Fish 4 native and fallback prompt marking
         run: |

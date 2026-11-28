@@ -78,8 +78,8 @@ impl Setup {
                 "shell",
                 ComboBox::new()
                     .automation_name("PATH setup shell")
-                    .items_source(["Bash", "Zsh"])
-                    .selected_index(usize::from(self.shell == DotfileShell::Zsh))
+                    .items_source(DotfileShell::ALL.map(DotfileShell::label))
+                    .selected_index(self.shell.menu_index())
                     .is_enabled(ready)
                     .on_selection_changed(ctx.callback(|index| path_message(Action::Shell(index)))),
             ),
@@ -173,6 +173,8 @@ pub struct Review {
     shell: String,
     home: String,
     bin_directory: String,
+    #[serde(default)]
+    directories_to_create: Vec<String>,
     files: Vec<File>,
     blocked: Option<String>,
     pub(super) ready: bool,
@@ -209,6 +211,12 @@ impl Review {
                 self.bin_directory
             ),
         ));
+        for (index, path) in self.directories_to_create.iter().enumerate() {
+            fields.push(detail(
+                format!("path-directory-{index}"),
+                format!("Create directory · {path}"),
+            ));
+        }
         for (index, file) in self.files.iter().enumerate() {
             let action = match file.action.as_str() {
                 "create" => "Create",
@@ -293,18 +301,14 @@ impl TerminalApp {
                     installer.path_review = None;
                 }
             }
-            Action::Shell(Some(index @ 0..=1)) if idle && current.is_some() => {
-                if let Some(setup) = installer.path_setup.as_mut().filter(|setup| setup.open) {
-                    let shell = if index == 0 {
-                        DotfileShell::Bash
-                    } else {
-                        DotfileShell::Zsh
-                    };
-                    if setup.shell != shell {
-                        setup.shell = shell;
-                        installer.path_review = None;
-                        installer.status = None;
-                    }
+            Action::Shell(Some(index)) if idle && current.is_some() => {
+                if let Some(&shell) = DotfileShell::ALL.get(index)
+                    && let Some(setup) = installer.path_setup.as_mut().filter(|setup| setup.open)
+                    && setup.shell != shell
+                {
+                    setup.shell = shell;
+                    installer.path_review = None;
+                    installer.status = None;
                 }
             }
             Action::Zdotdir(text) if idle && current.is_some() => {

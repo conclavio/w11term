@@ -69,15 +69,11 @@ impl Engine {
     ) -> Result<Value> {
         validate_zdotdir(shell, zdotdir)?;
         let home = self.dotfile_home().await?;
-        let mut directories = Vec::new();
-        if shell == DotfileShell::Fish {
-            for relative in [CONFIG_DIRECTORY, FISH_DIRECTORY] {
-                let path = under_home(&home, relative);
-                if !self.dotfile_directory_exists(&path).await? {
-                    directories.push(path);
-                }
-            }
-        }
+        let directories = if shell == DotfileShell::Fish {
+            self.missing_fish_startup_directories(&home).await?
+        } else {
+            Vec::new()
+        };
         let edits = self
             .dotfile_hooks(&home, shell, zdotdir)
             .await?

@@ -896,6 +896,17 @@ impl Engine {
         Ok(())
     }
 
+    async fn missing_fish_startup_directories(&self, home: &str) -> Result<Vec<String>> {
+        let mut directories = Vec::new();
+        for relative in [CONFIG_DIRECTORY, FISH_DIRECTORY] {
+            let path = under_home(home, relative);
+            if !self.dotfile_directory_exists(&path).await? {
+                directories.push(path);
+            }
+        }
+        Ok(directories)
+    }
+
     async fn dotfiles_plan(
         &self,
         bundle: &DotfileBundle,

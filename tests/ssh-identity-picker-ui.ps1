@@ -345,6 +345,16 @@ try {
             $tools.fingerprint -ceq $fingerprint -and $tools.add_to_path.shell -ceq 'bash' -and
             [FixtureDialog]::SameFile($toolBundle, $tools.bundle)
     }
+    Select-NativeComboItem 'Tool bundle shell PATH' 'Manage Fish PATH'
+    Click 'Review tool bundle'
+    $null = Wait-Until 'the Fish PATH approval has the same tool destination' { Find-Element $review }
+    Click 'Approve tool sync'
+    $null = Wait-Until 'Fish PATH approved for the tool bundle' { Find-Element 'Approved tool bundle: portable' }
+    Click 'Save profile changes'
+    $null = Wait-Until 'Fish PATH approval persisted' {
+        $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+        $tools.add_to_path.shell -ceq 'fish' -and $tools.bin_directory -ceq '.local/bin'
+    }
     Click 'Disable tool sync'
     $null = Wait-Until 'tool sync disabled' { Find-Element 'Tool sync off' }
     Click 'Save profile changes'

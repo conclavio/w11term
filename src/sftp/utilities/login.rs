@@ -90,15 +90,11 @@ pub(crate) async fn sync_login_tools(
     };
     if let Some(path) = &settings.add_to_path {
         // Profiles on separate connections can share the same shell startup files.
-        let result = install::with_lock(session, &home, async {
-            ensure!(
-                !home.contains(':'),
-                "The account home contains a PATH separator"
-            );
-            engine
-                .sync_tool_path(&home, &settings.bin_directory, path)
-                .await
-        })
+        let result = install::with_lock(
+            session,
+            &home,
+            engine.sync_tool_path(&home, &settings.bin_directory, path),
+        )
         .await;
         match result {
             Ok(changed) => {

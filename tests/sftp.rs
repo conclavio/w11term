@@ -680,7 +680,7 @@ impl server::Handler for Peer {
                 .into_bytes(),
             )?;
         }
-        if self.root.join("utility-shell-probe").is_file() {
+        if let Ok(probe) = fs::read_to_string(self.root.join("utility-shell-probe")) {
             let store = self.root.join(".local/share/w11term/tools/portable");
             let selector = fs::read_to_string(store.join("current")).unwrap_or_default();
             let target = selector.lines().nth(1).unwrap_or_default();
@@ -691,7 +691,12 @@ impl server::Handler for Peer {
                         && self.root.join(".local/bin/rg").is_file()
                 })
                 .unwrap_or("absent");
-            let path = fs::read_to_string(self.root.join(".bashrc"))
+            let startup = if probe == "fish" {
+                ".config/fish/config.fish"
+            } else {
+                ".bashrc"
+            };
+            let path = fs::read_to_string(self.root.join(startup))
                 .unwrap_or_default()
                 .contains("w11term tool PATH");
             s.data(c, format!("tools-at-shell:{id}:{path}\r\n").into_bytes())?;

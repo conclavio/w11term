@@ -11,6 +11,12 @@ use w11term::{
 mod local_bundle;
 
 const TITLE: &str = "SSH tools";
+const PATH_MODES: [&str; 4] = [
+    "Manual PATH setup",
+    "Manage Bash PATH",
+    "Manage Zsh PATH",
+    "Manage Fish PATH",
+];
 
 #[derive(Clone, Copy)]
 pub enum Field {
@@ -45,7 +51,7 @@ pub(super) struct Editor {
     home: String,
     fingerprint: String,
     zdotdir: String,
-    path_mode: usize,
+    path_shell: Option<DotfileShell>,
     approved: Option<Box<ToolSync>>,
     reviewed: Option<Box<ToolSync>>,
     work: Option<Arc<()>>,
@@ -60,27 +66,16 @@ impl Editor {
         let Some(settings) = approved.as_ref() else {
             return Self::default();
         };
-        let (path_mode, zdotdir) =
-            settings
-                .add_to_path
-                .as_ref()
-                .map_or((0, String::new()), |path| {
-                    (
-                        if path.shell == DotfileShell::Zsh {
-                            2
-                        } else {
-                            1
-                        },
-                        path.zdotdir.clone().unwrap_or_default(),
-                    )
-                });
+        let path = settings.add_to_path.as_ref();
         Self {
             bundle: settings.bundle.to_string_lossy().into_owned(),
             preset: ToolBundlePreset::from_managed_path(&settings.bundle).unwrap_or_default(),
             home: settings.home.clone(),
             fingerprint: settings.fingerprint.clone(),
-            zdotdir,
-            path_mode,
+            zdotdir: path
+                .and_then(|path| path.zdotdir.clone())
+                .unwrap_or_default(),
+            path_shell: path.map(|path| path.shell),
             approved,
             ..Self::default()
         }
@@ -97,22 +92,19 @@ impl Editor {
         anyhow::ensure!(!self.bundle.trim().is_empty(), "Choose an SSH tool bundle");
         let home = self.home.trim();
         validate_dotfiles_home(home)?;
-        let add_to_path = match self.path_mode {
-            1 => Some(ToolPath {
-                shell: DotfileShell::Bash,
-                zdotdir: None,
-            }),
-            2 => {
+        let add_to_path = self
+            .path_shell
+            .map(|shell| -> anyhow::Result<_> {
                 let zdotdir = self.zdotdir.trim();
-                let zdotdir = (!zdotdir.is_empty()).then_some(zdotdir);
-                validate_zdotdir(DotfileShell::Zsh, zdotdir)?;
-                Some(ToolPath {
-                    shell: DotfileShell::Zsh,
+                let zdotdir =
+                    (shell == DotfileShell::Zsh && !zdotdir.is_empty()).then_some(zdotdir);
+                validate_zdotdir(shell, zdotdir)?;
+                Ok(ToolPath {
+                    shell,
                     zdotdir: zdotdir.map(str::to_owned),
                 })
-            }
-            _ => None,
-        };
+            })
+            .transpose()?;
         Ok(ToolSync {
             bundle: base.join(self.bundle.trim()),
             name: String::new(),
@@ -330,15 +322,15 @@ impl Editor {
                     TextBlock::new().text("Shell PATH"),
                     ComboBox::new()
                         .automation_name("Tool bundle shell PATH")
-                        .items_source(["Manual PATH setup", "Manage Bash PATH", "Manage Zsh PATH"])
-                        .selected_index(self.path_mode)
+                        .items_source(PATH_MODES)
+                        .selected_index(self.path_shell.map_or(0, |shell| shell.menu_index() + 1))
                         .on_selection_changed(ctx.callback(move |index| {
                             Message::ProfileTools(id, Action::PathMode(index))
                         })),
                 )),
             ),
         ]);
-        if self.path_mode == 2 {
+        if self.path_shell == Some(DotfileShell::Zsh) {
             fields.push(KeyedView::new(
                 "zdotdir",
                 field(
@@ -445,9 +437,12 @@ impl TerminalApp {
         match action {
             Action::Local(_) => unreachable!("local bundle actions handled above"),
             Action::Expanded(expanded) => draft.tool_bundle.expanded = expanded,
-            Action::PathMode(Some(index)) if index != draft.tool_bundle.path_mode && index < 3 => {
-                draft.tool_bundle.path_mode = index;
-                draft.tool_bundle.edited();
+            Action::PathMode(Some(index)) if index < PATH_MODES.len() => {
+                let shell = index.checked_sub(1).map(|index| DotfileShell::ALL[index]);
+                if draft.tool_bundle.path_shell != shell {
+                    draft.tool_bundle.path_shell = shell;
+                    draft.tool_bundle.edited();
+                }
             }
             Action::PathMode(_) => (),
             Action::Preset(Some(index))
