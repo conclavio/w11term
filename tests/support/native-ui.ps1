@@ -265,6 +265,35 @@ function Move-NativeControlIntoView($Element, [hashtable]$Search) {
         $Search.scroll = $null
     }
 }
+function Select-NativeComboItem([string]$Selector, [string]$Name) {
+    $combo = [System.Windows.Automation.ControlType]::ComboBox
+    $item = [System.Windows.Automation.ControlType]::ListItem
+    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+    $select = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    $search = @{ scroll = $null }
+    $null = Wait-Until "select '$Name' in '$Selector'" {
+        try {
+            $control = Find-Element $Selector $combo
+            if (!$control -or !$control.Current.IsEnabled) { return }
+            if ($control.Current.IsOffscreen) {
+                Move-NativeControlIntoView $control $search
+                return
+            }
+            $popup = $control.GetCurrentPattern($expand)
+            if ($popup.Current.ExpandCollapseState -eq 'Collapsed') {
+                $popup.Expand()
+                return
+            }
+            $choice = Find-Element $Name $item -Visible
+            if ($choice) {
+                $choice.GetCurrentPattern($select).Select()
+                return $true
+            }
+        } catch [System.Windows.Automation.ElementNotAvailableException] {
+            # WinUI can replace the controls while it lays out the dropdown.
+        }
+    }
+}
 function Get-ScrollableMenuAction([string]$TriggerName, [string]$Name, [switch]$VisibleItem) {
     $button = [System.Windows.Automation.ControlType]::Button
     $search = @{ scroll = $null }
