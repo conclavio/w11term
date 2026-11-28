@@ -136,6 +136,13 @@ impl LocalCapture {
         Self::scan(path, None, None)
     }
 
+    /// Read the verified capture through the same handle that checked its digest.
+    pub fn open_verified(path: PathBuf, bytes: u64, sha256: &str) -> Result<Self> {
+        ensure!(path.is_absolute(), "Choose an absolute capture file path");
+        let file = crate::sftp::open_local_verified(&path, bytes, sha256)?;
+        Self::scan_file(path, file, None, None)
+    }
+
     fn scan(
         path: PathBuf,
         offsets: Option<Range<i128>>,
@@ -143,6 +150,15 @@ impl LocalCapture {
     ) -> Result<Self> {
         ensure!(path.is_absolute(), "Choose an absolute capture file path");
         let file = File::open(&path).context("Opening the capture file")?;
+        Self::scan_file(path, file, offsets, expected)
+    }
+
+    fn scan_file(
+        path: PathBuf,
+        file: File,
+        offsets: Option<Range<i128>>,
+        expected: Option<SourceStamp>,
+    ) -> Result<Self> {
         let metadata = file.metadata().context("Reading capture file metadata")?;
         ensure!(metadata.is_file(), "Choose a capture file");
         let source_stamp = SourceStamp::from(&metadata);

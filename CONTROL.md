@@ -1745,6 +1745,8 @@ Choose **Save capture report…** on a completed capture to keep a JSON report a
 
 Choose **Reuse capture settings** on a completed capture or after verifying a report with recorded settings. The command fills the editable capture form and leaves the displayed capture available. Select the SSH pane for the new run, review the interface and limits, and choose a new output file to start it.
 
+After the new run is saved, **Compare with original capture** opens the source as **Before** and the new capture as **After**. w11term checks the saved sizes and SHA-256 values before comparing. **Back to capture** returns to the new capture.
+
 Pass `--report-file '.\after.pcap.json'` to `capture-packets` to save the report automatically. The reply includes `result.report_path` after export. If the report destination becomes unavailable during capture, the verified PCAP remains saved and the reply includes `result.report_error` alongside `result.capture`. Choose a new path for each file.
 
 Open the capture and choose **Verify capture report…**, or use `verify-packet-capture-report CAPTURE REPORT` from a shell. Either check compares the file's byte count and SHA-256 with the selected report and works offline. You can verify a moved or renamed capture. Windows shows the recorded host and host key, interface, filter, snap length, stop reason, and available drop and rotation counts after a match. The CLI returns the two absolute paths, byte count, digest, and the report's descriptive metadata in `result.details`. A digest-only report returns `details: null`. Invalid digests and mismatches return a nonzero exit code and a JSON error. The digest checks the capture file itself. The host, settings, and counters are the values recorded in the selected report.

@@ -59,6 +59,7 @@ pub enum Action {
     Stop(Arc<()>),
     OpenCaptureFile(Option<PathBuf>),
     CompareCapture,
+    CompareRepeat,
     Comparison(Arc<()>, compare::Change),
     BackToCapture,
     ChooseWireshark,
@@ -120,6 +121,29 @@ impl LoadedCapture {
         match self {
             Self::Captured(capture) => &capture.path,
             Self::Local(capture) => &capture.path,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SavedCaptureFile {
+    path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+impl SavedCaptureFile {
+    fn open(self) -> anyhow::Result<LocalPacketCapture> {
+        LocalPacketCapture::open_verified(self.path, self.bytes, &self.sha256)
+    }
+}
+
+impl From<&PacketCapture> for SavedCaptureFile {
+    fn from(capture: &PacketCapture) -> Self {
+        Self {
+            path: capture.path.clone(),
+            bytes: capture.bytes,
+            sha256: capture.sha256.clone(),
         }
     }
 }
@@ -250,7 +274,9 @@ pub(super) struct Panel {
     interfaces: Option<(flame_graph::Connection, PacketCaptureInterfaces)>,
     review: Option<Review>,
     loaded: Option<LoadedCapture>,
-    verified_report: Option<(PathBuf, Box<CaptureReportDetails>)>,
+    verified_report: Option<(PathBuf, CaptureReportVerification)>,
+    repeat_draft: Option<SavedCaptureFile>,
+    repeat_original: Option<SavedCaptureFile>,
     comparison: Option<compare::Comparison>,
     saved_interface: usize,
     timeline_expanded: bool,
@@ -394,6 +420,8 @@ impl Panel {
     fn install_local(&mut self, capture: Arc<LocalPacketCapture>) {
         self.loaded = Some(LoadedCapture::Local(capture));
         self.verified_report = None;
+        self.repeat_draft = None;
+        self.repeat_original = None;
         self.comparison = None;
         self.saved_interface = 0;
         self.timeline_expanded = false;
@@ -405,21 +433,32 @@ impl Panel {
         self.activity = None;
     }
 
-    fn reusable_settings(&self) -> Option<&PacketCaptureOptions> {
-        if let Some(LoadedCapture::Captured(capture)) = &self.loaded {
-            return Some(capture.options());
+    fn reusable_settings(&self) -> Option<(&PacketCaptureOptions, u64, &str)> {
+        match self.loaded.as_ref()? {
+            LoadedCapture::Captured(capture) => {
+                Some((capture.options(), capture.bytes, &capture.sha256))
+            }
+            LoadedCapture::Local(_) => {
+                let (_, report) = self.verified_report.as_ref()?;
+                let details = report.details.as_ref()?;
+                Some((&details.reviewed.options, report.bytes, &report.sha256))
+            }
         }
-        self.verified_report
-            .as_ref()
-            .map(|(_, details)| &details.reviewed.options)
     }
 
     fn reuse_capture_settings(&mut self) {
-        let Some(options) = self.reusable_settings().cloned() else {
+        let Some((loaded, (options, bytes, sha256))) =
+            self.loaded.as_ref().zip(self.reusable_settings())
+        else {
             return;
         };
-        match options.validate() {
+        match options.clone().validate() {
             Ok(options) => {
+                self.repeat_draft = Some(SavedCaptureFile {
+                    path: loaded.path().to_owned(),
+                    bytes,
+                    sha256: sha256.to_owned(),
+                });
                 self.inputs = options.into();
                 self.review = None;
                 self.status = Some(
@@ -721,6 +760,14 @@ impl Panel {
             files.push(KeyedView::new(
                 "reuse-capture-settings",
                 button("Reuse capture settings", idle, || Action::ReuseSettings),
+            ));
+        }
+        if self.repeat_original.is_some() {
+            files.push(KeyedView::new(
+                "compare-repeat-capture",
+                button("Compare with original capture", idle, || {
+                    Action::CompareRepeat
+                }),
             ));
         }
         if let Some(LoadedCapture::Captured(saved)) = &self.loaded {
@@ -1135,7 +1182,9 @@ impl Panel {
                 ),
             ]);
         }
-        if let Some((path, details)) = &self.verified_report {
+        if let Some((path, report)) = &self.verified_report
+            && let Some(details) = &report.details
+        {
             files.extend(verified_report_view(path, details));
         }
         files.append(&mut fields);
@@ -1375,6 +1424,7 @@ impl TerminalApp {
                 });
             }
             Action::CompareCapture => self.choose_capture_file(FileChoice::Compare, ctx),
+            Action::CompareRepeat => self.compare_repeated_packet_capture(ctx),
             Action::Comparison(revision, compare::Change::OpenRouter) => {
                 if let Some(evidence) = panel
                     .comparison
@@ -1736,6 +1786,23 @@ impl TerminalApp {
         });
     }
 
+    fn compare_repeated_packet_capture(&mut self, ctx: &ComponentContext<Self>) {
+        let panel = &mut self.packet_capture;
+        let Some(original) = panel.repeat_original.clone() else {
+            return;
+        };
+        let Some(LoadedCapture::Captured(repeated)) = &panel.loaded else {
+            return;
+        };
+        let repeated = SavedCaptureFile::from(repeated);
+        let ticket = panel.begin("Comparing the original and repeated captures…");
+        work(ctx, ticket, move || {
+            let before = Arc::new(original.open().context("Opening the original capture")?);
+            let after = repeated.open().context("Opening the repeated capture")?;
+            Ok(Some(build_capture_comparison(before, after, false)))
+        });
+    }
+
     fn verify_packet_report(&mut self, ctx: &ComponentContext<Self>) {
         let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
             return;
@@ -1813,6 +1880,7 @@ impl TerminalApp {
                 let path = capture.path.clone();
                 panel.loaded = Some(LoadedCapture::Captured(capture));
                 panel.verified_report = None;
+                panel.repeat_original = panel.repeat_draft.take();
                 panel.comparison = None;
                 panel.status = Some("Saved packet capture".into());
                 self.remember_diagnostic(
@@ -1827,11 +1895,12 @@ impl TerminalApp {
             Ok(Some(Outcome::ReportVerified(path, verified))) => {
                 let bytes = verified.bytes;
                 panel.status = Some(format!("Capture matches report · {bytes} bytes verified"));
-                panel.verified_report = verified.details.map(|details| (path, details));
+                panel.verified_report = Some((path, verified));
             }
             Ok(Some(Outcome::SettingsLoaded(path, settings))) => {
                 panel.inputs = settings.into();
                 panel.review = None;
+                panel.repeat_draft = None;
                 panel.status = Some(format!(
                     "Loaded packet capture settings · {}",
                     path.display()
@@ -1943,11 +2012,19 @@ fn compare_captures(
     install_baseline: bool,
 ) -> anyhow::Result<Outcome> {
     let after = LocalPacketCapture::open(after).context("Opening the after capture")?;
-    Ok(Outcome::Compared {
+    Ok(build_capture_comparison(before, after, install_baseline))
+}
+
+fn build_capture_comparison(
+    before: Arc<LocalPacketCapture>,
+    after: LocalPacketCapture,
+    install_baseline: bool,
+) -> Outcome {
+    Outcome::Compared {
         comparison: Arc::new(PacketCaptureComparison::new(&before, &after)),
         paths: [before.path.clone(), after.path],
         baseline: install_baseline.then_some(before),
-    })
+    }
 }
 
 fn work(

@@ -71,7 +71,7 @@ mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;
 pub use checksum::local_sha256;
-pub(crate) use checksum::local_sha256_with_size;
+pub(crate) use checksum::{local_sha256_with_size, open_local_verified};
 mod permissions;
 mod remote_copy;
 mod symbolic_link;

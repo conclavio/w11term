@@ -18,6 +18,7 @@ $viewer = Join-Path $State 'Fixture Wireshark.exe'
 $startMarker = [IO.File]::ReadAllText((Join-Path $State 'pcap-start-marker'))
 $saveLabel = 'Capture and save' + [char]0x2026
 $reuseLabel = 'Reuse capture settings'
+$repeatCompareLabel = 'Compare with original capture'
 $openCaptureLabel = 'Open capture file' + [char]0x2026
 $compareCaptureLabel = 'Compare captures' + [char]0x2026
 $chooseViewerLabel = 'Choose Wireshark executable' + [char]0x2026
@@ -1128,6 +1129,9 @@ try {
             (Find-Element "Rolling capture${dot}3 captured${dot}2 files kept${dot}1 overwritten") -and
             [IO.File]::Exists($destination)
     }
+    if (Find-Element $repeatCompareLabel $button) {
+        throw 'A standalone packet capture offered comparison with an unrelated original'
+    }
     Set-Field 'Duration in seconds' '5'
     Click $reuseLabel
     Wait-ReusedSettings
@@ -1262,7 +1266,37 @@ try {
     }
     Click 'Stop and save'
     $null = Wait-Until 'the repeated packet capture is saved' {
-        (Find-Element 'Saved packet capture') -and [IO.File]::Exists($repeated)
+        (Find-Element 'Saved packet capture') -and [IO.File]::Exists($repeated) -and
+            (Find-Element $repeatCompareLabel $button)
+    }
+
+    $original = [IO.File]::ReadAllBytes($destination)
+    $changed = [byte[]]$original.Clone()
+    $changed[$changed.Length - 1] = [byte]($changed[$changed.Length - 1] -bxor 1)
+    try {
+        [IO.File]::WriteAllBytes($destination, $changed)
+        Click $repeatCompareLabel
+        $null = Wait-Until 'a size-preserving change to the original capture is rejected' {
+            (Find-Element 'Opening the original capture: File SHA-256 differs from the expected digest') -and
+                !(Find-Element 'Back to capture' $button)
+        }
+    } finally {
+        [IO.File]::WriteAllBytes($destination, $original)
+    }
+    Click $repeatCompareLabel
+    $null = Wait-Until 'the original and repeat are compared in capture order' {
+        (Find-Element "Before${dot}reviewed capture.pcap${dot}PCAP") -and
+            (Find-Element "After${dot}reused settings.pcap${dot}PCAP") -and
+            (Find-Element 'Back to capture' $button)
+    }
+    Click 'Back to capture'
+    $null = Wait-Until 'the repeated result and its report export remain available' {
+        (Test-CaptureFile $repeated) -and (Find-Element $repeatCompareLabel $button) -and
+            (Find-Element ('Save capture report' + [char]0x2026) $button)
+    }
+    Select-Capture $other
+    $null = Wait-Until 'opening another capture clears the repeat link' {
+        (Test-CaptureFile $other) -and !(Find-Element $repeatCompareLabel $button)
     }
 } finally {
     Close-FixtureApp $app
