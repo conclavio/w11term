@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{collections::BTreeMap, io::Write, path, sync::Arc};
 use w11term::{
     control::{Request, SyscallFilter, SyscallOptions},
-    syscall_trace::{Comparison, Trace},
+    syscall_trace::{Comparison, SummarySort, Trace},
 };
 
 pub(super) const HELP: &str = concat!(
@@ -14,6 +14,60 @@ pub(super) const HELP: &str = concat!(
     "TRACE OPTIONS: [--arg ARG ...] [--directory PATH] [--seconds N] [--max-mib N] ",
     "[--string-size N] [--filter all|files|processes|network]",
 );
+
+pub(super) const INSPECT_VERB: &str = "inspect-syscall-trace";
+pub(super) const INSPECT_HELP: &str = concat!(
+    "w11term-cli inspect-syscall-trace --trace PATH [--trace PATH ...] ",
+    "[--pid PID] [--sort total|slowest|calls|errors] [--output-file PATH]",
+);
+
+pub(super) fn inspect_files(args: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let mut args = args.iter();
+    let mut traces = Vec::new();
+    let mut pid = None;
+    let mut sort = None;
+    let mut output_file = None;
+    while let Some(flag) = args.next() {
+        let mut value = || {
+            args.next()
+                .with_context(|| format!("{flag} requires a value"))
+        };
+        match flag.as_str() {
+            "--trace" => traces.push(path::absolute(value()?)?),
+            "--pid" => {
+                ensure!(pid.is_none(), "specify {flag} only once");
+                pid = Some(
+                    value()?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|&pid| pid > 0)
+                        .context("--pid requires a positive process ID")?,
+                );
+            }
+            "--sort" => {
+                ensure!(sort.is_none(), "specify {flag} only once");
+                let choice = value()?;
+                sort = Some(
+                    SummarySort::CHOICES
+                        .iter()
+                        .find_map(|(_, key, sort)| (*key == choice).then_some(*sort))
+                        .context("--sort requires total, slowest, calls or errors")?,
+                );
+            }
+            "--output-file" => {
+                ensure!(output_file.is_none(), "specify {flag} only once");
+                output_file = Some(value()?.as_str());
+            }
+            _ => bail!("unknown option {flag} for {INSPECT_VERB}"),
+        }
+    }
+    ensure!(!traces.is_empty(), "provide at least one --trace file");
+    let trace = Trace::open(traces).context("Reading the syscall trace")?;
+    let summary = trace.summarize(pid);
+    offline::write_report(stdout, output_file, |dest| {
+        summary.write_json(&trace, sort.unwrap_or_default(), dest)
+    })
+}
 
 pub(super) const COMPARE_VERB: &str = "compare-syscall-traces";
 pub(super) const COMPARE_HELP: &str = concat!(

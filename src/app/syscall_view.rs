@@ -5,6 +5,7 @@ use w11term::syscall_trace::{self as trace, Filter, Group, Raw, Trace};
 mod capture;
 mod compare;
 mod handles;
+mod summary;
 
 pub(super) const LABEL: &str = "Syscall trace viewer";
 const GROUPS_PER_PAGE: usize = 64;
@@ -25,6 +26,7 @@ pub enum Action {
     Groups(TabId, bool),
     Originals(TabId, bool),
     Handles(handles::Action),
+    Summary(summary::Action),
     Compare(compare::Action),
     Capture(capture::Action),
 }
@@ -41,6 +43,7 @@ pub(super) struct PageState {
     raw_page: usize,
     selected: Option<usize>,
     descriptors: handles::ViewState,
+    timing: summary::ViewState,
     comparison: compare::ViewState,
     capture: capture::ViewState,
 }
@@ -169,6 +172,7 @@ impl TerminalApp {
                 }
             }
             Action::Handles(action) => self.syscall_handles_action(action, ctx),
+            Action::Summary(action) => self.syscall_summary_action(action, ctx),
             Action::Compare(action) => self.syscall_compare_action(action, ctx),
             Action::Capture(action) => self.syscall_capture_action(action, ctx),
             Action::Show => (),
@@ -293,6 +297,7 @@ impl PageState {
         self.query.clear();
         self.filter = Filter::default();
         self.descriptors = Default::default();
+        self.timing = Default::default();
         self.comparison = Default::default();
         self.capture.back();
         self.reset_position();
@@ -394,6 +399,10 @@ impl PageState {
             };
             header.push(KeyedView::new("order", TextBlock::new().text(order)));
         }
+        if self.timing.open {
+            header.push(self.timing.switch(id, idle, ctx));
+            return self.timing.view(id, trace, header, idle, ctx);
+        }
         if self.comparison.open {
             return self.comparison.view(id, header, idle, ctx);
         }
@@ -402,6 +411,7 @@ impl PageState {
         if self.descriptors.open {
             return self.descriptors.view(id, trace, header, idle, ctx);
         }
+        header.push(self.timing.switch(id, idle, ctx));
         let selected_filter = Filter::CHOICES
             .iter()
             .position(|(_, filter)| *filter == self.filter)

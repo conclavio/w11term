@@ -330,8 +330,9 @@ async fn main() -> ExitCode {
             packet_capture::CLIP_HELP
         );
         println!(
-            "\n{}\n{}",
+            "\n{}\n{}\n{}",
             syscall_capture::HELP,
+            syscall_capture::INSPECT_HELP,
             syscall_capture::COMPARE_HELP
         );
         println!("\n{}", diagnostics::HELP);

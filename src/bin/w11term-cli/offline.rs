@@ -13,6 +13,10 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
     let (verb, args) = args.split_first()?;
     let (help, command): (&str, OfflineCommand) = match verb.as_str() {
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
+        syscall_capture::INSPECT_VERB => (
+            syscall_capture::INSPECT_HELP,
+            syscall_capture::inspect_files,
+        ),
         syscall_capture::COMPARE_VERB => (
             syscall_capture::COMPARE_HELP,
             syscall_capture::compare_files,
