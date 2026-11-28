@@ -5,7 +5,6 @@ use std::{
     fs,
     io::{BufRead, BufReader, Cursor, Write},
     net::{TcpListener, TcpStream},
-    path::Path,
     time::{Duration, Instant},
 };
 use w11term::windows_release::{VERSION, build_commit};
@@ -29,6 +28,8 @@ fn native_windows_release_checks_and_saves_verified_zip() {
     };
     let archive = fixture_zip();
     let expected_archive = archive.clone();
+    let initial_download = archive.len() / 2;
+    let mib = 1048576.0;
     let digest: String = Sha256::digest(&archive)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -50,7 +51,12 @@ fn native_windows_release_checks_and_saves_verified_zip() {
             "running": running,
             "first": expected,
             "retry": format!("Latest Windows build · build-{}", &other[..12]),
-            "published": format!("Published 2026-11-27 · {:.1} MiB ZIP", archive.len() as f64 / 1048576.0)
+            "published": format!("Published 2026-11-27 · {:.1} MiB ZIP", archive.len() as f64 / mib),
+            "partial_download": format!(
+                "Downloading and verifying · {:.1} / {:.1} MiB",
+                initial_download as f64 / mib,
+                archive.len() as f64 / mib
+            ),
         }))
         .unwrap(),
     )
@@ -91,11 +97,20 @@ fn native_windows_release_checks_and_saves_verified_zip() {
                 }
                 "good" => stream.write_all(&archive).unwrap(),
                 "cancel" => {
-                    let split = archive.len() / 2;
-                    stream.write_all(&archive[..split]).unwrap();
-                    fs::write(checks.join("release-download-cancel-ready"), []).unwrap();
-                    wait_for_file(&checks.join("release-download-cancelled"));
-                    let _ = stream.write_all(&archive[split..]);
+                    stream.write_all(&archive[..initial_download]).unwrap();
+                    let finished = checks.join("release-download-cancelled");
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    // Let WinHTTP finish its blocking reads while withholding the end of the ZIP.
+                    for chunk in archive[initial_download..archive.len() - 1].chunks(4096) {
+                        if finished.exists() || stream.write_all(chunk).is_err() {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "the ZIP download was not cancelled"
+                        );
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -139,18 +154,6 @@ fn fixture_zip() -> Vec<u8> {
         .unwrap();
     writer.write_all(&vec![b'x'; 1100 * 1024]).unwrap();
     writer.finish().unwrap().into_inner()
-}
-
-fn wait_for_file(file: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !file.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "missing fixture signal {}",
-            file.display()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
 }
 
 fn request(mut stream: TcpStream) -> (TcpStream, String, bool) {

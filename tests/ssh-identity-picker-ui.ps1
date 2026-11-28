@@ -88,12 +88,33 @@ function Set-DotfileFragment([string]$Name, [string]$Text) {
     $field.GetCurrentPattern($value).SetValue($Text.Replace("`n", "`r"))
     $null = Wait-Until "the multiline dotfile fragment '$Name' is retained" { (Dotfile-Fragment $Name) -ceq $Text }
 }
+function Get-DotfileMenuAction([string]$TriggerName, [string]$ItemName) {
+    $search = @{ scroll = $null; attemptedReveal = $false }
+    Get-NativeMenuAction $TriggerName $ItemName -VisibleItem -Reveal {
+        try {
+            $trigger = Find-Element $TriggerName $button
+            if ($trigger -and $trigger.Current.IsEnabled -and !$search.attemptedReveal) {
+                $search.attemptedReveal = $true
+                $scrollItem = $null
+                if ($trigger.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scrollItem)) {
+                    $scrollItem.ScrollIntoView()
+                    return
+                }
+                if ($trigger.Current.IsKeyboardFocusable) {
+                    $trigger.SetFocus()
+                    return
+                }
+            }
+            Move-NativeControlIntoView $trigger $search
+        } catch [System.Windows.Automation.ElementNotAvailableException] {
+            $search.attemptedReveal = $false
+            $search.scroll = $null
+        }
+    }
+}
 function Import-ShellFragment([string]$Destination, [string]$Source) {
     $import = 'Import shell fragment'
-    $search = @{ scroll = $null }
-    Invoke-Button (Get-NativeMenuAction $import $Destination -VisibleItem -Reveal {
-        Move-NativeControlIntoView (Find-Element $import $button) $search
-    })
+    Invoke-Button (Get-DotfileMenuAction $import $Destination)
     $title = 'Choose a shell fragment file'
     $dialog = Wait-OwnedDialog $title
     if ($Source) {
@@ -109,11 +130,7 @@ function Import-ShellFragment([string]$Destination, [string]$Source) {
     }
 }
 function Add-ShellSetup([string]$Mode) {
-    $setup = 'Add shell setup'
-    $search = @{ scroll = $null }
-    Invoke-Button (Get-NativeMenuAction $setup $Mode -VisibleItem -Reveal {
-        Move-NativeControlIntoView (Find-Element $setup $button) $search
-    })
+    Invoke-Button (Get-DotfileMenuAction 'Add shell setup' $Mode)
 }
 function Save-DotfilesBundle([string]$Action, [string]$Path) {
     Invoke-Button (Wait-DotfileControl $Action $button)
