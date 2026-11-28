@@ -25,13 +25,16 @@ function Click([string]$Name) {
         }
     })
 }
+function Save-DotfileBundleDialog([string]$Path) {
+    $dialog = Wait-OwnedDialog 'Save new dotfiles bundle'
+    $null = Wait-Until 'enter a draft bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, "$Path.draft") }
+    $null = Wait-Until 'choose the bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, $Path) }
+    $null = Wait-Until 'submit the bundle picker' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
 function Save-RetainedDotfiles([string]$Path) {
     $prefix = "Saved dotfile bundle${dot}"
     Click 'Save selected dotfile bundle'
-    $dialog = Wait-OwnedDialog 'Save new dotfiles bundle'
-    $null = Wait-Until 'enter a draft retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, "$Path.draft") }
-    $null = Wait-Until 'choose the retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, $Path) }
-    $null = Wait-Until 'save the retained bundle' { [FixtureDialog]::ClickButton($dialog, 1) }
+    Save-DotfileBundleDialog $Path
     $null = Wait-Until 'saved bundle is available at the selected Windows destination' {
         if ([IO.File]::Exists($Path)) {
             Get-NativeTextLabels | Where-Object {
@@ -431,22 +434,34 @@ try {
     $fishEnv = 'set -gx EDITOR vi'
     $fishStartup = 'function fish_prompt; printf "fleet> "; end'
     foreach ($fragment in @(@('Fish environment fragment', $fishEnv), @('Fish startup fragment', $fishStartup))) {
-        $field = Wait-Until "the bundle editor exposes '$($fragment[0])'" {
+        $search = @{ scroll = $null }
+        $null = Wait-Until "the bundle editor shows the input for '$($fragment[0])'" {
             $entry = Find-Element $fragment[0] $edit
-            if ($entry -and $entry.Current.IsEnabled) { $entry }
+            if (!$entry -or !$entry.Current.IsEnabled) { return }
+            if ($entry.Current.IsOffscreen) {
+                Move-NativeControlIntoView $entry $search
+                return
+            }
+            $field = $entry.GetCurrentPattern($value)
+            if ($field.Current.Value -ceq $fragment[1]) { return $true }
+            $field.SetValue($fragment[1])
         }
-        $field.GetCurrentPattern($value).SetValue($fragment[1])
     }
     Click 'Save dotfiles revision'
     $fishBundle = Join-Path $State 'Fish profile bundle.json'
-    $dialog = Wait-OwnedDialog 'Save new dotfiles bundle'
-    $null = Wait-Until 'select the Fish bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, $fishBundle) }
-    $null = Wait-Until 'save the Fish bundle' { [FixtureDialog]::ClickButton($dialog, 1) }
-    $null = Wait-Until 'the saved Fish fragments are in the revised bundle' {
-        if ([IO.File]::Exists($fishBundle)) {
-            $saved = [IO.File]::ReadAllText($fishBundle) | ConvertFrom-Json
-            $saved.fish_environment -ceq $fishEnv -and $saved.fish -ceq $fishStartup -and $saved.bash.Contains('verified> ')
-        }
+    Save-DotfileBundleDialog $fishBundle
+    $null = Wait-Until 'the profile selects the saved Fish revision' {
+        $field = Find-Element 'Dotfiles bundle' $edit
+        $field -and [IO.File]::Exists($fishBundle) -and
+            [FixtureDialog]::SameFile($fishBundle, $field.GetCurrentPattern($value).Current.Value)
+    }
+    $saved = [IO.File]::ReadAllText($fishBundle) | ConvertFrom-Json
+    $original = $originalSnapshot | ConvertFrom-Json
+    if ($saved.fish_environment -cne $fishEnv -or $saved.fish -cne $fishStartup) {
+        throw 'The saved revision did not retain both Fish edits'
+    }
+    if ($saved.bash -cne $original.bash -or $saved.environment -cne $original.environment) {
+        throw 'The Fish revision changed the original Bash fragments'
     }
     Select-NativeComboItem 'Dotfiles shell' 'Fish'
     $fishDirectory = Wait-Until 'the profile shows the Fish configuration directory field' {
