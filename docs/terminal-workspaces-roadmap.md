@@ -364,6 +364,8 @@ English tldr-pages are bundled for offline lookup. The platform defaults to Wind
 
 **Saved pages** brings frequently used manuals back by command and platform. Keep a private and a bundled variant in the list together, reopen them offline after a restart, and remove shortcuts from the panel.
 
+**Find saved manual…** searches saved page titles, commands, and platforms from the command palette. Opening a result restores that exact page beside the current pane.
+
 Save an edited example to the shared **Saved commands** library from Command reference. Open the example editor offline, choose a name for the exact line, and recall it from the palette or a group later.
 
 **Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.

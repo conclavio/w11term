@@ -29,13 +29,14 @@ function Click([string]$Name) {
     })
 }
 
-function Start-Reference([string]$Log) {
+function Start-Reference([string]$Log, [switch]$SkipDrawer) {
     $script:app = Start-Process -FilePath $Gui -ArgumentList @(
         '--profiles', ('"' + $profiles + '"'), '--profile', '"Palette PowerShell"'
     ) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State $Log)
     $script:window = Wait-InputWindow
     $pane = ((Control @('list')).sessions | Where-Object label -eq 'Palette PowerShell').id
     Wait-Text $pane 'PS '
+    if ($SkipDrawer) { return }
     Run-Palette 'Command reference'
     $null = Wait-Until 'bundled catalog available offline' {
         Find-Element "Bundled TLDR pages${dot}v2.3"
@@ -79,8 +80,20 @@ function Save-Page {
     }
 }
 
+function Search-SavedManuals([string]$Text) {
+    Run-Palette ('Find saved manual' + [char]0x2026)
+    $field = Wait-PickerEditor 'Search saved manuals' 'Find saved manual'
+    $field.GetCurrentPattern($value).SetValue($Text)
+}
+
 try {
     Start-Reference 'gui.log'
+    Search-SavedManuals ''
+    $null = Wait-Until 'an empty saved list has its own message' { Find-Element 'No saved manuals' }
+    $null = Press-FocusedKey 27
+    $null = Wait-Until 'Escape leaves the already open reference panel in place' {
+        !(Find-Element 'Search saved manuals' $edit) -and (Find-Element 'Search command reference' $edit)
+    }
     Search 'rg'
     $null = Wait-Until 'the Common manual is active' {
         (Find-Element 'rg') -and (Find-Element "Common${dot}tldr-pages (CC BY 4.0)")
@@ -102,7 +115,48 @@ try {
     Stop-Reference
     [IO.File]::Delete($only)
 
-    Start-Reference 'restart.log'
+    Start-Reference 'restart.log' -SkipDrawer
+    $pane = ((Control @('list')).sessions | Where-Object active).id
+    Search-SavedManuals 'team-only'
+    $null = Wait-Until 'the missing manual is visible and disabled in the palette' {
+        $missing = Find-Element "team-only    Linux${dot}Unavailable" $button
+        $missing -and !$missing.Current.IsEnabled
+    }
+    $null = Press-FocusedKey 27
+    $null = Wait-Until 'Escape leaves Command reference closed' {
+        !(Find-Element 'Search saved manuals' $edit) -and !(Find-Element 'Search command reference' $edit)
+    }
+    Wait-Focus $pane
+
+    Search-SavedManuals 'Linux notes rg'
+    $rowName = "Team rg notes    Linux${dot}rg"
+    $null = Wait-Until 'title and platform find the private variant' {
+        $row = Find-Element $rowName $button
+        $row -and $row.Current.IsEnabled -and !(Find-Element 'rg    Common' $button)
+    }
+    $savedText = [IO.File]::ReadAllText($saved)
+    $withoutLinux = $savedText | ConvertFrom-Json
+    $withoutLinux.pages = @($withoutLinux.pages | Where-Object { $_.platform -cne 'linux' -or $_.name -cne 'rg' })
+    try {
+        [IO.File]::WriteAllText($saved, ($withoutLinux | ConvertTo-Json -Depth 4))
+        $null = Press-FocusedKey 13
+        $notice = 'This saved manual was removed. Open the search again.  ' + [char]0xb7 + '  Dismiss'
+        $null = Wait-Until 'a removed shortcut cannot open from stale search results' {
+            (Find-Element $notice $button) -and !(Find-Element 'Search command reference' $edit)
+        }
+        Click $notice
+    } finally {
+        [IO.File]::WriteAllText($saved, $savedText)
+    }
+    Search-SavedManuals 'Linux notes rg'
+    $null = Wait-Until 'the restored shortcut can be selected again' { Find-Element $rowName $button }
+    $null = Press-FocusedKey 13
+    $null = Wait-Until 'Enter opens the exact Linux page from the palette' {
+        (Find-Element 'Team rg notes') -and (Find-Element "Linux${dot}Custom page") -and
+            (Find-Element 'Remove from saved pages' $button)
+    }
+    Wait-Focus $pane
+
     Show-Saved
     Click "Open saved page rg${dot}Common"
     $null = Wait-Until 'the saved Common manual opens after restart' {

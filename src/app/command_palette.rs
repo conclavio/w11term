@@ -9,6 +9,7 @@ pub(super) const FIND_CLOSED_TAB_LABEL: &str = "Recently closed tabs…";
 pub(super) const FIND_COMMAND_HISTORY_LABEL: &str = "Find command history…";
 pub(super) const FIND_RUNNING_COMMANDS_LABEL: &str = "Find running commands…";
 pub(super) const FIND_BOOKMARK_LABEL: &str = "Find scrollback bookmark…";
+pub(super) const FIND_SAVED_MANUAL_LABEL: &str = "Find saved manual…";
 pub(super) const FIND_PROFILE_LABEL: &str = "Find profile…";
 pub(super) const WINDOW_PROFILE_LABEL: &str = "Open profile in new window…";
 pub(super) const SPLIT_RIGHT_PROFILE_LABEL: &str = "Find profile to split right…";
@@ -35,6 +36,7 @@ pub(super) enum Search {
     GroupRuns(TabId),
     WindowGroupRuns(WindowRunScope),
     Bookmarks(clipboard_paste::Origin, BookmarkScreen),
+    SavedManuals,
 }
 
 impl Search {
@@ -60,6 +62,7 @@ impl Search {
                 axis: Axis::Rows, ..
             }) => "Search profiles to split below",
             Self::Bookmarks(..) => "Search scrollback bookmarks",
+            Self::SavedManuals => "Search saved manuals",
             Self::GroupLibrary(_) => "Search saved commands",
             Self::GroupRecent(_) => "Search recent group commands",
             Self::GroupRuns(_) => "Search group runs",
@@ -99,6 +102,8 @@ impl Search {
             Self::Profiles(_) => "No matching profiles",
             Self::Bookmarks(..) if query.is_empty() => "No retained scrollback bookmarks",
             Self::Bookmarks(..) => "No matching scrollback bookmarks",
+            Self::SavedManuals if query.trim().is_empty() => "No saved manuals",
+            Self::SavedManuals => "No matching saved manuals",
             _ => "No matching commands",
         }
     }
@@ -124,6 +129,8 @@ pub enum CommandId {
     ScrollToBookmark(Option<clipboard_paste::Origin>, bool),
     FindScrollbackBookmark(clipboard_paste::Origin, BookmarkScreen),
     OpenScrollbackBookmark(clipboard_paste::Origin, BookmarkScreen, isize),
+    FindSavedManuals,
+    OpenSavedManual(w11term::saved_reference_pages::Entry),
     SelectAll(Option<clipboard_paste::Origin>),
     PaneFind(Option<clipboard_paste::Origin>, Shortcut),
     CopySelection(Option<clipboard_paste::Origin>),
@@ -272,7 +279,7 @@ fn menu_rows(items: Vec<MenuItem>, profiles: bool, rows: &mut Vec<Row>) {
     }
 }
 
-fn filter(mut rows: Vec<Row>, query: &str) -> Vec<Row> {
+pub(super) fn filter(mut rows: Vec<Row>, query: &str) -> Vec<Row> {
     let query = query.trim().to_lowercase();
     let words: Vec<_> = query.split_whitespace().collect();
     rows.retain(|row| {
@@ -447,7 +454,12 @@ impl TerminalApp {
     }
 
     pub(super) fn command_rows(&self, query: &str) -> Vec<Row> {
-        let mut rows = vec![];
+        let mut rows = vec![Row {
+            id: CommandId::FindSavedManuals,
+            label: FIND_SAVED_MANUAL_LABEL.into(),
+            chord: String::new(),
+            enabled: !self.command_reference.subpanel_open(),
+        }];
         let exited = self.tabs.active().and_then(AppTab::exited_pane);
         let arrangement = self.pane_arrangement();
         let directory_split = self.directory_split_origin();
@@ -944,6 +956,10 @@ impl TerminalApp {
     }
 
     pub(super) fn run_palette_command(&mut self, id: CommandId, ctx: &ComponentContext<Self>) {
+        let manual_lookup = match &id {
+            CommandId::OpenSavedManual(_) => self.take_saved_manual_lookup(),
+            _ => None,
+        };
         let history_search = match &id {
             CommandId::OpenWindowCommand(pane, link, _) => {
                 self.window_history_return((*pane, *link))
@@ -952,6 +968,13 @@ impl TerminalApp {
         };
         self.close_picker(ctx);
         let message = match id {
+            CommandId::FindSavedManuals => return self.open_saved_manual_search(ctx),
+            CommandId::OpenSavedManual(entry) => {
+                if let Some(lookup) = manual_lookup {
+                    self.open_saved_manual_from_palette(lookup, entry);
+                }
+                return;
+            }
             CommandId::RenamePane(target) => tab_title::show_pane(target),
             CommandId::SaveLiveProfile(origin) => live_profile::open(origin),
             CommandId::ReopenClosedTab(group) => Message::ReopenClosedTab(group),
@@ -1167,7 +1190,7 @@ pub(super) fn view(
     let page = ((app.window_height - search_height) / 40.0).clamp(1.0, 10.0) as usize;
     let first = selected / page * page;
     let search_label = mode.placeholder();
-    let window_details = mode == Search::Windows;
+    let split_details = matches!(mode, Search::Windows | Search::SavedManuals);
     let trimming = if matches!(
         mode,
         Search::Tabs
@@ -1180,6 +1203,7 @@ pub(super) fn view(
             | Search::GroupRuns(_)
             | Search::WindowGroupRuns(_)
             | Search::Bookmarks(..)
+            | Search::SavedManuals
     ) {
         TextTrimming::CharacterEllipsis
     } else {
@@ -1215,6 +1239,7 @@ pub(super) fn view(
                     Search::RunningCommands => "Close running command search",
                     Search::Profiles(_) => "Close profile search",
                     Search::Bookmarks(..) => "Close bookmark search",
+                    Search::SavedManuals => "Close saved manual search",
                     _ => "Close command palette",
                 })
                 .on_click(ctx.callback(|_| Message::Shortcut(Shortcut::PickerCancel)))
@@ -1241,7 +1266,7 @@ pub(super) fn view(
             .on_click(ctx.callback(move |_| Message::PaletteChoose(id.clone())))
             .content(
                 Grid::new()
-                    .columns(if window_details {
+                    .columns(if split_details {
                         [GridLength::Star(3.0), GridLength::Star(2.0)]
                     } else {
                         [GridLength::STAR, GridLength::Auto]
@@ -1254,7 +1279,7 @@ pub(super) fn view(
                         TextBlock::new()
                             .grid_column(1)
                             .text(&row.chord)
-                            .text_trimming(if window_details {
+                            .text_trimming(if split_details {
                                 TextTrimming::CharacterEllipsis
                             } else {
                                 TextTrimming::None
@@ -1273,6 +1298,7 @@ pub(super) fn view(
                         picker
                             .window_history_status()
                             .or_else(|| picker.bookmark_status(app))
+                            .or_else(|| picker.saved_manual_status())
                     })
                     .unwrap_or_else(|| {
                         if mode.is_profiles() && app.profile_error.is_some() {

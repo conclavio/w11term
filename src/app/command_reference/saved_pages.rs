@@ -1,5 +1,85 @@
 use super::*;
+use command_palette::{CommandId, Row};
 use w11term::saved_reference_pages::{Entry, Store};
+
+pub struct Lookup {
+    entries: Vec<Entry>,
+    library: Option<Loaded>,
+}
+
+impl Lookup {
+    pub(in crate::app) fn load() -> anyhow::Result<Self> {
+        let entries = Store::user()?.list()?;
+        let library = (!entries.is_empty()).then(catalog::load).transpose()?;
+        Ok(Self { entries, library })
+    }
+
+    pub(in crate::app) fn rows(&self, query: &str) -> Vec<Row> {
+        let rows = self.entries.iter().map(|entry| {
+            let key = key(entry);
+            let platform = key
+                .as_ref()
+                .map_or(entry.platform.as_str(), |key| key.platform.1);
+            let page = key
+                .as_ref()
+                .and_then(|key| self.library.as_ref()?.catalog.page(key));
+            let (label, chord) = match page {
+                Some(page) if page.title.eq_ignore_ascii_case(&entry.name) => {
+                    (page.title.clone(), platform.to_owned())
+                }
+                Some(page) => (page.title.clone(), format!("{platform} · {}", entry.name)),
+                None => (entry.name.clone(), format!("{platform} · Unavailable")),
+            };
+            Row {
+                id: CommandId::OpenSavedManual(entry.clone()),
+                label,
+                chord,
+                enabled: page.is_some(),
+            }
+        });
+        command_palette::filter(rows.collect(), query)
+    }
+}
+
+impl TerminalApp {
+    pub(in crate::app) fn open_saved_manual_from_palette(&mut self, lookup: Lookup, entry: Entry) {
+        if self.command_reference.subpanel_open() {
+            return;
+        }
+        let Some(key) = key(&entry) else { return };
+        let Some(library) = lookup
+            .library
+            .filter(|library| library.catalog.page(&key).is_some())
+        else {
+            return;
+        };
+        let entries = match Store::user().and_then(|store| store.list()) {
+            Ok(entries) if entries.contains(&entry) => entries,
+            Ok(_) => {
+                self.window_error =
+                    Some("This saved manual was removed. Open the search again.".into());
+                return;
+            }
+            Err(error) => {
+                self.window_error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        let auto = self.reference_platform();
+        self.set_diagnostics_drawer(None);
+        let panel = &mut self.command_reference;
+        panel.open = true;
+        panel.library = Some(library);
+        panel.error = None;
+        panel.cached.replace(None);
+        panel.saved_pages.close();
+        if panel.saved_pages.pending.is_none() {
+            panel.saved_pages.entries = Some(entries);
+            panel.saved_pages.error = None;
+        }
+        panel.show_page(key, auto);
+    }
+}
 
 pub enum Action {
     Expanded(bool),

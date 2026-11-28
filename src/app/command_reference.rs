@@ -14,6 +14,8 @@ mod saved_pages;
 mod tool_install;
 mod tool_removal;
 
+pub use saved_pages::Lookup as SavedManualLookup;
+
 pub(super) const LABEL: &str = "Command reference";
 pub(super) const SELECTION: &str = "Look up selected command";
 
@@ -157,7 +159,7 @@ impl Panel {
         }
     }
 
-    fn subpanel_open(&self) -> bool {
+    pub(super) fn subpanel_open(&self) -> bool {
         self.private_page.is_some()
             || self.tool_install.is_some()
             || self.tool_removal.is_some()

@@ -87,6 +87,8 @@ Choose **Copy** to copy an example, or **Edit example** to fill in its placehold
 
 Choose **Save page** on a manual to keep it in **Saved pages**. Each entry remembers the command and its platform, including private pages with the same command name as a bundled manual. The list stays available after restarting w11term. Use **Remove from saved pages** on an open manual to remove its shortcut. When a manual disappears from the catalog, its saved entry offers removal from the list.
 
+From the command palette, choose **Find saved manual…** and search by page title, command name, or platform. Press Enter to open the selected manual beside the current pane, or Esc to leave the search.
+
 After editing an example, choose **Save as command…**, give it a name, and choose **Save to commands**. This works offline and without a writable terminal. The shared command library keeps the edited text for recall from the command palette or an SSH group. Inserting or sending a saved command takes a separate action.
 
 Use **Ctrl+Shift+P** or **More → Find pane…** to search terminal panes in every window in the same w11term instance, including panes in other tabs and hidden splits. Type part of the terminal title, profile name or SSH `user@host`. Add **Window N** to search only that window. Use the arrow keys or hover over a match to preview its live viewport, including terminal graphics. The preview preserves each pane’s grid size and focus. Screen readers can read the last two nonblank preview lines. Press Enter or click a result to bring its window forward and focus that pane. Escape returns to the pane you were using.
