@@ -32,6 +32,7 @@ pub(super) enum Purpose {
         suggestion: String,
     },
     SaveDotfileRolloutReceipt(PathBuf),
+    OpenDotfileRolloutReceipt(PathBuf),
     ToolBundle(PathBuf),
     ToolExecutable(PathBuf),
     SaveToolBundle {
@@ -272,6 +273,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::FlameGraph { export: false, .. }
                 | Purpose::SshConfig(_)
                 | Purpose::DotfilesBundle(_)
+                | Purpose::OpenDotfileRolloutReceipt(_)
                 | Purpose::DotfileFragment(_)
                 | Purpose::PrivatePageMarkdown
                 | Purpose::ToolBundle(_)
@@ -698,18 +700,29 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::SaveDotfileRolloutReceipt(candidate) => {
+            Purpose::SaveDotfileRolloutReceipt(ref current)
+            | Purpose::OpenDotfileRolloutReceipt(ref current) => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-                dialog.SetTitle(w!("Save dotfile rollout receipt"))?;
+                let save = matches!(purpose, Purpose::SaveDotfileRolloutReceipt(_));
+                dialog.SetTitle(if save {
+                    w!("Save dotfile rollout receipt")
+                } else {
+                    w!("Open dotfile rollout receipt")
+                })?;
                 dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
                     pszName: w!("JSON files"),
                     pszSpec: w!("*.json"),
                 }])?;
-                dialog.SetFileName(w!("dotfile-rollout.json"))?;
-                dialog.SetDefaultExtension(w!("json"))?;
-                options &= !FOS_OVERWRITEPROMPT;
-                options |= FOS_NOTESTFILECREATE | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
-                if let Some(folder) = candidate.parent() {
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if save {
+                    dialog.SetFileName(w!("dotfile-rollout.json"))?;
+                    dialog.SetDefaultExtension(w!("json"))?;
+                    options &= !FOS_OVERWRITEPROMPT;
+                    options |= FOS_NOTESTFILECREATE;
+                } else {
+                    options |= FOS_FILEMUSTEXIST;
+                }
+                if let Some(folder) = current.parent() {
                     local_folder(&dialog, folder);
                 }
                 None

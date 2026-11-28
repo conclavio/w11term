@@ -1422,6 +1422,8 @@ While the Windows rollout result is open, **Review rollback** lists the bundle p
 
 Choose **Save rollout receipt** in the Windows result to keep a JSON file you can use after closing the editor. The receipt includes the local catalog and bundle paths and the profile names and approval metadata. For a CLI rollout, save the JSON reply from the successful apply for the same purpose.
 
+To reopen either receipt in Windows, go to **Settings → Edit profile → SSH dotfiles → Review rollout receipt**. Choose a receipt for the profile catalog the window uses. Review the previous paths, pins, and bundle status, then choose **Apply reviewed rollback** to restore the listed approvals.
+
 `rollback-dotfiles-profiles` accepts either receipt and previews the previous bundle paths and pins for the profiles that rollout changed. It uses the catalog recorded in the reply and rejects the whole batch if any of those approvals have since changed. The preview reports whether each previous bundle is available and whether it matches its saved pin. Rollback restores the prior approvals even if a previous bundle is missing. Login sync checks the restored approval and bundle when a new SSH session opens.
 
 ```powershell

@@ -28,6 +28,12 @@ function Wait-Control([string]$Name, $Type = $button) {
     }
 }
 function Click([string]$Name, $Type = $button) { Invoke-Button (Wait-Control $Name $Type) }
+function Open-RolloutReceipt([string]$Path) {
+    Click 'Review rollout receipt'
+    $dialog = Wait-OwnedDialog 'Open dotfile rollout receipt'
+    $null = Wait-Until 'enter the rollout receipt filename' { [FixtureDialog]::SetFilename($dialog, $Path, '') }
+    $null = Wait-Until 'open the rollout receipt' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Fixture local"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
@@ -125,7 +131,50 @@ try {
     }
     if ([IO.File]::ReadAllText($profiles) -cne $rolledOut) { throw 'Stale rollback changed the catalog' }
     [IO.File]::WriteAllText($previous, $oldBundle)
-    Click 'Review rollback'
+    Click 'Close dotfile rollout'
+
+    Click 'Review rollout receipt'
+    $dialog = Wait-OwnedDialog 'Open dotfile rollout receipt'
+    $null = Wait-Until 'cancel the open receipt picker' { [FixtureDialog]::ClickButton($dialog, 2) }
+    $null = Wait-Control 'Review rollout receipt'
+
+    $otherCatalog = Join-Path $State 'other-profiles.json'
+    $otherReceipt = Join-Path $State 'Other rollout.json'
+    [IO.File]::WriteAllText($otherCatalog, $rolledOut)
+    $savedReceipt = [IO.File]::ReadAllText($receipt)
+    $otherReply = $savedReceipt | ConvertFrom-Json
+    $otherReply.result.profiles_path = $otherCatalog
+    [IO.File]::WriteAllText($otherReceipt, ($otherReply | ConvertTo-Json -Depth 25))
+    Open-RolloutReceipt $otherReceipt
+    $null = Wait-Until 'the window rejects a receipt for a different catalog' {
+        Find-Element 'This rollout receipt is for a different profile catalog'
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $rolledOut -or
+        [IO.File]::ReadAllText($otherCatalog) -cne $rolledOut) {
+        throw 'Reviewing a receipt for a different catalog changed a catalog'
+    }
+    Click 'Close rollout receipt'
+
+    Open-RolloutReceipt $receipt
+    $null = Wait-Until 'the reopened receipt shows the previous pin and missing Fish bundle' {
+        (Find-Element "Restore pin $oldPin") -and
+            (Find-Element 'The previous bundle matches its pin.') -and
+            (Find-Element 'The previous bundle is unavailable for this shell.')
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $rolledOut) { throw 'Reviewing the reopened receipt changed the catalog' }
+
+    $alternateBundle = Join-Path $State 'Alternate baseline.json'
+    [IO.File]::WriteAllText($alternateBundle, $oldBundle)
+    $editedReceipt = $savedReceipt | ConvertFrom-Json
+    ($editedReceipt.result.profiles | Where-Object profile -eq 'East').previous.bundle = $alternateBundle
+    [IO.File]::WriteAllText($receipt, ($editedReceipt | ConvertTo-Json -Depth 25))
+    Click 'Apply reviewed rollback'
+    $null = Wait-Until 'apply rejects a receipt changed after review' {
+        Find-Element 'The rollback files or approvals changed. Preview the rollback again.'
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $rolledOut) { throw 'An edited receipt changed the catalog' }
+    [IO.File]::WriteAllText($receipt, $savedReceipt)
+    Click 'Review receipt again'
     Click 'Apply reviewed rollback'
     $null = Wait-Until 'the previous approvals were restored together' { Find-Element 'Restored dotfiles in 2 saved SSH profiles.' }
     $saved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles
@@ -134,7 +183,7 @@ try {
         $saved.Other.dotfiles.bundle -cne 'previous.json') {
         throw 'The rollback did not restore the selected approvals while preserving the unchecked profile'
     }
-    Click 'Close dotfile rollout'
+    Click 'Close rollout receipt'
     $null = Wait-Until 'the initiating draft shows its restored pin' { Find-Element "Pinned dotfile version $oldPin" }
     Invoke-Button (Wait-Until 'the profile save action is enabled' {
         $save = Find-Element 'Save profile changes' $button

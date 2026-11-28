@@ -286,6 +286,10 @@ impl Editor {
                         .is_enabled(can_compose && !self.bundle.trim().is_empty())
                         .on_click(send(Action::Rollout(rollout::Action::Open)))
                         .content("Roll out to saved profiles"),
+                    Button::new()
+                        .is_enabled(can_compose)
+                        .on_click(send(Action::Rollout(rollout::Action::OpenReceipt)))
+                        .content("Review rollout receipt"),
                 )),
             ),
             KeyedView::new(

@@ -206,7 +206,29 @@ pub fn rollback_dotfile_rollout(
     receipt: &Path,
     review: Option<&str>,
 ) -> Result<DotfileRollbackReport> {
-    rollback(Receipt::load(receipt)?, review)
+    let receipt = Receipt::load(receipt)?;
+    let store = ProfileStore::new(receipt.profiles_path.clone())?;
+    rollback(&store, receipt, review)
+}
+
+impl ProfileStore {
+    /// Review or restore a receipt for this catalog.
+    pub fn rollback_dotfile_receipt(
+        &self,
+        path: &Path,
+        review: Option<&str>,
+    ) -> Result<DotfileRollbackReport> {
+        let receipt = Receipt::load(path)?;
+        if receipt.profiles_path != self.path() {
+            let recorded = receipt.profiles_path.canonicalize();
+            let current = self.path().canonicalize();
+            ensure!(
+                matches!((recorded, current), (Ok(recorded), Ok(current)) if recorded == current),
+                "This rollout receipt is for a different profile catalog"
+            );
+        }
+        rollback(self, receipt, review)
+    }
 }
 
 impl DotfileRolloutReport {
@@ -249,13 +271,17 @@ impl DotfileRolloutReport {
                 .collect(),
         }
         .checked()?;
-        rollback(receipt, review)
+        let store = ProfileStore::new(receipt.profiles_path.clone())?;
+        rollback(&store, receipt, review)
     }
 }
 
-fn rollback(receipt: Receipt, review: Option<&str>) -> Result<DotfileRollbackReport> {
+fn rollback(
+    store: &ProfileStore,
+    receipt: Receipt,
+    review: Option<&str>,
+) -> Result<DotfileRollbackReport> {
     const STALE: &str = "The rollback files or approvals changed. Preview the rollback again.";
-    let store = ProfileStore::new(receipt.profiles_path.clone())?;
     let rows = plan(&receipt, &store.load()?)?;
     let token = review_token(store.path(), &rows)?;
     if let Some(review) = review {

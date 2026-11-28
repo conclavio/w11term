@@ -11,6 +11,8 @@ type Targets = Vec<(String, DotfileSync)>;
 #[derive(Clone)]
 pub enum Action {
     Open,
+    OpenReceipt,
+    ReceiptPicked(Arc<()>, Result<Option<PathBuf>, String>),
     Loaded(Arc<()>, Result<Arc<Targets>, String>),
     Filter(Arc<()>, String),
     Select(Arc<()>, String, bool),
@@ -29,17 +31,22 @@ pub enum Action {
 #[derive(Clone)]
 enum Work {
     Loading,
+    PickingReceipt,
+    Receipt(PathBuf),
     Editing,
     Reviewing,
     Reviewed(Arc<ReviewedRollout>),
     Applying,
     Applied(Arc<ReviewedRollout>),
     SavingReceipt(Arc<ReviewedRollout>),
-    Rollback {
-        applied: Arc<ReviewedRollout>,
-        state: Undo,
-    },
+    Rollback { source: UndoSource, state: Undo },
     RolledBack(usize),
+}
+
+#[derive(Clone)]
+enum UndoSource {
+    Applied(Arc<ReviewedRollout>),
+    Receipt(PathBuf),
 }
 
 #[derive(Clone)]
@@ -52,7 +59,7 @@ enum Undo {
 #[derive(Clone)]
 pub(super) struct Panel {
     ticket: Arc<()>,
-    candidate: PathBuf,
+    candidate: Option<PathBuf>,
     targets: Arc<Targets>,
     selected: BTreeSet<String>,
     query: String,
@@ -97,14 +104,19 @@ fn message(id: TabId, action: Action) -> Message {
 }
 
 impl Panel {
-    fn new(candidate: PathBuf) -> Self {
+    fn new(candidate: Option<PathBuf>) -> Self {
+        let work = if candidate.is_some() {
+            Work::Loading
+        } else {
+            Work::PickingReceipt
+        };
         Self {
             ticket: Arc::new(()),
             candidate,
             targets: Arc::default(),
             selected: BTreeSet::new(),
             query: String::new(),
-            work: Work::Loading,
+            work,
             error: None,
             saved_receipt: None,
         }
@@ -117,6 +129,9 @@ impl Panel {
         review: Option<String>,
         ctx: &ComponentContext<TerminalApp>,
     ) {
+        let Some(candidate) = self.candidate.clone() else {
+            return;
+        };
         self.work = if review.is_some() {
             Work::Applying
         } else {
@@ -124,7 +139,6 @@ impl Panel {
         };
         self.error = None;
         let ticket = self.ticket.clone();
-        let candidate = self.candidate.clone();
         let profiles: Vec<_> = self.selected.iter().cloned().collect();
         let rejected = message(
             id,
@@ -148,7 +162,8 @@ impl Panel {
     fn request_rollback(
         &mut self,
         id: TabId,
-        applied: Arc<ReviewedRollout>,
+        source: UndoSource,
+        catalog: PathBuf,
         review: Option<String>,
         ctx: &ComponentContext<TerminalApp>,
     ) {
@@ -158,7 +173,7 @@ impl Panel {
             Undo::Reviewing
         };
         self.work = Work::Rollback {
-            applied: applied.clone(),
+            source: source.clone(),
             state,
         };
         self.error = None;
@@ -169,11 +184,14 @@ impl Panel {
         );
         ctx.spawn_background_with_rejection(
             move |_| {
-                let result = applied
-                    .report
-                    .rollback(review.as_deref())
-                    .map(Arc::new)
-                    .map_err(|error| format!("{error:#}"));
+                let review = review.as_deref();
+                let result = match source {
+                    UndoSource::Applied(applied) => applied.report.rollback(review),
+                    UndoSource::Receipt(path) => ProfileStore::new(catalog)
+                        .and_then(|store| store.rollback_dotfile_receipt(&path, review)),
+                }
+                .map(Arc::new)
+                .map_err(|error| format!("{error:#}"));
                 message(id, Action::RollbackCompleted(ticket, result))
             },
             rejected,
@@ -220,12 +238,25 @@ impl Panel {
 
     pub(super) fn view(&self, id: TabId, ctx: &ViewContext<TerminalApp>) -> View {
         let send = |action: Action| ctx.callback(move |_| message(id, action.clone()));
-        let mut fields = vec![
-            label("heading", "Roll out dotfile bundle"),
-            label("candidate", self.candidate.display().to_string()),
-        ];
+        let mut fields = Vec::new();
+        if let Some(candidate) = &self.candidate {
+            fields.push(label("heading", "Roll out dotfile bundle"));
+            fields.push(label("candidate", candidate.display().to_string()));
+        } else {
+            fields.push(label("heading", "Review dotfile rollout receipt"));
+        }
         match &self.work {
             Work::Loading => fields.push(label("status", "Reading saved SSH profiles…")),
+            Work::PickingReceipt => fields.push(label("status", "Choosing a rollout receipt…")),
+            Work::Receipt(path) => {
+                fields.push(label("receipt-path", path.display().to_string()));
+                fields.push(KeyedView::new(
+                    "review-receipt",
+                    Button::new()
+                        .on_click(send(Action::ReviewRollback(self.ticket.clone())))
+                        .content("Review receipt again"),
+                ));
+            }
             Work::Reviewing => fields.push(label("status", "Checking the selected profiles…")),
             Work::Applying => fields.push(label("status", "Saving the reviewed rollout…")),
             Work::SavingReceipt(_) => fields.push(label("status", "Saving rollout receipt…")),
@@ -256,7 +287,7 @@ impl Panel {
                     ));
                 }
             }
-            Work::Rollback { state, .. } => match state {
+            Work::Rollback { state, source } => match state {
                 Undo::Reviewing => {
                     fields.push(label("status", "Checking the previous dotfile approvals…"))
                 }
@@ -264,6 +295,9 @@ impl Panel {
                     fields.push(label("status", "Restoring the reviewed dotfile approvals…"))
                 }
                 Undo::Reviewed(rollback) => {
+                    if let UndoSource::Receipt(path) = source {
+                        fields.push(label("receipt-path", path.display().to_string()));
+                    }
                     for entry in &rollback.profiles {
                         let restore = &entry.restore;
                         let policy = restore.bundle_sha256.as_deref().map_or_else(
@@ -303,16 +337,19 @@ impl Panel {
                         ));
                     }
                     fields.push(KeyedView::new(
-                        "rollback-actions",
-                        StackPanel::new().spacing(6.0).children((
-                            Button::new()
-                                .on_click(send(Action::ApplyRollback(self.ticket.clone())))
-                                .content("Apply reviewed rollback"),
+                        "apply-rollback",
+                        Button::new()
+                            .on_click(send(Action::ApplyRollback(self.ticket.clone())))
+                            .content("Apply reviewed rollback"),
+                    ));
+                    if matches!(source, UndoSource::Applied(_)) {
+                        fields.push(KeyedView::new(
+                            "back-to-rollout",
                             Button::new()
                                 .on_click(send(Action::Back(self.ticket.clone())))
                                 .content("Back to rollout result"),
-                        )),
-                    ));
+                        ));
+                    }
                 }
             },
             Work::RolledBack(count) => fields.push(label(
@@ -457,6 +494,7 @@ impl Panel {
                 .is_enabled(!matches!(
                     self.work,
                     Work::Applying
+                        | Work::PickingReceipt
                         | Work::SavingReceipt(_)
                         | Work::Rollback {
                             state: Undo::Applying,
@@ -464,7 +502,11 @@ impl Panel {
                         }
                 ))
                 .on_click(send(Action::Close(self.ticket.clone())))
-                .content("Close dotfile rollout"),
+                .content(if self.candidate.is_some() {
+                    "Close dotfile rollout"
+                } else {
+                    "Close rollout receipt"
+                }),
         ));
         StackPanel::new().spacing(6.0).keyed_children(fields)
     }
@@ -502,19 +544,54 @@ impl TerminalApp {
             return;
         };
         let editor = &mut draft.dotfiles;
-        if matches!(action, Action::Open) {
+        if matches!(action, Action::Open | Action::OpenReceipt) {
             if editor.rollout.is_some()
                 || editor.composer.is_some()
                 || editor.checking.is_some()
                 || editor.browsing.is_some()
                 || editor.preview.loading()
-                || editor.bundle.trim().is_empty()
             {
+                return;
+            }
+            if matches!(action, Action::OpenReceipt) {
+                let Some(owner) = owner else {
+                    return;
+                };
+                let owner = owner.0 as usize;
+                let panel = Panel::new(None);
+                let ticket = panel.ticket.clone();
+                let rejected = message(
+                    id,
+                    Action::ReceiptPicked(
+                        ticket.clone(),
+                        Err("Rollout receipt picker unavailable".into()),
+                    ),
+                );
+                editor.rollout = Some(Box::new(panel));
+                ctx.spawn_background_with_rejection(
+                    move |cancel| {
+                        let result = if cancel.is_cancelled() {
+                            Ok(None)
+                        } else {
+                            file_picker::pick(
+                                owner,
+                                file_picker::Purpose::OpenDotfileRolloutReceipt(catalog),
+                            )
+                            .map(|file| file.map(|file| file.path))
+                            .map_err(|error| format!("{error:#}"))
+                        };
+                        message(id, Action::ReceiptPicked(ticket, result))
+                    },
+                    rejected,
+                );
+                return;
+            }
+            if editor.bundle.trim().is_empty() {
                 return;
             }
             let base = catalog.parent().unwrap_or(Path::new("."));
             let candidate = base.join(editor.bundle.trim());
-            let panel = Panel::new(candidate.clone());
+            let panel = Panel::new(Some(candidate.clone()));
             let ticket = panel.ticket.clone();
             let rejected = message(
                 id,
@@ -541,6 +618,7 @@ impl TerminalApp {
         };
         let ticket = match &action {
             Action::Loaded(ticket, _)
+            | Action::ReceiptPicked(ticket, _)
             | Action::Filter(ticket, _)
             | Action::Select(ticket, ..)
             | Action::Review(ticket)
@@ -553,12 +631,24 @@ impl TerminalApp {
             | Action::ApplyRollback(ticket)
             | Action::RollbackCompleted(ticket, _)
             | Action::Close(ticket) => ticket,
-            Action::Open => unreachable!(),
+            Action::Open | Action::OpenReceipt => unreachable!(),
         };
         if !Arc::ptr_eq(&panel.ticket, ticket) {
             return;
         }
         match action {
+            Action::ReceiptPicked(_, result) if matches!(panel.work, Work::PickingReceipt) => {
+                match result {
+                    Ok(Some(path)) => {
+                        panel.request_rollback(id, UndoSource::Receipt(path), catalog, None, ctx);
+                    }
+                    Ok(None) => editor.rollout = None,
+                    Err(error) => {
+                        editor.rollout = None;
+                        editor.error = Some(error);
+                    }
+                }
+            }
             Action::Loaded(_, result) if matches!(panel.work, Work::Loading) => {
                 panel.work = Work::Editing;
                 match result {
@@ -579,7 +669,7 @@ impl TerminalApp {
             }
             Action::Back(_) => {
                 if let Work::Rollback {
-                    applied,
+                    source: UndoSource::Applied(applied),
                     state: Undo::Reviewed(_),
                 } = &panel.work
                 {
@@ -645,22 +735,31 @@ impl TerminalApp {
                 }
             }
             Action::ReviewRollback(_) => {
-                if let Work::Applied(applied) = &panel.work {
-                    panel.request_rollback(id, applied.clone(), None, ctx);
-                }
+                let source = match &panel.work {
+                    Work::Applied(applied) => UndoSource::Applied(applied.clone()),
+                    Work::Receipt(path) => UndoSource::Receipt(path.clone()),
+                    _ => return,
+                };
+                panel.request_rollback(id, source, catalog, None, ctx);
             }
             Action::ApplyRollback(_) => {
                 if let Work::Rollback {
-                    applied,
+                    source,
                     state: Undo::Reviewed(rollback),
                 } = &panel.work
                 {
-                    panel.request_rollback(id, applied.clone(), Some(rollback.review.clone()), ctx);
+                    panel.request_rollback(
+                        id,
+                        source.clone(),
+                        catalog,
+                        Some(rollback.review.clone()),
+                        ctx,
+                    );
                 }
             }
             Action::RollbackCompleted(_, result) => {
                 let Work::Rollback {
-                    applied,
+                    source,
                     state: Undo::Reviewing | Undo::Applying,
                 } = &panel.work
                 else {
@@ -683,12 +782,15 @@ impl TerminalApp {
                     }
                     Ok(rollback) => {
                         panel.work = Work::Rollback {
-                            applied: applied.clone(),
+                            source: source.clone(),
                             state: Undo::Reviewed(rollback),
                         }
                     }
                     Err(error) => {
-                        panel.work = Work::Applied(applied.clone());
+                        panel.work = match source {
+                            UndoSource::Applied(applied) => Work::Applied(applied.clone()),
+                            UndoSource::Receipt(path) => Work::Receipt(path.clone()),
+                        };
                         panel.error = Some(error);
                     }
                 }
@@ -697,6 +799,7 @@ impl TerminalApp {
                 if !matches!(
                     panel.work,
                     Work::Applying
+                        | Work::PickingReceipt
                         | Work::SavingReceipt(_)
                         | Work::Rollback {
                             state: Undo::Applying,
