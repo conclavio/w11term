@@ -49,6 +49,9 @@ pub enum Action {
     Tmpfs(bool),
     Review,
     Save,
+    SettingsExpanded(bool),
+    OpenSettings,
+    SaveSettings,
     Stop(Arc<()>),
     OpenCaptureFile(Option<PathBuf>),
     CompareCapture,
@@ -72,6 +75,8 @@ pub enum Outcome {
     Reviewed(u64, Box<PacketCapturePlan>),
     Destination(PathBuf),
     Saved(PacketCapture),
+    SettingsLoaded(PathBuf, PacketCaptureOptions),
+    SettingsSaved(PathBuf),
     ExcerptSaved(PacketCaptureExcerpt),
     Loaded(Arc<LocalPacketCapture>),
     Compared {
@@ -90,6 +95,8 @@ enum FileChoice {
     Compare,
     Save,
     Wireshark,
+    OpenSettings,
+    SaveSettings,
 }
 
 enum WiresharkFilter {
@@ -190,6 +197,28 @@ impl Inputs {
     }
 }
 
+impl From<PacketCaptureOptions> for Inputs {
+    fn from(options: PacketCaptureOptions) -> Self {
+        Self {
+            interface: options.interface,
+            filter: options.filter,
+            seconds: options.seconds.to_string(),
+            snapshot: options.snap_length.to_string(),
+            budget: options.max_mib.to_string(),
+            packet_limit: options
+                .packet_limit
+                .map(|limit| limit.to_string())
+                .unwrap_or_default(),
+            rotate_files: options
+                .rotate_files
+                .map(|files| files.to_string())
+                .unwrap_or_default(),
+            scratch: options.scratch_directory,
+            tmpfs: options.require_tmpfs,
+        }
+    }
+}
+
 struct Review {
     pane: u64,
     plan: PacketCapturePlan,
@@ -210,6 +239,7 @@ pub(super) struct Panel {
     pub(super) open: bool,
     pub(super) activity: Option<diagnostics::Activity>,
     inputs: Inputs,
+    settings_expanded: bool,
     interfaces: Option<(flame_graph::Connection, PacketCaptureInterfaces)>,
     review: Option<Review>,
     loaded: Option<LoadedCapture>,
@@ -334,6 +364,33 @@ impl Panel {
         let inputs = &self.inputs;
         let destination = PacketCaptureOptions::default_scratch_directory(inputs.tmpfs);
         let mut fields = vec![
+            KeyedView::new(
+                "settings-files",
+                Expander::new()
+                    .automation_name("Capture settings files")
+                    .automation_id("packet-capture-settings")
+                    .is_expanded(self.settings_expanded)
+                    .on_is_expanded_changed(
+                        ctx.callback(|expanded| message(Action::SettingsExpanded(expanded))),
+                    )
+                    .slots([
+                        SlotView::new(
+                            ExpanderSlot::Header,
+                            TextBlock::new().text("Capture settings files"),
+                        ),
+                        SlotView::new(
+                            ExpanderSlot::Content,
+                            StackPanel::new().spacing(6.0).children((
+                                button("Load settings…", idle, || Action::OpenSettings),
+                                button(
+                                    "Save settings…",
+                                    idle && !inputs.interface.trim().is_empty(),
+                                    || Action::SaveSettings,
+                                ),
+                            )),
+                        ),
+                    ]),
+            ),
             input(
                 "interface",
                 Field::Interface,
@@ -1042,6 +1099,7 @@ impl TerminalApp {
                                 conversations::Change::Expanded(_)
                                     | conversations::Change::Select { .. }
                             ) | Action::ProtocolsExpanded(_)
+                                | Action::SettingsExpanded(_)
                                 | Action::Comparison(_, compare::Change::Pair { .. })
                                 | Action::Comparison(_, compare::Change::ProtocolsExpanded(_))
                                 | Action::Comparison(_, compare::Change::TimelineExpanded(_))
@@ -1137,6 +1195,9 @@ impl TerminalApp {
             }
             Action::Review => self.review_packet_capture(ctx),
             Action::Save => self.choose_capture_file(FileChoice::Save, ctx),
+            Action::SettingsExpanded(expanded) => panel.settings_expanded = expanded,
+            Action::OpenSettings => self.choose_capture_file(FileChoice::OpenSettings, ctx),
+            Action::SaveSettings => self.choose_capture_file(FileChoice::SaveSettings, ctx),
             Action::OpenCaptureFile(None) => self.choose_capture_file(FileChoice::Capture, ctx),
             Action::OpenCaptureFile(Some(path)) => {
                 let ticket = panel.begin("Opening packet capture…");
@@ -1400,6 +1461,17 @@ impl TerminalApp {
         let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
             return;
         };
+        let settings = if matches!(choice, FileChoice::SaveSettings) {
+            match panel.inputs.options() {
+                Ok(options) => Some(options),
+                Err(error) => {
+                    panel.status = Some(format!("{error:#}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let initial = self.store.path();
         let capture = || {
             panel
@@ -1414,6 +1486,12 @@ impl TerminalApp {
             FileChoice::Capture => file_picker::Purpose::OpenPacketCapture(capture()),
             FileChoice::Compare => file_picker::Purpose::ComparePacketCapture(capture()),
             FileChoice::Save => file_picker::Purpose::SavePacketCapture(capture()),
+            FileChoice::OpenSettings => {
+                file_picker::Purpose::OpenPacketCaptureSettings(initial.into())
+            }
+            FileChoice::SaveSettings => {
+                file_picker::Purpose::SavePacketCaptureSettings(initial.into())
+            }
         };
         let before = if matches!(choice, FileChoice::Compare) {
             panel.loaded.as_ref().map(|capture| match capture {
@@ -1443,6 +1521,16 @@ impl TerminalApp {
                 }
                 FileChoice::Save => Outcome::Destination(file.path),
                 FileChoice::Wireshark => Outcome::Wireshark(file.path),
+                FileChoice::OpenSettings => {
+                    let options = PacketCaptureOptions::load_settings(&file.path)?;
+                    Outcome::SettingsLoaded(file.path, options)
+                }
+                FileChoice::SaveSettings => {
+                    settings
+                        .context("Choose capture settings to save")?
+                        .save_settings(&file.path)?;
+                    Outcome::SettingsSaved(file.path)
+                }
             }))
         });
     }
@@ -1507,6 +1595,20 @@ impl TerminalApp {
                     [path],
                     ctx,
                 );
+            }
+            Ok(Some(Outcome::SettingsLoaded(path, settings))) => {
+                panel.inputs = settings.into();
+                panel.review = None;
+                panel.status = Some(format!(
+                    "Loaded packet capture settings · {}",
+                    path.display()
+                ));
+            }
+            Ok(Some(Outcome::SettingsSaved(path))) => {
+                panel.status = Some(format!(
+                    "Saved packet capture settings · {}",
+                    path.display()
+                ));
             }
             Ok(Some(Outcome::Loaded(capture))) => {
                 let path = capture.path.clone();

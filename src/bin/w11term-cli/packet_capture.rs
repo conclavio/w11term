@@ -14,13 +14,24 @@ use w11term::ssh::{
 
 pub(super) const HELP: &str = concat!(
     "w11term-cli [--pid PID] list-packet-interfaces --pane ID\n",
-    "w11term-cli [--pid PID] preview-packet-capture --pane ID --interface NAME [CAPTURE OPTIONS]\n",
-    "w11term-cli [--pid PID] capture-packets --pane ID --interface NAME [CAPTURE OPTIONS] ",
+    "w11term-cli [--pid PID] preview-packet-capture --pane ID (--settings PATH | --interface NAME [CAPTURE OPTIONS])\n",
+    "w11term-cli [--pid PID] capture-packets --pane ID (--settings PATH | --interface NAME [CAPTURE OPTIONS]) ",
     "--connection-generation N --review-id ID --output-file PATH [--job-id HEX] [--wireshark PATH]\n",
     "w11term-cli [--pid PID] stop-packet-capture --pane ID --connection-generation N --job-id HEX\n",
     "CAPTURE OPTIONS: [--filter EXPR] [--snap-length BYTES] [--seconds N] [--max-mib N] ",
     "[--packet-limit N] [--rotate-files 2..16] [--scratch-directory PATH] [--tmpfs]",
 );
+
+const CAPTURE_FLAGS: &[&str] = &[
+    "--interface",
+    "--filter",
+    "--snap-length",
+    "--seconds",
+    "--max-mib",
+    "--packet-limit",
+    "--rotate-files",
+    "--scratch-directory",
+];
 
 pub(super) const INSPECT_VERB: &str = "inspect-packet-capture";
 pub(super) const INSPECT_HELP: &str = concat!(
@@ -210,18 +221,7 @@ pub(super) fn parse(
             continue;
         }
         let accepted = flag == "--pane"
-            || !stop
-                && matches!(
-                    flag.as_str(),
-                    "--interface"
-                        | "--filter"
-                        | "--snap-length"
-                        | "--seconds"
-                        | "--max-mib"
-                        | "--packet-limit"
-                        | "--rotate-files"
-                        | "--scratch-directory"
-                )
+            || !stop && (flag == "--settings" || CAPTURE_FLAGS.contains(&flag.as_str()))
             || (capture || stop) && matches!(flag.as_str(), "--connection-generation" | "--job-id")
             || capture
                 && matches!(
@@ -268,7 +268,47 @@ pub(super) fn parse(
             None,
         ));
     }
-    let options = PacketCaptureOptions {
+    let options = if let Some(settings) = flags.remove("--settings") {
+        ensure!(
+            !tmpfs && !CAPTURE_FLAGS.iter().any(|flag| flags.contains_key(*flag)),
+            "--settings cannot be combined with capture option flags"
+        );
+        PacketCaptureOptions::load_settings(&path::absolute(settings)?)?
+    } else {
+        capture_options(&mut flags, tmpfs)?
+    };
+    if !capture {
+        return Ok((Request::PreviewPacketCapture { pane, options }, None));
+    }
+    let request = Request::CapturePackets {
+        pane,
+        options,
+        connection_generation: flags
+            .remove("--connection-generation")
+            .context("provide --connection-generation from the reviewed plan")?
+            .parse()?,
+        review_id: flags
+            .remove("--review-id")
+            .context("provide --review-id from the reviewed plan")?,
+        job_id: flags.remove("--job-id"),
+        output_file: path::absolute(
+            flags
+                .remove("--output-file")
+                .context("choose --output-file PATH")?,
+        )?,
+    };
+    let wireshark = flags
+        .remove("--wireshark")
+        .map(path::absolute)
+        .transpose()?;
+    Ok((request, wireshark))
+}
+
+fn capture_options(
+    flags: &mut BTreeMap<String, String>,
+    tmpfs: bool,
+) -> Result<PacketCaptureOptions> {
+    PacketCaptureOptions {
         interface: flags
             .remove("--interface")
             .context("choose --interface NAME")?,
@@ -306,32 +346,7 @@ pub(super) fn parse(
             .unwrap_or_else(|| PacketCaptureOptions::default_scratch_directory(tmpfs).into()),
         require_tmpfs: tmpfs,
     }
-    .validate()?;
-    if !capture {
-        return Ok((Request::PreviewPacketCapture { pane, options }, None));
-    }
-    let request = Request::CapturePackets {
-        pane,
-        options,
-        connection_generation: flags
-            .remove("--connection-generation")
-            .context("provide --connection-generation from the reviewed plan")?
-            .parse()?,
-        review_id: flags
-            .remove("--review-id")
-            .context("provide --review-id from the reviewed plan")?,
-        job_id: flags.remove("--job-id"),
-        output_file: path::absolute(
-            flags
-                .remove("--output-file")
-                .context("choose --output-file PATH")?,
-        )?,
-    };
-    let wireshark = flags
-        .remove("--wireshark")
-        .map(path::absolute)
-        .transpose()?;
-    Ok((request, wireshark))
+    .validate()
 }
 
 pub(super) fn open_in_wireshark(reply: &mut Reply, executable: PathBuf) {
@@ -354,6 +369,77 @@ pub(super) fn open_in_wireshark(reply: &mut Reply, executable: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uses_saved_options_for_preview_and_capture_without_importing_execution_scope() {
+        let temporary = tempfile::tempdir().unwrap();
+        let settings = temporary.path().join("packet settings.json");
+        let options = capture_options(
+            &mut [
+                ("--interface".into(), "lo".into()),
+                ("--filter".into(), "udp and port 4096".into()),
+                ("--rotate-files".into(), "3".into()),
+                (
+                    "--scratch-directory".into(),
+                    "/dev/shm/capture files".into(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            true,
+        )
+        .unwrap();
+        options.clone().save_settings(&settings).unwrap();
+        let original = std::fs::read(&settings).unwrap();
+        assert!(options.clone().save_settings(&settings).is_err());
+        assert_eq!(std::fs::read(&settings).unwrap(), original);
+        let expected = serde_json::to_value(options).unwrap();
+        let file = settings.to_str().unwrap();
+        let args = ["--settings", file, "--pane", "7"];
+        let (preview, _) = parse(
+            "preview-packet-capture",
+            args.map(str::to_owned).into_iter(),
+            None,
+        )
+        .unwrap();
+        let preview = serde_json::to_value(preview).unwrap();
+        assert_eq!(preview["pane"], 7);
+        assert_eq!(preview["options"], expected);
+        let review_id = "89".repeat(32);
+        let (capture, _) = parse(
+            "capture-packets",
+            args.into_iter()
+                .chain([
+                    "--connection-generation",
+                    "3",
+                    "--review-id",
+                    &review_id,
+                    "--output-file",
+                    "after.pcap",
+                ])
+                .map(str::to_owned),
+            None,
+        )
+        .unwrap();
+        let capture = serde_json::to_value(capture).unwrap();
+        assert_eq!(capture["options"], expected);
+        assert_eq!(capture["connection_generation"], 3);
+        assert_eq!(capture["review_id"], review_id);
+        for conflict in [&["--tmpfs"][..], &["--snap-length", "256"]] {
+            assert!(
+                parse(
+                    "preview-packet-capture",
+                    args.into_iter()
+                        .chain(conflict.iter().copied())
+                        .map(str::to_owned),
+                    None
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be combined")
+            );
+        }
+    }
 
     #[test]
     fn stop_matches_the_reviewed_pane_generation_and_job() {

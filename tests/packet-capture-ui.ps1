@@ -989,6 +989,61 @@ try {
         (Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","3","-w","-","--","udp and dst port 4321"]') -and
             (Find-Element "Keep up to 2 files${dot}524288 bytes per file. The oldest file is replaced when the buffer fills.")
     }
+
+    $settingsFile = Join-Path $State 'packet capture settings.json'
+    $settingsSection = Open-PacketSection 'packet-capture-settings'
+    Click ('Save settings' + [char]0x2026)
+    $dialog = Wait-Until 'owned packet settings save dialog' { Find-OwnedDialog 'Save packet capture settings' }
+    $null = Wait-Until 'enter the settings destination' {
+        [FixtureDialog]::SetFilename($dialog, $settingsFile, 'packet-capture-settings.json')
+    }
+    $null = Wait-Until 'save packet capture settings' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the saved capture settings and enabled inputs' {
+        $field = Find-Element 'Capture filter (optional)' $edit
+        [IO.File]::Exists($settingsFile) -and $field -and $field.Current.IsEnabled
+    }
+    $settings = [IO.File]::ReadAllText($settingsFile) | ConvertFrom-Json
+    if ($settings.schema_version -ne 1 -or $settings.options.interface -cne 'lo' -or
+        $settings.options.filter -cne 'udp and dst port 4321' -or $settings.options.snap_length -ne 192 -or
+        $settings.options.seconds -ne 15 -or $settings.options.max_mib -ne 1 -or
+        $settings.options.packet_limit -ne 3 -or $settings.options.rotate_files -ne 2 -or
+        !$settings.options.require_tmpfs -or $settings.options.scratch_directory -cne '/dev/shm' -or
+        @($settings.PSObject.Properties.Name).Count -ne 2) {
+        throw 'The packet settings file changed the reviewed inputs or contained execution scope'
+    }
+
+    Set-Field 'Capture filter (optional)' 'udp and dst port 1234'
+    Set-Field 'Duration in seconds' '10'
+    Click 'Review packet capture'
+    $null = Wait-Until 'changed inputs have their own review' {
+        Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","3","-w","-","--","udp and dst port 1234"]'
+    }
+    Select-Capture $settingsFile ('Load settings' + [char]0x2026) 'Open packet capture settings'
+    $null = Wait-Until 'loading restores the original filter and clears the previous review' {
+        $field = Find-Element 'Capture filter (optional)' $edit
+        $duration = Find-Element 'Duration in seconds' $edit
+        $field -and $field.Current.IsEnabled -and
+            $field.GetCurrentPattern($value).Current.Value -ceq 'udp and dst port 4321' -and
+            $duration -and $duration.GetCurrentPattern($value).Current.Value -ceq '15' -and
+            !(Find-Element $saveLabel $button)
+    }
+    $plan = (Control @('preview-packet-capture','--pane',"$remote",'--settings',$settingsFile)).plan
+    if (@($plan.options.PSObject.Properties.Name).Count -ne @($settings.options.PSObject.Properties.Name).Count) {
+        throw 'The CLI preview returned a different set of capture options'
+    }
+    foreach ($property in $settings.options.PSObject.Properties) {
+        $preview = $plan.options.PSObject.Properties[$property.Name]
+        if ($null -eq $preview -or $preview.Value -cne $property.Value) {
+            throw "The CLI preview differs from the exported packet setting $($property.Name)"
+        }
+    }
+    if ([IO.File]::Exists($startMarker)) { throw 'Loading or reviewing settings started a capture' }
+    $settingsSection.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
+    Click 'Review packet capture'
+    $null = Wait-Until 'the reloaded packet settings receive a fresh review' {
+        Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","3","-w","-","--","udp and dst port 4321"]'
+    }
+
     $null = Control @('focus-pane','--pane',"$local")
     Wait-Focus $local
     $null = Wait-Until 'the other pane cannot start the reviewed capture' {

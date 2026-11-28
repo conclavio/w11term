@@ -25,6 +25,7 @@ const CAPTURE_OVERHEAD_SECONDS: u64 = 72;
 pub(crate) const CONTROL_SECONDS: u64 = 155;
 mod local;
 mod ring;
+mod settings;
 pub use local::{
     CaptureComparison, CaptureExcerpt, CaptureExcerptPlan, ConversationChange,
     ConversationEndpoints, ConversationQuery, LocalCapture, ip_protocol_label,

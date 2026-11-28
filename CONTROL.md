@@ -1572,6 +1572,16 @@ Use `open-diagnostic` to open files in a running instance. Get the target ID wit
 
 In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → Packet capture** or search for it in the command palette. Choose the interface, optional BPF filter, snap length, duration, and byte budget. Turn on **Use RAM-backed scratch storage** to require tmpfs. **Review packet capture** shows the verified host, effective packet limit, scratch location, and tcpdump arguments. **Capture and save…** starts the capture after you choose a new Windows file. **Stop and save** asks the running tcpdump to finish writing its capture, then transfers the verified file. The result reports why the capture ended and how many packets the kernel dropped when tcpdump reports that count.
 
+Expand **Capture settings files** to save the current inputs as a new JSON file or load settings from an earlier run. Loading fills the editable fields and clears the previous review. Select the SSH pane and review the settings for that connection before capturing. The file contains `schema_version: 1` and `options`, using the packet capture request's option fields. It carries the interface, filter, duration, snap length, packet and file limits, byte budget, and scratch settings.
+
+Use `--settings PATH` in place of the capture option flags in both CLI commands. Pass the pane, review ID, connection generation, and output path as usual. Both commands read the settings file when called. If its capture options change after preview, run the review again.
+
+```powershell
+$settings = '.\packet-capture-settings.json'
+$plan = (& $ctl --pid 12345 preview-packet-capture --pane 1 --settings $settings | ConvertFrom-Json).result.plan
+& $ctl --pid 12345 capture-packets --pane 1 --settings $settings --connection-generation $plan.connection_generation --review-id $plan.review_id --output-file '.\after.pcap'
+```
+
 Choose **Open in Wireshark** after saving. w11term looks in the standard Windows Program Files folders. Use **Choose Wireshark executable…** for another installation. The saved capture stays available after you disconnect the SSH pane or close the packet capture panel.
 
 Choose **Open capture file…** in the same panel to reopen a local PCAP or PCAPNG file from an earlier session. This works without SSH. The panel shows the format, file size, packet count, captured bytes, truncated packets, and interface link types. The timestamp span uses the earliest and latest timestamps and shows how many packets were timestamped. The scan stops after one million records or blocks and reads only a bounded prefix of each packet. A partial summary shows the reason it stopped. **Open in Wireshark** opens the original file for packet analysis. [PCAP format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcap/) · [PCAPNG format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/) · [Link types](https://www.iana.org/assignments/pcap)

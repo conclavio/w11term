@@ -78,6 +78,8 @@ pub(super) enum Purpose {
     OpenPacketCapture(PathBuf),
     ComparePacketCapture(PathBuf),
     SavePacketCapture(PathBuf),
+    OpenPacketCaptureSettings(PathBuf),
+    SavePacketCaptureSettings(PathBuf),
     SavePacketExcerpt(PathBuf, &'static str),
     WiresharkExecutable(PathBuf),
     OpenSyscallTrace(PathBuf),
@@ -259,6 +261,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::OpenTriageReport(_)
                 | Purpose::CompareTriageReport(_)
                 | Purpose::OpenPacketCapture(_)
+                | Purpose::OpenPacketCaptureSettings(_)
                 | Purpose::ComparePacketCapture(_)
                 | Purpose::WiresharkExecutable(_)
                 | Purpose::OpenSyscallTrace(_)
@@ -387,6 +390,28 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     },
                 ])?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if let Some(folder) = path.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
+            Purpose::OpenPacketCaptureSettings(path) | Purpose::SavePacketCaptureSettings(path) => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                    pszName: w!("Packet capture settings"),
+                    pszSpec: w!("*.json"),
+                }])?;
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if clsid == FileOpenDialog {
+                    dialog.SetTitle(w!("Open packet capture settings"))?;
+                    options |= FOS_FILEMUSTEXIST;
+                } else {
+                    dialog.SetTitle(w!("Save packet capture settings"))?;
+                    dialog.SetDefaultExtension(w!("json"))?;
+                    dialog.SetFileName(w!("packet-capture-settings.json"))?;
+                    options &= !FOS_OVERWRITEPROMPT;
+                    options |= FOS_NOTESTFILECREATE;
+                }
                 if let Some(folder) = path.parent() {
                     local_folder(&dialog, folder);
                 }
