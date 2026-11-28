@@ -319,7 +319,7 @@ impl Loaded {
             profile: self.profile.clone(),
             path: self.path.clone(),
             report: report::capture_report(self)
-                .filter(|report| report::matches_profile(&self.profile, report))
+                .filter(|report| report.matches_profile(&self.profile))
                 .or_else(|| {
                     self.verified_report
                         .as_ref()
@@ -950,9 +950,15 @@ impl TerminalApp {
                     }
                     compare::Action::Export => {
                         let snapshot = view.results.clone();
+                        let reports = view.capture_reports();
                         self.begin_text_export(
                             text_export::Subject::CpuComparison,
-                            move |output| snapshot.write_json(output),
+                            move |output| {
+                                snapshot.write_json_with_capture_reports(
+                                    output,
+                                    reports.each_ref().map(Option::as_deref),
+                                )
+                            },
                             ctx,
                         );
                     }

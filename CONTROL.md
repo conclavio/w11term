@@ -2040,12 +2040,20 @@ Choose **Differential flame graph** to view both complete profiles. **After widt
 
 Choose **Export comparison…** to save a new JSON file. Schema version 1 records both source file names and sample totals, the applied filter, and every matching change in the same order as the viewer across all pages. Each row includes its full stack as an array of original symbols, both sample counts and shares, and the signed change in percentage points.
 
+When capture details are available, the JSON includes `before.capture_report` and/or `after.capture_report`. With both present, `sampling_differences` lists any differences in event, duration, frequency, and unwind mode. An empty list means those settings match. These embedded reports contain recorded SSH endpoints and may contain literal command arguments. Review them before sharing an export.
+
 Scripts can use `compare-cpu-profiles` with the same Before/After order, file size limit, and case-insensitive literal filter. The command requires no running w11term instance or SSH connection. It writes the same JSON report to stdout by default. With `--output-file`, it saves the report to a new file and prints a CLI reply whose `result.path` is the absolute destination. Errors return a nonzero exit code and a JSON error reply on stderr.
 
 ```powershell
 $report = & $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --filter 'worker' | ConvertFrom-Json
 $report.changes
 & $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --output-file '.\comparison.json'
+```
+
+Use `--before-report PATH` or `--after-report PATH` to verify and embed either report in a CLI JSON comparison. The command rejects a report whose digest differs from its folded file.
+
+```powershell
+& $ctl compare-cpu-profiles '.\before.folded' '.\after.folded' --before-report '.\before.folded.json' --after-report '.\after.folded.json'
 ```
 
 Use `--format svg` to draw a full differential flame graph offline. The graph defaults to After widths. Pass `--widths before` to see removed call paths. Both modes use the same colors and sample-share deltas as the Windows viewer. SVG goes to stdout unless you provide `--output-file`. The `--filter` option applies to JSON reports.

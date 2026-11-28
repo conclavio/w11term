@@ -6,7 +6,10 @@ use crate::app::*;
 use std::{path::Path, path::PathBuf};
 use w11term::{
     control::CpuCallGraph,
-    ssh::{CpuProfileCaptureReport, CpuProfileReportTarget, verify_cpu_profile_report},
+    ssh::{
+        CpuProfileCaptureReport, CpuProfileReportTarget, CpuProfileSampling,
+        verify_cpu_profile_report,
+    },
 };
 
 pub enum Action {
@@ -59,10 +62,6 @@ impl Task {
     }
 }
 
-pub(super) fn matches_profile(profile: &Profile, report: &CpuProfileCaptureReport) -> bool {
-    profile.loaded_sha256() == Some(report.folded.sha256.as_str())
-}
-
 pub(super) fn verify_for_profile(
     profile: &Profile,
     folded: &Path,
@@ -70,7 +69,7 @@ pub(super) fn verify_for_profile(
 ) -> anyhow::Result<Arc<CpuProfileCaptureReport>> {
     let report = verify_cpu_profile_report(folded, path, None)?;
     anyhow::ensure!(
-        matches_profile(profile, &report),
+        report.matches_profile(profile),
         "The folded profile changed after it was opened. Reopen it before verifying the report."
     );
     Ok(Arc::new(report))
@@ -301,43 +300,17 @@ impl Verified {
     }
 }
 
-pub(super) struct Sampling<'a> {
-    pub seconds: u8,
-    pub frequency: u8,
-    pub call_graph: CpuCallGraph,
-    pub event: &'a str,
-}
-
-impl<'a> Sampling<'a> {
-    pub(super) fn of(report: &'a CpuProfileCaptureReport) -> Self {
-        let (seconds, frequency, call_graph) = match &report.reviewed.target {
-            CpuProfileReportTarget::Process { options, .. } => {
-                (options.seconds, options.frequency, options.call_graph)
-            }
-            CpuProfileReportTarget::Command { options, .. } => {
-                (options.seconds, options.frequency, options.call_graph)
-            }
-        };
-        Self {
-            seconds,
-            frequency,
-            call_graph,
-            event: &report.reviewed.event,
-        }
-    }
-
-    fn label(&self) -> String {
-        let unwind = match self.call_graph {
-            CpuCallGraph::Fp => "Frame pointers",
-            CpuCallGraph::Dwarf => "DWARF",
-        };
-        format!(
-            "{} seconds · {} Hz · {unwind} · {}",
-            self.seconds,
-            self.frequency,
-            preview(self.event, 64),
-        )
-    }
+fn sampling_label(sampling: CpuProfileSampling<'_>) -> String {
+    let unwind = match sampling.call_graph {
+        CpuCallGraph::Fp => "Frame pointers",
+        CpuCallGraph::Dwarf => "DWARF",
+    };
+    format!(
+        "{} seconds · {} Hz · {unwind} · {}",
+        sampling.seconds,
+        sampling.frequency,
+        preview(sampling.event, 64),
+    )
 }
 
 pub(super) fn capture_fields(report: &CpuProfileCaptureReport) -> Vec<KeyedView> {
@@ -394,7 +367,7 @@ pub(super) fn capture_fields(report: &CpuProfileCaptureReport) -> Vec<KeyedView>
             ]);
         }
     }
-    fields.push(text("sampling", Sampling::of(report).label()));
+    fields.push(text("sampling", sampling_label(report.sampling())));
     if let Some(workload) = &report.workload {
         fields.push(text("outcome", workload.to_string()));
     } else if report.stopped_by_user {

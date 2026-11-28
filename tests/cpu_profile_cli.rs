@@ -1,9 +1,14 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
+    fs, io,
     path::Path,
     process::{Command, Output},
+    sync::Arc,
+};
+use w11term::{
+    cpu_profile::{Comparison, Profile},
+    ssh::verify_cpu_profile_report,
 };
 
 fn compare(directory: &Path, after: &str, options: &[&str]) -> Output {
@@ -16,29 +21,23 @@ fn compare(directory: &Path, after: &str, options: &[&str]) -> Output {
         .unwrap()
 }
 
-#[test]
-fn verifies_renamed_cpu_artifacts_and_reports_distinct_mismatches() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path();
-    let folded = b"main 3\n";
-    let raw = b"PERFILE2 fixture";
-    fs::write(path.join("renamed profile.folded"), folded).unwrap();
-    fs::write(path.join("renamed raw.data"), raw).unwrap();
-    let artifact = |file_name: &str, bytes: &[u8]| {
-        let sha256: String = Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        json!({
-            "file_name": file_name,
-            "bytes": bytes.len(),
-            "sha256": sha256,
-        })
-    };
-    let mut report = json!({
+fn artifact(file_name: &str, bytes: &[u8]) -> Value {
+    let sha256: String = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    json!({
+        "file_name": file_name,
+        "bytes": bytes.len(),
+        "sha256": sha256,
+    })
+}
+
+fn process_report(file_name: &str, stacks: &[u8], samples: u64) -> Value {
+    json!({
         "schema_version": 1,
         "kind": "cpu-profile-capture",
-        "folded": artifact("original.folded", folded),
+        "folded": artifact(file_name, stacks),
         "reviewed": {
             "host": "bench.example",
             "user": "reviewed",
@@ -51,14 +50,34 @@ fn verifies_renamed_cpu_artifacts_and_reports_distinct_mismatches() {
                 "process_start_ticks": 800,
                 "options": { "target_pid": 42, "seconds": 2, "frequency": 99, "call_graph": "fp" },
             },
-            "raw_perf_data_requested": true,
+            "raw_perf_data_requested": false,
         },
-        "samples": 3,
+        "samples": samples,
         "distinct_stacks": 1,
         "unresolved_frames": 0,
         "stopped_by_user": false,
-        "raw_perf_data": artifact("original.perf.data", raw),
-    });
+    })
+}
+
+fn assert_rejected(output: Output, expected: &str) {
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    let reply: Value = serde_json::from_slice(&output.stderr).unwrap();
+    let error = reply["error"].as_str().unwrap();
+    assert!(error.contains(expected), "{error}");
+}
+
+#[test]
+fn verifies_renamed_cpu_artifacts_and_reports_distinct_mismatches() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let folded = b"main 3\n";
+    let raw = b"PERFILE2 fixture";
+    fs::write(path.join("renamed profile.folded"), folded).unwrap();
+    fs::write(path.join("renamed raw.data"), raw).unwrap();
+    let mut report = process_report("original.folded", folded, 3);
+    report["reviewed"]["raw_perf_data_requested"] = json!(true);
+    report["raw_perf_data"] = artifact("original.perf.data", raw);
     let save_report = |report: &Value| {
         fs::write(
             path.join("report.json"),
@@ -90,29 +109,108 @@ fn verifies_renamed_cpu_artifacts_and_reports_distinct_mismatches() {
             .ends_with("renamed raw.data")
     );
 
-    let rejected = |output: Output, expected: &str| {
-        assert!(!output.status.success(), "{output:?}");
-        assert!(output.stdout.is_empty());
-        let reply: Value = serde_json::from_slice(&output.stderr).unwrap();
-        let error = reply["error"].as_str().unwrap();
-        assert!(error.contains(expected), "{error}");
-    };
     fs::write(path.join("renamed raw.data"), b"PERFILE2 modified").unwrap();
-    rejected(verify(&options), "byte count differs");
+    assert_rejected(verify(&options), "byte count differs");
     fs::write(path.join("renamed raw.data"), b"PERFILE2 Fixture").unwrap();
-    rejected(verify(&options), "Raw perf recording SHA-256 differs");
+    assert_rejected(verify(&options), "Raw perf recording SHA-256 differs");
     let folded_only = verify(&[]);
     assert!(folded_only.status.success(), "{folded_only:?}");
     let reply: Value = serde_json::from_slice(&folded_only.stdout).unwrap();
     assert!(reply["result"]["verified_perf_data_path"].is_null());
 
     fs::write(path.join("renamed profile.folded"), b"main 4\n").unwrap();
-    rejected(verify(&[]), "Folded profile SHA-256 differs");
+    assert_rejected(verify(&[]), "Folded profile SHA-256 differs");
     report["schema_version"] = json!(2);
     save_report(&report);
-    rejected(verify(&[]), "Unsupported CPU profile report version 2");
+    assert_rejected(verify(&[]), "Unsupported CPU profile report version 2");
     fs::write(path.join("report.json"), vec![b' '; 256 * 1024 + 1]).unwrap();
-    rejected(verify(&[]), "CPU profile report exceeds 256 KiB");
+    assert_rejected(verify(&[]), "CPU profile report exceeds 256 KiB");
+}
+
+#[test]
+fn comparison_exports_verified_reports_and_only_compares_available_sampling_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let [before, after] = [b"main 3\n", b"main 9\n"];
+    let after_file = "after capture.folded";
+    fs::write(path.join("before capture.folded"), before).unwrap();
+    fs::write(path.join(after_file), after).unwrap();
+    let before_report = process_report("original before.folded", before, 3);
+    let mut after_report = process_report("original after.folded", after, 9);
+    let save = |file, report: &Value| {
+        fs::write(path.join(file), serde_json::to_vec(report).unwrap()).unwrap();
+    };
+    save("before report.json", &before_report);
+    save("after report.json", &after_report);
+
+    let read = |options: &[&str]| -> Value {
+        let output = compare(path, after_file, options);
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let both = [
+        "--before-report",
+        "before report.json",
+        "--after-report",
+        "after report.json",
+    ];
+    let same = read(&both);
+    assert_eq!(same["sampling_differences"], json!([]));
+    assert_eq!(same["before"]["capture_report"], before_report);
+    assert_eq!(same["after"]["capture_report"], after_report);
+
+    after_report["reviewed"]["event"] = json!("cycles:u");
+    after_report["reviewed"]["target"]["options"]["seconds"] = json!(4);
+    after_report["reviewed"]["target"]["options"]["frequency"] = json!(67);
+    after_report["reviewed"]["target"]["options"]["call_graph"] = json!("dwarf");
+    save("after report.json", &after_report);
+    let changed = read(&both);
+    assert_eq!(
+        changed["sampling_differences"],
+        json!(["event", "duration", "frequency", "unwind-mode"])
+    );
+    assert_eq!(changed["after"]["capture_report"], after_report);
+    assert_eq!(changed["changes"], json!([]));
+
+    let one = read(&both[2..]);
+    assert!(one.get("sampling_differences").is_none());
+    assert!(one["before"].get("capture_report").is_none());
+    assert_eq!(one["after"]["capture_report"], after_report);
+
+    let wrong = compare(
+        path,
+        after_file,
+        &[
+            "--after-report",
+            "before report.json",
+            "--output-file",
+            "should not exist.json",
+        ],
+    );
+    assert_rejected(wrong, "Verifying the After capture report");
+    assert!(!path.join("should not exist.json").exists());
+    let paths = [path.join("before capture.folded"), path.join(after_file)];
+    let folded = paths
+        .each_ref()
+        .map(|path| Arc::new(Profile::open(path).unwrap()));
+    let verified_before =
+        verify_cpu_profile_report(&paths[0], &path.join("before report.json"), None).unwrap();
+    let comparison = Arc::new(Comparison::new(folded, paths));
+    let mut invalid_json = Vec::new();
+    let error = comparison
+        .filter("")
+        .write_json_with_capture_reports(&mut invalid_json, [None, Some(&verified_before)])
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(invalid_json.is_empty());
+    assert_rejected(
+        compare(
+            path,
+            after_file,
+            &["--format", "svg", "--before-report", "before report.json"],
+        ),
+        "apply to JSON comparisons",
+    );
 }
 
 #[test]

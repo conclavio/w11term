@@ -25,7 +25,8 @@ pub(super) const HELP: &str = concat!(
 
 pub(super) const COMPARE_VERB: &str = "compare-cpu-profiles";
 pub(super) const COMPARE_HELP: &str = concat!(
-    "w11term-cli compare-cpu-profiles BEFORE AFTER [--format json] [--filter TEXT] [--output-file PATH]\n",
+    "w11term-cli compare-cpu-profiles BEFORE AFTER [--format json] [--filter TEXT] ",
+    "[--before-report PATH] [--after-report PATH] [--output-file PATH]\n",
     "w11term-cli compare-cpu-profiles BEFORE AFTER --format svg [--widths before|after] [--output-file PATH]",
 );
 
@@ -64,12 +65,16 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
     let mut output_file = None;
     let mut format = None;
     let mut widths = None;
+    let mut before_report = None;
+    let mut after_report = None;
     while let Some(flag) = args.next() {
         let target = match flag.as_str() {
             "--filter" => &mut filter,
             "--output-file" => &mut output_file,
             "--format" => &mut format,
             "--widths" => &mut widths,
+            "--before-report" => &mut before_report,
+            "--after-report" => &mut after_report,
             _ => bail!("unknown option {flag} for {COMPARE_VERB}"),
         };
         ensure!(target.is_none(), "specify {flag} only once");
@@ -88,6 +93,10 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
             ensure!(
                 filter.is_none(),
                 "SVG uses both full profiles. --filter applies to JSON reports"
+            );
+            ensure!(
+                before_report.is_none() && after_report.is_none(),
+                "--before-report and --after-report apply to JSON comparisons"
             );
             Some(match widths {
                 None | Some("after") => ProfileSide::After,
@@ -111,8 +120,23 @@ pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<(
             Differential { comparison, side }.write_svg(0, dest)
         }),
         None => {
+            let verify = |side: usize, label, path: Option<&String>| {
+                path.map(|path| {
+                    let profile = path::absolute(&comparison.paths()[side])?;
+                    let report = path::absolute(path)?;
+                    verify_cpu_profile_report(&profile, &report, None)
+                        .with_context(|| format!("Verifying the {label} capture report {path}"))
+                })
+                .transpose()
+            };
+            let reports = [
+                verify(0, "Before", before_report)?,
+                verify(1, "After", after_report)?,
+            ];
             let report = comparison.filter(filter.map_or("", String::as_str));
-            offline::write_report(stdout, output_file, |dest| report.write_json(dest))
+            offline::write_report(stdout, output_file, |dest| {
+                report.write_json_with_capture_reports(dest, reports.each_ref().map(Option::as_ref))
+            })
         }
     }
 }

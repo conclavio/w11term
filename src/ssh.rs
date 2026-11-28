@@ -31,8 +31,8 @@ pub use triage::capture_job::CaptureStop as SyscallCaptureStop;
 pub use triage::cpu_profile::launch::{CpuLaunchOptions, CpuLaunchPlan, CpuWorkloadOutcome};
 pub use triage::cpu_profile::{
     CpuProfileCaptureReport, CpuProfilePlan, CpuProfileReportArtifact, CpuProfileReportReview,
-    CpuProfileReportTarget, CpuProfileSummary, PERF_DATA_TRANSFER_SECONDS, PerfDataArtifact,
-    verify_cpu_profile_report,
+    CpuProfileReportTarget, CpuProfileSampling, CpuProfileSamplingField, CpuProfileSummary,
+    PERF_DATA_TRANSFER_SECONDS, PerfDataArtifact, verify_cpu_profile_report,
 };
 pub use triage::packet_capture::{
     Capture as PacketCapture, CaptureComparison as PacketCaptureComparison,
