@@ -8,6 +8,7 @@ use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 mod catalog;
 mod dotfiles;
 mod download;
+mod example;
 mod private_page;
 mod saved_pages;
 mod tool_install;
@@ -23,11 +24,8 @@ pub enum Action {
     Query(String),
     Platform(Option<usize>),
     Select(usize),
-    Edit(clipboard_paste::Origin, String),
-    Draft(String),
-    CancelEdit,
+    Example(example::Action),
     Copy(String),
-    Insert(clipboard_paste::Origin),
     Link(String),
     Refresh,
     Loaded(Result<Loaded, String>),
@@ -89,11 +87,6 @@ struct ToolLookup {
     result: Option<Result<InstalledTools, String>>,
 }
 
-struct Draft {
-    origin: clipboard_paste::Origin,
-    text: String,
-}
-
 struct Search {
     query: String,
     mode: SearchMode,
@@ -120,7 +113,7 @@ pub(super) struct Panel {
     platform: Option<Platform>,
     cached: RefCell<Option<Search>>,
     selected: usize,
-    draft: Option<Draft>,
+    draft: Option<example::Draft>,
     query_field: ElementRef<TextBox>,
     draft_field: ElementRef<TextBox>,
     focus: u64,
@@ -280,11 +273,14 @@ impl Panel {
         if let Some(installer) = &self.dotfiles {
             return installer.view(tool_pane, dotfile_sync, ctx);
         }
-        let target = if self
+        let preferred = self.platform.unwrap_or(auto);
+        let results = self.results(preferred);
+        let selected = results.get(self.selected).or_else(|| results.first());
+        let draft = self
             .draft
             .as_ref()
-            .is_some_and(|draft| Some(draft.origin) == origin)
-        {
+            .filter(|draft| selected == Some(&draft.page));
+        let target = if draft.is_some() {
             self.draft_field.clone()
         } else {
             self.query_field.clone()
@@ -293,9 +289,6 @@ impl Panel {
             let _ = target.request_focus();
             None
         });
-        let preferred = self.platform.unwrap_or(auto);
-        let results = self.results(preferred);
-        let selected = results.get(self.selected).or_else(|| results.first());
         let page = selected.and_then(|key| {
             let page = self.library.as_ref()?.catalog.page(key)?;
             Some((page, key.platform))
@@ -477,7 +470,7 @@ impl Panel {
                 ));
             }
         }
-        if let Some((page, _)) = page {
+        if let (Some((page, _)), Some(key)) = (page, selected) {
             if let Some(link) = &page.link {
                 let url = link.clone();
                 pieces.push(KeyedView::new(
@@ -490,41 +483,15 @@ impl Panel {
                         .content(link.as_str()),
                 ));
             }
-            if let Some(draft) = &self.draft {
-                let insert = draft.origin;
-                let available = Some(insert) == origin && catalog::insertable(&draft.text);
+            if let Some(draft) = draft {
                 pieces.push(KeyedView::new(
                     "draft",
-                    StackPanel::new().spacing(6.0).children((
-                        TextBox::new()
-                            .element_ref(&self.draft_field)
-                            .automation_name("Edit command example")
-                            .text(&draft.text)
-                            .on_text_changed(
-                                ctx.callback(|text| Message::CommandReference(Action::Draft(text))),
-                            ),
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .spacing(8.0)
-                            .children((
-                                Button::new()
-                                    .is_enabled(available)
-                                    .on_click(ctx.callback(move |_| {
-                                        Message::CommandReference(Action::Insert(insert))
-                                    }))
-                                    .content("Insert into terminal"),
-                                Button::new()
-                                    .on_click(ctx.callback(|_| {
-                                        Message::CommandReference(Action::CancelEdit)
-                                    }))
-                                    .content("Cancel edit"),
-                            )),
-                    )),
+                    draft.view(origin, &self.draft_field, ctx),
                 ));
             }
             for (index, example) in page.examples.iter().enumerate() {
                 let copy = example.command.clone();
-                let edit = example.command.clone();
+                let edit = key.clone();
                 pieces.push(KeyedView::new(
                     format!("example-{index}"),
                     StackPanel::new().spacing(4.0).children((
@@ -546,14 +513,10 @@ impl Panel {
                                     .content("Copy"),
                                 Button::new()
                                     .automation_name(format!("Edit example {}", index + 1))
-                                    .is_enabled(origin.is_some())
                                     .on_click(ctx.callback(move |_| {
-                                        origin.map_or(Message::ControlIdle, |origin| {
-                                            Message::CommandReference(Action::Edit(
-                                                origin,
-                                                edit.clone(),
-                                            ))
-                                        })
+                                        Message::CommandReference(Action::Example(
+                                            example::Action::Edit(edit.clone(), index, origin),
+                                        ))
                                     }))
                                     .content("Edit example"),
                             )),
@@ -912,36 +875,11 @@ impl TerminalApp {
                     panel.draft = None;
                 }
             }
-            Action::Edit(target, text) => {
-                if Some(target) == origin {
-                    panel.draft = Some(Draft {
-                        origin: target,
-                        text,
-                    });
-                    panel.focus = panel.focus.wrapping_add(1);
-                }
-            }
+            Action::Example(action) => self.reference_example_action(action, auto, origin, ctx),
             Action::Copy(text) => {
                 panel.error = w11term::clipboard::write(&text)
                     .err()
                     .map(|err| format!("Copying the command example: {err:#}"));
-            }
-            Action::Draft(text) => {
-                if let Some(draft) = &mut panel.draft {
-                    draft.text = text.chars().take(4096).collect();
-                }
-            }
-            Action::CancelEdit => panel.draft = None,
-            Action::Insert(target) => {
-                if Some(target) == origin
-                    && let Some(draft) = &panel.draft
-                    && draft.origin == target
-                    && catalog::insertable(&draft.text)
-                {
-                    let text = draft.text.clone();
-                    panel.draft = None;
-                    self.paste_saved_text(target, text, ctx);
-                }
             }
             Action::Link(link) => Self::open_link(&link),
             Action::Refresh => self.start_reference_load(true, ctx),

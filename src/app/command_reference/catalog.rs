@@ -48,9 +48,9 @@ pub(super) const PLATFORMS: &[Platform] = &[
 ];
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct Key {
-    pub platform: Platform,
-    pub name: String,
+pub struct Key {
+    pub(super) platform: Platform,
+    pub(super) name: String,
 }
 
 #[derive(Debug)]

@@ -70,6 +70,13 @@ fn native_saved_command_reference_pages_keep_their_platform_after_restart() {
 }
 
 #[test]
+#[ignore = "saves an offline manual example and recalls it in a real PowerShell pane"]
+fn native_reference_examples_save_offline_and_require_explicit_shell_submit() {
+    let state = tempfile::tempdir().unwrap();
+    drive_gui("command-reference-save-example-ui.ps1", state.path());
+}
+
+#[test]
 #[ignore = "starts each saved diagnostics viewer without opening the configured startup profile"]
 fn native_saved_diagnostics_open_directly_without_terminal_panes() {
     let state = tempfile::tempdir().unwrap();
