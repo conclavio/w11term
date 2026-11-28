@@ -153,7 +153,7 @@ impl Page {
 fn related_names(quote: &str) -> Option<Vec<String>> {
     let list = quote.strip_prefix("See also: ")?.trim_end_matches('.');
     let mut pieces = list.split('`');
-    if pieces.next()? != "" {
+    if !pieces.next()?.is_empty() {
         return None;
     }
     let mut names = Vec::new();
