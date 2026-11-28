@@ -1281,20 +1281,22 @@ Direct pipe clients send
 
 ### Preview and apply SSH dotfiles
 
-From a connected SSH pane, open **More → Command reference → Apply SSH dotfiles**. The panel starts with the profile's bundle and shell if set. You can also choose a local bundle, Bash or Zsh, and an optional startup directory for Zsh. Select **Review dotfiles changes** to see the account, resolved SFTP home, planned file changes, and any conflicts. Check that the resolved directory is the shell account's home, then select **Apply reviewed dotfiles** on the same connection. A changed bundle or remote startup file requires another review. Applying updates the managed startup files for future shells and leaves the profile's login-sync settings in place.
+From a connected SSH pane, open **More → Command reference → Apply SSH dotfiles**. The panel starts with the profile's bundle and shell if set. You can also choose a local bundle and Bash, Zsh, or Fish as the target. Zsh accepts an optional startup directory. Select **Review dotfiles changes** to see the account, resolved SFTP home, planned file changes, and any conflicts. Check that the resolved directory is the shell account's home, then select **Apply reviewed dotfiles** on the same connection. A changed bundle or remote startup file requires another review. Applying updates the managed startup files for future shells and leaves the profile's login-sync settings in place.
 
 Expand **Environment fragment changes** or **Prompt fragment changes** to review the lines that will be added and removed. Expand a proposed **Startup hook** to see the generated block in context of its target path. The review omits unrelated startup-file contents. If the active managed fragments cannot be verified, the review identifies that condition and shows the proposed lines. A verified active fragment that changes after review makes the confirmation stale.
 
-`sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. For a Zsh setup that uses a different startup directory under that home, pass `--zdotdir RELATIVE_DIR`.
+`sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh|fish` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. For a Zsh setup that uses a different startup directory under that home, pass `--zdotdir RELATIVE_DIR`.
 
-Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` fragment is shared by the chosen shells. Set `bash` or `zsh` for the prompt, aliases, and interactive setup specific to that shell. Each fragment supports up to 16 KiB. The preview computes planned file hashes with LF line endings and a final newline on nonempty fragments.
+Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` fragment is shared by Bash and Zsh. Set `bash`, `zsh`, or `fish` for the prompt, aliases, and interactive setup specific to that shell. Fish reads its own `fish_environment` fragment and uses Fish syntax in both sections. Each fragment supports up to 16 KiB. The preview computes planned file hashes with LF line endings and a final newline on nonempty fragments.
 
 ```json
 {
   "version": 1,
   "environment": "export EDITOR=vim\n",
   "bash": "PS1='ops \\u@\\h> '\n",
-  "zsh": "PROMPT='ops %n@%m> '\n"
+  "zsh": "PROMPT='ops %n@%m> '\n",
+  "fish_environment": "set -gx EDITOR vim\n",
+  "fish": "function fish_prompt\n    printf 'ops> '\nend\n"
 }
 ```
 
@@ -1309,6 +1311,8 @@ $review = $preview.result.sftp.review
 
 In `result.sftp`, `directories_to_create` names missing managed directories and `files` gives the absolute paths, proposed actions, and before/after SHA-256 hashes. For Bash, the preview selects the first existing login file in the order `.bash_profile`, `.bash_login`, `.profile`, and plans a new `.profile` if none exists. It also previews `.bashrc`. Zsh previews `.zprofile` and `.zshrc`. Startup entries include the exact `hook` block. A changed or duplicated marker block is a `hook-conflict`, and modified version files or selectors get their own conflict status. The `supports_atomic_replace` field reports whether the server offers the OpenSSH atomic replacement extension.
 
+For Fish installations that use the default configuration directory, w11term manages a block in `~/.config/fish/config.fish`. Its hook loads the Fish environment on startup and loads the prompt fragment in interactive shells. The review includes creation of the startup directory if needed. [Fish configuration files](https://fishshell.com/docs/current/language.html#configuration-files)
+
 Pass the returned `review` token to apply on the same pane with the same bundle, shell and optional `--zdotdir`. If either the plan or the SFTP connection changed, preview again. Apply checks for conflicts and atomic replacement support before writing. It stages fragments in a directory named for `bundle_sha256` under `~/.config/w11term/dotfiles/`, installs the startup hooks, then switches the shell’s active bundle with a single file rename. New shells use that version. A failed activation can leave staged files, which a fresh preview can reuse. Older bundle directories are retained.
 
 Apply replies with `shell`, `home`, `bundle_sha256` and the ordered `changed_files`. An unchanged bundle returns an empty list. A missing fragment becomes an empty managed file. Direct pipe clients can send `{"op":"preview-dotfiles","shell":"bash","bundle":{"version":1,"bash":"PS1='ops> '"}}` with the normal SFTP request fields. Use `"op":"apply-dotfiles"` plus the returned `"review"` for the reviewed installation.
@@ -1317,7 +1321,7 @@ Install and switch previews include `fragment_changes`. Its `baseline` is `verif
 
 To recover an edited or missing startup hook, choose **Review startup hook repair** in the dotfiles installer and confirm **Repair reviewed startup hooks**. The review shows changed lines inside a replaced block and the full block for a missing hook. Repair uses the selected shell and Zsh startup directory, preserves the surrounding file text, and keeps the active version and update policy. Duplicate, incomplete, or nested w11term markers block repair. Changes to existing files require the server's atomic rename support.
 
-Scripts use `preview-dotfile-hooks --shell bash|zsh [--zdotdir RELATIVE_DIR]` and `repair-dotfile-hooks --shell bash|zsh --review TOKEN` with the same optional `--zdotdir`. The preview includes `ready` and `files`, with the old managed block in `replaced_hook` and replacement in `hook`. Repair returns `changed_files`. A failed or interrupted repair requires a fresh review.
+Scripts use `preview-dotfile-hooks --shell bash|zsh|fish [--zdotdir RELATIVE_DIR]` and `repair-dotfile-hooks --shell bash|zsh|fish --review TOKEN` with the same optional `--zdotdir` for Zsh. The preview includes `ready` and `files`, with the old managed block in `replaced_hook` and replacement in `hook`. Repair returns `changed_files`. A failed or interrupted repair requires a fresh review.
 
 ### Restore or disable SSH dotfiles
 
@@ -1325,9 +1329,9 @@ In **Command reference → Apply SSH dotfiles**, choose the shell and its startu
 
 Choose **Review resuming automatic dotfile sync** and then **Resume automatic dotfile sync** to allow an approved profile to sync on its next SSH connection. After a restore, the currently selected version stays active. After disabling, managed fragments stay inactive until a bundle is installed. To apply a particular local bundle immediately, return to the installer and review it there.
 
-Use `list-dotfile-versions --shell bash|zsh` to get a shell's SFTP home, active hash, selector state and up to 64 retained versions. The active version appears first, followed by the most recently modified directories. After resuming from disabled, the selector state is `awaiting-sync` until a bundle is installed. The listing identifies candidate directories. **Review dotfile restore** verifies the selected bundle's contents and startup hooks.
+Use `list-dotfile-versions --shell bash|zsh|fish` to get a shell's SFTP home, active hash, selector state and up to 64 retained versions. The active version appears first, followed by the most recently modified directories. After resuming from disabled, the selector state is `awaiting-sync` until a bundle is installed. The listing identifies candidate directories. **Review dotfile restore** verifies the selected bundle's contents and startup hooks.
 
-Use `preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh` to review a switch on the pane's SFTP connection. The preview includes the current `active_bundle_sha256` and the proposed `bundle_sha256`. A null value represents disabled or inactive dotfiles. Pass the same `--zdotdir` used to install Zsh hooks in a custom directory.
+Use `preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh|fish` to review a switch on the pane's SFTP connection. The preview includes the current `active_bundle_sha256` and the proposed `bundle_sha256`. A null value represents disabled or inactive dotfiles. Pass the same `--zdotdir` used to install Zsh hooks in a custom directory.
 
 ```powershell
 $versions = & $ctl --pid 12345 sftp --pane $pane list-dotfile-versions --shell bash | ConvertFrom-Json
@@ -1345,11 +1349,11 @@ Select an active or older version in **Dotfile versions** and choose **Save sele
 
 For the profile that opened the connected pane, choose **Review saved dotfiles in this SSH profile** after saving. The profile editor shows the saved digest, verified host-key fingerprint, SFTP home, shell, and optional Zsh startup directory. **Approve dotfiles sync** checks that the manifest still reproduces the saved version. This handoff selects **Pin approved dotfile version** by default. Choose **Save profile changes** to use it on the next connection.
 
-Scripts use `sftp --pane ID export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh`. The result includes `shell`, `home`, `bundle_sha256`, and the saved `local` path. Direct pipe clients send `"op":"export-dotfile-bundle"` with `shell`, `bundle_sha256`, and an absolute Windows `local` path.
+Scripts use `sftp --pane ID export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh|fish`. The result includes `shell`, `home`, `bundle_sha256`, and the saved `local` path. Direct pipe clients send `"op":"export-dotfile-bundle"` with `shell`, `bundle_sha256`, and an absolute Windows `local` path.
 
 ### Sync dotfiles on SSH connect
 
-In **Settings → Edit profile → SSH dotfiles**, choose **Create dotfiles bundle** and enter a shared environment fragment, a Bash startup fragment, or a Zsh startup fragment. You can fill in more than one. **Save dotfiles bundle** writes a new local file and selects it in the profile. To change an existing bundle, select it and choose **Revise selected dotfiles bundle**. Save the revision to a new file. Profiles that use the original file continue to use it until you approve and save the revision for those profiles.
+In **Settings → Edit profile → SSH dotfiles**, choose **Create dotfiles bundle** and fill in the fragments you want to manage. Use the shared environment for Bash and Zsh and the separate Fish environment and startup fields for Fish. **Save dotfiles bundle** writes a new local file and selects it in the profile. To change an existing bundle, select it and choose **Revise selected dotfiles bundle**. Save the revision to a new file. Profiles that use the original file continue to use it until you approve and save the revision for those profiles.
 
 In either editor, **Import shell fragment** appends a local UTF-8 file to the section you choose, including extensionless files such as `.profile`, `.bashrc`, and `.zshrc`. It accepts a UTF-8 BOM and converts CRLF to LF. Review or edit the combined text before saving. Each combined fragment can be up to 16 KiB.
 
@@ -1357,7 +1361,7 @@ From the full text preview of an SSH file, **Use in dotfiles editor** brings a s
 
 Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.
 
-Select **Pin approved dotfile version** before approving to record the digest of the shared environment and the selected shell fragment. If the local bundle later produces a different digest, login sync skips the update and the SSH shell still opens. Approve and save the revised bundle to update the pin. Clear the checkbox, approve, and save to follow future edits to the local bundle. Existing approvals keep following the file until you pin them.
+Select **Pin approved dotfile version** before approving to record the digest of the selected shell's environment and startup fragments. If the local bundle later produces a different digest, login sync skips the update and the SSH shell still opens. Approve and save the revised bundle to update the pin. Clear the checkbox, approve, and save to follow future edits to the local bundle. Existing approvals keep following the file until you pin them.
 
 The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. An optional `bundle_sha256` field stores the pin shown in the editor. For Zsh with an alternate startup directory under the approved home, set `"zdotdir":"relative/directory"` or fill in the corresponding field in the editor.
 

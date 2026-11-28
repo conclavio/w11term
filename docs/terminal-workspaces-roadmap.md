@@ -334,7 +334,7 @@ Ship selection explanation and Bash drafting with a shared request preview, then
 
 Use a single SSH profile to bring your shell setup and tools to a Linux account. Under **Settings → Edit profile**, configure **SSH dotfiles** for prompt and shell startup fragments and **SSH tools** for your pinned executables. Review and approve each bundle for the remote account. On an ordinary SSH connect or reconnect, w11term syncs the approved dotfiles first and then syncs the tools over SFTP before starting the shell. Each step reports its own outcome. A skipped sync still lets the shell open. [SSH dotfile sync](../CONTROL.md#sync-dotfiles-on-ssh-connect) · [SSH tool sync](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
 
-The SSH dotfiles editor can create a bundle locally or revise an existing bundle in a new file. It edits the shared environment and the Bash and Zsh fragments directly. Choosing the new file leaves the profile's saved approval in place until the new selection is approved and saved.
+The SSH dotfiles editor can create a bundle locally or revise an existing bundle in a new file. It edits Bash and Zsh startup fragments and their shared environment, plus two separate Fish fragments. Choosing the new file leaves the profile's saved approval in place until the new selection is approved and saved.
 
 **Import shell fragment** appends an existing local shell file to the selected editor section for review before saving a bundle. [Import local dotfiles](../CONTROL.md#sync-dotfiles-on-ssh-connect)
 
@@ -344,9 +344,9 @@ For an already connected SSH pane, **More → Command reference → Apply SSH do
 
 Install and version reviews show which lines change in the managed environment and prompt fragments. The install review also shows the generated startup hooks it will add. [Dotfile content review](../CONTROL.md#preview-and-apply-ssh-dotfiles)
 
-**Review startup hook repair** restores an edited or missing Bash or Zsh hook while keeping the active dotfile version and the surrounding startup text. [Startup hook repair](../CONTROL.md#preview-and-apply-ssh-dotfiles)
+**Review startup hook repair** restores an edited or missing Bash, Zsh, or Fish hook while keeping the active dotfile version and the surrounding startup text. [Startup hook repair](../CONTROL.md#preview-and-apply-ssh-dotfiles)
 
-**Dotfile versions** lists the active and retained versions for Bash or Zsh. Review and restore a previous version, or disable managed fragments for the account. Both pause automatic sync. Resume it from the same panel to let approved profiles sync on reconnect. [Dotfile version history](../CONTROL.md#restore-or-disable-ssh-dotfiles)
+**Dotfile versions** lists the active and retained versions for Bash, Zsh, or Fish. Review and restore a previous version, or disable managed fragments for the account. Both pause automatic sync. Resume it from the same panel to let approved profiles sync on reconnect. [Dotfile version history](../CONTROL.md#restore-or-disable-ssh-dotfiles)
 
 Select a version and save its verified fragments as a Windows bundle for reuse in another SSH profile. [Save a retained version](../CONTROL.md#restore-or-disable-ssh-dotfiles)
 

@@ -218,10 +218,7 @@ fn detail(key: impl Into<String>, text: String) -> KeyedView {
 }
 
 pub(super) fn login_summary(report: &DotfileSyncReport) -> String {
-    let shell = match report.shell {
-        DotfileShell::Bash => "Bash",
-        DotfileShell::Zsh => "Zsh",
-    };
+    let shell = report.shell.label();
     let outcome = match report.status {
         DotfileSyncStatus::Updated => "Updated",
         DotfileSyncStatus::Current => "Already current",
@@ -311,8 +308,8 @@ impl Installer {
                     TextBlock::new().text("Target shell"),
                     ComboBox::new()
                         .automation_name("Target dotfiles shell")
-                        .items_source(["Bash", "Zsh"])
-                        .selected_index(usize::from(self.shell == DotfileShell::Zsh))
+                        .items_source(DotfileShell::ALL.map(DotfileShell::label))
+                        .selected_index(self.shell.menu_index())
                         .is_enabled(ready)
                         .on_selection_changed(ctx.callback(|index| message(Action::Shell(index)))),
                 )),
@@ -514,13 +511,10 @@ impl TerminalApp {
                     }
                 }
             }
-            Action::Shell(Some(index @ 0..=1)) if idle => {
-                let shell = if index == 0 {
-                    DotfileShell::Bash
-                } else {
-                    DotfileShell::Zsh
-                };
-                if installer.shell != shell {
+            Action::Shell(index) if idle => {
+                if let Some(shell) = index.and_then(|index| DotfileShell::ALL.get(index).copied())
+                    && installer.shell != shell
+                {
                     installer.shell = shell;
                     installer.review = None;
                     installer.status = None;

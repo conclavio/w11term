@@ -427,6 +427,35 @@ try {
         $approved -and [FixtureDialog]::SameFile($profileSnapshot, $approved.bundle) -and
             !$approved.PSObject.Properties['bundle_sha256']
     }
+    Click 'Revise selected dotfiles bundle'
+    $fishEnv = 'set -gx EDITOR vi'
+    $fishStartup = 'function fish_prompt; printf "fleet> "; end'
+    foreach ($fragment in @(@('Fish environment fragment', $fishEnv), @('Fish startup fragment', $fishStartup))) {
+        $field = Wait-Until "the bundle editor exposes '$($fragment[0])'" {
+            $entry = Find-Element $fragment[0] $edit
+            if ($entry -and $entry.Current.IsEnabled) { $entry }
+        }
+        $field.GetCurrentPattern($value).SetValue($fragment[1])
+    }
+    Click 'Save dotfiles bundle'
+    $fishBundle = Join-Path $State 'Fish profile bundle.json'
+    $dialog = Wait-OwnedDialog 'Save new dotfiles bundle'
+    $null = Wait-Until 'select the Fish bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, $fishBundle) }
+    $null = Wait-Until 'save the Fish bundle' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the saved Fish fragments are in the revised bundle' {
+        if ([IO.File]::Exists($fishBundle)) {
+            $saved = [IO.File]::ReadAllText($fishBundle) | ConvertFrom-Json
+            $saved.fish_environment -ceq $fishEnv -and $saved.fish -ceq $fishStartup -and $saved.bash.Contains('verified> ')
+        }
+    }
+    Select-NativeComboItem 'Dotfiles shell' 'Fish'
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'the profile can approve its Fish settings' { Find-Element "Approved for ${target}${dot}/" }
+    Save-ProfileEdit
+    $null = Wait-Until 'the Fish target and approved bundle survive saving the profile' {
+        $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.dotfiles
+        $approved.shell -ceq 'fish' -and [FixtureDialog]::SameFile($fishBundle, $approved.bundle)
+    }
     if ([IO.File]::ReadAllText($selectorPath) -cne "$first`n") { throw 'Profile review changed the active remote version' }
 } finally {
     if ($app) { Close-FixtureApp $app }

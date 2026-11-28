@@ -652,17 +652,22 @@ impl server::Handler for Peer {
         if let Some(wire) = &self.wire {
             let _ = wire.send(in_band_resize::Wire::Shell(c, s.handle()));
         }
-        if self.root.join("dotfiles-shell-probe").is_file() {
+        if let Ok(probe) = fs::read_to_string(self.root.join("dotfiles-shell-probe")) {
+            let (shell, extension, startups): (_, _, &[_]) = if probe == "fish" {
+                ("fish", "fish", &[".config/fish/config.fish"])
+            } else {
+                ("bash", "sh", &[".bashrc", ".profile"])
+            };
             let managed = self.root.join(".config/w11term/dotfiles");
-            let active = fs::read_to_string(managed.join("bash-current")).unwrap_or_default();
+            let active =
+                fs::read_to_string(managed.join(format!("{shell}-current"))).unwrap_or_default();
             let value = active.lines().next().unwrap_or("absent");
             let ready = if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 // Check the files at the instant of the SSH shell request.
-                let bundle = managed.join(format!("bash-{value}"));
-                bundle.join("prompt.sh").is_file()
-                    && bundle.join("environment.sh").is_file()
-                    && self.root.join(".bashrc").is_file()
-                    && self.root.join(".profile").is_file()
+                let bundle = managed.join(format!("{shell}-{value}"));
+                bundle.join(format!("prompt.{extension}")).is_file()
+                    && bundle.join(format!("environment.{extension}")).is_file()
+                    && startups.iter().all(|path| self.root.join(path).is_file())
             } else {
                 value == "disabled"
             };

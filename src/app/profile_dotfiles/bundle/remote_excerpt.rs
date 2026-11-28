@@ -55,7 +55,7 @@ impl Source {
         Ok((first, last, start..start + bytes))
     }
 
-    pub(super) fn edit(&mut self, action: ExcerptAction, fragments: &mut [Option<String>; 3]) {
+    pub(super) fn edit(&mut self, action: ExcerptAction, fragments: &mut [Option<String>]) {
         match action {
             ExcerptAction::First(value) => {
                 self.first = value;

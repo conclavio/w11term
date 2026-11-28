@@ -69,10 +69,21 @@ impl Engine {
     ) -> Result<Value> {
         validate_zdotdir(shell, zdotdir)?;
         let home = self.dotfile_home().await?;
+        let mut directories = Vec::new();
+        if shell == DotfileShell::Fish {
+            for relative in [CONFIG_DIRECTORY, FISH_DIRECTORY] {
+                let path = under_home(&home, relative);
+                if !self.dotfile_directory_exists(&path).await? {
+                    directories.push(path);
+                }
+            }
+        }
         let edits = self
             .dotfile_hooks(&home, shell, zdotdir)
             .await?
-            .map(repair_hook);
+            .into_iter()
+            .map(repair_hook)
+            .collect::<Vec<_>>();
         let atomic = self.extension(editor::POSIX_RENAME, "1").is_ok();
         let mut report = json!({
             "operation": "repair-dotfile-hooks",
@@ -84,6 +95,9 @@ impl Engine {
             "ready": edits.iter().all(|edit| edit.after.is_some()
                 && (atomic || edit.before.is_none() || !edit.changed())),
         });
+        if shell == DotfileShell::Fish {
+            report["directories_to_create"] = json!(directories);
+        }
         let Some(review) = review else {
             report["review"] = json!(self.dotfiles_review(&report)?);
             return Ok(report);
@@ -102,13 +116,17 @@ impl Engine {
             );
         }
         let mut changed = Vec::new();
+        for path in &directories {
+            self.create_dotfile_directory(path).await?;
+        }
         for edit in edits.iter().filter(|edit| edit.changed()) {
             let current = self.startup_files(&home, shell, zdotdir).await?;
             ensure!(
-                current
-                    .iter()
-                    .zip(&edits)
-                    .all(|((path, _), edit)| *path == edit.path),
+                current.len() == edits.len()
+                    && current
+                        .iter()
+                        .zip(&edits)
+                        .all(|((path, _), edit)| *path == edit.path),
                 "The startup files changed. Review the hooks again."
             );
             self.write_dotfile(edit, stage).await?;

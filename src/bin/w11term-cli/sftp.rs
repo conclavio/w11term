@@ -39,14 +39,14 @@ w11term-cli [--pid PID] sftp --pane ID [--timeout SECONDS] COMMAND [ARGS]\n\
   resume-tool-bundle-updates NAME SHA256 --review TOKEN\n\
   preview-tool-bundle-pause NAME SHA256\n\
   pause-tool-bundle-updates NAME SHA256 --review TOKEN\n\
-  preview-dotfiles BUNDLE.json --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
-  apply-dotfiles BUNDLE.json --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
-  preview-dotfile-hooks --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
-  repair-dotfile-hooks --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
-  export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh\n\
-  list-dotfile-versions --shell bash|zsh\n\
-  preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh [--zdotdir RELATIVE_DIR]\n\
-  switch-dotfiles SHA256|disabled|automatic --shell bash|zsh --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  preview-dotfiles BUNDLE.json --shell bash|zsh|fish [--zdotdir RELATIVE_DIR]\n\
+  apply-dotfiles BUNDLE.json --shell bash|zsh|fish --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  preview-dotfile-hooks --shell bash|zsh|fish [--zdotdir RELATIVE_DIR]\n\
+  repair-dotfile-hooks --shell bash|zsh|fish --review TOKEN [--zdotdir RELATIVE_DIR]\n\
+  export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh|fish\n\
+  list-dotfile-versions --shell bash|zsh|fish\n\
+  preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh|fish [--zdotdir RELATIVE_DIR]\n\
+  switch-dotfiles SHA256|disabled|automatic --shell bash|zsh|fish --review TOKEN [--zdotdir RELATIVE_DIR]\n\
   stat PATH | lstat PATH | realpath PATH | readlink PATH | statvfs PATH | expand-path PATH\n\
   mkdir PATH [--permissions OCTAL] | setstat PATH [ATTRS]\n\
   rename FROM TO | hardlink FROM TO | symlink TARGET LINK [--spec-order]\n\
@@ -71,7 +71,8 @@ fn dotfile_shell(value: Option<&str>) -> Result<DotfileShell> {
     match value {
         Some("bash") => Ok(DotfileShell::Bash),
         Some("zsh") => Ok(DotfileShell::Zsh),
-        _ => bail!("--shell requires bash or zsh"),
+        Some("fish") => Ok(DotfileShell::Fish),
+        _ => bail!("--shell requires bash, zsh, or fish"),
     }
 }
 
@@ -792,6 +793,24 @@ mod tests {
             },
             ..
         } if review == token));
+    }
+
+    #[test]
+    fn fish_dotfile_commands_target_fish_and_reject_zdotdir() {
+        let args = ["--pane", "2", "preview-dotfile-hooks", "--shell", "fish"];
+        let (_, preview) = p(&args).unwrap();
+        assert!(matches!(
+            preview,
+            Request::Sftp {
+                operation: Operation::RepairDotfileHooks {
+                    shell: DotfileShell::Fish,
+                    zdotdir: None,
+                    review: None,
+                },
+                ..
+            }
+        ));
+        assert!(p(&[args.as_slice(), &["--zdotdir", "config/fish"]].concat()).is_err());
     }
 
     #[test]

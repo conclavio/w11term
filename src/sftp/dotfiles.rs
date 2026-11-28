@@ -8,7 +8,9 @@ mod tool_path;
 use comparison::FragmentBaseline;
 
 const DIRECTORY: &str = ".config/w11term/dotfiles";
-const PARENTS: [&str; 3] = [".config", ".config/w11term", DIRECTORY];
+const CONFIG_DIRECTORY: &str = ".config";
+const PARENTS: [&str; 3] = [CONFIG_DIRECTORY, ".config/w11term", DIRECTORY];
+const FISH_DIRECTORY: &str = ".config/fish";
 const DISABLED: &str = "disabled\n";
 // Startup hooks only load fragments when the first line is a bundle digest.
 const AUTOMATIC: &str = "automatic\n";
@@ -87,11 +89,13 @@ pub(crate) async fn sync_login_dotfiles(
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DotfileShell {
+    #[default]
     Bash,
     Zsh,
+    Fish,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -137,17 +141,32 @@ pub struct ExportedDotfileBundle {
 }
 
 impl DotfileShell {
-    fn name(self) -> &'static str {
+    pub const ALL: [Self; 3] = [Self::Bash, Self::Zsh, Self::Fish];
+
+    pub fn name(self) -> &'static str {
         match self {
             Self::Bash => "bash",
             Self::Zsh => "zsh",
+            Self::Fish => "fish",
         }
     }
 
-    fn version_variable(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Bash => "BASH_VERSION",
-            Self::Zsh => "ZSH_VERSION",
+            Self::Bash => "Bash",
+            Self::Zsh => "Zsh",
+            Self::Fish => "Fish",
+        }
+    }
+
+    pub fn menu_index(self) -> usize {
+        self as usize
+    }
+
+    fn fragment_extension(self) -> &'static str {
+        match self {
+            Self::Bash | Self::Zsh => "sh",
+            Self::Fish => "fish",
         }
     }
 }
@@ -159,6 +178,10 @@ pub struct DotfileBundle {
     pub environment: Option<String>,
     pub bash: Option<String>,
     pub zsh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fish_environment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fish: Option<String>,
 }
 
 impl DotfileBundle {
@@ -185,7 +208,9 @@ impl DotfileBundle {
     pub fn validate(&self, shell: DotfileShell) -> Result<()> {
         self.validate_fragments()?;
         ensure!(
-            self.environment.is_some() || self.prompt(shell).is_some(),
+            self.selected_fragments(shell)
+                .into_iter()
+                .any(|item| item.is_some()),
             "The bundle needs an environment or {} fragment",
             shell.name()
         );
@@ -209,7 +234,7 @@ impl DotfileBundle {
     pub fn validate_for_editing(&self) -> Result<()> {
         self.validate_fragments()?;
         ensure!(
-            self.environment.is_some() || self.bash.is_some() || self.zsh.is_some(),
+            self.all_fragments().into_iter().any(|item| item.is_some()),
             "Enter at least one dotfile fragment"
         );
         Ok(())
@@ -270,27 +295,32 @@ impl DotfileBundle {
 
     fn validate_fragments(&self) -> Result<()> {
         ensure!(self.version == 1, "Unsupported dotfiles bundle version");
-        for fragment in [&self.environment, &self.bash, &self.zsh]
-            .into_iter()
-            .flatten()
-        {
+        for fragment in self.all_fragments().into_iter().flatten() {
             validate_fragment(fragment)?;
         }
         Ok(())
     }
 
-    fn prompt(&self, shell: DotfileShell) -> Option<&str> {
+    fn all_fragments(&self) -> [Option<&str>; 5] {
+        [
+            self.environment.as_deref(),
+            self.bash.as_deref(),
+            self.zsh.as_deref(),
+            self.fish_environment.as_deref(),
+            self.fish.as_deref(),
+        ]
+    }
+
+    fn selected_fragments(&self, shell: DotfileShell) -> [Option<&str>; 2] {
         match shell {
-            DotfileShell::Bash => self.bash.as_deref(),
-            DotfileShell::Zsh => self.zsh.as_deref(),
+            DotfileShell::Bash => [self.environment.as_deref(), self.bash.as_deref()],
+            DotfileShell::Zsh => [self.environment.as_deref(), self.zsh.as_deref()],
+            DotfileShell::Fish => [self.fish_environment.as_deref(), self.fish.as_deref()],
         }
     }
 
     fn fragments(&self, shell: DotfileShell) -> [String; 2] {
-        [
-            payload(self.environment.as_deref()),
-            payload(self.prompt(shell)),
-        ]
+        self.selected_fragments(shell).map(payload)
     }
 }
 
@@ -460,8 +490,12 @@ enum Hook {
 }
 
 fn hook_text(shell: DotfileShell, hook: Hook) -> String {
+    let version = match shell {
+        DotfileShell::Bash => "BASH_VERSION",
+        DotfileShell::Zsh => "ZSH_VERSION",
+        DotfileShell::Fish => return include_str!("dotfiles/startup.fish").to_owned(),
+    };
     let name = shell.name();
-    let version = shell.version_variable();
     let selected = format!("_w11term_dotfiles_{name}_version");
     let selector = format!("$HOME/{DIRECTORY}/{name}-current");
     let source = |role| {
@@ -474,10 +508,12 @@ fn hook_text(shell: DotfileShell, hook: Hook) -> String {
     let environment = source("environment");
     let prompt = source("prompt");
     let interactive = |body: &str| format!("case $- in *i*)\n{body};;\nesac\n");
-    let body = match (shell, hook) {
-        (_, Hook::Interactive) => interactive(&format!("{environment}{prompt}")),
-        (DotfileShell::Bash, Hook::Login) => format!("{environment}{}", interactive(&prompt)),
-        (DotfileShell::Zsh, Hook::Login) => environment,
+    let body = match hook {
+        Hook::Interactive => interactive(&format!("{environment}{prompt}")),
+        Hook::Login if shell == DotfileShell::Bash => {
+            format!("{environment}{}", interactive(&prompt))
+        }
+        Hook::Login => environment,
     };
     format!(
         "{BEGIN}
@@ -654,17 +690,7 @@ impl Engine {
             "Dotfiles installation was interrupted. Preview again to check the active bundle.";
         let mut changed = Vec::new();
         for path in &plan.create {
-            self.check_entry_parent(remote_parent(path)?).await?;
-            self.raw
-                .mkdir(
-                    path,
-                    FileAttributes {
-                        permissions: Some(0o700),
-                        ..FileAttributes::empty()
-                    },
-                )
-                .await
-                .with_context(|| format!("Creating dotfiles directory {path}"))?;
+            self.create_dotfile_directory(path).await?;
         }
         for edit in &plan.files {
             if edit.changed() {
@@ -810,10 +836,10 @@ impl Engine {
                 hook.path
             );
         }
-        let mut files = Vec::with_capacity(4);
+        let mut files = Vec::with_capacity(FRAGMENT_ROLES.len() + hooks.len());
         let directory = under_home(home, &version_directory(shell, id));
         for (role, contents) in FRAGMENT_ROLES.into_iter().zip(&fragments) {
-            let path = format!("{directory}/{role}.sh");
+            let path = fragment_path(&directory, shell, role);
             files.push(
                 Edit::new(
                     path,
@@ -855,6 +881,21 @@ impl Engine {
         .with_context(|| format!("Installing dotfile {}", edit.path))
     }
 
+    async fn create_dotfile_directory(&self, path: &str) -> Result<()> {
+        self.check_entry_parent(remote_parent(path)?).await?;
+        self.raw
+            .mkdir(
+                path,
+                FileAttributes {
+                    permissions: Some(0o700),
+                    ..FileAttributes::empty()
+                },
+            )
+            .await
+            .with_context(|| format!("Creating dotfiles directory {path}"))?;
+        Ok(())
+    }
+
     async fn dotfiles_plan(
         &self,
         bundle: &DotfileBundle,
@@ -878,15 +919,20 @@ impl Engine {
         let id = bundle_id(&environment, &prompt);
         let version_directory = version_directory(shell, &id);
         let mut directories_to_create = Vec::new();
-        for relative in PARENTS.into_iter().chain([version_directory.as_str()]) {
+        for relative in PARENTS
+            .into_iter()
+            .chain((shell == DotfileShell::Fish).then_some(FISH_DIRECTORY))
+            .chain([version_directory.as_str()])
+        {
             let path = under_home(&home, relative);
             if !self.dotfile_directory_exists(&path).await? {
                 directories_to_create.push(path);
             }
         }
         let mut files = Vec::with_capacity(4);
+        let directory = under_home(&home, &version_directory);
         for (role, desired) in [("environment", environment), ("prompt", prompt)] {
-            let path = under_home(&home, &format!("{version_directory}/{role}.sh"));
+            let path = fragment_path(&directory, shell, role);
             let original = self.dotfile_text(&path).await?;
             let (action, after) = match original.as_deref() {
                 None => ("create", Some(desired)),
@@ -925,13 +971,13 @@ impl Engine {
         home: &str,
         shell: DotfileShell,
         zdotdir: Option<&str>,
-    ) -> Result<[Edit; 2]> {
-        let [(login, login_original), (rc, rc_original)] =
-            self.startup_files(home, shell, zdotdir).await?;
-        Ok([
-            hook_change(login, login_original, hook_text(shell, Hook::Login)),
-            hook_change(rc, rc_original, hook_text(shell, Hook::Interactive)),
-        ])
+    ) -> Result<Vec<Edit>> {
+        let files = self.startup_files(home, shell, zdotdir).await?;
+        Ok(files
+            .into_iter()
+            .zip([Hook::Login, Hook::Interactive])
+            .map(|((path, original), hook)| hook_change(path, original, hook_text(shell, hook)))
+            .collect())
     }
 
     async fn startup_files(
@@ -939,7 +985,7 @@ impl Engine {
         home: &str,
         shell: DotfileShell,
         zdotdir: Option<&str>,
-    ) -> Result<[(String, Option<String>); 2]> {
+    ) -> Result<Vec<(String, Option<String>)>> {
         let home_prefix = home.trim_end_matches('/');
         let startup_dir = if let Some(relative) = zdotdir {
             let mut path = home_prefix.to_owned();
@@ -973,10 +1019,25 @@ impl Engine {
                 let contents = self.dotfile_text(&path).await?;
                 (path, contents)
             }
+            DotfileShell::Fish => {
+                let path = startup(".config/fish/config.fish");
+                let original = if self
+                    .dotfile_directory_exists(&startup(CONFIG_DIRECTORY))
+                    .await?
+                    && self
+                        .dotfile_directory_exists(&startup(FISH_DIRECTORY))
+                        .await?
+                {
+                    self.dotfile_text(&path).await?
+                } else {
+                    None
+                };
+                return Ok(vec![(path, original)]);
+            }
         };
         let rc = startup(&format!(".{}rc", shell.name()));
         let rc_original = self.dotfile_text(&rc).await?;
-        Ok([(login, login_original), (rc, rc_original)])
+        Ok(vec![(login, login_original), (rc, rc_original)])
     }
 
     async fn dotfile_directory_exists(&self, path: &str) -> Result<bool> {
@@ -1039,6 +1100,10 @@ fn bundle_id(environment: &str, prompt: &str) -> String {
 
 fn version_directory(shell: DotfileShell, id: &str) -> String {
     format!("{DIRECTORY}/{}-{id}", shell.name())
+}
+
+fn fragment_path(directory: &str, shell: DotfileShell, role: &str) -> String {
+    format!("{directory}/{role}.{}", shell.fragment_extension())
 }
 
 pub(super) fn under_home(home: &str, relative: &str) -> String {
@@ -1121,6 +1186,8 @@ mod tests {
             environment: None,
             bash: None,
             zsh: Some("PROMPT='ops> '\nexport EDITOR=vi\n".into()),
+            fish_environment: None,
+            fish: None,
         };
         bundle.save_new(&path).unwrap();
         let original = std::fs::read(&path).unwrap();

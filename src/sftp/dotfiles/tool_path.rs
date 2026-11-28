@@ -96,6 +96,10 @@ impl Engine {
     ) -> Result<PathPlan> {
         validate_zdotdir(settings.shell, settings.zdotdir.as_deref())?;
         ensure!(
+            settings.shell != DotfileShell::Fish,
+            "Managed tool PATH changes require Bash or Zsh"
+        );
+        ensure!(
             valid_bin_directory(bin),
             "Invalid approved tool bin directory"
         );
@@ -112,7 +116,6 @@ impl Engine {
         } else {
             self.startup_files(home, settings.shell, settings.zdotdir.as_deref())
                 .await?
-                .into()
         };
         let edits = files
             .into_iter()

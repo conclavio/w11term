@@ -84,7 +84,7 @@ pub(super) struct Editor {
     home: String,
     fingerprint: String,
     zdotdir: String,
-    zsh: bool,
+    shell: DotfileShell,
     approved: Option<Box<DotfileSync>>,
     pin_version: bool,
     snapshot_version: Option<String>,
@@ -104,7 +104,7 @@ impl Editor {
             home: settings.home.clone(),
             fingerprint: settings.fingerprint.clone(),
             zdotdir: settings.zdotdir.clone().unwrap_or_default(),
-            zsh: settings.shell == DotfileShell::Zsh,
+            shell: settings.shell,
             pin_version: settings.bundle_sha256.is_some(),
             approved,
             ..Default::default()
@@ -144,7 +144,7 @@ impl Editor {
         editor.expanded = true;
         editor.home = saved.home;
         editor.fingerprint = fingerprint;
-        editor.zsh = saved.shell == DotfileShell::Zsh;
+        editor.shell = saved.shell;
         editor.zdotdir = zdotdir.unwrap_or_default();
         editor.pin_version = true;
         editor.snapshot_version = Some(saved.bundle_sha256);
@@ -157,13 +157,9 @@ impl Editor {
         anyhow::ensure!(!self.bundle.trim().is_empty(), "Choose a dotfiles bundle");
         let home = self.home.trim();
         validate_dotfiles_home(home)?;
-        let shell = if self.zsh {
-            DotfileShell::Zsh
-        } else {
-            DotfileShell::Bash
-        };
+        let shell = self.shell;
         let zdotdir = self.zdotdir.trim();
-        let zdotdir = (self.zsh && !zdotdir.is_empty()).then_some(zdotdir);
+        let zdotdir = (shell == DotfileShell::Zsh && !zdotdir.is_empty()).then_some(zdotdir);
         validate_zdotdir(shell, zdotdir)?;
         Ok(DotfileSync {
             bundle: base.join(self.bundle.trim()),
@@ -260,8 +256,8 @@ impl Editor {
                     TextBlock::new().text("Dotfiles shell"),
                     ComboBox::new()
                         .automation_name("Dotfiles shell")
-                        .items_source(["Bash", "Zsh"])
-                        .selected_index(usize::from(self.zsh))
+                        .items_source(DotfileShell::ALL.map(DotfileShell::label))
+                        .selected_index(self.shell.menu_index())
                         .on_selection_changed(ctx.callback(move |index| {
                             Message::ProfileDotfiles(id, Action::Shell(index))
                         })),
@@ -277,7 +273,7 @@ impl Editor {
                 ),
             ),
         ];
-        if self.zsh {
+        if self.shell == DotfileShell::Zsh {
             content.push(KeyedView::new(
                 "zdotdir",
                 field(
@@ -616,15 +612,16 @@ impl TerminalApp {
                     editor.error = None;
                 }
             }
-            Action::Shell(Some(index)) => {
-                if draft.dotfiles.zsh != (index == 1) {
-                    draft.dotfiles.zsh = index == 1;
+            Action::Shell(index) => {
+                if let Some(shell) = index.and_then(|index| DotfileShell::ALL.get(index).copied())
+                    && draft.dotfiles.shell != shell
+                {
+                    draft.dotfiles.shell = shell;
                     draft.dotfiles.snapshot_version = None;
                     draft.dotfiles.checking = None;
                     draft.dotfiles.error = None;
                 }
             }
-            Action::Shell(None) => {}
             Action::PinVersion(pin) => {
                 if draft.dotfiles.pin_version != pin {
                     draft.dotfiles.pin_version = pin;

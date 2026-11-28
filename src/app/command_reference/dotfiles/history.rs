@@ -106,10 +106,7 @@ impl Panel {
                 .on_click(ctx.callback(move |_| send(action())))
                 .content(label)
         };
-        let shell = match installer.shell {
-            DotfileShell::Bash => "Bash",
-            DotfileShell::Zsh => "Zsh",
-        };
+        let shell = installer.shell.label();
         let mut fields = vec![
             KeyedView::new(
                 "title",
@@ -584,10 +581,7 @@ impl Installer {
     ) {
         let target = self.target;
         let shell = self.shell;
-        let name = match shell {
-            DotfileShell::Bash => "bash",
-            DotfileShell::Zsh => "zsh",
-        };
+        let name = shell.name();
         let purpose = file_picker::Purpose::SaveDotfilesBundle {
             current,
             suggestion: format!("dotfiles-{name}-{}.json", short_id(&bundle_sha256)),

@@ -4,15 +4,19 @@ use std::cell::OnceCell;
 
 mod remote_excerpt;
 
-const FRAGMENTS: [&str; 3] = [
+const FRAGMENTS: [&str; 5] = [
     "Shared environment fragment",
     "Bash startup fragment",
     "Zsh startup fragment",
+    "Fish environment fragment",
+    "Fish startup fragment",
 ];
-const IMPORT_ITEMS: [&str; 3] = [
+const IMPORT_ITEMS: [&str; FRAGMENTS.len()] = [
     "Append to shared environment",
     "Append to Bash fragment",
     "Append to Zsh fragment",
+    "Append to Fish environment",
+    "Append to Fish fragment",
 ];
 
 #[derive(Clone)]
@@ -49,7 +53,7 @@ enum Phase {
 pub(super) struct Editor {
     ticket: Arc<()>,
     source: Option<PathBuf>,
-    fragments: [Option<String>; 3],
+    fragments: [Option<String>; FRAGMENTS.len()],
     import_menu: OnceCell<Menu>,
     remote: Option<Box<remote_excerpt::Source>>,
     phase: Phase,
@@ -87,13 +91,19 @@ impl Editor {
     }
 
     fn load(&mut self, bundle: DotfileBundle) {
-        self.fragments = [bundle.environment, bundle.bash, bundle.zsh]
-            .map(|text| text.as_deref().map(editor_text));
+        self.fragments = [
+            bundle.environment,
+            bundle.bash,
+            bundle.zsh,
+            bundle.fish_environment,
+            bundle.fish,
+        ]
+        .map(|text| text.as_deref().map(editor_text));
         self.phase = Phase::Ready;
     }
 
     fn bundle(&self) -> DotfileBundle {
-        let [environment, bash, zsh] = self
+        let [environment, bash, zsh, fish_environment, fish] = self
             .fragments
             .each_ref()
             .map(|text| text.as_deref().map(fragment_text));
@@ -102,6 +112,8 @@ impl Editor {
             environment,
             bash,
             zsh,
+            fish_environment,
+            fish,
         }
     }
 

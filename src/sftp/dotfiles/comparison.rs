@@ -34,7 +34,7 @@ impl Engine {
             "Retained dotfiles bundle not found: {id}"
         );
         let read = |role| {
-            let path = format!("{directory}/{role}.sh");
+            let path = fragment_path(&directory, shell, role);
             async move {
                 let contents = self
                     .dotfile_text(&path)
