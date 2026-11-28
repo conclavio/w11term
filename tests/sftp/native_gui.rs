@@ -183,11 +183,11 @@ fn native_saved_diagnostics_open_directly_without_terminal_panes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reviews an SSH packet capture, saves verified bytes and opens a local viewer"]
+#[ignore = "reviews and repeats packet captures, verifies saved reports, and opens a local viewer"]
 async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, _, server) =
-        fixture_counting_accepts(false, 1, transports.clone()).await
+        fixture_counting_accepts(false, 2, transports.clone()).await
     else {
         unreachable!()
     };
@@ -207,11 +207,10 @@ async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
     assert!(remote.path().join("pcap-verified").is_file());
     let mut expected = packet_ring_segment(1);
     expected.extend_from_slice(&packet_ring_segment(0)[24..]);
-    assert_eq!(
-        fs::read(state.path().join("reviewed capture.pcap")).unwrap(),
-        expected
-    );
-    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    for name in ["reviewed capture.pcap", "reused settings.pcap"] {
+        assert_eq!(fs::read(state.path().join(name)).unwrap(), expected);
+    }
+    assert_eq!(transports.load(Ordering::Relaxed), 2);
     server.abort();
 }
 

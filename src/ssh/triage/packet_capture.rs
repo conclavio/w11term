@@ -259,6 +259,12 @@ pub struct Capture {
     reviewed: Box<CaptureReportReview>,
 }
 
+impl Capture {
+    pub fn options(&self) -> &PacketCaptureOptions {
+        &self.reviewed.options
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct RotationResult {
     pub retained_files: usize,

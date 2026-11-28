@@ -4,6 +4,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $destination = Join-Path $State 'reviewed capture.pcap'
+$repeated = Join-Path $State 'reused settings.pcap'
 $olderCapture = Join-Path $State 'older capture.pcapng'
 $partialCapture = Join-Path $State 'incomplete capture.pcapng'
 $conversationCapture = Join-Path $State 'IP conversations.pcap'
@@ -16,6 +17,7 @@ $invalidCapture = Join-Path $State 'not a capture.pcap'
 $viewer = Join-Path $State 'Fixture Wireshark.exe'
 $startMarker = [IO.File]::ReadAllText((Join-Path $State 'pcap-start-marker'))
 $saveLabel = 'Capture and save' + [char]0x2026
+$reuseLabel = 'Reuse capture settings'
 $openCaptureLabel = 'Open capture file' + [char]0x2026
 $compareCaptureLabel = 'Compare captures' + [char]0x2026
 $chooseViewerLabel = 'Choose Wireshark executable' + [char]0x2026
@@ -162,8 +164,11 @@ function Click([string]$Name, [System.Windows.Automation.ControlType]$Type = $bu
 }
 
 function Set-Field([string]$Name, [string]$Text) {
-    $field = Wait-Until "editable '$Name' field" { Find-Element $Name $edit }
-    $field.SetFocus()
+    $field = Wait-Until "editable '$Name' field" {
+        $item = Find-Element $Name $edit
+        if ($item -and $item.Current.IsEnabled) { $item }
+    }
+    try { $field.SetFocus() } catch { throw "Could not focus '$Name': $_" }
     $field = Wait-Until "focused '$Name' field" {
         $item = Find-Element $Name $edit
         if ($item -and $item.Current.HasKeyboardFocus) { $item }
@@ -174,12 +179,50 @@ function Set-Field([string]$Name, [string]$Text) {
     }
 }
 
+function Read-CaptureField([string]$Name) {
+    $field = Find-Element $Name $edit
+    if ($field) { $field.GetCurrentPattern($value).Current.Value }
+}
+
+function Wait-ReusedSettings {
+    $expected = @{
+        'Linux network interface' = 'lo'
+        'Capture filter (optional)' = 'udp and dst port 4321'
+        'Duration in seconds' = '15'
+        'Snap length in bytes' = '192'
+        'Maximum capture size in MiB' = '1'
+        'Packet limit (optional)' = '3'
+        'Rolling capture files (optional)' = '2'
+        'Remote scratch directory (optional)' = '/dev/shm'
+    }
+    $null = Wait-Until 'recorded packet settings populate the focused form and require review' {
+        foreach ($name in $expected.Keys) {
+            if ((Read-CaptureField $name) -cne $expected[$name]) { return }
+        }
+        $interface = Find-Element 'Linux network interface' $edit
+        $ram = Find-Element 'Use RAM-backed scratch storage' $check
+        $interface -and $interface.Current.HasKeyboardFocus -and
+            $ram -and $ram.GetCurrentPattern($toggle).Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On -and
+            !(Find-Element $saveLabel $button)
+    }
+}
+
 function Select-Capture([string]$Path, [string]$Trigger = $openCaptureLabel, [string]$Title = 'Open packet capture') {
     Click $Trigger
     $dialog = Wait-Until 'owned source capture picker' { Find-OwnedDialog $Title }
     $null = Wait-Until 'enter the source capture path' { [FixtureDialog]::SetFilename($dialog, $Path, '') }
     $null = Wait-Until 'select the source capture' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'source capture picker closed' { !(Find-OwnedDialog $Title) }
+}
+
+function Select-CaptureReport([string]$Path, [string]$Suggested) {
+    Click ('Verify capture report' + [char]0x2026)
+    $dialog = Wait-Until 'owned packet capture verification picker' { Find-OwnedDialog 'Open packet capture report' }
+    $null = Wait-Until 'select the packet report path' {
+        [FixtureDialog]::SetFilename($dialog, $Path, $Suggested) -or
+            [FixtureDialog]::SetCommonDialogFilename($dialog, $Path)
+    }
+    $null = Wait-Until 'verify the selected report' { [FixtureDialog]::ClickButton($dialog, 1) }
 }
 
 function Test-CaptureFile([string]$Path) {
@@ -1085,6 +1128,9 @@ try {
             (Find-Element "Rolling capture${dot}3 captured${dot}2 files kept${dot}1 overwritten") -and
             [IO.File]::Exists($destination)
     }
+    Set-Field 'Duration in seconds' '5'
+    Click $reuseLabel
+    Wait-ReusedSettings
 
     $null = Control @('close-pane','--pane',"$remote")
     Wait-Focus $local
@@ -1131,20 +1177,23 @@ try {
     }
     Select-Capture $destination
     $null = Wait-Until 'the saved packet file reopens in offline inspection' {
-        (Find-Element "PCAP${dot}64 bytes") -and !(Find-Element ('Save capture report' + [char]0x2026) $button)
+        (Find-Element "PCAP${dot}64 bytes") -and !(Find-Element ('Save capture report' + [char]0x2026) $button) -and
+            !(Find-Element $reuseLabel $button)
     }
-    Click ('Verify capture report' + [char]0x2026)
-    $dialog = Wait-Until 'owned packet capture verification picker' { Find-OwnedDialog 'Open packet capture report' }
-    $null = Wait-Until 'select the matching report path' {
-        [FixtureDialog]::SetFilename($dialog, $reportPath, [IO.Path]::GetFileName($reportPath)) -or
-            [FixtureDialog]::SetFilename($dialog, $reportPath, '')
-    }
-    $null = Wait-Until 'verify the selected report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $reportName = [IO.Path]::GetFileName($reportPath)
+    Select-CaptureReport $reportPath $reportName
     $null = Wait-Until 'the offline viewer verifies the matching report' {
         (Find-Element "Capture matches report${dot}64 bytes verified") -and
             (Find-Element 'Details from capture report') -and
             (Find-Element "Capture filter${dot}udp and dst port 4321") -and
             (Find-Element "Stopped by request${dot}2 packets saved")
+    }
+    Set-Field 'Capture filter (optional)' 'udp and dst port 2345'
+    Click $reuseLabel
+    Wait-ReusedSettings
+    $review = Find-Element 'Review packet capture' $button
+    if (!$review -or $review.Current.IsEnabled -or !(Find-Element 'Details from capture report')) {
+        throw 'Offline reuse did not retain the report or required SSH review'
     }
     Select-Viewer
     if ([IO.File]::Exists($destination + '.opened')) { throw 'Selecting a viewer opened it without activation' }
@@ -1160,7 +1209,60 @@ try {
         (Test-CaptureFile $other) -and
             (Find-Element "PCAP${dot}24 bytes") -and
             !(Find-Element 'Details from capture report') -and
-            !(Find-Element "Capture matches report${dot}64 bytes verified")
+            !(Find-Element "Capture matches report${dot}64 bytes verified") -and !(Find-Element $reuseLabel $button)
+    }
+
+    Select-Capture $destination
+    $invalidReport = Join-Path $State 'invalid packet capture settings.json'
+    $report.reviewed.options.seconds = 0
+    [IO.File]::WriteAllText($invalidReport, ($report | ConvertTo-Json -Depth 8))
+    Select-CaptureReport $invalidReport $reportName
+    $null = Wait-Until 'the report with invalid settings still verifies the capture bytes' {
+        (Find-Element "Capture matches report${dot}64 bytes verified") -and
+            (Find-Element "Interface lo${dot}192-byte snap length${dot}0 seconds${dot}1 MiB")
+    }
+    Set-Field 'Duration in seconds' '5'
+    Click $reuseLabel
+    $null = Wait-Until 'invalid recorded options leave the editable draft intact' {
+        (Find-Element 'Invalid recorded capture settings: Packet capture duration must be 1..=60 seconds') -and
+            (Read-CaptureField 'Duration in seconds') -ceq '5'
+    }
+    Select-CaptureReport $reportPath $reportName
+    Click $reuseLabel
+    Wait-ReusedSettings
+    $startStamp = [IO.File]::GetLastWriteTimeUtc($startMarker)
+    $remote = (Control @('open','--profile','palette-ssh','--activate')).pane
+    Wait-Focus $remote
+    $null = Control @('wait-ssh-connected','--pane',"$remote",'--timeout','15')
+    Run-Palette 'Packet capture'
+    Set-Field 'Duration in seconds' '5'
+    Click 'Review packet capture'
+    $null = Wait-Until 'the edited draft has a different review' {
+        (Find-Element "5 seconds${dot}1 MiB${dot}Packet ceiling 3") -and
+            (Find-Element $saveLabel $button)
+    }
+    Click $reuseLabel
+    Wait-ReusedSettings
+    Click 'Review packet capture'
+    $null = Wait-Until 'restored packet settings are reviewed on the new SSH connection' {
+        (Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","3","-w","-","--","udp and dst port 4321"]') -and
+            (Find-Element '/dev/shm (tmpfs)')
+    }
+    Click $saveLabel
+    $dialog = Wait-OwnedDialog 'Save packet capture'
+    if ([IO.File]::GetLastWriteTimeUtc($startMarker) -ne $startStamp) {
+        throw 'The repeated packet capture started before destination approval'
+    }
+    $null = Wait-Until 'enter the new capture path' {
+        [FixtureDialog]::SetFilename($dialog, $repeated, 'packet-capture.pcap')
+    }
+    $null = Wait-Until 'save the new capture path' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the repeated packet capture starts' {
+        [IO.File]::GetLastWriteTimeUtc($startMarker) -gt $startStamp
+    }
+    Click 'Stop and save'
+    $null = Wait-Until 'the repeated packet capture is saved' {
+        (Find-Element 'Saved packet capture') -and [IO.File]::Exists($repeated)
     }
 } finally {
     Close-FixtureApp $app

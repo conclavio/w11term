@@ -52,6 +52,7 @@ pub enum Action {
     Save,
     SaveReport,
     VerifyReport,
+    ReuseSettings,
     SettingsExpanded(bool),
     OpenSettings,
     SaveSettings,
@@ -244,6 +245,7 @@ pub(super) struct Panel {
     pub(super) open: bool,
     pub(super) activity: Option<diagnostics::Activity>,
     inputs: Inputs,
+    interface_input: ElementRef<TextBox>,
     settings_expanded: bool,
     interfaces: Option<(flame_graph::Connection, PacketCaptureInterfaces)>,
     review: Option<Review>,
@@ -403,6 +405,36 @@ impl Panel {
         self.activity = None;
     }
 
+    fn reusable_settings(&self) -> Option<&PacketCaptureOptions> {
+        if let Some(LoadedCapture::Captured(capture)) = &self.loaded {
+            return Some(capture.options());
+        }
+        self.verified_report
+            .as_ref()
+            .map(|(_, details)| &details.reviewed.options)
+    }
+
+    fn reuse_capture_settings(&mut self) {
+        let Some(options) = self.reusable_settings().cloned() else {
+            return;
+        };
+        match options.validate() {
+            Ok(options) => {
+                self.inputs = options.into();
+                self.review = None;
+                self.status = Some(
+                    "Capture settings restored. Review the selected SSH pane before capturing."
+                        .into(),
+                );
+                let _ = self.interface_input.request_bring_into_view();
+                let _ = self.interface_input.request_focus();
+            }
+            Err(error) => {
+                self.status = Some(format!("Invalid recorded capture settings: {error:#}"))
+            }
+        }
+    }
+
     fn conversation_interval_checkbox(
         &self,
         capture: &LocalPacketCapture,
@@ -447,19 +479,23 @@ impl Panel {
                 .content(label)
         };
         let input = |key, field, label, value: &str| {
+            let editor = TextBox::new()
+                .automation_name(label)
+                .is_enabled(idle)
+                .text(value)
+                .on_text_changed(ctx.callback(move |value| message(Action::Edit(field, value))));
+            let editor = if matches!(field, Field::Interface) {
+                editor.element_ref(&self.interface_input)
+            } else {
+                editor
+            };
             KeyedView::new(
                 key,
                 StackPanel::new().spacing(4.0).children((
                     TextBlock::new()
                         .text(label)
                         .text_wrapping(TextWrapping::Wrap),
-                    TextBox::new()
-                        .automation_name(label)
-                        .is_enabled(idle)
-                        .text(value)
-                        .on_text_changed(
-                            ctx.callback(move |value| message(Action::Edit(field, value))),
-                        ),
+                    editor,
                 )),
             )
         };
@@ -680,6 +716,12 @@ impl Panel {
         )];
         if let Some(status) = &self.status {
             files.push(text("status", status));
+        }
+        if self.reusable_settings().is_some() {
+            files.push(KeyedView::new(
+                "reuse-capture-settings",
+                button("Reuse capture settings", idle, || Action::ReuseSettings),
+            ));
         }
         if let Some(LoadedCapture::Captured(saved)) = &self.loaded {
             let reason = stop_reason(saved.stop_reason);
@@ -1319,6 +1361,7 @@ impl TerminalApp {
             Action::Save => self.choose_capture_file(FileChoice::Save, ctx),
             Action::SaveReport => self.save_packet_report(ctx),
             Action::VerifyReport => self.verify_packet_report(ctx),
+            Action::ReuseSettings => panel.reuse_capture_settings(),
             Action::SettingsExpanded(expanded) => panel.settings_expanded = expanded,
             Action::OpenSettings => self.choose_capture_file(FileChoice::OpenSettings, ctx),
             Action::SaveSettings => self.choose_capture_file(FileChoice::SaveSettings, ctx),
