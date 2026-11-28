@@ -1,4 +1,5 @@
 use super::*;
+use diagnostics::safe_text;
 use std::{fmt::Write as _, path::PathBuf};
 use w11term::syscall_trace::{self as trace, Filter, Group, Raw, Trace};
 
@@ -667,20 +668,6 @@ fn navigation(
                 .on_click(go_forward)
                 .content("Next"),
         ))
-}
-
-fn safe_text(text: &str) -> String {
-    let mut safe = String::with_capacity(text.len());
-    for c in text.chars() {
-        if (c.is_control() && c != '\t')
-            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-        {
-            safe.extend(c.escape_default());
-        } else {
-            safe.push(c);
-        }
-    }
-    safe
 }
 
 #[cfg(test)]

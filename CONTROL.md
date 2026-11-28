@@ -1984,6 +1984,8 @@ Choose **Review CPU profile** to check the live process and verified SSH endpoin
 
 On a completed capture, choose **Save capture report…** to write a new JSON file beside the folded profile or at another destination. The report records the reviewed SSH endpoint, PID and start ticks or resolved command and literal arguments, sampling settings, stop or command outcome, and sample totals. It includes the original filenames, byte counts, and SHA-256 digests of the folded profile and any saved raw recording. Review the endpoint and command metadata before sharing the report.
 
+Choose **Verify capture report…** on a loaded flame graph to select the JSON and check it against the folded file. **Capture report** then shows the recorded target, sampling settings, outcome, and checksums alongside the graph. If the report includes a raw recording, choose **Verify raw perf recording…** to select it separately. Both checks work offline with renamed files. Reopen the folded file if it changed after the graph was loaded.
+
 `verify-cpu-profile-report` checks a selected folded file against that report offline. Pass `--perf-data` to check both files in one command. Filenames may change. The JSON reply contains the report and the paths checked, and a mismatch returns a nonzero exit code. The digests verify file contents against the supplied report.
 
 ```powershell

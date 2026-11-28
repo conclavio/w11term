@@ -4,11 +4,12 @@ use std::path::PathBuf;
 use w11term::cpu_profile::flame_graph::{Differential, ProfileSide, ROW_HEIGHT, Range};
 use w11term::cpu_profile::{FilteredComparison, Profile, Search, sample_share};
 use w11term::diagnostic_history::Kind as ArtifactKind;
-use w11term::ssh::{CaptureStop, CpuProfileCaptureReport, CpuProfileSummary};
+use w11term::ssh::{CaptureStop, CpuProfileSummary};
 
 mod capture;
 mod compare;
 mod plot;
+mod report;
 pub(super) use capture::Connection;
 
 pub(super) const LABEL: &str = "CPU flame graph";
@@ -24,7 +25,7 @@ pub enum Action {
     DifferentialWidth(ProfileSide, Arc<()>),
     ReturnToComparison,
     Export(Arc<()>),
-    SaveCaptureReport,
+    Report(report::Action),
     Capture(capture::Action),
     Stop(Arc<()>),
     Graph(Arc<()>, GraphAction),
@@ -52,7 +53,7 @@ pub enum Outcome {
     Destination(Box<capture::Recording>),
     Captured(Arc<Profile>, PathBuf, Box<CapturedProfile>),
     Exported,
-    CaptureReportSaved,
+    Report(report::Outcome),
 }
 
 pub struct CapturedProfile {
@@ -72,6 +73,7 @@ struct Loaded {
     path: PathBuf,
     plot: Plot,
     capture: Option<Box<CapturedProfile>>,
+    verified_report: Option<report::Verified>,
     differential: Option<Differential>,
     ticket: Arc<()>,
     zoom: usize,
@@ -258,15 +260,6 @@ impl Panel {
                             .content("Repeat CPU profile…"),
                     ));
                 }
-                if loaded.capture_report().is_some() {
-                    fields.push(KeyedView::new(
-                        "save-capture-report",
-                        Button::new()
-                            .is_enabled(idle)
-                            .on_click(send(|| Action::SaveCaptureReport))
-                            .content("Save capture report…"),
-                    ));
-                }
                 if loaded
                     .capture
                     .as_ref()
@@ -287,6 +280,7 @@ impl Panel {
                         .on_click(send(|| Action::CompareFile))
                         .content("Compare profiles"),
                 ));
+                report::fields(loaded, idle, ctx, &mut fields);
                 loaded.graph(window_height, ctx, &mut fields);
             } else if self.status.is_none() {
                 fields.push(text(
@@ -304,10 +298,6 @@ impl Panel {
 }
 
 impl Loaded {
-    fn capture_report(&self) -> Option<&Arc<CpuProfileCaptureReport>> {
-        self.capture.as_ref()?.summary.capture_report.as_ref()
-    }
-
     fn source(&self) -> ProfileSource {
         ProfileSource {
             profile: self.profile.clone(),
@@ -348,6 +338,7 @@ impl Loaded {
             profile,
             path,
             capture,
+            verified_report: None,
             differential,
             ticket: Arc::new(()),
             zoom,
@@ -818,47 +809,7 @@ impl TerminalApp {
                     rejected,
                 );
             }
-            Action::SaveCaptureReport => {
-                if !panel.open || panel.pending.is_some() {
-                    return;
-                }
-                let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
-                    return;
-                };
-                let Some(loaded) = panel.visible_graph() else {
-                    return;
-                };
-                let Some(report) = loaded.capture_report().cloned() else {
-                    return;
-                };
-                let purpose = file_picker::Purpose::CaptureReport {
-                    capture: loaded.path.clone(),
-                    kind: file_picker::CaptureReportKind::CpuProfile,
-                    save: true,
-                };
-                let ticket = panel.begin("Choosing a CPU profile report file…");
-                let rejected = message(Action::Finished(
-                    ticket.clone(),
-                    Err("CPU profile report worker unavailable".into()),
-                ));
-                ctx.spawn_background_with_rejection(
-                    move |scope| {
-                        let result = (|| -> anyhow::Result<_> {
-                            let Some(file) = file_picker::pick(owner, purpose)? else {
-                                return Ok(None);
-                            };
-                            if scope.is_cancelled() {
-                                return Ok(None);
-                            }
-                            report.save(&file.path)?;
-                            Ok(Some(Outcome::CaptureReportSaved))
-                        })()
-                        .map_err(|error| format!("{error:#}"));
-                        message(Action::Finished(ticket, result))
-                    },
-                    rejected,
-                );
-            }
+            Action::Report(action) => self.cpu_report_action(action, ctx),
             Action::OpenFile(_) | Action::CompareFile | Action::Export(_) => {
                 let export = matches!(action, Action::Export(_));
                 let inspecting = export && panel.inspection.is_some();
@@ -1085,9 +1036,7 @@ impl TerminalApp {
                     Ok(Some(Outcome::Exported)) => {
                         panel.status = Some("Saved flame graph SVG".into())
                     }
-                    Ok(Some(Outcome::CaptureReportSaved)) => {
-                        panel.status = Some("Saved CPU profile report".into());
-                    }
+                    Ok(Some(Outcome::Report(result))) => report::finish(panel, result),
                     Ok(None) => (),
                     Err(error) => panel.status = Some(error),
                 }

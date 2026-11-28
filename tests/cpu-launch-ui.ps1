@@ -211,6 +211,71 @@ try {
             !(Find-Element $compareOriginal $button) -and
             !(Find-Element ('Save capture report' + [char]0x2026) $button)
     }
+    $null = Control @('close-pane','--pane',"$remote")
+    $verifyReport = 'Verify capture report' + [char]0x2026
+    $verifyRaw = 'Verify raw perf recording' + [char]0x2026
+    $openReportTitle = 'Open CPU profile report'
+    $rawTitle = 'Choose raw perf recording'
+    Click-LaunchButton $verifyReport
+    $dialog = Wait-OwnedDialog $openReportTitle
+    $null = Wait-Until 'choose the saved CPU profile report' {
+        [FixtureDialog]::SetFilename($dialog, $reportPath, [IO.Path]::GetFileName($reportPath))
+    }
+    $null = Wait-Until 'open the saved CPU profile report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $foldedVerified = "Folded profile matches report$dot$($report.folded.bytes) bytes verified"
+    $null = Wait-Until 'the verified report shows recorded metadata without SSH' {
+        (Find-Element $foldedVerified) -and
+            (Find-Element 'Executable /tmp/work space/cpu worker') -and
+            (Find-Element ('2 seconds' + $dot + '99 Hz' + $dot + 'Frame pointers' + $dot + 'cpu-clock:u'))
+    }
+
+    $changedRaw = Join-Path $State 'changed raw.data'
+    $actual[0] = 0
+    [IO.File]::WriteAllBytes($changedRaw, $actual)
+    Click-LaunchButton $verifyRaw
+    $dialog = Wait-OwnedDialog $rawTitle
+    $null = Wait-Until 'choose the changed raw recording' {
+        [FixtureDialog]::SetFilename($dialog, $changedRaw, '')
+    }
+    $null = Wait-Until 'confirm the changed raw recording' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'same-size raw changes fail verification' {
+        Find-Element 'Raw perf recording SHA-256 differs from the CPU profile report'
+    }
+
+    $renamedRaw = Join-Path $State 'renamed raw.data'
+    [IO.File]::Move($raw, $renamedRaw)
+    Click-LaunchButton $verifyRaw
+    $dialog = Wait-OwnedDialog $rawTitle
+    $null = Wait-Until 'choose the renamed raw recording' {
+        [FixtureDialog]::SetFilename($dialog, $renamedRaw, '')
+    }
+    $null = Wait-Until 'confirm the renamed raw recording' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'a raw file with matching contents is verified' {
+        (Find-Element 'Raw perf recording matches report') -and
+            (Find-Element 'Executable /tmp/work space/cpu worker')
+    }
+
+    [IO.File]::WriteAllText($folded, ('replacement;child 1' + [char]10 + 'replacement;main 1' + [char]10))
+    $replacement = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+    $replacementBytes = [IO.File]::ReadAllBytes($folded)
+    $replacement.folded.bytes = $replacementBytes.Length
+    $digest = [Security.Cryptography.SHA256]::Create()
+    try {
+        $replacement.folded.sha256 = [BitConverter]::ToString($digest.ComputeHash($replacementBytes)).Replace('-', '').ToLowerInvariant()
+    } finally { $digest.Dispose() }
+    $replacementReport = Join-Path $State 'replacement report.json'
+    [IO.File]::WriteAllText($replacementReport, ($replacement | ConvertTo-Json -Depth 10))
+    Click-LaunchButton $verifyReport
+    $dialog = Wait-OwnedDialog $openReportTitle
+    $null = Wait-Until 'choose the report for the changed folded file' {
+        [FixtureDialog]::SetFilename($dialog, $replacementReport, [IO.Path]::GetFileName($reportPath))
+    }
+    $null = Wait-Until 'confirm the replacement report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'matching changed disk bytes cannot verify a stale graph' {
+        (Find-Element 'The folded profile changed after it was opened. Reopen it before verifying the report.') -and
+            !(Find-Element 'CPU profile capture report') -and
+            !(Find-Element $verifyRaw $button)
+    }
 } finally {
     Close-FixtureApp $app
 }

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
@@ -38,6 +39,7 @@ pub struct Profile {
     frames: Vec<Frame>,
     rows: Vec<Vec<usize>>,
     raw_symbols: HashMap<usize, String>,
+    loaded_sha256: Option<String>,
 }
 
 impl Profile {
@@ -56,7 +58,13 @@ impl Profile {
             "The folded stacks file exceeds 16 MiB"
         );
         let input = std::str::from_utf8(&bytes).context("Folded stacks must be UTF-8 text")?;
-        Self::parse(input.trim_start_matches('\u{feff}'))
+        let mut profile = Self::parse(input.trim_start_matches('\u{feff}'))?;
+        profile.loaded_sha256 = Some(crate::sftp::digest_hex(Sha256::new_with_prefix(&bytes)));
+        Ok(profile)
+    }
+
+    pub fn loaded_sha256(&self) -> Option<&str> {
+        self.loaded_sha256.as_deref()
     }
 
     pub fn parse(input: &str) -> Result<Self> {
@@ -118,6 +126,7 @@ impl Profile {
             frames,
             rows,
             raw_symbols,
+            loaded_sha256: None,
         })
     }
 
