@@ -2682,7 +2682,7 @@ async fn cpu_profile_raw_export_keeps_valid_recording_when_folding_fails() {
         .await
         .unwrap();
     let plan = &preview["plan"];
-    let request = |name, perf_data_file| Request::CaptureCpuProfile {
+    let request = |name, perf_data_file, report_file| Request::CaptureCpuProfile {
         pane: 1,
         options,
         connection_generation: plan["connection_generation"]
@@ -2693,16 +2693,30 @@ async fn cpu_profile_raw_export_keeps_valid_recording_when_folding_fails() {
         process_start_ticks: plan["process_start_ticks"].as_u64().unwrap(),
         output_file: local.path().join(name),
         perf_data_file: Some(perf_data_file),
+        report_file,
     };
     let before = opens.load(Ordering::SeqCst);
     let same = registry
         .execute(
-            request("run.folded", local.path().join("RUN.FOLDED")),
+            request("run.folded", local.path().join("RUN.FOLDED"), None),
             capture.clone(),
         )
         .await
         .unwrap_err();
     assert!(format!("{same:#}").contains("different destinations"));
+    assert_eq!(opens.load(Ordering::SeqCst), before);
+    let same_report = registry
+        .execute(
+            request(
+                "run.folded",
+                local.path().join("run.perf.data"),
+                Some(local.path().join("RUN.PERF.DATA")),
+            ),
+            capture.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{same_report:#}").contains("different destinations"));
     assert_eq!(opens.load(Ordering::SeqCst), before);
 
     let preserved = local.path().join("preserved.perf.data");
@@ -2712,7 +2726,10 @@ async fn cpu_profile_raw_export_keeps_valid_recording_when_folding_fails() {
     )
     .unwrap();
     let error = registry
-        .execute(request("empty.folded", preserved.clone()), capture.clone())
+        .execute(
+            request("empty.folded", preserved.clone(), None),
+            capture.clone(),
+        )
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("Raw perf recording saved"));
@@ -2720,9 +2737,14 @@ async fn cpu_profile_raw_export_keeps_valid_recording_when_folding_fails() {
     assert_eq!(fs::read(preserved).unwrap(), PERF_DATA_FIXTURE);
 
     let raw = local.path().join("run.perf.data");
+    let report = local.path().join("run report.json");
+    let folded = local.path().join("run.folded");
     fs::write(&profile, "w11term-cpu-profile-v1\t800\td29ya2Vy\n 42 22.01: cpu-clock:u: ab hot_loop (worker)\n\nw11term-cpu-profile-end\n").unwrap();
     let captured = registry
-        .execute(request("run.folded", raw.clone()), capture.clone())
+        .execute(
+            request("run.folded", raw.clone(), Some(report.clone())),
+            capture.clone(),
+        )
         .await
         .unwrap();
     assert_eq!(captured["summary"]["perf_data"]["path"], json!(raw));
@@ -2731,14 +2753,39 @@ async fn cpu_profile_raw_export_keeps_valid_recording_when_folding_fails() {
         PERF_DATA_FIXTURE.len()
     );
     assert_eq!(fs::read(&raw).unwrap(), PERF_DATA_FIXTURE);
+    assert_eq!(fs::read_to_string(&folded).unwrap(), "worker;hot_loop 1\n");
+    assert_eq!(captured["report_path"], json!(report));
+    let provenance = w11term::ssh::verify_cpu_profile_report(&folded, &report, Some(&raw)).unwrap();
+    let provenance = serde_json::to_value(provenance).unwrap();
+    assert_eq!(provenance["reviewed"]["host"], plan["host"]);
     assert_eq!(
-        fs::read_to_string(local.path().join("run.folded")).unwrap(),
-        "worker;hot_loop 1\n"
+        provenance["reviewed"]["host_key_fingerprint"],
+        plan["host_key_fingerprint"]
     );
+    assert_eq!(
+        provenance["reviewed"]["target"]["process_name"],
+        plan["process_name"]
+    );
+    assert_eq!(provenance["reviewed"]["raw_perf_data_requested"], true);
     let before = opens.load(Ordering::SeqCst);
+    let saved_report = fs::read(&report).unwrap();
     assert!(
         registry
-            .execute(request("new.folded", raw.clone()), capture)
+            .execute(
+                request(
+                    "new.folded",
+                    local.path().join("new.perf.data"),
+                    Some(report.clone())
+                ),
+                capture.clone(),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(fs::read(report).unwrap(), saved_report);
+    assert!(
+        registry
+            .execute(request("new.folded", raw.clone(), None), capture)
             .await
             .is_err()
     );
@@ -2781,6 +2828,7 @@ async fn cpu_profile_reuses_the_verified_ssh_transport_and_saves_only_complete_s
         process_start_ticks,
         output_file: destination.clone(),
         perf_data_file: None,
+        report_file: None,
     };
     let prior = opens.load(Ordering::SeqCst);
     assert!(

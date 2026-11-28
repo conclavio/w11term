@@ -85,7 +85,7 @@ pub(super) enum Purpose {
     SavePacketCapture(PathBuf),
     CaptureReport {
         capture: PathBuf,
-        kind: CaptureFileKind,
+        kind: CaptureReportKind,
         save: bool,
     },
     CaptureSettings {
@@ -115,6 +115,12 @@ pub(super) enum RolloutReceiptKind {
 pub(super) enum CaptureFileKind {
     Packet,
     Syscall,
+}
+
+pub(super) enum CaptureReportKind {
+    Packet,
+    Syscall,
+    CpuProfile,
 }
 
 #[derive(Clone, Copy)]
@@ -490,10 +496,12 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
                 options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
                 dialog.SetTitle(match (&kind, save) {
-                    (CaptureFileKind::Packet, true) => w!("Save packet capture report"),
-                    (CaptureFileKind::Packet, false) => w!("Open packet capture report"),
-                    (CaptureFileKind::Syscall, true) => w!("Save syscall capture report"),
-                    (CaptureFileKind::Syscall, false) => w!("Open syscall capture report"),
+                    (CaptureReportKind::Packet, true) => w!("Save packet capture report"),
+                    (CaptureReportKind::Packet, false) => w!("Open packet capture report"),
+                    (CaptureReportKind::Syscall, true) => w!("Save syscall capture report"),
+                    (CaptureReportKind::Syscall, false) => w!("Open syscall capture report"),
+                    (CaptureReportKind::CpuProfile, true) => w!("Save CPU profile report"),
+                    (CaptureReportKind::CpuProfile, false) => w!("Open CPU profile report"),
                 })?;
                 if save {
                     dialog.SetDefaultExtension(w!("json"))?;
@@ -504,8 +512,9 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
                     pszName: match kind {
-                        CaptureFileKind::Packet => w!("Packet capture report"),
-                        CaptureFileKind::Syscall => w!("Syscall capture report"),
+                        CaptureReportKind::Packet => w!("Packet capture report"),
+                        CaptureReportKind::Syscall => w!("Syscall capture report"),
+                        CaptureReportKind::CpuProfile => w!("CPU profile report"),
                     },
                     pszSpec: w!("*.json"),
                 }])?;

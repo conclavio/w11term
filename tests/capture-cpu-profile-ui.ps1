@@ -94,6 +94,22 @@ try {
     if ([IO.File]::ReadAllText($output) -cne ('worker;main;hot_loop 1' + [char]10)) {
         throw 'The saved profile does not contain the reviewed stack'
     }
+    $reportPath = "$output.json"
+    Click-CaptureButton ('Save capture report' + [char]0x2026)
+    $dialog = Wait-OwnedDialog 'Save CPU profile report'
+    $null = Wait-Until 'choose the PID capture report destination' {
+        [FixtureDialog]::SetFilename($dialog, $reportPath, [IO.Path]::GetFileName($reportPath))
+    }
+    $null = Wait-Until 'confirm the PID capture report destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'PID capture report is saved' { Find-Element 'Saved CPU profile report' }
+    $proof = & $Cli verify-cpu-profile-report $output $reportPath | ConvertFrom-Json
+    $report = $proof.result.report
+    if ($LASTEXITCODE -ne 0 -or !$proof.ok -or $report.reviewed.target.mode -ne 'process' -or
+        $report.reviewed.target.process_start_ticks -ne 800 -or $report.reviewed.target.options.target_pid -ne 42 -or
+        $report.reviewed.target.options.seconds -ne 2 -or $report.samples -ne 1 -or !$report.stopped_by_user -or
+        $report.reviewed.raw_perf_data_requested -or $report.raw_perf_data) {
+        throw "PID capture report did not preserve the reviewed target and stopped result: $($proof | ConvertTo-Json -Depth 10 -Compress)"
+    }
     $null = Control @('focus-pane','--pane',"$remotePane")
     Wait-Focus $remotePane
     Click-CaptureButton $repeat

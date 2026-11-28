@@ -3,10 +3,7 @@ use crate::ssh::triage::DiagnosticStdout;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 
@@ -182,21 +179,6 @@ impl Target {
         let (stdout, recording) = receiver.finish().await?;
         Ok((stdout, stderr, Some(recording)))
     }
-}
-
-pub(super) fn distinct_destinations(folded: &Path, raw: &Path) -> Result<()> {
-    let raw_dir = diagnostic_destination(raw, "raw perf recording")?.canonicalize()?;
-    let folded_dir = diagnostic_destination(folded, "folded CPU profile")?.canonicalize()?;
-    ensure!(
-        raw_dir != folded_dir
-            || !raw
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&folded.file_name().unwrap_or_default().to_string_lossy()),
-        "Choose different destinations for the folded and raw CPU profiles"
-    );
-    Ok(())
 }
 
 #[cfg(test)]

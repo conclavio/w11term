@@ -78,6 +78,8 @@ pub enum Request {
         output_file: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         perf_data_file: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_file: Option<PathBuf>,
     },
     PreviewPacketCapture {
         pane: u64,
@@ -1576,13 +1578,17 @@ impl Registry {
                 process_start_ticks,
                 output_file,
                 perf_data_file,
+                report_file,
             } => {
                 self.capture_cpu_profile(
                     pane,
                     options,
                     connection_generation,
                     process_start_ticks,
-                    output_file,
+                    triage::CapturePaths {
+                        capture: output_file,
+                        report: report_file,
+                    },
                     perf_data_file,
                 )
                 .await

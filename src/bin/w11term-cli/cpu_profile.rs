@@ -7,11 +7,12 @@ use std::{
     sync::Arc,
 };
 use w11term::{
-    control::{CpuCallGraph, CpuProfileOptions, Request},
+    control::{CpuCallGraph, CpuProfileOptions, Reply, Request},
     cpu_profile::{
         Comparison, Profile,
         flame_graph::{Differential, ProfileSide},
     },
+    ssh::verify_cpu_profile_report,
 };
 
 pub(super) const HELP: &str = concat!(
@@ -19,7 +20,7 @@ pub(super) const HELP: &str = concat!(
     "[--seconds N] [--frequency HZ] [--call-graph fp|dwarf]\n",
     "w11term-cli [--pid PID] capture-cpu-profile --pane ID --target-pid PID ",
     "[--seconds N] [--frequency HZ] [--call-graph fp|dwarf] ",
-    "--connection-generation N --process-start-ticks N --output-file PATH [--perf-data PATH]",
+    "--connection-generation N --process-start-ticks N --output-file PATH [--perf-data PATH] [--report-file PATH]",
 );
 
 pub(super) const COMPARE_VERB: &str = "compare-cpu-profiles";
@@ -27,6 +28,33 @@ pub(super) const COMPARE_HELP: &str = concat!(
     "w11term-cli compare-cpu-profiles BEFORE AFTER [--format json] [--filter TEXT] [--output-file PATH]\n",
     "w11term-cli compare-cpu-profiles BEFORE AFTER --format svg [--widths before|after] [--output-file PATH]",
 );
+
+pub(super) const VERIFY_REPORT_VERB: &str = "verify-cpu-profile-report";
+pub(super) const VERIFY_REPORT_HELP: &str =
+    "w11term-cli verify-cpu-profile-report PROFILE REPORT [--perf-data PATH]";
+
+pub(super) fn verify_report(args: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let [profile, report, rest @ ..] = args else {
+        bail!("Provide the folded profile and report paths");
+    };
+    let perf_data = match rest {
+        [] => None,
+        [flag, path] if flag == "--perf-data" => Some(path::absolute(path)?),
+        _ => bail!("After the two paths, use --perf-data PATH at most once"),
+    };
+    let profile = path::absolute(profile)?;
+    let report = path::absolute(report)?;
+    let verified = verify_cpu_profile_report(&profile, &report, perf_data.as_deref())?;
+    let reply = Reply::from_result(Ok(serde_json::json!({
+        "profile_path": profile,
+        "report_path": report,
+        "verified_perf_data_path": perf_data,
+        "report": verified,
+    })));
+    serde_json::to_writer(&mut *stdout, &reply)?;
+    writeln!(stdout)?;
+    Ok(())
+}
 
 pub(super) fn compare_files(args: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut args = args.iter();
@@ -106,6 +134,7 @@ pub(super) fn parse(
                     | "--process-start-ticks"
                     | "--output-file"
                     | "--perf-data"
+                    | "--report-file"
             ));
         ensure!(allowed, "unknown option {flag} for {verb}");
         let value = args
@@ -179,6 +208,10 @@ pub(super) fn parse(
             .remove("--perf-data")
             .map(path::absolute)
             .transpose()?,
+        report_file: flags
+            .remove("--report-file")
+            .map(path::absolute)
+            .transpose()?,
     })
 }
 
@@ -191,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_data_is_opt_in_and_the_capture_path_is_absolute() {
+    fn optional_capture_artifact_paths_are_absolute() {
         let args = [
             "--target-pid",
             "54",
@@ -205,9 +238,20 @@ mod tests {
         let original = invoke("capture-cpu-profile", &args).unwrap();
         let json = serde_json::to_value(original).unwrap();
         assert!(json.get("perf_data_file").is_none());
-        let raw = [args.as_slice(), &["--perf-data", "raw.perf.data"]].concat();
-        assert!(matches!(invoke("capture-cpu-profile", &raw).unwrap(),
-            Request::CaptureCpuProfile { perf_data_file: Some(path), .. } if path.is_absolute()));
+        assert!(json.get("report_file").is_none());
+        let artifacts = [
+            args.as_slice(),
+            &[
+                "--perf-data",
+                "raw.perf.data",
+                "--report-file",
+                "capture report.json",
+            ],
+        ]
+        .concat();
+        assert!(matches!(invoke("capture-cpu-profile", &artifacts).unwrap(),
+            Request::CaptureCpuProfile { perf_data_file: Some(raw), report_file: Some(report), .. }
+                if raw.is_absolute() && report.is_absolute()));
         assert!(
             invoke(
                 "preview-cpu-profile",

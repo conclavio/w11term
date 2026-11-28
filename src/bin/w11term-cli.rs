@@ -338,7 +338,12 @@ async fn main() -> ExitCode {
             "\nw11term-cli [--pid PID] preview-linux-triage --pane ID\nw11term-cli [--pid PID] linux-triage --pane ID --connection-generation N --output-file PATH"
         );
         println!("{}", triage::COMPARE_HELP);
-        println!("\n{}\n{}", cpu_profile::HELP, cpu_profile::COMPARE_HELP);
+        println!(
+            "\n{}\n{}\n{}",
+            cpu_profile::HELP,
+            cpu_profile::COMPARE_HELP,
+            cpu_profile::VERIFY_REPORT_HELP,
+        );
         println!(
             "\n{}\n{}\n{}\n{}\n{}\n{}",
             packet_capture::HELP,

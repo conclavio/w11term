@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::Path,
@@ -13,6 +14,105 @@ fn compare(directory: &Path, after: &str, options: &[&str]) -> Output {
         .args(options)
         .output()
         .unwrap()
+}
+
+#[test]
+fn verifies_renamed_cpu_artifacts_and_reports_distinct_mismatches() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let folded = b"main 3\n";
+    let raw = b"PERFILE2 fixture";
+    fs::write(path.join("renamed profile.folded"), folded).unwrap();
+    fs::write(path.join("renamed raw.data"), raw).unwrap();
+    let artifact = |file_name: &str, bytes: &[u8]| {
+        let sha256: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        json!({
+            "file_name": file_name,
+            "bytes": bytes.len(),
+            "sha256": sha256,
+        })
+    };
+    let mut report = json!({
+        "schema_version": 1,
+        "kind": "cpu-profile-capture",
+        "folded": artifact("original.folded", folded),
+        "reviewed": {
+            "host": "bench.example",
+            "user": "reviewed",
+            "port": 22,
+            "host_key_fingerprint": "SHA256:fixture",
+            "event": "cpu-clock:u",
+            "target": {
+                "mode": "process",
+                "process_name": "main",
+                "process_start_ticks": 800,
+                "options": { "target_pid": 42, "seconds": 2, "frequency": 99, "call_graph": "fp" },
+            },
+            "raw_perf_data_requested": true,
+        },
+        "samples": 3,
+        "distinct_stacks": 1,
+        "unresolved_frames": 0,
+        "stopped_by_user": false,
+        "raw_perf_data": artifact("original.perf.data", raw),
+    });
+    let save_report = |report: &Value| {
+        fs::write(
+            path.join("report.json"),
+            serde_json::to_vec(report).unwrap(),
+        )
+        .unwrap();
+    };
+    save_report(&report);
+    let verify = |options: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+            .current_dir(path)
+            .env_remove("LOCALAPPDATA")
+            .args([
+                "verify-cpu-profile-report",
+                "renamed profile.folded",
+                "report.json",
+            ])
+            .args(options)
+            .output()
+            .unwrap()
+    };
+    let options = ["--perf-data", "renamed raw.data"];
+    let both = verify(&options);
+    assert!(both.status.success(), "{both:?}");
+    let reply: Value = serde_json::from_slice(&both.stdout).unwrap();
+    assert_eq!(reply["result"]["report"], report);
+    assert!(
+        Path::new(reply["result"]["verified_perf_data_path"].as_str().unwrap())
+            .ends_with("renamed raw.data")
+    );
+
+    let rejected = |output: Output, expected: &str| {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty());
+        let reply: Value = serde_json::from_slice(&output.stderr).unwrap();
+        let error = reply["error"].as_str().unwrap();
+        assert!(error.contains(expected), "{error}");
+    };
+    fs::write(path.join("renamed raw.data"), b"PERFILE2 modified").unwrap();
+    rejected(verify(&options), "byte count differs");
+    fs::write(path.join("renamed raw.data"), b"PERFILE2 Fixture").unwrap();
+    rejected(verify(&options), "Raw perf recording SHA-256 differs");
+    let folded_only = verify(&[]);
+    assert!(folded_only.status.success(), "{folded_only:?}");
+    let reply: Value = serde_json::from_slice(&folded_only.stdout).unwrap();
+    assert!(reply["result"]["verified_perf_data_path"].is_null());
+
+    fs::write(path.join("renamed profile.folded"), b"main 4\n").unwrap();
+    rejected(verify(&[]), "Folded profile SHA-256 differs");
+    report["schema_version"] = json!(2);
+    save_report(&report);
+    rejected(verify(&[]), "Unsupported CPU profile report version 2");
+    fs::write(path.join("report.json"), vec![b' '; 256 * 1024 + 1]).unwrap();
+    rejected(verify(&[]), "CPU profile report exceeds 256 KiB");
 }
 
 #[test]

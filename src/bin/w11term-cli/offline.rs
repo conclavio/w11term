@@ -37,6 +37,9 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
         tool_bundles::ROLLOUT_VERB => (tool_bundles::ROLLOUT_HELP, tool_bundles::rollout),
         tool_bundles::ROLLBACK_VERB => (tool_bundles::ROLLBACK_HELP, tool_bundles::rollback),
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
+        cpu_profile::VERIFY_REPORT_VERB => {
+            (cpu_profile::VERIFY_REPORT_HELP, cpu_profile::verify_report)
+        }
         syscall_capture::INSPECT_VERB => (
             syscall_capture::INSPECT_HELP,
             syscall_capture::inspect_files,

@@ -84,10 +84,14 @@ impl Registry {
         options: CpuProfileOptions,
         generation: NonZeroU64,
         process_start_ticks: u64,
-        path: PathBuf,
+        paths: CapturePaths,
         perf_data_file: Option<PathBuf>,
     ) -> Result<Value> {
-        Recording::check_destinations(&path, perf_data_file.as_deref())?;
+        let CapturePaths {
+            capture: path,
+            report,
+        } = paths;
+        Recording::check_destinations(&path, perf_data_file.as_deref(), report.as_deref())?;
         let target = self.diagnostic_target(pane, Some(generation)).await?;
         let profile = target
             .capture_cpu_profile(options, process_start_ticks, perf_data_file, None)
@@ -97,13 +101,21 @@ impl Registry {
             Ok((path, summary))
         })
         .await??;
-        Ok(json!({
+        let mut result = json!({
             "pane": pane,
             "connection_generation": generation,
             "target_pid": options.target_pid,
             "profile_path": path,
             "summary": summary,
-        }))
+        });
+        append_capture_report(&mut result, report, "CPU profile report", move |path| {
+            summary
+                .capture_report
+                .context("CPU profile capture metadata unavailable")?
+                .save(path)
+        })
+        .await;
+        Ok(result)
     }
 
     pub(super) async fn preview_packet_capture(

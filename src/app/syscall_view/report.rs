@@ -105,7 +105,7 @@ impl TerminalApp {
         };
         let purpose = file_picker::Purpose::CaptureReport {
             capture: trace.clone(),
-            kind: file_picker::CaptureFileKind::Syscall,
+            kind: file_picker::CaptureReportKind::Syscall,
             save,
         };
         let ticket = page.begin("Choosing a syscall capture report file…");
