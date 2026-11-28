@@ -1,6 +1,14 @@
 use super::*;
-use crate::ssh::{CaptureStop, TriageReport, TriageTarget, triage::cpu_profile::Recording};
+use crate::ssh::{
+    CaptureStop, TriageReport, TriageTarget,
+    triage::{cpu_profile::Recording, diagnostic_destination},
+};
 use std::num::NonZeroU64;
+
+pub(super) struct PacketCapturePaths {
+    pub capture: PathBuf,
+    pub report: Option<PathBuf>,
+}
 
 impl Registry {
     pub(super) async fn linux_triage(
@@ -132,8 +140,15 @@ impl Registry {
         connection_generation: NonZeroU64,
         review_id: &str,
         job_id: Option<String>,
-        output_file: PathBuf,
+        paths: PacketCapturePaths,
     ) -> Result<Value> {
+        if let Some(report) = &paths.report {
+            ensure!(
+                report != &paths.capture,
+                "Choose separate capture and report files"
+            );
+            diagnostic_destination(report, "packet capture report")?;
+        }
         let target = self
             .diagnostic_target(pane, Some(connection_generation))
             .await?;
@@ -144,13 +159,28 @@ impl Registry {
                 options,
                 review_id,
                 &job_id,
-                output_file,
+                paths.capture,
                 CaptureStop::default(),
             )
             .await?;
-        Ok(
-            json!({ "pane": pane, "connection_generation": connection_generation, "job_id": job_id, "capture": capture }),
-        )
+        let mut result = json!({
+            "pane": pane,
+            "connection_generation": connection_generation,
+            "job_id": job_id,
+            "capture": &capture,
+        });
+        if let Some(path) = paths.report {
+            let destination = path.clone();
+            let saved = tokio::task::spawn_blocking(move || capture.save_report(&destination))
+                .await
+                .context("Writing the packet capture report")
+                .and_then(|saved| saved);
+            match saved {
+                Ok(()) => result["report_path"] = json!(path),
+                Err(error) => result["report_error"] = json!(format!("{error:#}")),
+            }
+        }
+        Ok(result)
     }
 
     pub(super) async fn stop_packet_capture(

@@ -328,7 +328,7 @@ impl Report {
     }
 }
 
-fn diagnostic_destination<'a>(path: &'a Path, artifact: &str) -> Result<&'a Path> {
+pub(crate) fn diagnostic_destination<'a>(path: &'a Path, artifact: &str) -> Result<&'a Path> {
     ensure!(
         path.is_absolute() && path.file_name().is_some(),
         "Choose an absolute path for a new {artifact}"

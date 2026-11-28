@@ -111,6 +111,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job_id: Option<String>,
         output_file: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_file: Option<PathBuf>,
     },
     StopPacketCapture {
         pane: u64,
@@ -1538,6 +1540,7 @@ impl Registry {
                 review_id,
                 job_id,
                 output_file,
+                report_file,
             } => {
                 self.capture_packets(
                     pane,
@@ -1545,7 +1548,10 @@ impl Registry {
                     connection_generation,
                     &review_id,
                     job_id,
-                    output_file,
+                    triage::PacketCapturePaths {
+                        capture: output_file,
+                        report: report_file,
+                    },
                 )
                 .await
             }

@@ -24,6 +24,7 @@ const MAX_INTERFACES: usize = 512;
 const CAPTURE_OVERHEAD_SECONDS: u64 = 72;
 pub(crate) const CONTROL_SECONDS: u64 = 155;
 mod local;
+mod report;
 mod ring;
 mod settings;
 pub use local::{
@@ -236,7 +237,7 @@ pub struct Plan {
     pub review_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Capture {
     pub path: PathBuf,
     pub bytes: u64,
@@ -248,9 +249,11 @@ pub struct Capture {
     pub dropped_by_kernel: Option<u64>,
     pub stop_reason: &'static str,
     pub diagnostics: Vec<String>,
+    #[serde(skip)]
+    reviewed: Box<report::Reviewed>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct RotationResult {
     pub retained_files: usize,
     pub overwritten_files: u64,
@@ -751,6 +754,7 @@ async fn capture_and_download(
                 .map(crate::events::display_field)
                 .filter(|line| !line.is_empty())
                 .collect(),
+            reviewed: Box::new(report::Reviewed::from(plan)),
         },
     ))
 }

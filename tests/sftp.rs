@@ -2337,28 +2337,48 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
         .unwrap()
         .try_into()
         .unwrap();
-    let request = |name: &str, options, job_id| Request::CapturePackets {
+    let request = |name: &str, options, job_id, report: Option<&str>| Request::CapturePackets {
         pane: 1,
         options,
         connection_generation: generation,
         review_id: plan["review_id"].as_str().unwrap().into(),
         job_id,
         output_file: local.path().join(name),
+        report_file: report.map(|name| local.path().join(name)),
     };
     let scratch = remote.path().join("dev/shm");
     let mut changed = options.clone();
     changed.seconds += 1;
     let error = registry
-        .execute(request("stale.pcap", changed, None), callback.clone())
+        .execute(request("stale.pcap", changed, None, None), callback.clone())
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("Review again"));
     assert!(!scratch.exists());
 
+    let existing = local.path().join("existing.json");
+    fs::write(&existing, b"previous report").unwrap();
+    for (destination, expected) in [
+        ("existing.json", "destination already exists"),
+        ("blocked.pcap", "separate capture and report files"),
+    ] {
+        let error = registry
+            .execute(
+                request("blocked.pcap", options.clone(), None, Some(destination)),
+                callback.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(expected));
+        assert!(!local.path().join("blocked.pcap").exists());
+        assert!(!scratch.exists());
+    }
+    assert_eq!(fs::read(existing).unwrap(), b"previous report");
+
     fs::write(remote.path().join("pcap-bad-digest"), []).unwrap();
     let error = registry
         .execute(
-            request("corrupt.pcap", options.clone(), None),
+            request("corrupt.pcap", options.clone(), None, Some("corrupt.json")),
             callback.clone(),
         )
         .await
@@ -2366,11 +2386,17 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
     assert!(format!("{error:#}").contains("SHA-256 digest"));
     assert!(!remote.path().join("pcap-verified").exists());
     assert!(!local.path().join("corrupt.pcap").exists());
+    assert!(!local.path().join("corrupt.json").exists());
     fs::remove_file(remote.path().join("pcap-bad-digest")).unwrap();
 
     let result = registry
         .execute(
-            request("reviewed capture.pcap", options.clone(), None),
+            request(
+                "reviewed capture.pcap",
+                options.clone(),
+                None,
+                Some("capture report.json"),
+            ),
             callback.clone(),
         )
         .await
@@ -2381,6 +2407,36 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
     assert_eq!(capture["received_by_filter"], 2);
     assert_eq!(capture["dropped_by_kernel"], 0);
     assert_eq!(capture["stop_reason"], "packet-limit");
+    let report_path = local.path().join("capture report.json");
+    assert_eq!(result["report_path"], json!(report_path));
+    let report: Value = serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["file_name"], "reviewed capture.pcap");
+    for field in [
+        "bytes",
+        "sha256",
+        "packets",
+        "stop_reason",
+        "dropped_by_kernel",
+        "received_by_filter",
+    ] {
+        assert_eq!(report[field], capture[field], "{field}");
+    }
+    for field in [
+        "host",
+        "user",
+        "port",
+        "host_key_fingerprint",
+        "options",
+        "scratch_directory",
+        "scratch_filesystem",
+        "effective_packet_limit",
+        "tcpdump_arguments",
+    ] {
+        assert_eq!(report["reviewed"][field], plan[field], "{field}");
+    }
+    assert!(report.get("path").is_none());
+    assert!(report["reviewed"].get("review_id").is_none());
     assert!(remote.path().join("pcap-verified").exists());
     assert_eq!(
         fs::read(local.path().join("reviewed capture.pcap")).unwrap(),
@@ -2397,13 +2453,23 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
         job_id: job_id.into(),
     };
     let capture = registry.execute(
-        request("stopped.pcap", options, Some(job.into())),
+        request(
+            "stopped.pcap",
+            options,
+            Some(job.into()),
+            Some("raced report.json"),
+        ),
         callback.clone(),
     );
     let requested = async {
         while !started.is_file() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        fs::write(
+            local.path().join("raced report.json"),
+            b"created during capture",
+        )
+        .unwrap();
         let error = registry
             .execute(stop("00000000000000000000000000000000"), callback.clone())
             .await
@@ -2426,6 +2492,17 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
     assert_eq!(stopped["job_id"], job);
     assert_eq!(stopped["capture"]["stop_reason"], "stopped");
     assert_eq!(stopped["capture"]["packets"], 1);
+    assert!(stopped.get("report_path").is_none());
+    assert!(
+        stopped["report_error"]
+            .as_str()
+            .unwrap()
+            .contains("Saving new packet capture report")
+    );
+    assert_eq!(
+        fs::read(local.path().join("raced report.json")).unwrap(),
+        b"created during capture"
+    );
     assert_eq!(
         fs::read(local.path().join("stopped.pcap")).unwrap(),
         PCAP_FIXTURE

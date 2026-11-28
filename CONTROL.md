@@ -1585,6 +1585,10 @@ $plan = (& $ctl --pid 12345 preview-packet-capture --pane 1 --settings $settings
 & $ctl --pid 12345 capture-packets --pane 1 --settings $settings --connection-generation $plan.connection_generation --review-id $plan.review_id --output-file '.\after.pcap'
 ```
 
+Choose **Save capture report…** on a completed capture to keep a JSON report alongside the PCAP. It is available from the completed result after the SSH pane closes. The report includes the filename, byte count, SHA-256, stop reason, available packet counters, and rolling-buffer outcome. Its `reviewed` section records the verified SSH endpoint and host key fingerprint, the settings, the resolved scratch location, and the effective tcpdump arguments.
+
+Pass `--report-file '.\after.pcap.json'` to `capture-packets` to save the report automatically. The reply includes `result.report_path` after export. If the report destination becomes unavailable during capture, the verified PCAP remains saved and the reply includes `result.report_error` alongside `result.capture`. Choose a new path for each file.
+
 Choose **Open in Wireshark** after saving. w11term looks in the standard Windows Program Files folders. Use **Choose Wireshark executable…** for another installation. The saved capture stays available after you disconnect the SSH pane or close the packet capture panel.
 
 Choose **Open capture file…** in the same panel to reopen a local PCAP or PCAPNG file from an earlier session. This works without SSH. The panel shows the format, file size, packet count, captured bytes, truncated packets, and interface link types. The timestamp span uses the earliest and latest timestamps and shows how many packets were timestamped. The scan stops after one million records or blocks and reads only a bounded prefix of each packet. A partial summary shows the reason it stopped. **Open in Wireshark** opens the original file for packet analysis. [PCAP format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcap/) · [PCAPNG format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/) · [Link types](https://www.iana.org/assignments/pcap)

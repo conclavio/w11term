@@ -1094,6 +1094,32 @@ try {
         Find-Element ('Reopen ' + [IO.Path]::GetFileName($destination)) $button
     }
     Click 'Open Packet capture activity'
+    $reportPath = $destination + '.json'
+    Click ('Save capture report' + [char]0x2026)
+    $dialog = Wait-Until 'owned packet capture report picker' { Find-OwnedDialog 'Save packet capture report' }
+    $null = Wait-Until 'accept the suggested packet capture report location' {
+        [FixtureDialog]::SetFilename($dialog, $reportPath, [IO.Path]::GetFileName($reportPath))
+    }
+    $null = Wait-Until 'save the packet capture report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the capture report is saved after closing SSH' {
+        [IO.File]::Exists($reportPath) -and (Find-Element 'Open in Wireshark' $button).Current.IsEnabled
+    }
+    $report = [IO.File]::ReadAllText($reportPath) | ConvertFrom-Json
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($destination))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+    if ($report.schema_version -ne 1 -or $report.file_name -cne [IO.Path]::GetFileName($destination) -or
+        $report.sha256 -cne $digest -or
+        $report.bytes -ne 64 -or $report.packets -ne 2 -or $report.stop_reason -cne 'stopped' -or
+        $report.dropped_by_kernel -ne 0 -or $report.rotation.overwritten_files -ne 1 -or
+        $report.reviewed.host_key_fingerprint -cne $plan.host_key_fingerprint -or
+        $report.reviewed.options.filter -cne 'udp and dst port 4321' -or
+        $report.reviewed.options.rotate_files -ne 2 -or $report.reviewed.scratch_filesystem -cne 'tmpfs') {
+        throw 'The saved report does not describe the verified packet capture and its reviewed settings'
+    }
     Select-Viewer
     if ([IO.File]::Exists($destination + '.opened')) { throw 'Selecting a viewer opened it without activation' }
     Click 'Open in Wireshark'

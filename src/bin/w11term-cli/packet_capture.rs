@@ -16,7 +16,7 @@ pub(super) const HELP: &str = concat!(
     "w11term-cli [--pid PID] list-packet-interfaces --pane ID\n",
     "w11term-cli [--pid PID] preview-packet-capture --pane ID (--settings PATH | --interface NAME [CAPTURE OPTIONS])\n",
     "w11term-cli [--pid PID] capture-packets --pane ID (--settings PATH | --interface NAME [CAPTURE OPTIONS]) ",
-    "--connection-generation N --review-id ID --output-file PATH [--job-id HEX] [--wireshark PATH]\n",
+    "--connection-generation N --review-id ID --output-file PATH [--report-file PATH] [--job-id HEX] [--wireshark PATH]\n",
     "w11term-cli [--pid PID] stop-packet-capture --pane ID --connection-generation N --job-id HEX\n",
     "CAPTURE OPTIONS: [--filter EXPR] [--snap-length BYTES] [--seconds N] [--max-mib N] ",
     "[--packet-limit N] [--rotate-files 2..16] [--scratch-directory PATH] [--tmpfs]",
@@ -221,7 +221,11 @@ pub(super) fn parse(
             || !listing
                 && (!stop && (flag == "--settings" || CAPTURE_FLAGS.contains(&flag))
                     || (capture || stop) && matches!(flag, "--connection-generation" | "--job-id")
-                    || capture && matches!(flag, "--review-id" | "--output-file" | "--wireshark"))
+                    || capture
+                        && matches!(
+                            flag,
+                            "--review-id" | "--output-file" | "--report-file" | "--wireshark"
+                        ))
     })?;
     let pane_arg = flags
         .remove("--pane")
@@ -282,6 +286,10 @@ pub(super) fn parse(
                 .remove("--output-file")
                 .context("choose --output-file PATH")?,
         )?,
+        report_file: flags
+            .remove("--report-file")
+            .map(path::absolute)
+            .transpose()?,
     };
     let wireshark = flags
         .remove("--wireshark")
@@ -438,6 +446,8 @@ mod tests {
                     &review_id,
                     "--output-file",
                     "after.pcap",
+                    "--report-file",
+                    "after.pcap.json",
                 ])
                 .map(str::to_owned),
             None,
@@ -447,6 +457,10 @@ mod tests {
         assert_eq!(capture["options"], expected);
         assert_eq!(capture["connection_generation"], 3);
         assert_eq!(capture["review_id"], review_id);
+        assert_eq!(
+            capture["report_file"],
+            serde_json::json!(path::absolute("after.pcap.json").unwrap())
+        );
         for conflict in [&["--tmpfs"][..], &["--snap-length", "256"]] {
             assert!(
                 parse(

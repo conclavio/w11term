@@ -78,6 +78,7 @@ pub(super) enum Purpose {
     OpenPacketCapture(PathBuf),
     ComparePacketCapture(PathBuf),
     SavePacketCapture(PathBuf),
+    SavePacketCaptureReport(PathBuf),
     OpenPacketCaptureSettings(PathBuf),
     SavePacketCaptureSettings(PathBuf),
     SavePacketExcerpt(PathBuf, &'static str),
@@ -438,6 +439,25 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     }])?;
                     options |= FOS_FILEMUSTEXIST;
                 }
+                if let Some(folder) = path.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
+            Purpose::SavePacketCaptureReport(path) => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                dialog.SetTitle(w!("Save packet capture report"))?;
+                dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                    pszName: w!("Packet capture report"),
+                    pszSpec: w!("*.json"),
+                }])?;
+                dialog.SetDefaultExtension(w!("json"))?;
+                let mut suggestion = path.file_name().unwrap_or_default().to_os_string();
+                suggestion.push(".json");
+                let wide: Vec<_> = suggestion.encode_wide().chain(Some(0)).collect();
+                dialog.SetFileName(PCWSTR(wide.as_ptr()))?;
+                options &= !FOS_OVERWRITEPROMPT;
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT | FOS_NOTESTFILECREATE;
                 if let Some(folder) = path.parent() {
                     local_folder(&dialog, folder);
                 }
