@@ -1995,6 +1995,8 @@ Choose **Verify capture report…** on a loaded flame graph to select the JSON a
 
 Choose **Repeat CPU profile…** on a completed capture to reuse its sampling settings, raw recording choice, and any command inputs. A recorded PID is filled in on its original SSH connection and checked against the original process start time at review. With another pane selected, enter a PID for that pane. Each repeat requires a fresh review and a new destination.
 
+Choose **Repeat from report…** under a verified **Capture report** to reuse those settings after reopening a folded file. A command draft restores the original executable input, working directory, and literal arguments. For a process draft, enter a current PID on a connected Linux SSH pane. Review the target on that connection before recording. The reopened graph becomes **Before** when you compare it with the new run.
+
 After recording a repeat, choose **Compare with original profile** to open the original stacks as **Before** and the repeated run as **After**. The comparison uses the loaded stacks. **Back to flame graph** returns to the repeated result.
 
 Choose **Stop and save profile** during a recording to finish early and save the collected samples. For an attached PID, the target keeps running. For a profiled command, the remote wrapper stops the workload it started. The viewer and Diagnostics Activity show the stop reason. A requested raw `.perf.data` file uses the same verification and save path as a timed capture.

@@ -6,6 +6,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $folded = Join-Path $State 'launched workload.folded'
 $raw = [IO.Path]::ChangeExtension($folded, 'perf.data')
+$reportPath = "$folded.json"
 $repeated = Join-Path $State 'repeated workload.folded'
 $compareOriginal = 'Compare with original profile'
 $dot = ' ' + [char]0xb7 + ' '
@@ -28,6 +29,44 @@ function Click-LaunchButton([string]$Name) {
 function Set-LaunchField([string]$Name, [string]$Value) {
     $field = Wait-Until "field '$Name'" { Find-Element $Name $editType }
     $field.GetCurrentPattern($valuePattern).SetValue($Value)
+}
+
+function Open-LaunchedProfile {
+    Click-LaunchButton 'Open folded stacks'
+    $dialog = Wait-OwnedDialog 'Open folded stacks'
+    $null = Wait-Until 'enter the standalone profile path' { [FixtureDialog]::SetFilename($dialog, $folded, '') }
+    $null = Wait-Until 'open the standalone profile' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'opening a standalone profile clears the capture actions' {
+        (Find-Element 'launched workload.folded') -and
+            !(Find-Element $compareOriginal $button) -and
+            !(Find-Element ('Save capture report' + [char]0x2026) $button) -and
+            !(Find-Element ('Repeat from report' + [char]0x2026) $button)
+    }
+}
+
+function Verify-LaunchedReport([string]$Path) {
+    Click-LaunchButton ('Verify capture report' + [char]0x2026)
+    $dialog = Wait-OwnedDialog 'Open CPU profile report'
+    $null = Wait-Until 'choose the CPU profile report' {
+        [FixtureDialog]::SetFilename($dialog, $Path, [IO.Path]::GetFileName($reportPath))
+    }
+    $null = Wait-Until 'confirm the CPU profile report' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+
+function Wait-LaunchedDraft {
+    $null = Wait-Until 'the repeat draft restores the literal command and requires fresh review' {
+        $program = Find-Element 'Linux executable' $editType
+        $argv = Find-Element 'Arguments (JSON array)' $editType
+        $directory = Find-Element 'Working directory (defaults to home)' $editType
+        $seconds = Find-Element 'Time limit in seconds' $editType
+        $frequency = Find-Element 'Sampling frequency in Hz' $editType
+        $program -and $program.GetCurrentPattern($valuePattern).Current.Value -ceq './cpu worker' -and
+            $argv -and $argv.GetCurrentPattern($valuePattern).Current.Value -ceq '["one arg","it''s $literal","","--child"]' -and
+            $directory -and $directory.GetCurrentPattern($valuePattern).Current.Value -ceq '/tmp/work space' -and
+            $seconds -and $seconds.GetCurrentPattern($valuePattern).Current.Value -ceq '2' -and
+            $frequency -and $frequency.GetCurrentPattern($valuePattern).Current.Value -ceq '73' -and
+            !(Find-Element 'Record CPU profile' $button)
+    }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -54,6 +93,7 @@ try {
         } catch [System.Windows.Automation.ElementNotAvailableException] {}
     }
     Set-LaunchField 'Time limit in seconds' '2'
+    Set-LaunchField 'Sampling frequency in Hz' '73'
     Set-LaunchField 'Working directory (defaults to home)' '/tmp/work space'
     Set-LaunchField 'Arguments (JSON array)' '["one arg","it''s $literal","","--child"]'
     # The review button becomes enabled after the app applies the executable edit.
@@ -126,7 +166,6 @@ try {
     $expected = [Text.Encoding]::ASCII.GetBytes('PERFILE2') +
         [byte[]]@(0,255,13,10) + [Text.Encoding]::ASCII.GetBytes('raw perf fixture') + [byte]0
     if (($actual -join ',') -cne ($expected -join ',')) { throw 'The raw perf recording was not preserved byte for byte' }
-    $reportPath = "$folded.json"
     Click-LaunchButton ('Save capture report' + [char]0x2026)
     $dialog = Wait-OwnedDialog 'Save CPU profile report'
     $null = Wait-Until 'choose the command capture report destination' {
@@ -149,17 +188,13 @@ try {
     if (Find-Element $compareOriginal $button) { throw 'A standalone profile has no original to compare' }
     [IO.File]::Delete($marker)
     Click-LaunchButton ('Repeat CPU profile' + [char]0x2026)
-    $null = Wait-Until 'the repeat draft restores the literal command and requires fresh review' {
-        $program = Find-Element 'Linux executable' $editType
-        $argv = Find-Element 'Arguments (JSON array)' $editType
-        $directory = Find-Element 'Working directory (defaults to home)' $editType
-        $seconds = Find-Element 'Time limit in seconds' $editType
-        $program -and $program.GetCurrentPattern($valuePattern).Current.Value -ceq './cpu worker' -and
-            $argv -and $argv.GetCurrentPattern($valuePattern).Current.Value -ceq '["one arg","it''s $literal","","--child"]' -and
-            $directory -and $directory.GetCurrentPattern($valuePattern).Current.Value -ceq '/tmp/work space' -and
-            $seconds -and $seconds.GetCurrentPattern($valuePattern).Current.Value -ceq '2' -and
-            !(Find-Element 'Record CPU profile' $button)
-    }
+    Wait-LaunchedDraft
+    Click-LaunchButton 'Back to flame graph'
+    Open-LaunchedProfile
+    Verify-LaunchedReport $reportPath
+    Click-LaunchButton ('Repeat from report' + [char]0x2026)
+    Wait-LaunchedDraft
+    if ([IO.File]::Exists($marker)) { throw 'Opening a repeat draft launched the command' }
     Click-LaunchButton 'Review CPU profile'
     $null = Wait-Until 'the fresh review retains the raw recording option' {
         (Find-Element 'Executable "/tmp/work space/cpu worker"') -and
@@ -202,31 +237,16 @@ try {
             (Find-Element $compareOriginal $button) -and
             (Find-Element ('Repeat CPU profile' + [char]0x2026) $button)
     }
-    Click-LaunchButton 'Open folded stacks'
-    $dialog = Wait-OwnedDialog 'Open folded stacks'
-    $null = Wait-Until 'enter the standalone profile path' { [FixtureDialog]::SetFilename($dialog, $folded, '') }
-    $null = Wait-Until 'open the standalone profile' { [FixtureDialog]::ClickButton($dialog, 1) }
-    $null = Wait-Until 'opening a standalone profile clears the capture actions' {
-        (Find-Element 'launched workload.folded') -and
-            !(Find-Element $compareOriginal $button) -and
-            !(Find-Element ('Save capture report' + [char]0x2026) $button)
-    }
+    Open-LaunchedProfile
     $null = Control @('close-pane','--pane',"$remote")
-    $verifyReport = 'Verify capture report' + [char]0x2026
     $verifyRaw = 'Verify raw perf recording' + [char]0x2026
-    $openReportTitle = 'Open CPU profile report'
     $rawTitle = 'Choose raw perf recording'
-    Click-LaunchButton $verifyReport
-    $dialog = Wait-OwnedDialog $openReportTitle
-    $null = Wait-Until 'choose the saved CPU profile report' {
-        [FixtureDialog]::SetFilename($dialog, $reportPath, [IO.Path]::GetFileName($reportPath))
-    }
-    $null = Wait-Until 'open the saved CPU profile report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    Verify-LaunchedReport $reportPath
     $foldedVerified = "Folded profile matches report$dot$($report.folded.bytes) bytes verified"
     $null = Wait-Until 'the verified report shows recorded metadata without SSH' {
         (Find-Element $foldedVerified) -and
             (Find-Element 'Executable /tmp/work space/cpu worker') -and
-            (Find-Element ('2 seconds' + $dot + '99 Hz' + $dot + 'Frame pointers' + $dot + 'cpu-clock:u'))
+            (Find-Element ('2 seconds' + $dot + '73 Hz' + $dot + 'Frame pointers' + $dot + 'cpu-clock:u'))
     }
 
     $changedRaw = Join-Path $State 'changed raw.data'
@@ -265,12 +285,7 @@ try {
     } finally { $digest.Dispose() }
     $replacementReport = Join-Path $State 'replacement report.json'
     [IO.File]::WriteAllText($replacementReport, ($replacement | ConvertTo-Json -Depth 10))
-    Click-LaunchButton $verifyReport
-    $dialog = Wait-OwnedDialog $openReportTitle
-    $null = Wait-Until 'choose the report for the changed folded file' {
-        [FixtureDialog]::SetFilename($dialog, $replacementReport, [IO.Path]::GetFileName($reportPath))
-    }
-    $null = Wait-Until 'confirm the replacement report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    Verify-LaunchedReport $replacementReport
     $null = Wait-Until 'matching changed disk bytes cannot verify a stale graph' {
         (Find-Element 'The folded profile changed after it was opened. Reopen it before verifying the report.') -and
             !(Find-Element 'CPU profile capture report') -and

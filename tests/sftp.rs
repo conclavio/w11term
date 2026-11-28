@@ -468,9 +468,9 @@ impl server::Handler for Peer {
                 STANDARD.encode(program),
             );
             let argv = r#"'one arg' 'it'\''s $literal' '' '--child'"#;
-            let inspect = format!(" 2 99 fp 32768 4096 '{directory}' './cpu worker' '' '' {argv}");
+            let inspect = format!(" 2 73 fp 32768 4096 '{directory}' './cpu worker' '' '' {argv}");
             let launch = format!(
-                " 2 99 fp 32768 4096 '{directory}' './cpu worker' '{directory}' '{program}' {argv}"
+                " 2 73 fp 32768 4096 '{directory}' './cpu worker' '{directory}' '{program}' {argv}"
             );
             fs::write(self.root.join("profile-launch-wire"), command)?;
             s.channel_success(c)?;
