@@ -1,13 +1,13 @@
 use super::*;
 use w11term::{
     options::ToolPath,
-    sftp::{DotfileShell, InstalledToolPath, validate_zdotdir},
+    sftp::{DotfileShell, InstalledToolPath},
 };
 
 pub enum Action {
     OpenSetup,
     Shell(Option<usize>),
-    Zdotdir(String),
+    StartupDirectory(DotfileShell, String),
     Preview,
     PreviewRemoval,
     Apply,
@@ -21,6 +21,7 @@ pub(super) struct Setup {
     sha256: String,
     shell: DotfileShell,
     zdotdir: String,
+    fish_config_dir: String,
     pub(super) open: bool,
 }
 
@@ -31,21 +32,23 @@ impl Setup {
             sha256,
             shell: DotfileShell::Bash,
             zdotdir: String::new(),
+            fish_config_dir: String::new(),
             open: false,
         }
     }
 
     fn operation(&self, remove: bool, review: Option<String>) -> Result<Operation, String> {
-        let path = self.zdotdir.trim();
-        let zdotdir = (self.shell == DotfileShell::Zsh && !path.is_empty()).then_some(path);
-        validate_zdotdir(self.shell, zdotdir).map_err(|error| format!("{error:#}"))?;
+        let (zdotdir, fish_config_dir) =
+            profile_dotfiles::startup_fields(self.shell, &self.zdotdir, &self.fish_config_dir)
+                .map_err(|error| format!("{error:#}"))?;
         Ok(Operation::ReviewInstalledToolPath {
             installed: InstalledToolPath {
                 bundle: self.bundle.clone(),
                 bundle_sha256: self.sha256.clone(),
                 path: ToolPath {
                     shell: self.shell,
-                    zdotdir: zdotdir.map(str::to_owned),
+                    zdotdir,
+                    fish_config_dir,
                 },
                 remove,
             },
@@ -84,15 +87,28 @@ impl Setup {
                     .on_selection_changed(ctx.callback(|index| path_message(Action::Shell(index)))),
             ),
         ];
-        if self.shell == DotfileShell::Zsh {
+        if self.shell != DotfileShell::Bash {
+            let shell = self.shell;
+            let (name, directory) = if shell == DotfileShell::Zsh {
+                ("PATH setup Zsh startup directory", &self.zdotdir)
+            } else {
+                (
+                    "PATH setup Fish configuration directory",
+                    &self.fish_config_dir,
+                )
+            };
             fields.push(KeyedView::new(
-                "zdotdir",
+                name,
                 TextBox::new()
-                    .automation_name("PATH setup Zsh startup directory")
+                    .automation_name(name)
                     .placeholder_text("Relative to home (optional)")
-                    .text(&self.zdotdir)
+                    .text(directory)
                     .is_enabled(ready)
-                    .on_text_changed(ctx.callback(|text| path_message(Action::Zdotdir(text)))),
+                    .on_text_changed(
+                        ctx.callback(move |text| {
+                            path_message(Action::StartupDirectory(shell, text))
+                        }),
+                    ),
             ));
         }
         fields.push(KeyedView::new(
@@ -311,16 +327,22 @@ impl TerminalApp {
                     installer.status = None;
                 }
             }
-            Action::Zdotdir(text) if idle && current.is_some() => {
+            Action::StartupDirectory(shell, text) if idle && current.is_some() => {
                 if let Some(setup) = installer
                     .path_setup
                     .as_mut()
-                    .filter(|setup| setup.open && setup.shell == DotfileShell::Zsh)
-                    && setup.zdotdir != text
+                    .filter(|setup| setup.open && setup.shell == shell)
                 {
-                    setup.zdotdir = text;
-                    installer.path_review = None;
-                    installer.status = None;
+                    let directory = match shell {
+                        DotfileShell::Zsh => &mut setup.zdotdir,
+                        DotfileShell::Fish => &mut setup.fish_config_dir,
+                        DotfileShell::Bash => return,
+                    };
+                    if *directory != text {
+                        *directory = text;
+                        installer.path_review = None;
+                        installer.status = None;
+                    }
                 }
             }
             Action::Preview | Action::PreviewRemoval | Action::Apply => {

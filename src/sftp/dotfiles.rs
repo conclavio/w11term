@@ -27,8 +27,11 @@ pub(crate) async fn sync_login_dotfiles(
     settings: &crate::options::DotfileSync,
 ) -> Result<DotfileSyncStatus> {
     let shell = settings.shell;
-    let zdotdir = settings.zdotdir.as_deref();
-    validate_zdotdir(shell, zdotdir)?;
+    let startup_directory = select_startup_directory(
+        shell,
+        settings.zdotdir.as_deref(),
+        settings.fish_config_dir.as_deref(),
+    )?;
     let engine = Engine::connect(session).await?;
     let home = engine.dotfile_home().await?;
     ensure!(
@@ -66,20 +69,20 @@ pub(crate) async fn sync_login_dotfiles(
         None => bundle.validate(shell)?,
     }
     let plan = engine
-        .dotfiles_plan_at(home, &bundle, shell, zdotdir)
+        .dotfiles_plan_at(home, &bundle, shell, startup_directory)
         .await?;
     if plan.selector.before.as_deref().is_some_and(selector_held) {
         return Ok(DotfileSyncStatus::Held);
     }
     if let Some(active) = plan.selector.active_version() {
         engine
-            .verified_dotfile_version(&plan.home, shell, zdotdir, active)
+            .verified_dotfile_version(&plan.home, shell, startup_directory, active)
             .await
             .context("The active bundle or its hooks changed. Review dotfiles manually.")?;
     }
     let mut stage = JobStage::Checking("Syncing dotfiles");
     let changed = engine
-        .install_dotfiles(&plan, &bundle, zdotdir, None, &mut stage)
+        .install_dotfiles(&plan, &bundle, startup_directory, None, &mut stage)
         .await
         .with_context(|| stage.interrupted())?;
     Ok(if changed.is_empty() {
@@ -357,6 +360,21 @@ pub fn validate_zdotdir(shell: DotfileShell, zdotdir: Option<&str>) -> Result<()
         );
     }
     Ok(())
+}
+
+pub fn select_startup_directory<'a>(
+    shell: DotfileShell,
+    zdotdir: Option<&'a str>,
+    fish_config_dir: Option<&'a str>,
+) -> Result<Option<&'a str>> {
+    validate_zdotdir(shell, zdotdir)?;
+    if let Some(path) = fish_config_dir {
+        ensure!(
+            shell == DotfileShell::Fish && path.len() <= 512 && relative_path(path),
+            "The Fish configuration directory must be a relative directory under the Fish account's home"
+        );
+    }
+    Ok(zdotdir.or(fish_config_dir))
 }
 
 pub fn validate_dotfiles_home(home: &str) -> Result<()> {
@@ -639,9 +657,11 @@ impl Engine {
         &self,
         bundle: DotfileBundle,
         shell: DotfileShell,
-        zdotdir: Option<&str>,
+        startup_directory: Option<&str>,
     ) -> Result<Value> {
-        let plan = self.dotfiles_plan(&bundle, shell, zdotdir).await?;
+        let plan = self
+            .dotfiles_plan(&bundle, shell, startup_directory)
+            .await?;
         let (mut report, _) = self.review_dotfile_install(&plan, &bundle).await?;
         report["review"] = json!(self.dotfiles_review(&report)?);
         Ok(report)
@@ -651,15 +671,17 @@ impl Engine {
         &self,
         bundle: DotfileBundle,
         shell: DotfileShell,
-        zdotdir: Option<&str>,
+        startup_directory: Option<&str>,
         review: &str,
         stage: &mut JobStage,
     ) -> Result<Value> {
-        let plan = self.dotfiles_plan(&bundle, shell, zdotdir).await?;
+        let plan = self
+            .dotfiles_plan(&bundle, shell, startup_directory)
+            .await?;
         let (report, baseline) = self.review_dotfile_install(&plan, &bundle).await?;
         self.check_dotfiles_review(review, &report)?;
         let changed = self
-            .install_dotfiles(&plan, &bundle, zdotdir, Some(baseline), stage)
+            .install_dotfiles(&plan, &bundle, startup_directory, Some(baseline), stage)
             .await?;
         Ok(
             json!({ "shell": shell, "home": plan.home, "bundle_sha256": plan.id, "changed_files": changed }),
@@ -670,7 +692,7 @@ impl Engine {
         &self,
         plan: &'a Plan,
         bundle: &DotfileBundle,
-        zdotdir: Option<&str>,
+        startup_directory: Option<&str>,
         baseline: Option<FragmentBaseline>,
         stage: &mut JobStage,
     ) -> Result<Vec<&'a str>> {
@@ -700,7 +722,9 @@ impl Engine {
             }
         }
         if plan.selector.changed() {
-            let current = self.dotfiles_plan(bundle, plan.shell, zdotdir).await?;
+            let current = self
+                .dotfiles_plan(bundle, plan.shell, startup_directory)
+                .await?;
             ensure!(
                 current.create.is_empty()
                     && current.files.len() == plan.files.len()
@@ -734,11 +758,10 @@ impl Engine {
         &self,
         target: DotfileTarget,
         shell: DotfileShell,
-        zdotdir: Option<&str>,
+        startup_directory: Option<&str>,
         review: Option<&str>,
         stage: &mut JobStage,
     ) -> Result<Value> {
-        validate_zdotdir(shell, zdotdir)?;
         let target = match target {
             DotfileTarget::Bundle { sha256 } => DotfileTarget::Bundle {
                 sha256: normalize_sha256(&sha256)?,
@@ -773,7 +796,7 @@ impl Engine {
         let (files, proposed) = match &id {
             Some(id) => {
                 let (files, fragments) = self
-                    .verified_dotfile_version(&home, shell, zdotdir, id)
+                    .verified_dotfile_version(&home, shell, startup_directory, id)
                     .await?;
                 (files, Some(fragments))
             }
@@ -824,11 +847,11 @@ impl Engine {
         &self,
         home: &str,
         shell: DotfileShell,
-        zdotdir: Option<&str>,
+        startup_directory: Option<&str>,
         id: &str,
     ) -> Result<(Vec<Value>, [String; 2])> {
         let fragments = self.verified_dotfile_fragments(home, shell, id).await?;
-        let hooks = self.dotfile_hooks(home, shell, zdotdir).await?;
+        let hooks = self.dotfile_hooks(home, shell, startup_directory).await?;
         for hook in &hooks {
             ensure!(
                 hook.action == "unchanged",
@@ -911,12 +934,12 @@ impl Engine {
         &self,
         bundle: &DotfileBundle,
         shell: DotfileShell,
-        zdotdir: Option<&str>,
+        startup_directory: Option<&str>,
     ) -> Result<Plan> {
         bundle.validate(shell)?;
-        validate_zdotdir(shell, zdotdir)?;
         let home = self.dotfile_home().await?;
-        self.dotfiles_plan_at(home, bundle, shell, zdotdir).await
+        self.dotfiles_plan_at(home, bundle, shell, startup_directory)
+            .await
     }
 
     async fn dotfiles_plan_at(
@@ -924,7 +947,7 @@ impl Engine {
         home: String,
         bundle: &DotfileBundle,
         shell: DotfileShell,
-        zdotdir: Option<&str>,
+        startup_directory: Option<&str>,
     ) -> Result<Plan> {
         let [environment, prompt] = bundle.fragments(shell);
         let id = bundle_id(&environment, &prompt);
@@ -932,7 +955,10 @@ impl Engine {
         let mut directories_to_create = Vec::new();
         for relative in PARENTS
             .into_iter()
-            .chain((shell == DotfileShell::Fish).then_some(FISH_DIRECTORY))
+            .chain(
+                (shell == DotfileShell::Fish && startup_directory.is_none())
+                    .then_some(FISH_DIRECTORY),
+            )
             .chain([version_directory.as_str()])
         {
             let path = under_home(&home, relative);
@@ -952,7 +978,7 @@ impl Engine {
             };
             files.push(Edit::new(path, action, original, after));
         }
-        files.extend(self.dotfile_hooks(&home, shell, zdotdir).await?);
+        files.extend(self.dotfile_hooks(&home, shell, startup_directory).await?);
         let path = selector_path(&home, shell);
         let before = self.dotfile_text(&path).await?;
         let selector = Edit::selector(path, before, format!("{id}\n"));
@@ -981,9 +1007,9 @@ impl Engine {
         &self,
         home: &str,
         shell: DotfileShell,
-        zdotdir: Option<&str>,
+        startup_directory: Option<&str>,
     ) -> Result<Vec<Edit>> {
-        let files = self.startup_files(home, shell, zdotdir).await?;
+        let files = self.startup_files(home, shell, startup_directory).await?;
         Ok(files
             .into_iter()
             .zip([Hook::Login, Hook::Interactive])
@@ -995,17 +1021,22 @@ impl Engine {
         &self,
         home: &str,
         shell: DotfileShell,
-        zdotdir: Option<&str>,
+        startup_directory: Option<&str>,
     ) -> Result<Vec<(String, Option<String>)>> {
         let home_prefix = home.trim_end_matches('/');
-        let startup_dir = if let Some(relative) = zdotdir {
+        let startup_dir = if let Some(relative) = startup_directory {
+            let kind = if shell == DotfileShell::Fish {
+                "Fish configuration"
+            } else {
+                "ZDOTDIR"
+            };
             let mut path = home_prefix.to_owned();
             for part in relative.split('/') {
                 path.push('/');
                 path.push_str(part);
                 ensure!(
                     self.dotfile_directory_exists(&path).await?,
-                    "ZDOTDIR directory is missing: {path}"
+                    "{kind} directory is missing: {path}"
                 );
             }
             path
@@ -1031,6 +1062,11 @@ impl Engine {
                 (path, contents)
             }
             DotfileShell::Fish => {
+                if startup_directory.is_some() {
+                    let path = startup("config.fish");
+                    let original = self.dotfile_text(&path).await?;
+                    return Ok(vec![(path, original)]);
+                }
                 let path = startup(".config/fish/config.fish");
                 let original = if self
                     .dotfile_directory_exists(&startup(CONFIG_DIRECTORY))

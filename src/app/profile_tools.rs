@@ -4,7 +4,7 @@ use w11term::{
     options::{ToolPath, ToolSync},
     sftp::{
         DotfileShell, ToolBundlePreset, UtilityBundle, builtin_tool_names,
-        prepare_builtin_tool_bundle, validate_dotfiles_home, validate_zdotdir,
+        prepare_builtin_tool_bundle, validate_dotfiles_home,
     },
 };
 
@@ -24,6 +24,7 @@ pub enum Field {
     Home,
     Fingerprint,
     Zdotdir,
+    FishConfigDir,
 }
 
 #[derive(Clone)]
@@ -51,6 +52,7 @@ pub(super) struct Editor {
     home: String,
     fingerprint: String,
     zdotdir: String,
+    fish_config_dir: String,
     path_shell: Option<DotfileShell>,
     approved: Option<Box<ToolSync>>,
     reviewed: Option<Box<ToolSync>>,
@@ -75,6 +77,9 @@ impl Editor {
             zdotdir: path
                 .and_then(|path| path.zdotdir.clone())
                 .unwrap_or_default(),
+            fish_config_dir: path
+                .and_then(|path| path.fish_config_dir.clone())
+                .unwrap_or_default(),
             path_shell: path.map(|path| path.shell),
             approved,
             ..Self::default()
@@ -95,13 +100,12 @@ impl Editor {
         let add_to_path = self
             .path_shell
             .map(|shell| -> anyhow::Result<_> {
-                let zdotdir = self.zdotdir.trim();
-                let zdotdir =
-                    (shell == DotfileShell::Zsh && !zdotdir.is_empty()).then_some(zdotdir);
-                validate_zdotdir(shell, zdotdir)?;
+                let (zdotdir, fish_config_dir) =
+                    profile_dotfiles::startup_fields(shell, &self.zdotdir, &self.fish_config_dir)?;
                 Ok(ToolPath {
                     shell,
-                    zdotdir: zdotdir.map(str::to_owned),
+                    zdotdir,
+                    fish_config_dir,
                 })
             })
             .transpose()?;
@@ -340,6 +344,16 @@ impl Editor {
                     "Relative to the remote home",
                 ),
             ));
+        } else if self.path_shell == Some(DotfileShell::Fish) {
+            fields.push(KeyedView::new(
+                "fish-config-dir",
+                field(
+                    Field::FishConfigDir,
+                    "Tool PATH Fish configuration directory",
+                    &self.fish_config_dir,
+                    "Relative to the remote home",
+                ),
+            ));
         }
         fields.extend([
             KeyedView::new(
@@ -487,6 +501,7 @@ impl TerminalApp {
                     Field::Home => &mut editor.home,
                     Field::Fingerprint => &mut editor.fingerprint,
                     Field::Zdotdir => &mut editor.zdotdir,
+                    Field::FishConfigDir => &mut editor.fish_config_dir,
                 };
                 if *slot != value {
                     *slot = value;

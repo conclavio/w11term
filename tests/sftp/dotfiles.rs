@@ -10,6 +10,7 @@ fn bundle(shell: DotfileShell, zdotdir: Option<&str>) -> Operation {
         bundle: manifest("managed"),
         shell,
         zdotdir: zdotdir.map(String::from),
+        fish_config_dir: None,
     }
 }
 
@@ -29,6 +30,7 @@ fn apply(prompt: &str, plan: &Value) -> Operation {
         bundle: manifest(prompt),
         shell: DotfileShell::Bash,
         zdotdir: None,
+        fish_config_dir: None,
         review: plan["review"].as_str().unwrap().to_owned(),
     }
 }
@@ -47,6 +49,7 @@ fn dotfile_switch(target: DotfileTarget, preview: Option<&Value>) -> Operation {
         target,
         shell: DotfileShell::Bash,
         zdotdir: None,
+        fish_config_dir: None,
         review: preview.map(|plan| plan["review"].as_str().unwrap().into()),
     }
 }
@@ -55,6 +58,7 @@ fn repair_hooks(shell: DotfileShell, zdotdir: Option<&str>, preview: Option<&Val
     Operation::RepairDotfileHooks {
         shell,
         zdotdir: zdotdir.map(String::from),
+        fish_config_dir: None,
         review: preview.map(|plan| plan["review"].as_str().unwrap().into()),
     }
 }
@@ -204,6 +208,7 @@ async fn preview_dotfiles_uses_the_selected_zsh_startup_directory() {
             bundle: manifest("managed"),
             shell: DotfileShell::Zsh,
             zdotdir: Some("config/zsh".into()),
+            fish_config_dir: None,
             review: plan["review"].as_str().unwrap().into(),
         },
     )
@@ -384,6 +389,7 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         bundle: manifest(prompt),
         shell: DotfileShell::Bash,
         zdotdir: None,
+        fish_config_dir: None,
     };
     let stale = guarded_job(&pane, None, preview("first")).await.unwrap();
     fs::write(&startup, "# corrected Bash configuration\n").unwrap();
@@ -533,6 +539,7 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
             bundle: snapshot_bundle,
             shell: DotfileShell::Bash,
             zdotdir: None,
+            fish_config_dir: None,
         },
     )
     .await
@@ -699,6 +706,7 @@ async fn exported_dotfile_bundle_round_trips_a_fragment_at_its_size_limit() {
         bundle,
         shell: DotfileShell::Zsh,
         zdotdir: None,
+        fish_config_dir: None,
     };
     let plan = guarded_job(&pane, None, preview(bundle.clone()))
         .await
@@ -711,6 +719,7 @@ async fn exported_dotfile_bundle_round_trips_a_fragment_at_its_size_limit() {
             bundle,
             shell: DotfileShell::Zsh,
             zdotdir: None,
+            fish_config_dir: None,
             review: plan["review"].as_str().unwrap().into(),
         },
     )
@@ -786,6 +795,7 @@ pub(super) fn connect_options(source: Source, local: &std::path::Path) -> SshOpt
         shell: DotfileShell::Bash,
         bundle_sha256: None,
         zdotdir: None,
+        fish_config_dir: None,
         host: options.host.clone(),
         user: options.user.clone(),
         port: options.port,

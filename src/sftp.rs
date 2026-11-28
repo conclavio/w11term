@@ -32,7 +32,8 @@ mod utilities;
 pub(crate) use dotfiles::sync_login_dotfiles;
 pub use dotfiles::{
     DotfileBundle, DotfileShell, DotfileTarget, DotfileVersionState, DotfileVersions,
-    ExportedDotfileBundle, RetainedDotfileVersion, validate_dotfiles_home, validate_zdotdir,
+    ExportedDotfileBundle, RetainedDotfileVersion, select_startup_directory,
+    validate_dotfiles_home, validate_zdotdir,
 };
 pub(crate) use utilities::sync_login_tools;
 pub use utilities::{
@@ -357,6 +358,8 @@ pub enum Operation {
         shell: DotfileShell,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zdotdir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fish_config_dir: Option<String>,
     },
     ListDotfileVersions {
         shell: DotfileShell,
@@ -371,12 +374,16 @@ pub enum Operation {
         shell: DotfileShell,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zdotdir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fish_config_dir: Option<String>,
         review: String,
     },
     RepairDotfileHooks {
         shell: DotfileShell,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zdotdir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fish_config_dir: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         review: Option<String>,
     },
@@ -385,6 +392,8 @@ pub enum Operation {
         shell: DotfileShell,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         zdotdir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fish_config_dir: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         review: Option<String>,
     },
@@ -1894,9 +1903,14 @@ impl Engine {
                 bundle,
                 shell,
                 zdotdir,
+                fish_config_dir,
             } => {
-                self.preview_dotfiles(bundle, shell, zdotdir.as_deref())
-                    .await?
+                let directory = select_startup_directory(
+                    shell,
+                    zdotdir.as_deref(),
+                    fish_config_dir.as_deref(),
+                )?;
+                self.preview_dotfiles(bundle, shell, directory).await?
             }
             ExportDotfileBundle {
                 shell,
@@ -1910,26 +1924,44 @@ impl Engine {
                 bundle,
                 shell,
                 zdotdir,
+                fish_config_dir,
                 review,
             } => {
-                self.apply_dotfiles(bundle, shell, zdotdir.as_deref(), &review, stage)
+                let directory = select_startup_directory(
+                    shell,
+                    zdotdir.as_deref(),
+                    fish_config_dir.as_deref(),
+                )?;
+                self.apply_dotfiles(bundle, shell, directory, &review, stage)
                     .await?
             }
             RepairDotfileHooks {
                 shell,
                 zdotdir,
+                fish_config_dir,
                 review,
             } => {
-                self.repair_dotfile_hooks(shell, zdotdir.as_deref(), review.as_deref(), stage)
+                let directory = select_startup_directory(
+                    shell,
+                    zdotdir.as_deref(),
+                    fish_config_dir.as_deref(),
+                )?;
+                self.repair_dotfile_hooks(shell, directory, review.as_deref(), stage)
                     .await?
             }
             SwitchDotfiles {
                 target,
                 shell,
                 zdotdir,
+                fish_config_dir,
                 review,
             } => {
-                self.switch_dotfiles(target, shell, zdotdir.as_deref(), review.as_deref(), stage)
+                let directory = select_startup_directory(
+                    shell,
+                    zdotdir.as_deref(),
+                    fish_config_dir.as_deref(),
+                )?;
+                self.switch_dotfiles(target, shell, directory, review.as_deref(), stage)
                     .await?
             }
             PreviewImage { path } => self.read_preview_image(&path, cancel).await?,

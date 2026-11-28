@@ -490,6 +490,8 @@ pub struct DotfileSync {
     pub bundle_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zdotdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fish_config_dir: Option<String>,
     pub host: String,
     pub user: String,
     pub port: u16,
@@ -540,6 +542,8 @@ pub struct ToolPath {
     pub shell: crate::sftp::DotfileShell,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zdotdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fish_config_dir: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]

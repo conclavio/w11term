@@ -2995,6 +2995,7 @@ async fn native_command_reference_installs_a_selected_catalog_tool() {
             "conflict": conflict, "pin": pin, "startup": startup, "login": login,
             "probe": root.join("utility-probe-response"),
             "fishStartup": root.join(".config/fish/config.fish"),
+            "fishCustomStartup": root.join("xdg settings/fish/config.fish"),
         }))
         .unwrap(),
     )

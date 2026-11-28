@@ -100,7 +100,11 @@ impl Engine {
         settings: &ToolPath,
         mode: PathEdit,
     ) -> Result<PathPlan> {
-        validate_zdotdir(settings.shell, settings.zdotdir.as_deref())?;
+        let startup_directory = select_startup_directory(
+            settings.shell,
+            settings.zdotdir.as_deref(),
+            settings.fish_config_dir.as_deref(),
+        )?;
         ensure!(
             !home.contains(':'),
             "The account home contains a PATH separator"
@@ -110,7 +114,10 @@ impl Engine {
             "Invalid approved tool bin directory"
         );
         let hook = path_hook(settings.shell, bin);
-        let create = if settings.shell == DotfileShell::Fish && mode != PathEdit::Remove {
+        let create = if settings.shell == DotfileShell::Fish
+            && startup_directory.is_none()
+            && mode != PathEdit::Remove
+        {
             self.missing_fish_startup_directories(home).await?
         } else {
             Vec::new()
@@ -125,7 +132,7 @@ impl Engine {
             }
             files
         } else {
-            self.startup_files(home, settings.shell, settings.zdotdir.as_deref())
+            self.startup_files(home, settings.shell, startup_directory)
                 .await?
         };
         let edits = files

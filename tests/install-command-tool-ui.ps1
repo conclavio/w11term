@@ -136,6 +136,22 @@ try {
         (Find-Element 'Managed PATH blocks removed for new shells') -and
             [IO.File]::ReadAllText($fixture.fishStartup) -ceq "# keep Fish settings`n"
     }
+    $null = [IO.Directory]::CreateDirectory((Split-Path -Parent $fixture.fishCustomStartup))
+    $fishDirectory = Wait-Until 'the Fish PATH setup shows the custom directory field' {
+        Find-Element 'PATH setup Fish configuration directory' $edit
+    }
+    $fishDirectory.GetCurrentPattern($value).SetValue('xdg settings/fish')
+    Click 'Review PATH setup'
+    $null = Wait-Until 'Fish PATH setup reviews the selected config file' {
+        (Find-Element "Create${dot}/xdg settings/fish/config.fish") -and
+            (Find-Element 'Apply reviewed PATH setup' $button).Current.IsEnabled
+    }
+    Click 'Apply reviewed PATH setup'
+    $null = Wait-Until 'Fish PATH setup writes only the alternate file' {
+        [IO.File]::Exists($fixture.fishCustomStartup) -and
+            [IO.File]::ReadAllText($fixture.fishCustomStartup).Contains('builtin set -gx PATH') -and
+            [IO.File]::ReadAllText($fixture.fishStartup) -ceq "# keep Fish settings`n"
+    }
     [IO.File]::WriteAllText($fixture.probe, $probe)
     Click 'Back to tool installer'
     Click 'Back to command reference'

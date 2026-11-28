@@ -449,12 +449,17 @@ try {
         }
     }
     Select-NativeComboItem 'Dotfiles shell' 'Fish'
+    $fishDirectory = Wait-Until 'the profile shows the Fish configuration directory field' {
+        Find-Element 'Fish configuration directory (optional)' $edit
+    }
+    $fishDirectory.GetCurrentPattern($value).SetValue('xdg settings/fish')
     Click 'Approve dotfiles sync'
     $null = Wait-Until 'the profile can approve its Fish settings' { Find-Element "Approved for ${target}${dot}/" }
     Save-ProfileEdit
     $null = Wait-Until 'the Fish target and approved bundle survive saving the profile' {
         $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.dotfiles
-        $approved.shell -ceq 'fish' -and [FixtureDialog]::SameFile($fishBundle, $approved.bundle)
+        $approved.shell -ceq 'fish' -and $approved.fish_config_dir -ceq 'xdg settings/fish' -and
+            [FixtureDialog]::SameFile($fishBundle, $approved.bundle)
     }
     if ([IO.File]::ReadAllText($selectorPath) -cne "$first`n") { throw 'Profile review changed the active remote version' }
 } finally {

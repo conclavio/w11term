@@ -6,7 +6,7 @@ use w11term::{
     sftp::{
         Attributes, DEFAULT_TIMEOUT, DotfileBundle, DotfileShell, DotfileTarget, EntryKind,
         FileSizeRange, FilenameFilter, ModifiedDateRange, Operation, UtilityBundle,
-        normalize_sha256, validate_zdotdir,
+        normalize_sha256, select_startup_directory,
     },
 };
 
@@ -61,6 +61,7 @@ Find matches filenames by default. --match-path matches slash-separated paths re
 Size limits are inclusive and accept whole bytes or binary units (for example 16MiB).\n\
 Modification date limits are inclusive UTC calendar dates.\n\
 --contains searches UTF-8 file lines. --regex and --match-case apply to both queries.\n\
+Use --fish-config-dir RELATIVE_DIR to target a custom Fish dotfile startup directory.\n\
 Underscore spellings (remove_file, remove_dir) are accepted. Use -- before paths starting with --.\n\
 Transfers stream through the GUI's existing SSH connection. Folder transfers require a new\n\
 destination. Single files can be replaced with --overwrite. Uploads can leave a partial remote\n\
@@ -426,7 +427,8 @@ pub fn parse(
         | "switch-dotfiles" => {
             let shell = dotfile_shell(opts.remove("--shell").as_deref())?;
             let zdotdir = opts.remove("--zdotdir");
-            validate_zdotdir(shell, zdotdir.as_deref())?;
+            let fish_config_dir = opts.remove("--fish-config-dir");
+            select_startup_directory(shell, zdotdir.as_deref(), fish_config_dir.as_deref())?;
             if matches!(
                 command.as_str(),
                 "apply-dotfiles" | "repair-dotfile-hooks" | "switch-dotfiles"
@@ -438,6 +440,7 @@ pub fn parse(
             }
             fields.insert("shell".into(), json!(shell));
             fields.insert("zdotdir".into(), json!(zdotdir));
+            fields.insert("fish_config_dir".into(), json!(fish_config_dir));
             if matches!(
                 command.as_str(),
                 "preview-dotfile-hooks" | "repair-dotfile-hooks"
@@ -770,7 +773,7 @@ mod tests {
         assert!(matches!(preview, Request::Sftp {
             pane: 2,
             operation: Operation::RepairDotfileHooks {
-                shell: DotfileShell::Zsh, zdotdir: Some(directory), review: None,
+                shell: DotfileShell::Zsh, zdotdir: Some(directory), review: None, ..
             },
             ..
         } if directory == "config/zsh"));
@@ -789,28 +792,40 @@ mod tests {
         assert!(matches!(apply, Request::Sftp {
             pane: 2,
             operation: Operation::RepairDotfileHooks {
-                shell: DotfileShell::Bash, zdotdir: None, review: Some(review),
+                shell: DotfileShell::Bash, zdotdir: None, review: Some(review), ..
             },
             ..
         } if review == token));
     }
 
     #[test]
-    fn fish_dotfile_commands_target_fish_and_reject_zdotdir() {
+    fn fish_dotfile_commands_accept_only_relative_fish_directories() {
         let args = ["--pane", "2", "preview-dotfile-hooks", "--shell", "fish"];
-        let (_, preview) = p(&args).unwrap();
+        let fish_dir = ["--fish-config-dir", "xdg settings/fish"];
+        let (_, preview) = p(&[args.as_slice(), &fish_dir].concat()).unwrap();
         assert!(matches!(
             preview,
             Request::Sftp {
                 operation: Operation::RepairDotfileHooks {
                     shell: DotfileShell::Fish,
                     zdotdir: None,
+                    fish_config_dir: Some(directory),
                     review: None,
                 },
                 ..
-            }
+            } if directory == "xdg settings/fish"
         ));
         assert!(p(&[args.as_slice(), &["--zdotdir", "config/fish"]].concat()).is_err());
+        for invalid in [
+            "/home/test/config/fish",
+            "../config/fish",
+            "config//fish",
+            "",
+        ] {
+            assert!(p(&[args.as_slice(), &["--fish-config-dir", invalid]].concat()).is_err());
+        }
+        let zsh_args = ["--pane", "2", "preview-dotfile-hooks", "--shell", "zsh"];
+        assert!(p(&[zsh_args.as_slice(), &fish_dir].concat()).is_err());
     }
 
     #[test]
@@ -962,7 +977,7 @@ mod tests {
             request,
             Request::Sftp {
                 pane: 2,
-                operation: Operation::PreviewDotfiles { bundle, shell: DotfileShell::Zsh, zdotdir },
+                operation: Operation::PreviewDotfiles { bundle, shell: DotfileShell::Zsh, zdotdir, .. },
                 ..
             } if bundle.zsh.as_deref() == Some("PROMPT='fleet> '") && zdotdir.as_deref() == Some("etc/zsh")
         ));

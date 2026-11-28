@@ -4,14 +4,31 @@ use std::path::PathBuf;
 use w11term::{
     options::DotfileSync,
     sftp::{
-        DotfileBundle, DotfileShell, ExportedDotfileBundle, validate_dotfiles_home,
-        validate_zdotdir,
+        DotfileBundle, DotfileShell, ExportedDotfileBundle, select_startup_directory,
+        validate_dotfiles_home,
     },
 };
 
 mod bundle;
 
 const TITLE: &str = "SSH dotfiles";
+
+pub(super) fn startup_fields(
+    shell: DotfileShell,
+    zdotdir: &str,
+    fish_config_dir: &str,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let zdotdir = zdotdir.trim();
+    let fish_config_dir = fish_config_dir.trim();
+    let zdotdir = (shell == DotfileShell::Zsh && !zdotdir.is_empty()).then_some(zdotdir);
+    let fish_config_dir =
+        (shell == DotfileShell::Fish && !fish_config_dir.is_empty()).then_some(fish_config_dir);
+    select_startup_directory(shell, zdotdir, fish_config_dir)?;
+    Ok((
+        zdotdir.map(str::to_owned),
+        fish_config_dir.map(str::to_owned),
+    ))
+}
 
 pub(super) fn approved_fingerprint(entered: &str, profile_pin: &str) -> anyhow::Result<String> {
     let profile_pin = profile_pin.trim();
@@ -61,6 +78,7 @@ pub enum Field {
     Home,
     Fingerprint,
     Zdotdir,
+    FishConfigDir,
 }
 
 #[derive(Clone)]
@@ -84,6 +102,7 @@ pub(super) struct Editor {
     home: String,
     fingerprint: String,
     zdotdir: String,
+    fish_config_dir: String,
     shell: DotfileShell,
     approved: Option<Box<DotfileSync>>,
     pin_version: bool,
@@ -104,6 +123,7 @@ impl Editor {
             home: settings.home.clone(),
             fingerprint: settings.fingerprint.clone(),
             zdotdir: settings.zdotdir.clone().unwrap_or_default(),
+            fish_config_dir: settings.fish_config_dir.clone().unwrap_or_default(),
             shell: settings.shell,
             pin_version: settings.bundle_sha256.is_some(),
             approved,
@@ -126,10 +146,11 @@ impl Editor {
         draft: &mut ProfileDraft,
         saved: ExportedDotfileBundle,
         zdotdir: Option<String>,
+        fish_config_dir: Option<String>,
         endpoint: (&str, &str, u16, &str),
     ) -> anyhow::Result<()> {
         let fingerprint = snapshot_fingerprint(draft, &saved.home, endpoint)?;
-        validate_zdotdir(saved.shell, zdotdir.as_deref())?;
+        select_startup_directory(saved.shell, zdotdir.as_deref(), fish_config_dir.as_deref())?;
         let path = saved
             .local
             .into_os_string()
@@ -146,6 +167,7 @@ impl Editor {
         editor.fingerprint = fingerprint;
         editor.shell = saved.shell;
         editor.zdotdir = zdotdir.unwrap_or_default();
+        editor.fish_config_dir = fish_config_dir.unwrap_or_default();
         editor.pin_version = true;
         editor.snapshot_version = Some(saved.bundle_sha256);
         Ok(())
@@ -158,9 +180,8 @@ impl Editor {
         let home = self.home.trim();
         validate_dotfiles_home(home)?;
         let shell = self.shell;
-        let zdotdir = self.zdotdir.trim();
-        let zdotdir = (shell == DotfileShell::Zsh && !zdotdir.is_empty()).then_some(zdotdir);
-        validate_zdotdir(shell, zdotdir)?;
+        let (zdotdir, fish_config_dir) =
+            startup_fields(shell, &self.zdotdir, &self.fish_config_dir)?;
         Ok(DotfileSync {
             bundle: base.join(self.bundle.trim()),
             shell,
@@ -169,7 +190,8 @@ impl Editor {
                 .as_ref()
                 .filter(|_| self.pin_version)
                 .and_then(|approval| approval.bundle_sha256.clone()),
-            zdotdir: zdotdir.map(str::to_owned),
+            zdotdir,
+            fish_config_dir,
             host,
             user,
             port,
@@ -280,6 +302,16 @@ impl Editor {
                     Field::Zdotdir,
                     "Zsh startup directory (optional)",
                     &self.zdotdir,
+                    "Relative to the remote home",
+                ),
+            ));
+        } else if self.shell == DotfileShell::Fish {
+            content.push(KeyedView::new(
+                "fish-config-dir",
+                field(
+                    Field::FishConfigDir,
+                    "Fish configuration directory (optional)",
+                    &self.fish_config_dir,
                     "Relative to the remote home",
                 ),
             ));
@@ -412,15 +444,20 @@ impl TerminalApp {
         profile: &str,
         saved: ExportedDotfileBundle,
         zdotdir: Option<String>,
+        fish_config_dir: Option<String>,
         connection: &w11term::ssh::ConnectionShare,
         ctx: &ComponentContext<Self>,
     ) {
         let Some((_, draft)) = self.open_profile_for_snapshot(profile, ctx) else {
             return;
         };
-        if let Err(error) =
-            Editor::stage_snapshot(draft, saved, zdotdir, connection.verified_endpoint())
-        {
+        if let Err(error) = Editor::stage_snapshot(
+            draft,
+            saved,
+            zdotdir,
+            fish_config_dir,
+            connection.verified_endpoint(),
+        ) {
             draft.error = Some(format!("{error:#}"));
         }
     }
@@ -601,6 +638,7 @@ impl TerminalApp {
                     Field::Home => &mut editor.home,
                     Field::Fingerprint => &mut editor.fingerprint,
                     Field::Zdotdir => &mut editor.zdotdir,
+                    Field::FishConfigDir => &mut editor.fish_config_dir,
                 };
                 if *target != text {
                     *target = text;

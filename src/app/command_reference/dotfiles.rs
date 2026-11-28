@@ -2,7 +2,7 @@ use super::*;
 use serde::Deserialize;
 use std::path::PathBuf;
 use w11term::events::DotfileSyncStatus;
-use w11term::sftp::{DotfileBundle, DotfileShell, validate_zdotdir};
+use w11term::sftp::{DotfileBundle, DotfileShell};
 
 mod comparison;
 mod history;
@@ -13,7 +13,7 @@ pub enum Action {
     Browse,
     Picked(Arc<()>, Result<Option<PathBuf>, String>),
     Shell(Option<usize>),
-    Zdotdir(String),
+    StartupDirectory(DotfileShell, String),
     Preview,
     PreviewHooks,
     Previewed(Arc<()>, Result<Box<Review>, String>),
@@ -198,6 +198,7 @@ pub(super) struct Installer {
     bundle: Option<PathBuf>,
     shell: DotfileShell,
     zdotdir: String,
+    fish_config_dir: String,
     pending: Option<(Arc<()>, Work)>,
     review: Option<Box<Review>>,
     status: Option<String>,
@@ -253,11 +254,9 @@ impl Installer {
         })
     }
 
-    fn startup_directory(&self) -> Result<Option<String>, String> {
-        let path = self.zdotdir.trim();
-        let path = (self.shell == DotfileShell::Zsh && !path.is_empty()).then_some(path);
-        validate_zdotdir(self.shell, path).map_err(|error| format!("{error:#}"))?;
-        Ok(path.map(str::to_owned))
+    fn startup_directories(&self) -> Result<(Option<String>, Option<String>), String> {
+        profile_dotfiles::startup_fields(self.shell, &self.zdotdir, &self.fish_config_dir)
+            .map_err(|error| format!("{error:#}"))
     }
 
     pub(super) fn view(
@@ -315,17 +314,35 @@ impl Installer {
                 )),
             ),
         ]);
-        if self.shell == DotfileShell::Zsh {
+        if self.shell != DotfileShell::Bash {
+            let shell = self.shell;
+            let (title, name, directory) = if shell == DotfileShell::Zsh {
+                (
+                    "Zsh startup directory (optional)",
+                    "Dotfiles Zsh startup directory",
+                    &self.zdotdir,
+                )
+            } else {
+                (
+                    "Fish configuration directory (optional)",
+                    "Dotfiles Fish configuration directory",
+                    &self.fish_config_dir,
+                )
+            };
             fields.push(KeyedView::new(
-                "zdotdir",
+                name,
                 StackPanel::new().spacing(4.0).children((
-                    TextBlock::new().text("Zsh startup directory (optional)"),
+                    TextBlock::new().text(title),
                     TextBox::new()
-                        .automation_name("Dotfiles Zsh startup directory")
+                        .automation_name(name)
                         .placeholder_text("Relative to the SFTP home")
-                        .text(&self.zdotdir)
+                        .text(directory)
                         .is_enabled(ready)
-                        .on_text_changed(ctx.callback(|text| message(Action::Zdotdir(text)))),
+                        .on_text_changed(
+                            ctx.callback(move |text| {
+                                message(Action::StartupDirectory(shell, text))
+                            }),
+                        ),
                 )),
             ));
         }
@@ -455,6 +472,9 @@ impl TerminalApp {
                 zdotdir: settings
                     .and_then(|settings| settings.zdotdir.clone())
                     .unwrap_or_default(),
+                fish_config_dir: settings
+                    .and_then(|settings| settings.fish_config_dir.clone())
+                    .unwrap_or_default(),
                 pending: None,
                 review: None,
                 status: None,
@@ -520,9 +540,14 @@ impl TerminalApp {
                     installer.status = None;
                 }
             }
-            Action::Zdotdir(text) if idle && installer.shell == DotfileShell::Zsh => {
-                if installer.zdotdir != text {
-                    installer.zdotdir = text;
+            Action::StartupDirectory(shell, text) if idle && installer.shell == shell => {
+                let directory = match shell {
+                    DotfileShell::Zsh => &mut installer.zdotdir,
+                    DotfileShell::Fish => &mut installer.fish_config_dir,
+                    DotfileShell::Bash => return,
+                };
+                if *directory != text {
+                    *directory = text;
                     installer.review = None;
                     installer.status = None;
                 }
@@ -558,7 +583,7 @@ impl TerminalApp {
                     None
                 };
                 let shell = installer.shell;
-                let zdotdir = match installer.startup_directory() {
+                let (zdotdir, fish_config_dir) = match installer.startup_directories() {
                     Ok(path) => path,
                     Err(error) => {
                         installer.status = Some(error);
@@ -592,18 +617,21 @@ impl TerminalApp {
                                         bundle,
                                         shell,
                                         zdotdir,
+                                        fish_config_dir,
                                         review,
                                     },
                                     None => Operation::PreviewDotfiles {
                                         bundle,
                                         shell,
                                         zdotdir,
+                                        fish_config_dir,
                                     },
                                 }
                             } else {
                                 Operation::RepairDotfileHooks {
                                     shell,
                                     zdotdir,
+                                    fish_config_dir,
                                     review,
                                 }
                             };

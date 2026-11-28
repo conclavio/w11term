@@ -1122,6 +1122,7 @@ async fn installed_tool_path_requires_a_review_of_the_active_release_and_startup
                 path: ToolPath {
                     shell,
                     zdotdir: zdotdir.map(str::to_owned),
+                    fish_config_dir: None,
                 },
                 remove,
             },
@@ -1773,6 +1774,7 @@ fn approved_login(source: Source, local: &std::path::Path) -> SshOptions {
         add_to_path: Some(ToolPath {
             shell: DotfileShell::Bash,
             zdotdir: None,
+            fish_config_dir: None,
         }),
     }));
     let mut restored: SshOptions =
@@ -1902,6 +1904,7 @@ async fn fish_tool_path_syncs_before_the_shell_and_repairs_only_its_block() {
     options.tool_bundle.as_mut().unwrap().add_to_path = Some(ToolPath {
         shell: DotfileShell::Fish,
         zdotdir: None,
+        fish_config_dir: None,
     });
     let options: SshOptions =
         serde_json::from_value(serde_json::to_value(options).unwrap()).unwrap();
@@ -1948,6 +1951,98 @@ async fn fish_tool_path_syncs_before_the_shell_and_repairs_only_its_block() {
     let pane = connect_tools(&options);
     wait_tool_login(&pane, 1, "current", Some("current")).await;
     assert_eq!(fs::read_to_string(&config).unwrap(), combined(&hook));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fish_login_and_review_use_the_selected_configuration_directory() {
+    let (source, remote, _, server) = fixture_connections(false, 2).await;
+    let root = remote.path();
+    let local = tempfile::tempdir().unwrap();
+    let directory = "xdg settings/fish";
+    let custom = root.join(directory);
+    fs::create_dir_all(&custom).unwrap();
+    let config = custom.join("config.fish");
+    fs::write(&config, "# user Fish settings\n").unwrap();
+    let second = root.join("second/fish");
+    fs::create_dir_all(&second).unwrap();
+    probe_response(root, "x86_64", "/", "/usr/bin");
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("utility-shell-probe"), []).unwrap();
+    save_login_manifest(local.path(), 1);
+    let mut options = approved_login(source, local.path());
+    let tools = options.tool_bundle.as_mut().unwrap();
+    tools.add_to_path = Some(ToolPath {
+        shell: DotfileShell::Fish,
+        zdotdir: None,
+        fish_config_dir: Some(directory.into()),
+    });
+    let bundle = local.path().join("fish.json");
+    fs::write(
+        &bundle,
+        r#"{"version":1,"fish_environment":"set -gx EDITOR vim"}"#,
+    )
+    .unwrap();
+    options.dotfiles = Some(Box::new(w11term::options::DotfileSync {
+        bundle,
+        shell: DotfileShell::Fish,
+        bundle_sha256: None,
+        zdotdir: None,
+        fish_config_dir: Some(directory.into()),
+        host: tools.host.clone(),
+        user: tools.user.clone(),
+        port: tools.port,
+        fingerprint: tools.fingerprint.clone(),
+        home: tools.home.clone(),
+    }));
+    let options: SshOptions =
+        serde_json::from_value(serde_json::to_value(options).unwrap()).unwrap();
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("updated")).await;
+    let installed = fs::read_to_string(&config).unwrap();
+    assert!(installed.starts_with("# user Fish settings\n"));
+    assert!(installed.contains("# >>> w11term dotfiles >>>"));
+    assert!(installed.contains("# >>> w11term tool PATH "));
+    assert!(!root.join(".config/fish").exists());
+
+    let edited = installed.replace("/prompt.fish", "/edited-prompt.fish");
+    fs::write(&config, &edited).unwrap();
+    let repair = |path: &str, review| Operation::RepairDotfileHooks {
+        shell: DotfileShell::Fish,
+        zdotdir: None,
+        fish_config_dir: Some(path.into()),
+        review,
+    };
+    let missing = guarded_job(&pane, None, repair("missing/fish", None))
+        .await
+        .unwrap_err();
+    assert!(
+        missing.contains("Fish configuration directory is missing"),
+        "{missing}"
+    );
+    let preview = guarded_job(&pane, None, repair(directory, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["files"][0]["path"],
+        "/xdg settings/fish/config.fish"
+    );
+    assert_eq!(preview["files"][0]["action"], "replace-hook");
+    let token = || Some(preview["review"].as_str().unwrap().to_owned());
+    let stale = guarded_job(&pane, None, repair("second/fish", token()))
+        .await
+        .unwrap_err();
+    assert!(stale.contains("review is stale"), "{stale}");
+    assert!(!second.join("config.fish").exists());
+    assert_eq!(fs::read_to_string(&config).unwrap(), edited);
+    guarded_job(&pane, None, repair(directory, token()))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&config).unwrap(), installed);
+    drop(pane);
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "current", Some("current")).await;
+    assert_eq!(fs::read_to_string(&config).unwrap(), installed);
     server.abort();
 }
 
@@ -2068,6 +2163,7 @@ async fn approved_tool_sync_installs_before_shell_and_respects_manual_changes() 
         shell: DotfileShell::Bash,
         bundle_sha256: None,
         zdotdir: None,
+        fish_config_dir: None,
         host: scope.host.clone(),
         user: scope.user.clone(),
         port: scope.port,
@@ -2308,6 +2404,7 @@ async fn tool_sync_skips_scope_changes_and_preserves_edited_startup_hooks() {
     zsh.tool_bundle.as_mut().unwrap().add_to_path = Some(ToolPath {
         shell: DotfileShell::Zsh,
         zdotdir: Some("config/zsh".into()),
+        fish_config_dir: None,
     });
     let pane = connect_tools(&zsh);
     wait_tool_login(&pane, 1, "current", Some("updated")).await;

@@ -6,10 +6,11 @@ import subprocess
 import tempfile
 
 
-def run_fish(home, flags, command, home_variable=None):
+def run_fish(home, flags, command, home_variable=None, config_home=None):
     return subprocess.run(
         ["fish", *flags, "--command", command],
-        env={**os.environ, "HOME": home_variable or str(home), "XDG_CONFIG_HOME": str(home / ".config"),
+        env={**os.environ, "HOME": home_variable or str(home),
+             "XDG_CONFIG_HOME": str(config_home or home / ".config"),
              "TERM": "xterm-256color", "LC_ALL": "C", "EXISTING": "",
              "MANAGED_ENV": "", "MANAGED_PROMPT": ""},
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -44,11 +45,13 @@ def check_tool_path(home, config, dotfiles_hook, template):
         f"{user_bin}/path-conflict\n{managed_bin}/managed-command\n"
         f"{user_bin}:/usr/bin:/bin:{managed_bin}\nloaded\n"
     )
+    config_home = config.parent.parent
     for flags in [[], ["--interactive"]]:
-        fish = run_fish(home, flags, command, str(home) + "/")
+        fish = run_fish(home, flags, command, str(home) + "/", config_home)
         assert fish.stdout == expected, (flags, fish.stdout, fish.stderr)
     config.write_text(base, encoding="utf-8")
-    fish = run_fish(home, [], 'command -sq managed-command; and exit 1; printf "%s\\n" "$MANAGED_ENV"')
+    fish = run_fish(home, [], 'command -sq managed-command; and exit 1; printf "%s\\n" "$MANAGED_ENV"',
+                    config_home=config_home)
     assert fish.stdout == "loaded\n", (fish.stdout, fish.stderr)
 
 hook = Path(__file__).resolve().parents[1] / "src/sftp/dotfiles/startup.fish"
@@ -74,5 +77,10 @@ with tempfile.TemporaryDirectory(prefix="fish dotfiles ") as directory:
         selector.write_text(inactive + "\n", encoding="utf-8")
         check(home, ["--interactive"], "keep||")
     selector.write_text(version + "\n", encoding="utf-8")
-    check_tool_path(home, config, hook.read_text(encoding="utf-8"),
-                    (hook.parent / "tool-path.fish").read_text(encoding="utf-8"))
+    dotfiles_hook = hook.read_text(encoding="utf-8")
+    path_template = (hook.parent / "tool-path.fish").read_text(encoding="utf-8")
+    check_tool_path(home, config, dotfiles_hook, path_template)
+    config.write_text("echo 'unexpected default config'\n", encoding="utf-8")
+    custom = home / "xdg settings/fish/config.fish"
+    custom.parent.mkdir(parents=True)
+    check_tool_path(home, custom, dotfiles_hook, path_template)
