@@ -724,7 +724,7 @@ mod tests {
                 &id,
                 "bundle.json",
                 "--shell",
-                "fish"
+                "ksh"
             ])
             .is_err()
         );
@@ -1007,19 +1007,26 @@ mod tests {
 
     #[test]
     fn lists_retained_dotfiles_by_shell() {
-        let (_, list) = p(&["--pane", "2", "list-dotfile-versions", "--shell", "zsh"]).unwrap();
-        assert!(matches!(
-            list,
-            Request::Sftp {
-                pane: 2,
-                operation: Operation::ListDotfileVersions {
-                    shell: DotfileShell::Zsh
-                },
-                ..
-            }
-        ));
+        for shell in DotfileShell::ALL {
+            let (_, list) = p(&[
+                "--pane",
+                "2",
+                "list-dotfile-versions",
+                "--shell",
+                shell.name(),
+            ])
+            .unwrap();
+            assert!(matches!(
+                list,
+                Request::Sftp {
+                    pane: 2,
+                    operation: Operation::ListDotfileVersions { shell: listed },
+                    ..
+                } if listed == shell
+            ));
+        }
         assert!(p(&["--pane", "2", "list-dotfile-versions"]).is_err());
-        assert!(p(&["--pane", "2", "list-dotfile-versions", "--shell", "fish"]).is_err());
+        assert!(p(&["--pane", "2", "list-dotfile-versions", "--shell", "ksh"]).is_err());
     }
 
     #[test]
