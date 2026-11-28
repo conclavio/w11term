@@ -19,6 +19,8 @@ $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
 $select = [System.Windows.Automation.SelectionItemPattern]::Pattern
 $rawId = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'syscall-original-text')
+$summaryId = [System.Windows.Automation.PropertyCondition]::new(
+    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'syscall-summary-original-text')
 $descriptorId = [System.Windows.Automation.PropertyCondition]::new(
     [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'descriptor-original-text')
 $workingId = [System.Windows.Automation.PropertyCondition]::new(
@@ -149,6 +151,42 @@ try {
         $raw = Raw-Text
         $raw -and $raw.Contains('<unfinished ...>') -and
             $raw.Contains('<... read resumed>') -and $raw.Contains('Line 6')
+    }
+
+    Click 'Syscall timing summary'
+    $readTiming = Wait-Until 'timing summary counts and ranks the grouped reads' {
+        Find-TraceGroup 'read*2 calls*2 timed*total 0.005 ms*max 0.003 ms'
+    }
+    $readTiming.GetCurrentPattern($select).Select()
+    $null = Wait-Until 'slowest read shows both source records' {
+        $raw = Raw-Text $summaryId
+        $raw -and $raw.Contains('<unfinished ...>') -and $raw.Contains('<... read resumed>') -and
+            $raw.Contains('Line 4') -and $raw.Contains('Line 6')
+    }
+    $sortPicker = Wait-Until 'summary sort selector' { Find-Element 'Syscall summary sort' $combo }
+    $sortPopup = $sortPicker.GetCurrentPattern($expand)
+    $sortPopup.Expand()
+    $sortErrors = Wait-Until 'error count ranking' { Find-Element 'Error count' $listItem -Visible }
+    $sortErrors.GetCurrentPattern($select).Select()
+    if ($sortPopup.Current.ExpandCollapseState -eq 'Expanded') { $sortPopup.Collapse() }
+    $null = Wait-Until 'error ranking selects the call with most errors' {
+        $raw = Raw-Text $summaryId
+        $raw -and $raw.Contains('openat') -and $raw.Contains('Line 2')
+    }
+    $summaryPid = Wait-Until 'summary PID filter' { Find-Element 'Summary PID' $edit }
+    $summaryPid.SetFocus()
+    $summaryPid.GetCurrentPattern($value).SetValue('502')
+    $null = Wait-Until 'summary PID text entered' {
+        (Find-Element 'Summary PID' $edit).GetCurrentPattern($value).Current.Value -ceq '502'
+    }
+    Click 'Apply summary PID'
+    $null = Wait-Until 'only the requested process is summarized' {
+        (Find-TraceGroup 'execve*1 calls*1 timed*') -and !(Find-TraceGroup 'read*2 calls*')
+    }
+    Click 'Back to syscall groups'
+    $null = Wait-Until 'returning to groups restores the selected raw records' {
+        $raw = Raw-Text
+        $raw -and $raw.Contains('<... read resumed>')
     }
 
     $picker = Wait-Until 'syscall filter selector' { Find-Element 'Syscall filter' $combo }

@@ -87,6 +87,26 @@ function Set-DotfileFragment([string]$Name, [string]$Text) {
     $field.GetCurrentPattern($value).SetValue($Text.Replace("`n", "`r"))
     $null = Wait-Until "the multiline dotfile fragment '$Name' is retained" { (Dotfile-Fragment $Name) -ceq $Text }
 }
+function Import-ShellFragment([string]$Destination, [string]$Source) {
+    $import = 'Import shell fragment'
+    $search = @{ scroll = $null }
+    Invoke-Button (Get-NativeMenuAction $import $Destination -VisibleItem -Reveal {
+        Move-NativeControlIntoView (Find-Element $import $button) $search
+    })
+    $title = 'Choose a shell fragment file'
+    $dialog = Wait-OwnedDialog $title
+    if ($Source) {
+        $null = Wait-Until "enter the path for '$([IO.Path]::GetFileName($Source))'" {
+            [FixtureDialog]::SetFilename($dialog, $Source, '')
+        }
+        $command = 1
+    } else { $command = 2 }
+    $null = Wait-Until 'close the shell fragment picker' { [FixtureDialog]::ClickButton($dialog, $command) }
+    $null = Wait-Until 'the editor is ready after the import picker' {
+        $control = Find-Element $import $button
+        $control -and $control.Current.IsEnabled -and !(Find-OwnedDialog $title)
+    }
+}
 function Save-DotfilesBundle([string]$Action, [string]$Path) {
     Invoke-Button (Wait-DotfileControl $Action $button)
     $dialog = Wait-Until 'owned dotfiles bundle save dialog' { Find-OwnedDialog 'Save new dotfiles bundle' }
@@ -228,12 +248,35 @@ try {
     }
     $revisedBash = "PS1='revised> '`nalias ll='ls -lh'"
     Set-DotfileFragment 'Bash startup fragment' $revisedBash
+    Import-ShellFragment 'Append to Zsh fragment'
+    if ((Dotfile-Fragment 'Zsh startup fragment') -cne $zsh) {
+        throw 'Cancelling the import changed the Zsh fragment'
+    }
+    $invalidFragment = Join-Path $State 'oversized shell fragment.sh'
+    [IO.File]::WriteAllText($invalidFragment, ('x' * 16385))
+    Import-ShellFragment 'Append to Bash fragment' $invalidFragment
+    $null = Wait-Until 'the editor explains the fragment byte limit' {
+        Find-Element 'Importing shell fragment: Dotfile fragments must be at most 16 KiB of UTF-8 without NUL or a BOM'
+    }
+    if ((Dotfile-Fragment 'Bash startup fragment') -cne $revisedBash) {
+        throw 'An invalid import changed the draft'
+    }
+    $bashSource = Join-Path $State '.bashrc'
+    $extraBash = "export VISUAL=nano`n# " + [char]0x96ea + "`n"
+    [IO.File]::WriteAllText($bashSource, $extraBash.Replace("`n", "`r`n"), [Text.UTF8Encoding]::new($true))
+    $importHash = File-Sha256 $bashSource
+    Import-ShellFragment 'Append to Bash fragment' $bashSource
+    $revisedBash += "`n$extraBash"
+    $null = Wait-Until 'the Bash editor shows the appended UTF-8 text' {
+        (Dotfile-Fragment 'Bash startup fragment') -ceq $revisedBash
+    }
     $revision = Join-Path $State 'Revised dotfiles.json'
     Save-DotfilesBundle 'Save dotfiles revision' $revision
     $updated = [IO.File]::ReadAllText($revision) | ConvertFrom-Json
     $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles.bundle
     if ($updated.environment -cne $shared -or $updated.bash -cne $revisedBash -or
         $updated.zsh -cne $zsh -or (File-Sha256 $created) -cne $originalHash -or
+        (File-Sha256 $bashSource) -cne $importHash -or
         ![FixtureDialog]::SameFile($bundle, $approved)) {
         throw 'Revising a bundle changed its source, another fragment, or the saved approval'
     }

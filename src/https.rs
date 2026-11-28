@@ -75,8 +75,48 @@ pub(crate) fn request(
     max_bytes: usize,
     cancelled: impl Fn() -> bool,
 ) -> Result<(u32, Vec<u8>)> {
+    let timeout = Duration::from_secs(if matches!(request, Request::Download) {
+        45
+    } else {
+        60
+    });
+    let mut body = Vec::new();
+    let (status, _) = request_into(url, request, max_bytes, timeout, cancelled, |bytes| {
+        body.extend_from_slice(bytes);
+        Ok(())
+    })?;
+    Ok((status, body))
+}
+
+pub(crate) fn download_into(
+    url: &Url,
+    max_bytes: usize,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+    consume: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<usize> {
+    let (status, received) = request_into(
+        url,
+        Request::Download,
+        max_bytes,
+        timeout,
+        cancelled,
+        consume,
+    )?;
+    ensure!(status == 200, "Download returned HTTP {status}");
+    Ok(received)
+}
+
+fn request_into(
+    url: &Url,
+    request: Request<'_>,
+    max_bytes: usize,
+    timeout: Duration,
+    cancelled: impl Fn() -> bool,
+    mut consume: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<(u32, usize)> {
     let download = matches!(request, Request::Download);
-    let deadline = Instant::now() + Duration::from_secs(if download { 45 } else { 60 });
+    let deadline = Instant::now() + timeout;
     let check = || {
         ensure!(!cancelled(), "HTTPS request cancelled");
         ensure!(Instant::now() < deadline, "HTTPS request timed out");
@@ -180,10 +220,10 @@ pub(crate) fn request(
     }
     if status != 200 {
         // Error bodies may echo user data or credentials. Callers classify status codes.
-        return Ok((status, Vec::new()));
+        return Ok((status, 0));
     }
 
-    let mut archive = Vec::new();
+    let mut received = 0;
     let mut chunk = [0u8; 16 * 1024];
     loop {
         check()?;
@@ -199,13 +239,14 @@ pub(crate) fn request(
         }
         if length == 0 {
             check()?;
-            return Ok((status, archive));
+            return Ok((status, received));
         }
         let length = length as usize;
         ensure!(
-            length <= chunk.len() && length <= max_bytes.saturating_sub(archive.len()),
+            length <= chunk.len() && length <= max_bytes.saturating_sub(received),
             "HTTPS response exceeds the download byte limit"
         );
-        archive.extend_from_slice(&chunk[..length]);
+        consume(&chunk[..length])?;
+        received += length;
     }
 }

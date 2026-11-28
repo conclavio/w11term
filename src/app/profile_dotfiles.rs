@@ -3,7 +3,10 @@ use russh::keys::ssh_key::Fingerprint;
 use std::path::PathBuf;
 use w11term::{
     options::DotfileSync,
-    sftp::{DotfileBundle, DotfileShell, validate_dotfiles_home, validate_zdotdir},
+    sftp::{
+        DotfileBundle, DotfileShell, ExportedDotfileBundle, validate_dotfiles_home,
+        validate_zdotdir,
+    },
 };
 
 mod bundle;
@@ -30,6 +33,28 @@ pub(super) fn approved_fingerprint(entered: &str, profile_pin: &str) -> anyhow::
     Ok(fingerprint.to_string())
 }
 
+pub(super) fn snapshot_fingerprint(
+    draft: &ProfileDraft,
+    home: &str,
+    endpoint: (&str, &str, u16, &str),
+) -> anyhow::Result<String> {
+    let fingerprint = profile_fingerprint(draft, endpoint)?;
+    validate_dotfiles_home(home)?;
+    Ok(fingerprint)
+}
+
+fn profile_fingerprint(
+    draft: &ProfileDraft,
+    (host, user, port, fingerprint): (&str, &str, u16, &str),
+) -> anyhow::Result<String> {
+    let account = parse_ssh_address(&draft.host, &draft.user, &draft.port)?;
+    anyhow::ensure!(
+        (account.0.as_str(), account.1.as_str(), account.2) == (host, user, port),
+        "This profile's SSH account differs from the verified connection"
+    );
+    approved_fingerprint(fingerprint, &draft.fingerprint)
+}
+
 #[derive(Clone, Copy)]
 pub enum Field {
     Bundle,
@@ -43,10 +68,11 @@ pub enum Action {
     Expand(bool),
     Text(Field, String),
     Shell(Option<usize>),
+    PinVersion(bool),
     Browse,
     Picked(Arc<()>, Result<Option<PathBuf>, String>),
     Approve,
-    Reviewed(Arc<()>, Box<DotfileSync>, Result<(), String>),
+    Reviewed(Arc<()>, Box<DotfileSync>, Result<Option<String>, String>),
     Bundle(bundle::Action),
     Disable,
 }
@@ -60,6 +86,8 @@ pub(super) struct Editor {
     zdotdir: String,
     zsh: bool,
     approved: Option<Box<DotfileSync>>,
+    pin_version: bool,
+    snapshot_version: Option<String>,
     checking: Option<Arc<()>>,
     browsing: Option<Arc<()>>,
     composer: Option<bundle::Editor>,
@@ -77,6 +105,7 @@ impl Editor {
             fingerprint: settings.fingerprint.clone(),
             zdotdir: settings.zdotdir.clone().unwrap_or_default(),
             zsh: settings.shell == DotfileShell::Zsh,
+            pin_version: settings.bundle_sha256.is_some(),
             approved,
             ..Default::default()
         }
@@ -84,6 +113,42 @@ impl Editor {
 
     pub(super) fn approval(&self) -> Option<Box<DotfileSync>> {
         self.approved.clone()
+    }
+
+    fn select_bundle(&mut self, path: String) {
+        self.bundle = path;
+        self.snapshot_version = None;
+        self.checking = None;
+        self.error = None;
+    }
+
+    fn stage_snapshot(
+        draft: &mut ProfileDraft,
+        saved: ExportedDotfileBundle,
+        zdotdir: Option<String>,
+        endpoint: (&str, &str, u16, &str),
+    ) -> anyhow::Result<()> {
+        let fingerprint = snapshot_fingerprint(draft, &saved.home, endpoint)?;
+        validate_zdotdir(saved.shell, zdotdir.as_deref())?;
+        let path = saved
+            .local
+            .into_os_string()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("The saved path cannot be represented as text"))?;
+        let editor = &mut draft.dotfiles;
+        anyhow::ensure!(
+            editor.checking.is_none() && editor.browsing.is_none() && editor.composer.is_none(),
+            "Finish the open dotfiles edit before selecting the saved bundle"
+        );
+        editor.select_bundle(path);
+        editor.expanded = true;
+        editor.home = saved.home;
+        editor.fingerprint = fingerprint;
+        editor.zsh = saved.shell == DotfileShell::Zsh;
+        editor.zdotdir = zdotdir.unwrap_or_default();
+        editor.pin_version = true;
+        editor.snapshot_version = Some(saved.bundle_sha256);
+        Ok(())
     }
 
     fn candidate(&self, draft: &ProfileDraft, base: &Path) -> anyhow::Result<DotfileSync> {
@@ -103,6 +168,11 @@ impl Editor {
         Ok(DotfileSync {
             bundle: base.join(self.bundle.trim()),
             shell,
+            bundle_sha256: self
+                .approved
+                .as_ref()
+                .filter(|_| self.pin_version)
+                .and_then(|approval| approval.bundle_sha256.clone()),
             zdotdir: zdotdir.map(str::to_owned),
             host,
             user,
@@ -134,8 +204,10 @@ impl Editor {
             ))
         };
         let current = self.approved.as_deref().is_some_and(|approved| {
-            self.candidate(draft, base)
-                .is_ok_and(|candidate| candidate == *approved)
+            self.pin_version == approved.bundle_sha256.is_some()
+                && self
+                    .candidate(draft, base)
+                    .is_ok_and(|candidate| candidate == *approved)
         });
         let (header, status) = match &self.approved {
             Some(settings) if current => (
@@ -233,7 +305,39 @@ impl Editor {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
+        if let Some(version) = &self.snapshot_version {
+            content.push(KeyedView::new(
+                "snapshot-version",
+                TextBlock::new()
+                    .text(format!("Saved dotfile version {version}"))
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        } else if let Some(version) = self
+            .approved
+            .as_deref()
+            .filter(|_| current)
+            .and_then(|settings| settings.bundle_sha256.as_deref())
+        {
+            content.push(KeyedView::new(
+                "pinned-version",
+                TextBlock::new()
+                    .text(format!("Pinned dotfile version {version}"))
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
         content.extend([
+            KeyedView::new(
+                "pin-version",
+                CheckBox::new()
+                    .automation_name("Pin approved dotfile version")
+                    .is_checked(self.pin_version)
+                    .on_is_checked_changed(
+                        ctx.callback(move |pin| {
+                            Message::ProfileDotfiles(id, Action::PinVersion(pin))
+                        }),
+                    )
+                    .content("Pin approved dotfile version"),
+            ),
             KeyedView::new(
                 "actions",
                 StackPanel::new()
@@ -289,6 +393,63 @@ impl Editor {
 }
 
 impl TerminalApp {
+    pub(super) fn open_profile_for_snapshot(
+        &mut self,
+        profile: &str,
+        ctx: &ComponentContext<Self>,
+    ) -> Option<(TabId, &mut ProfileDraft)> {
+        self.command_reference.close();
+        self.edit_profile(profile.to_owned(), ctx);
+        let id = self.tabs.active_id()?;
+        let Page::NewProfile(draft) = &mut self.tabs.get_mut(id)?.page else {
+            return None;
+        };
+        draft
+            .origin
+            .editing()
+            .is_some_and(|base| base.name == profile)
+            .then_some((id, draft))
+    }
+
+    pub(super) fn open_dotfile_snapshot_profile(
+        &mut self,
+        profile: &str,
+        saved: ExportedDotfileBundle,
+        zdotdir: Option<String>,
+        connection: &w11term::ssh::ConnectionShare,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some((_, draft)) = self.open_profile_for_snapshot(profile, ctx) else {
+            return;
+        };
+        if let Err(error) =
+            Editor::stage_snapshot(draft, saved, zdotdir, connection.verified_endpoint())
+        {
+            draft.error = Some(format!("{error:#}"));
+        }
+    }
+
+    pub(super) fn open_profile_dotfile_excerpt(
+        &mut self,
+        profile: &str,
+        endpoint: (&str, &str, u16, &str),
+        path: String,
+        text: String,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some((_, draft)) = self.open_profile_for_snapshot(profile, ctx) else {
+            return;
+        };
+        let (host, user, port, _) = endpoint;
+        if let Err(error) = profile_fingerprint(draft, endpoint).and_then(|_| {
+            draft
+                .dotfiles
+                .stage_remote_excerpt(&format!("{user}@{host}:{port}"), path, text)
+        }) {
+            draft.error = Some(format!("{error:#}"));
+        }
+    }
+
     pub(super) fn edit_profile_dotfiles(
         &mut self,
         id: TabId,
@@ -324,6 +485,8 @@ impl TerminalApp {
                     }
                 };
                 let request = Arc::new(());
+                let snapshot_version = draft.dotfiles.snapshot_version.clone();
+                let pin_version = draft.dotfiles.pin_version;
                 draft.dotfiles.checking = Some(request.clone());
                 draft.dotfiles.error = None;
                 let rejected = Message::ProfileDotfiles(
@@ -337,14 +500,21 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |_| {
                         let result = DotfileBundle::load(&settings.bundle)
-                            .and_then(|bundle| bundle.validate(settings.shell))
+                            .and_then(|bundle| match (snapshot_version, pin_version) {
+                                (Some(version), pin) => {
+                                    bundle.verify_version(settings.shell, &version)?;
+                                    Ok(pin.then_some(version))
+                                }
+                                (None, true) => bundle.content_version(settings.shell).map(Some),
+                                (None, false) => bundle.validate(settings.shell).map(|()| None),
+                            })
                             .map_err(|err| format!("Checking the dotfiles bundle: {err:#}"));
                         Message::ProfileDotfiles(id, Action::Reviewed(request, settings, result))
                     },
                     rejected,
                 );
             }
-            Action::Reviewed(request, settings, result) => {
+            Action::Reviewed(request, mut settings, result) => {
                 if draft
                     .dotfiles
                     .checking
@@ -361,8 +531,10 @@ impl TerminalApp {
                     return;
                 }
                 match result {
-                    Ok(()) => {
+                    Ok(version) => {
+                        settings.bundle_sha256 = version;
                         draft.dotfiles.approved = Some(settings);
+                        draft.dotfiles.snapshot_version = None;
                         draft.dotfiles.error = None;
                         draft.saved = false;
                     }
@@ -414,9 +586,7 @@ impl TerminalApp {
                 match result {
                     Ok(Some(path)) => match path.into_os_string().into_string() {
                         Ok(path) => {
-                            draft.dotfiles.bundle = path;
-                            draft.dotfiles.checking = None;
-                            draft.dotfiles.error = None;
+                            draft.dotfiles.select_bundle(path);
                         }
                         Err(_) => {
                             draft.dotfiles.error =
@@ -440,6 +610,7 @@ impl TerminalApp {
                     *target = text;
                     if matches!(field, Field::Bundle) {
                         editor.browsing = None;
+                        editor.snapshot_version = None;
                     }
                     editor.checking = None;
                     editor.error = None;
@@ -448,11 +619,19 @@ impl TerminalApp {
             Action::Shell(Some(index)) => {
                 if draft.dotfiles.zsh != (index == 1) {
                     draft.dotfiles.zsh = index == 1;
+                    draft.dotfiles.snapshot_version = None;
                     draft.dotfiles.checking = None;
                     draft.dotfiles.error = None;
                 }
             }
             Action::Shell(None) => {}
+            Action::PinVersion(pin) => {
+                if draft.dotfiles.pin_version != pin {
+                    draft.dotfiles.pin_version = pin;
+                    draft.dotfiles.checking = None;
+                    draft.dotfiles.error = None;
+                }
+            }
             Action::Disable => {
                 draft.dotfiles.approved = None;
                 draft.dotfiles.checking = None;

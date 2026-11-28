@@ -1,12 +1,16 @@
 use super::*;
-use w11term::sftp::{DotfileTarget, DotfileVersionState, DotfileVersions, RetainedDotfileVersion};
+use w11term::sftp::{
+    DotfileTarget, DotfileVersionState, DotfileVersions, ExportedDotfileBundle,
+    RetainedDotfileVersion,
+};
 
 pub enum Action {
     Open,
     Refresh,
     Select(Option<usize>),
     Save,
-    Saved(Arc<()>, Result<Option<PathBuf>, String>),
+    Saved(Arc<()>, Result<Option<ExportedDotfileBundle>, String>),
+    ReviewProfile,
     ReviewRestore,
     ReviewDisable,
     ReviewResume,
@@ -21,6 +25,7 @@ pub(super) struct Panel {
     listing: Option<DotfileVersions>,
     selected: Option<usize>,
     review: Option<Box<SwitchReview>>,
+    saved: Option<ExportedDotfileBundle>,
 }
 
 #[derive(Deserialize)]
@@ -38,11 +43,6 @@ pub struct SwitchReview {
 struct Switched {
     target: DotfileTarget,
     changed: bool,
-}
-
-#[derive(Deserialize)]
-struct SavedBundle {
-    local: PathBuf,
 }
 
 fn send(action: Action) -> Message {
@@ -194,6 +194,14 @@ impl Panel {
                 ),
             ),
         ]);
+        if self.saved.is_some() && installer.profile.is_some() {
+            fields.push(KeyedView::new(
+                "review-saved-in-profile",
+                button("Review saved dotfiles in this SSH profile", idle, || {
+                    Action::ReviewProfile
+                }),
+            ));
+        }
         if self.can_resume() {
             fields.push(KeyedView::new(
                 "review-resume",
@@ -308,12 +316,62 @@ impl Panel {
 }
 
 impl TerminalApp {
+    fn review_saved_dotfiles_for_profile(&mut self, ctx: &ComponentContext<Self>) {
+        let Some(installer) = self
+            .command_reference
+            .dotfiles
+            .as_ref()
+            .filter(|installer| installer.pending.is_none())
+        else {
+            return;
+        };
+        let Some(saved) = installer
+            .history
+            .as_ref()
+            .and_then(|history| history.saved.clone())
+        else {
+            return;
+        };
+        let Some((pane, session)) = self
+            .reference_tool_target()
+            .filter(|(pane, _)| *pane == installer.target)
+        else {
+            return;
+        };
+        let Some(profile) = self
+            .tabs
+            .active()
+            .and_then(AppTab::ssh_profile_name)
+            .filter(|name| Some(*name) == installer.profile.as_deref())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let Some(connection) = session.ssh_connection_at(pane.generation) else {
+            return;
+        };
+        match installer.startup_directory() {
+            Ok(zdotdir) => {
+                self.open_dotfile_snapshot_profile(&profile, saved, zdotdir, &connection, ctx)
+            }
+            Err(error) => {
+                if let Some(installer) = &mut self.command_reference.dotfiles {
+                    installer.status = Some(error);
+                }
+            }
+        }
+    }
+
     pub(super) fn dotfile_history_action(
         &mut self,
         action: Action,
         current: Option<(ToolPane, tokio::sync::mpsc::UnboundedSender<Command>)>,
         ctx: &ComponentContext<Self>,
     ) {
+        if matches!(action, Action::ReviewProfile) {
+            self.review_saved_dotfiles_for_profile(ctx);
+            return;
+        }
         let owner = self.keyboard.hwnd().map(|window| window.0 as usize);
         let Some(installer) = &mut self.command_reference.dotfiles else {
             return;
@@ -350,6 +408,7 @@ impl TerminalApp {
                     if history.selected != selected {
                         history.selected = selected;
                         history.review = None;
+                        history.saved = None;
                         installer.status = None;
                     }
                     None
@@ -366,14 +425,18 @@ impl TerminalApp {
                         .as_deref()
                         .unwrap_or(self.store.path())
                         .to_owned();
+                    history.saved = None;
                     installer.save_dotfile_version(owner, current, id, input, ctx);
                     return;
                 }
                 Action::Saved(ticket, result) => {
                     if installer.finish(&ticket, Work::SaveVersion) {
                         installer.status = match result {
-                            Ok(Some(path)) => {
-                                Some(format!("Saved dotfile bundle · {}", path.display()))
+                            Ok(Some(saved)) => {
+                                let status =
+                                    format!("Saved dotfile bundle · {}", saved.local.display());
+                                installer.history.as_mut().unwrap().saved = Some(saved);
+                                Some(status)
                             }
                             Ok(None) => None,
                             Err(error) => Some(error),
@@ -547,14 +610,14 @@ impl Installer {
                         bundle_sha256,
                         local: file.path,
                     };
-                    decode::<SavedBundle>(run_pane_sftp_job(
+                    decode::<ExportedDotfileBundle>(run_pane_sftp_job(
                         input,
                         target,
                         operation,
                         Duration::from_secs(30),
                         None,
                     ))
-                    .map(|saved| Some(saved.local))
+                    .map(Some)
                 })();
                 send(Action::Saved(ticket, result))
             },

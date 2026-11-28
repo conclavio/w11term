@@ -780,6 +780,7 @@ pub(super) fn connect_options(source: Source, local: &std::path::Path) -> SshOpt
     let settings = DotfileSync {
         bundle: "Fleet dotfiles.json".into(),
         shell: DotfileShell::Bash,
+        bundle_sha256: None,
         zdotdir: None,
         host: options.host.clone(),
         user: options.user.clone(),
@@ -931,6 +932,60 @@ async fn profile_sync_activates_before_the_shell_and_respects_manual_selections(
         format!("{second}\n")
     );
     assert_eq!(fs::read_to_string(prompt).unwrap(), "PS1='remote edit> '\n");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_sync_with_a_pinned_version_skips_edits_until_reapproved() {
+    let (source, remote, _, server) = fixture_connections(false, 5).await;
+    let root = remote.path();
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("dotfiles-shell-probe"), []).unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let mut options = connect_options(source, local.path());
+    let path = options.dotfiles.as_ref().unwrap().bundle.clone();
+    let write =
+        |bundle: &DotfileBundle| fs::write(&path, serde_json::to_vec(bundle).unwrap()).unwrap();
+    let approved = manifest("approved");
+    let edited = manifest("edited");
+    let first = approved.content_version(DotfileShell::Bash).unwrap();
+    let next = edited.content_version(DotfileShell::Bash).unwrap();
+    options.dotfiles.as_mut().unwrap().bundle_sha256 = Some(first.clone());
+
+    write(&edited);
+    let pane = login(&options, "absent", "skipped").await;
+    let report = pane
+        .events
+        .dotfile_sync(pane.ssh_connection_generation().unwrap())
+        .unwrap();
+    assert!(
+        report
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("pinned dotfiles bundle changed")
+    );
+    assert!(!root.join(".config").exists());
+    drop(pane);
+
+    write(&approved);
+    drop(login(&options, &first, "updated").await);
+    let mut other_shell = approved.clone();
+    other_shell.zsh = edited.zsh.clone();
+    write(&other_shell);
+    drop(login(&options, &first, "current").await);
+
+    write(&edited);
+    drop(login(&options, &first, "skipped").await);
+    let managed = root.join(".config/w11term/dotfiles");
+    assert!(!managed.join(format!("bash-{next}")).exists());
+    assert_eq!(
+        fs::read_to_string(managed.join(format!("bash-{first}/prompt.sh"))).unwrap(),
+        "PS1='approved> '\n"
+    );
+
+    options.dotfiles.as_mut().unwrap().bundle_sha256 = Some(next.clone());
+    drop(login(&options, &next, "updated").await);
     server.abort();
 }
 

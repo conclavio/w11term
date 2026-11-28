@@ -13,11 +13,13 @@ use std::{
 
 mod comparison;
 mod descriptors;
+mod summary;
 pub use comparison::{
     Comparison, Kind as ComparisonKind, Row as ComparisonRow, RowMatch as ComparisonMatch,
     TimingAnchor as ComparisonTimingAnchor,
 };
 pub use descriptors::{DescriptorReport, Lifetime, Step};
+pub use summary::{CallStats, Summary, SummarySort, Timing};
 
 pub const MAX_QUERY_CHARS: usize = 256;
 

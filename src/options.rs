@@ -487,6 +487,8 @@ pub struct DotfileSync {
     pub bundle: PathBuf,
     pub shell: crate::sftp::DotfileShell,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zdotdir: Option<String>,
     pub host: String,
     pub user: String,
