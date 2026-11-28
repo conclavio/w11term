@@ -6,6 +6,10 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $destination = Join-Path $State 'stopped capture.strace'
 $started = [IO.File]::ReadAllText((Join-Path $State 'syscall-start-marker'))
 $saveLabel = 'Trace and save' + [char]0x2026
+$saveSettings = 'Save settings' + [char]0x2026
+$loadSettings = 'Load settings' + [char]0x2026
+$settingsFile = Join-Path $State 'Syscall capture settings.json'
+$cliSettings = Join-Path $State 'CLI trace settings.json'
 $edit = [System.Windows.Automation.ControlType]::Edit
 $value = [System.Windows.Automation.ValuePattern]::Pattern
 $textType = [System.Windows.Automation.ControlType]::Text
@@ -42,6 +46,21 @@ function Find-TraceText([string]$Prefix) {
     }
 }
 
+function Choose-Settings([string]$Path, [switch]$Save) {
+    $title = if ($Save) { 'Save syscall capture settings' } else { 'Open syscall capture settings' }
+    if ($Save) { Click $saveSettings } else { Click $loadSettings }
+    $dialog = Wait-OwnedDialog $title
+    if (!$Path) {
+        $null = Wait-Until 'cancel the settings file picker' { [FixtureDialog]::ClickButton($dialog, 2) }
+        return
+    }
+    $null = Wait-Until 'enter the settings filename' {
+        if ($Save) { [FixtureDialog]::SetCommonDialogFilename($dialog, $Path) }
+        else { [FixtureDialog]::SetFilename($dialog, $Path, '') }
+    }
+    $null = Wait-Until 'accept the settings filename' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -56,6 +75,7 @@ try {
     Set-Field 'Time limit (seconds)' '30'
     Set-Field 'Trace output limit (MiB)' '1'
     Set-Field 'Linux executable' '/bin/sh'
+    Select-NativeComboItem 'Syscall preset' 'Files and descriptors'
     Click 'Review syscall capture'
     $null = Wait-Until 'command and initial bounds were reviewed' {
         (Find-Element 'Executable /bin/sh') -and
@@ -65,12 +85,86 @@ try {
     }
     if ([IO.File]::Exists($started)) { throw 'Review launched the remote command' }
 
-    Set-Field 'Maximum string bytes' '64'
-    $null = Wait-Until 'editing a bound invalidates the first review' { !(Find-Element $saveLabel $button) }
+    Choose-Settings $settingsFile -Save
+    $null = Wait-Until 'the settings file is saved and the existing review is still available' {
+        $prefix = "Saved syscall capture settings$dot"
+        $notice = Find-TraceText $prefix
+        $review = Find-Element $saveLabel $button
+        $notice -and $review -and $review.Current.IsEnabled -and
+            [FixtureDialog]::SameFile($settingsFile, $notice.Current.Name.Substring($prefix.Length))
+    }
+    $export = [IO.File]::ReadAllText($settingsFile)
+    $settings = $export | ConvertFrom-Json
+    if ($settings.schema_version -ne 1 -or
+        @($settings.PSObject.Properties.Name).Count -ne 2 -or
+        @($settings.options.PSObject.Properties.Name).Count -ne 7 -or
+        $settings.options.program -cne '/bin/sh' -or
+        $settings.options.directory -cne '/home/test' -or
+        @($settings.options.arguments).Count -ne 3 -or
+        $settings.options.arguments[0] -cne 'one argument' -or
+        $settings.options.arguments[1] -cne '$literal' -or
+        $settings.options.arguments[2] -cne '--flag' -or
+        $settings.options.seconds -ne 30 -or $settings.options.max_mib -ne 1 -or
+        $settings.options.string_size -ne 128 -or $settings.options.filter -cne 'files') {
+        throw 'Windows exported different syscall inputs or included execution state'
+    }
+    $cliPreview = (Control @('preview-syscall-capture','--pane',"$remote",'--settings-file',$settingsFile)).plan
+    if ($cliPreview.options.filter -cne 'files' -or
+        ($cliPreview.options.arguments | ConvertTo-Json -Compress) -cne ($settings.options.arguments | ConvertTo-Json -Compress) -or
+        $cliPreview.options.string_size -ne 128) {
+        throw 'The CLI preview did not restore the Windows settings'
+    }
+
+    Choose-Settings $settingsFile -Save
+    $null = Wait-Until 'the export refuses to replace an existing settings file' {
+        Find-TraceText 'Saving new syscall capture settings'
+    }
+    if ([IO.File]::ReadAllText($settingsFile) -cne $export) { throw 'Saving replaced a settings file' }
+    Choose-Settings
+    $null = Wait-Until 'cancelling the settings picker preserves the review' {
+        $review = Find-Element $saveLabel $button
+        $review -and $review.Current.IsEnabled
+    }
+    $invalid = Join-Path $State 'invalid capture settings.json'
+    $settings | Add-Member -NotePropertyName 'review_id' -NotePropertyValue 'stale-review'
+    [IO.File]::WriteAllText($invalid, ($settings | ConvertTo-Json -Depth 8))
+    Choose-Settings $invalid
+    $null = Wait-Until 'the rejected settings leave the original review available' {
+        $error = Find-TraceText 'Reading syscall capture settings JSON'
+        $review = Find-Element $saveLabel $button
+        $error -and $review -and $review.Current.IsEnabled
+    }
+
+    $createdSettings = & $Cli save-syscall-capture-settings --program /bin/sh --directory /home/test `
+        --arg 'one argument' --arg '$literal' --arg '--flag' --seconds 30 --max-mib 1 --string-size 64 `
+        --filter all --output-file $cliSettings | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or !$createdSettings.ok -or
+        ![FixtureDialog]::SameFile($cliSettings, $createdSettings.result.path)) {
+        throw 'Could not make the CLI settings fixture'
+    }
+    Choose-Settings $cliSettings
+    $null = Wait-Until 'loading CLI settings replaces inputs and clears the previous review' {
+        $prefix = "Loaded syscall capture settings$dot"
+        $notice = Find-TraceText $prefix
+        $field = Find-Element 'Maximum string bytes' $edit
+        $combo = Find-Element 'Syscall preset' ([System.Windows.Automation.ControlType]::ComboBox)
+        $preset = if ($combo) {
+            $combo.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern).Current.GetSelection()
+        }
+        $notice -and [FixtureDialog]::SameFile($cliSettings, $notice.Current.Name.Substring($prefix.Length)) -and
+            $field -and $field.GetCurrentPattern($value).Current.Value -ceq '64' -and
+            $preset -and $preset[0].Current.Name -ceq 'All calls' -and
+            !(Find-Element $saveLabel $button)
+    }
+    if ([IO.File]::Exists($started)) { throw 'Saving or loading settings started the trace' }
     Click 'Review syscall capture'
     $null = Wait-Until 'new string size was reviewed' {
         Find-Element "30 seconds${dot}1 MiB${dot}64 bytes per string"
     }
+    Set-Field 'Maximum string bytes' '96'
+    $null = Wait-Until 'editing a bound invalidates the loaded settings review' { !(Find-Element $saveLabel $button) }
+    Set-Field 'Maximum string bytes' '64'
+    Click 'Review syscall capture'
     Click $saveLabel
     $dialog = Wait-Until 'owned syscall trace save dialog' { Find-OwnedDialog 'Save syscall trace' }
     if ([IO.File]::Exists($started)) { throw 'The command started before the destination was approved' }

@@ -15,7 +15,7 @@ const SCRIPT: &str = include_str!("syscall-capture.sh");
 const REVIEW_DEADLINE: Duration = Duration::from_secs(8);
 pub(crate) const CONTROL_SECONDS: u64 = 155;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SyscallFilter {
     #[default]

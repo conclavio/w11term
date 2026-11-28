@@ -85,8 +85,11 @@ pub(super) enum Purpose {
     SavePacketCapture(PathBuf),
     SavePacketCaptureReport(PathBuf),
     OpenPacketCaptureReport(PathBuf),
-    OpenPacketCaptureSettings(PathBuf),
-    SavePacketCaptureSettings(PathBuf),
+    CaptureSettings {
+        current: PathBuf,
+        kind: CaptureSettingsKind,
+        save: bool,
+    },
     SavePacketExcerpt(PathBuf, &'static str),
     WiresharkExecutable(PathBuf),
     OpenSyscallTrace(PathBuf),
@@ -104,6 +107,11 @@ pub(super) enum Purpose {
 pub(super) enum RolloutReceiptKind {
     Dotfiles,
     Tools,
+}
+
+pub(super) enum CaptureSettingsKind {
+    Packet,
+    Syscall,
 }
 
 #[derive(Clone, Copy)]
@@ -274,7 +282,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::CompareTriageReport(_)
                 | Purpose::OpenPacketCapture(_)
                 | Purpose::OpenPacketCaptureReport(_)
-                | Purpose::OpenPacketCaptureSettings(_)
+                | Purpose::CaptureSettings { save: false, .. }
                 | Purpose::ComparePacketCapture(_)
                 | Purpose::WiresharkExecutable(_)
                 | Purpose::OpenSyscallTrace(_)
@@ -409,24 +417,38 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::OpenPacketCaptureSettings(path) | Purpose::SavePacketCaptureSettings(path) => {
+            Purpose::CaptureSettings {
+                current,
+                kind,
+                save,
+            } => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
                 dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
-                    pszName: w!("Packet capture settings"),
+                    pszName: match kind {
+                        CaptureSettingsKind::Packet => w!("Packet capture settings"),
+                        CaptureSettingsKind::Syscall => w!("Syscall capture settings"),
+                    },
                     pszSpec: w!("*.json"),
                 }])?;
                 options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
-                if clsid == FileOpenDialog {
-                    dialog.SetTitle(w!("Open packet capture settings"))?;
-                    options |= FOS_FILEMUSTEXIST;
-                } else {
-                    dialog.SetTitle(w!("Save packet capture settings"))?;
+                dialog.SetTitle(match (&kind, save) {
+                    (CaptureSettingsKind::Packet, true) => w!("Save packet capture settings"),
+                    (CaptureSettingsKind::Packet, false) => w!("Open packet capture settings"),
+                    (CaptureSettingsKind::Syscall, true) => w!("Save syscall capture settings"),
+                    (CaptureSettingsKind::Syscall, false) => w!("Open syscall capture settings"),
+                })?;
+                if save {
                     dialog.SetDefaultExtension(w!("json"))?;
-                    dialog.SetFileName(w!("packet-capture-settings.json"))?;
+                    dialog.SetFileName(match kind {
+                        CaptureSettingsKind::Packet => w!("packet-capture-settings.json"),
+                        CaptureSettingsKind::Syscall => w!("syscall-capture-settings.json"),
+                    })?;
                     options &= !FOS_OVERWRITEPROMPT;
                     options |= FOS_NOTESTFILECREATE;
+                } else {
+                    options |= FOS_FILEMUSTEXIST;
                 }
-                if let Some(folder) = path.parent() {
+                if let Some(folder) = current.parent() {
                     local_folder(&dialog, folder);
                 }
                 None

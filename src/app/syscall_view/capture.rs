@@ -28,12 +28,19 @@ pub enum Field {
     StringSize,
 }
 
+#[derive(Clone, Copy)]
+pub enum SettingsFile {
+    Open,
+    Save,
+}
+
 pub enum Action {
     Open(TabId),
     Back(TabId),
     Select(TabId, Connection),
     Edit(TabId, Field, String),
     Preset(TabId, usize),
+    SettingsFile(TabId, SettingsFile),
     Review(TabId),
     Choose(TabId),
     Stop(TabId),
@@ -44,6 +51,8 @@ pub enum Outcome {
     Reviewed(Connection, Box<SyscallCapturePlan>),
     Destination(PathBuf),
     Saved(SyscallCapture, Result<Arc<Trace>, String>),
+    SettingsLoaded(PathBuf, SyscallOptions),
+    SettingsSaved(PathBuf),
 }
 
 struct Review {
@@ -76,6 +85,21 @@ impl Default for Inputs {
 }
 
 impl Inputs {
+    fn from_options(options: SyscallOptions) -> anyhow::Result<Self> {
+        Ok(Self {
+            program: options.program,
+            arguments: serde_json::to_string(&options.arguments)?,
+            directory: options.directory,
+            seconds: options.seconds.to_string(),
+            budget: options.max_mib.to_string(),
+            string_size: options.string_size.to_string(),
+            preset: PRESETS
+                .iter()
+                .position(|(_, filter)| *filter == options.filter)
+                .context("Unsupported syscall capture preset")?,
+        })
+    }
+
     fn options(&self) -> anyhow::Result<SyscallOptions> {
         let arguments = if self.arguments.trim().is_empty() {
             Vec::new()
@@ -127,6 +151,7 @@ pub(super) struct ViewState {
     source: Option<Connection>,
     review: Option<Review>,
     stop: Option<SyscallCaptureStop>,
+    settings_path: Option<PathBuf>,
 }
 
 impl Drop for ViewState {
@@ -240,6 +265,7 @@ impl TerminalApp {
                 }
             }
             Action::Review(tab) => self.review_syscall_capture(tab, ctx),
+            Action::SettingsFile(tab, choice) => self.syscall_settings_file(tab, choice, ctx),
             Action::Choose(tab) => self.choose_syscall_destination(tab, ctx),
             Action::Stop(tab) => {
                 if let Some(page) = self.syscall_page(tab)
@@ -290,6 +316,27 @@ impl TerminalApp {
                             ctx,
                         );
                     }
+                    Ok(Some(Outcome::SettingsLoaded(path, options))) => {
+                        match Inputs::from_options(options) {
+                            Ok(inputs) => {
+                                page.capture.inputs = inputs;
+                                page.capture.review = None;
+                                page.status = Some(format!(
+                                    "Loaded syscall capture settings · {}",
+                                    safe_text(&path.display().to_string())
+                                ));
+                                page.capture.settings_path = Some(path);
+                            }
+                            Err(error) => page.status = Some(format!("{error:#}")),
+                        }
+                    }
+                    Ok(Some(Outcome::SettingsSaved(path))) => {
+                        page.status = Some(format!(
+                            "Saved syscall capture settings · {}",
+                            safe_text(&path.display().to_string())
+                        ));
+                        page.capture.settings_path = Some(path);
+                    }
                     Ok(None) => (),
                     Err(error) => page.status = Some(error),
                 }
@@ -300,6 +347,59 @@ impl TerminalApp {
     fn syscall_capture_input(&mut self, tab: TabId) -> Option<&mut PageState> {
         self.syscall_page(tab)
             .filter(|page| page.capture.open && page.pending.is_none())
+    }
+
+    fn syscall_settings_file(
+        &mut self,
+        tab: TabId,
+        choice: SettingsFile,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.tabs.active_id() != Some(tab) {
+            return;
+        }
+        let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
+            return;
+        };
+        let profile_path = self.store.path().to_owned();
+        let Some(page) = self.syscall_capture_input(tab) else {
+            return;
+        };
+        let saved_json = if matches!(choice, SettingsFile::Save) {
+            match page
+                .capture
+                .inputs
+                .options()
+                .and_then(SyscallOptions::settings_json)
+            {
+                Ok(json) => Some(json),
+                Err(error) => {
+                    page.status = Some(format!("{error:#}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let purpose = file_picker::Purpose::CaptureSettings {
+            current: page.capture.settings_path.clone().unwrap_or(profile_path),
+            kind: file_picker::CaptureSettingsKind::Syscall,
+            save: saved_json.is_some(),
+        };
+        let ticket = page.begin("Choosing a syscall capture settings file…");
+        run(ctx, tab, ticket, move || {
+            let Some(file) = file_picker::pick(owner, purpose)? else {
+                return Ok(None);
+            };
+            Ok(Some(if let Some(json) = saved_json {
+                w11term::transcript::save(&file.path, &json, false)
+                    .context("Saving new syscall capture settings")?;
+                Outcome::SettingsSaved(file.path)
+            } else {
+                let options = SyscallOptions::load_settings(&file.path)?;
+                Outcome::SettingsLoaded(file.path, options)
+            }))
+        });
     }
 
     fn review_syscall_capture(&mut self, tab: TabId, ctx: &ComponentContext<Self>) {
@@ -512,6 +612,26 @@ impl ViewState {
             ));
         }
         let mut fields = Vec::new();
+        fields.push(KeyedView::new(
+            "capture-settings-files",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    Button::new()
+                        .is_enabled(idle)
+                        .on_click(ctx.callback(move |_| {
+                            message(Action::SettingsFile(tab, SettingsFile::Open))
+                        }))
+                        .content("Load settings…"),
+                    Button::new()
+                        .is_enabled(idle && !self.inputs.program.trim().is_empty())
+                        .on_click(ctx.callback(move |_| {
+                            message(Action::SettingsFile(tab, SettingsFile::Save))
+                        }))
+                        .content("Save settings…"),
+                )),
+        ));
         if targets.is_empty() {
             fields.push(text(
                 "connect",

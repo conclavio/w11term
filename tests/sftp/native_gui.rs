@@ -27,7 +27,7 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reviews a native SSH trace, requests Stop and opens the verified capture"]
+#[ignore = "round-trips syscall settings, reviews a native SSH trace, and opens the verified capture after Stop"]
 async fn native_syscall_capture_reviews_stops_and_opens_the_verified_trace() {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, _, server) =

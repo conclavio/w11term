@@ -1619,11 +1619,12 @@ impl TerminalApp {
             FileChoice::Capture => file_picker::Purpose::OpenPacketCapture(capture()),
             FileChoice::Compare => file_picker::Purpose::ComparePacketCapture(capture()),
             FileChoice::Save => file_picker::Purpose::SavePacketCapture(capture()),
-            FileChoice::OpenSettings => {
-                file_picker::Purpose::OpenPacketCaptureSettings(initial.into())
-            }
-            FileChoice::SaveSettings => {
-                file_picker::Purpose::SavePacketCaptureSettings(initial.into())
+            FileChoice::OpenSettings | FileChoice::SaveSettings => {
+                file_picker::Purpose::CaptureSettings {
+                    current: initial.into(),
+                    kind: file_picker::CaptureSettingsKind::Packet,
+                    save: matches!(choice, FileChoice::SaveSettings),
+                }
             }
         };
         let before = if matches!(choice, FileChoice::Compare) {
