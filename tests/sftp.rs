@@ -2537,6 +2537,9 @@ async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
         string_size: 128,
         filter: control::SyscallFilter::Files,
     };
+    let settings = local.path().join("syscall settings.json");
+    fs::write(&settings, options.settings_json().unwrap()).unwrap();
+    let options = control::SyscallOptions::load_settings(&settings).unwrap();
     let preview = registry
         .execute(
             Request::PreviewSyscallCapture {
@@ -2567,8 +2570,10 @@ async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
         job_id: job.into(),
         output_file: output_file.clone(),
     };
-    let mut changed = options.clone();
-    changed.arguments.push("changed".into());
+    let mut edited = options.clone();
+    edited.arguments.push("changed".into());
+    fs::write(&settings, edited.settings_json().unwrap()).unwrap();
+    let changed = control::SyscallOptions::load_settings(&settings).unwrap();
     let error = registry
         .execute(request(changed), callback.clone())
         .await

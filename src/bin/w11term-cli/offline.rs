@@ -45,6 +45,10 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
             syscall_capture::COMPARE_HELP,
             syscall_capture::compare_files,
         ),
+        syscall_capture::SAVE_SETTINGS_VERB => (
+            syscall_capture::SAVE_SETTINGS_HELP,
+            syscall_capture::save_settings,
+        ),
         triage::COMPARE_VERB => (triage::COMPARE_HELP, triage::compare_files),
         packet_capture::INSPECT_VERB => {
             (packet_capture::INSPECT_HELP, packet_capture::inspect_file)

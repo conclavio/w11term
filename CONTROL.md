@@ -1852,6 +1852,15 @@ $job = [guid]::NewGuid().ToString('N')
 
 From a separate prompt, `stop-syscall-capture --pane 1 --connection-generation GENERATION --job-id JOB` requests an early stop on the matching job. Choose a fresh job ID for each run. Stop, the deadline, and the byte limit terminate the launched command and traced descendants. The result gives the stop reason and reports the command's exit status when it completes on its own. A file that reaches the byte limit can end partway through a record.
 
+For comparable runs, save the Linux program, literal arguments, working directory, preset, and limits with `save-syscall-capture-settings`. Pass `--settings-file` to both preview and capture in place of those flags. Each run still selects its own pane, uses its fresh review and job ID, and saves to a new output file.
+
+```powershell
+& $ctl save-syscall-capture-settings --program /usr/bin/ls --arg -l --arg /tmp --directory /tmp --filter files --seconds 15 --max-mib 4 --output-file '.\working settings.json'
+$traceOptions = @('--pane','1','--settings-file','.\working settings.json')
+$plan = (& $ctl --pid 12345 preview-syscall-capture @traceOptions | ConvertFrom-Json).result.plan
+& $ctl --pid 12345 capture-syscalls @traceOptions --connection-generation $plan.connection_generation --review-id $plan.review_id --job-id ([guid]::NewGuid().ToString('N')) --output-file '.\working.strace'
+```
+
 The original PID-tagged trace includes per-call timing and decoded descriptor details. One byte budget covers the full stream across descendants. w11term checks the SFTP download's size and SHA-256 before acknowledging remote cleanup and saving a new local file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
 
 Open **More → Diagnostics → Syscall trace viewer** to inspect a saved trace offline. Open one combined log or select the files from the same `strace -ff` run together. Names ending in `.PID` identify the process for those split logs. w11term merges files with epoch timestamps. It also merges short runs with ordered time-of-day timestamps that fit in a window under 12 hours. A merge across midnight requires at least one file to show the rollover in its record order. When timestamps are ambiguous or incomplete, the viewer keeps the files in their input order. Capture with `-ttt` to retain dates in longer runs. [strace timestamp formats](https://github.com/strace/strace/blob/master/doc/strace-log-merge.1.in)

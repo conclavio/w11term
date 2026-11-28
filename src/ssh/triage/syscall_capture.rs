@@ -1,7 +1,7 @@
 use super::{
     ArtifactMessages, ConnectionShare, PendingChannel, Target,
     capture_job::{CaptureStop, Kind, validate_job},
-    diagnostic_destination, quote,
+    capture_settings, diagnostic_destination, quote,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,14 @@ impl SyscallOptions {
     pub const DEFAULT_SECONDS: u8 = 15;
     pub const DEFAULT_MAX_MIB: u8 = 16;
     pub const DEFAULT_STRING_SIZE: u16 = 128;
+
+    pub fn load_settings(path: &Path) -> Result<Self> {
+        capture_settings::load::<Self>(path, "syscall capture", 64)?.validate()
+    }
+
+    pub fn settings_json(self) -> Result<String> {
+        capture_settings::json(self.validate()?)
+    }
 
     pub fn validate(self) -> Result<Self> {
         ensure!(

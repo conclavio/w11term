@@ -1,51 +1,17 @@
 use super::PacketCaptureOptions;
-use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Read, path::Path};
+use crate::ssh::triage::capture_settings;
+use anyhow::{Context, Result};
+use std::path::Path;
 
-const SETTINGS_VERSION: u8 = 1;
-const MAX_SETTINGS_BYTES: u64 = 16 * 1024;
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Settings {
-    schema_version: u8,
-    options: PacketCaptureOptions,
-}
+const MAX_SETTINGS_KIB: u64 = 16;
 
 impl PacketCaptureOptions {
     pub fn load_settings(path: &Path) -> Result<Self> {
-        let file = File::open(path).context("Opening packet capture settings")?;
-        ensure!(
-            file.metadata()?.is_file(),
-            "Choose a packet capture settings file"
-        );
-        let mut bytes = Vec::new();
-        file.take(MAX_SETTINGS_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .context("Reading packet capture settings")?;
-        ensure!(
-            bytes.len() as u64 <= MAX_SETTINGS_BYTES,
-            "Packet capture settings exceed 16 KiB"
-        );
-        let settings: Settings =
-            serde_json::from_slice(&bytes).context("Reading packet capture settings JSON")?;
-        ensure!(
-            settings.schema_version == SETTINGS_VERSION,
-            "Unsupported packet capture settings version {}",
-            settings.schema_version
-        );
-        settings.options.validate()
+        capture_settings::load::<Self>(path, "packet capture", MAX_SETTINGS_KIB)?.validate()
     }
 
     pub fn settings_json(self) -> Result<String> {
-        let settings = Settings {
-            schema_version: SETTINGS_VERSION,
-            options: self.validate()?,
-        };
-        let mut json = serde_json::to_string_pretty(&settings)?;
-        json.push('\n');
-        Ok(json)
+        capture_settings::json(self.validate()?)
     }
 
     pub fn save_settings(self, path: &Path) -> Result<()> {
@@ -90,7 +56,7 @@ mod tests {
         saved["schema_version"] = json!(1);
         saved["review_id"] = json!("previous review");
         assert!(load(&saved).is_err());
-        fs::write(&path, vec![b' '; MAX_SETTINGS_BYTES as usize + 1]).unwrap();
+        fs::write(&path, vec![b' '; MAX_SETTINGS_KIB as usize * 1024 + 1]).unwrap();
         assert!(
             PacketCaptureOptions::load_settings(&path)
                 .unwrap_err()
