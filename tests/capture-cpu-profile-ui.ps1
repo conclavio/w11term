@@ -112,6 +112,22 @@ try {
     }
     $null = Control @('focus-pane','--pane',"$remotePane")
     Wait-Focus $remotePane
+    Click-CaptureButton ('Verify capture report' + [char]0x2026)
+    $dialog = Wait-OwnedDialog 'Open CPU profile report'
+    $null = Wait-Until 'choose the saved PID capture report' {
+        [FixtureDialog]::SetFilename($dialog, $reportPath, [IO.Path]::GetFileName($reportPath))
+    }
+    $null = Wait-Until 'open the saved PID capture report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    Click-CaptureButton ('Repeat from report' + [char]0x2026)
+    $null = Wait-Until 'report repeat leaves PID blank even on the original live pane' {
+        $pidField = Find-Element 'Linux process ID' $editType
+        $seconds = Find-Element 'Duration in seconds' $editType
+        $review = Find-Element 'Review CPU profile' $button
+        $pidField -and !$pidField.GetCurrentPattern($valuePattern).Current.Value -and
+            $seconds -and $seconds.GetCurrentPattern($valuePattern).Current.Value -eq '2' -and
+            $review -and !$review.Current.IsEnabled -and !(Find-Element 'Record CPU profile' $button)
+    }
+    Click-CaptureButton 'Back to flame graph'
     Click-CaptureButton $repeat
     $null = Wait-Until 'the repeated PID draft restores its target and sampling' {
         $pidField = Find-Element 'Linux process ID' $editType

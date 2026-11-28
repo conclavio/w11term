@@ -6,7 +6,10 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use w11term::{
     control::{CpuCallGraph, CpuProfileOptions},
-    ssh::{CaptureStop, CpuLaunchOptions, CpuLaunchPlan, CpuProfilePlan, TriageTarget},
+    ssh::{
+        CaptureStop, CpuLaunchOptions, CpuLaunchPlan, CpuProfileCaptureReport, CpuProfilePlan,
+        CpuProfileReportTarget, TriageTarget,
+    },
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -18,6 +21,7 @@ pub struct Connection {
 pub enum Action {
     Open,
     Repeat,
+    RepeatReport,
     Back,
     Edit(Field, String),
     Mode(usize),
@@ -109,6 +113,58 @@ impl Form {
             source: Some(source),
             ..Self::new()
         }
+    }
+
+    fn repeat(
+        original: ProfileSource,
+        options: Options,
+        keep_raw: bool,
+        expected_process: Option<(Connection, u64)>,
+    ) -> Self {
+        let (target, seconds, frequency, mode) = match options {
+            Options::Process(options) => (
+                TargetInput::Process(
+                    expected_process.map_or_else(String::new, |_| options.target_pid.to_string()),
+                ),
+                options.seconds,
+                options.frequency,
+                options.call_graph,
+            ),
+            Options::Command(options) => (
+                TargetInput::Command {
+                    program: options.program,
+                    arguments: serde_json::json!(options.arguments).to_string(),
+                    directory: options.directory,
+                },
+                options.seconds,
+                options.frequency,
+                options.call_graph,
+            ),
+        };
+        Self {
+            target,
+            seconds: seconds.to_string(),
+            frequency: frequency.to_string(),
+            mode,
+            keep_raw,
+            source: None,
+            expected_process,
+            original: Some(original),
+            review: None,
+        }
+    }
+
+    fn from_report(report: &CpuProfileCaptureReport, original: ProfileSource) -> Self {
+        let options = match &report.reviewed.target {
+            CpuProfileReportTarget::Process { options, .. } => Options::Process(*options),
+            CpuProfileReportTarget::Command { options, .. } => Options::Command(options.clone()),
+        };
+        Self::repeat(
+            original,
+            options,
+            report.reviewed.raw_perf_data_requested,
+            None,
+        )
     }
 
     fn launches(&self) -> bool {
@@ -332,41 +388,15 @@ impl Form {
 
 impl Repeat {
     fn draft(&self, active: Option<Connection>, original: ProfileSource) -> Form {
-        let mut form = Form {
-            keep_raw: self.keep_raw,
-            original: Some(original),
-            ..Form::new()
+        let (options, expected_process) = match &self.review.plan {
+            ReviewedTarget::Process(plan) => (
+                Options::Process(plan.options),
+                (active == Some(self.review.connection))
+                    .then_some((self.review.connection, plan.process_start_ticks)),
+            ),
+            ReviewedTarget::Command(plan) => (Options::Command(plan.options.clone()), None),
         };
-        let (seconds, frequency, mode) = match &self.review.plan {
-            ReviewedTarget::Process(plan) => {
-                if active == Some(self.review.connection) {
-                    form.target = TargetInput::Process(plan.options.target_pid.to_string());
-                    form.expected_process =
-                        Some((self.review.connection, plan.process_start_ticks));
-                }
-                (
-                    plan.options.seconds,
-                    plan.options.frequency,
-                    plan.options.call_graph,
-                )
-            }
-            ReviewedTarget::Command(plan) => {
-                form.target = TargetInput::Command {
-                    program: plan.options.program.clone(),
-                    arguments: serde_json::json!(plan.options.arguments).to_string(),
-                    directory: plan.options.directory.clone(),
-                };
-                (
-                    plan.options.seconds,
-                    plan.options.frequency,
-                    plan.options.call_graph,
-                )
-            }
-        };
-        form.seconds = seconds.to_string();
-        form.frequency = frequency.to_string();
-        form.mode = mode;
-        form
+        Form::repeat(original, options, self.keep_raw, expected_process)
     }
 }
 
@@ -490,6 +520,15 @@ impl TerminalApp {
                     && let Some(capture) = &graph.capture
                 {
                     panel.capture = Some(capture.repeat.draft(active, graph.source()));
+                    panel.status = None;
+                }
+            }
+            Action::RepeatReport => {
+                let panel = &mut self.flame_graph;
+                if let Some(graph) = panel.visible_graph()
+                    && let Some(verified) = &graph.verified_report
+                {
+                    panel.capture = Some(Form::from_report(&verified.report, graph.source()));
                     panel.status = None;
                 }
             }

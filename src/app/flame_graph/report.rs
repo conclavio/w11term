@@ -1,5 +1,6 @@
 use super::{
-    Action as ViewerAction, Loaded, Outcome as ViewerOutcome, Panel, ProfileSource, message, text,
+    Action as ViewerAction, Loaded, Outcome as ViewerOutcome, Panel, ProfileSource, capture,
+    message, text,
 };
 use crate::app::*;
 use std::{path::Path, path::PathBuf};
@@ -23,7 +24,7 @@ pub enum Outcome {
 
 pub struct Verified {
     path: PathBuf,
-    report: Arc<CpuProfileCaptureReport>,
+    pub(super) report: Arc<CpuProfileCaptureReport>,
     raw_path: Option<PathBuf>,
     expanded: bool,
 }
@@ -198,7 +199,15 @@ pub(super) fn fields(
             .content("Verify capture report…"),
     ));
     if let Some(verified) = &loaded.verified_report {
-        let mut content = Vec::new();
+        let mut content = vec![KeyedView::new(
+            "repeat-from-report",
+            Button::new()
+                .is_enabled(idle)
+                .on_click(
+                    ctx.callback(|_| message(ViewerAction::Capture(capture::Action::RepeatReport))),
+                )
+                .content("Repeat from report…"),
+        )];
         if verified.report.raw_perf_data.is_some() {
             content.push(KeyedView::new(
                 "verify-raw",
