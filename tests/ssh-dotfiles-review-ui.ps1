@@ -41,15 +41,10 @@ function Save-RetainedDotfiles([string]$Path) {
     }
 }
 function Save-ProfileEdit {
-    $saveProfile = Wait-Until 'enabled profile save action' {
+    Invoke-Button (Wait-Until 'enabled profile save action' {
         $save = Find-Element 'Save profile changes' $button
         if ($save -and $save.Current.IsEnabled) { $save }
-    }
-    if ($saveProfile.Current.IsOffscreen) {
-        $profileScroll = Find-NativeVerticalScroll $saveProfile
-        if ($profileScroll) { $profileScroll.SetScrollPercent(-1, 100) }
-    }
-    Click 'Save profile changes'
+    })
 }
 function Wait-Review {
     $null = Wait-Until 'dotfiles review is ready on the named account' {
