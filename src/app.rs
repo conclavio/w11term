@@ -7836,7 +7836,10 @@ impl Component for TerminalApp {
             Message::PacketCapture(action) => self.packet_capture_action(action, context),
             Message::SyscallView(action) => self.syscall_view_action(action, context),
             Message::OpenRouter(action) => self.openrouter_action(action, context),
-            Message::WindowsRelease(action) => self.windows_release.update(action, context),
+            Message::WindowsRelease(action) => {
+                let owner = self.keyboard.hwnd().map(|window| window.0 as usize);
+                self.windows_release.update(action, owner, context);
+            }
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 self.refresh_notification_visibility();

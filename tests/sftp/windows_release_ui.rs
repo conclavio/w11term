@@ -1,16 +1,18 @@
 use super::drive_gui;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Cursor, Write},
     net::{TcpListener, TcpStream},
+    path::Path,
     time::{Duration, Instant},
 };
 use w11term::windows_release::{VERSION, build_commit};
 
 #[test]
-#[ignore = "opens Settings in WinUI and checks GitHub release metadata using loopback HTTP"]
-fn native_windows_release_checks_only_when_requested_and_can_retry() {
+#[ignore = "checks release metadata and saves a verified Windows ZIP through WinUI and loopback HTTP"]
+fn native_windows_release_checks_and_saves_verified_zip() {
     let state = tempfile::tempdir().unwrap();
     let root = state.path();
     fs::write(root.join("profiles.json"), br#"{"profiles":{}}"#).unwrap();
@@ -25,6 +27,13 @@ fn native_windows_release_checks_only_when_requested_and_can_retry() {
     } else {
         sample
     };
+    let archive = fixture_zip();
+    let expected_archive = archive.clone();
+    let digest: String = Sha256::digest(&archive)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let checksum = format!("{digest}  w11term-windows-x64.zip\n");
     let (running, expected) = match build_commit() {
         Some(revision) => (
             format!("Running w11term {VERSION} · build-{}", &revision[..12]),
@@ -40,7 +49,8 @@ fn native_windows_release_checks_only_when_requested_and_can_retry() {
         serde_json::to_vec(&json!({
             "running": running,
             "first": expected,
-            "retry": format!("Latest Windows build · build-{}", &other[..12])
+            "retry": format!("Latest Windows build · build-{}", &other[..12]),
+            "published": format!("Published 2026-11-27 · {:.1} MiB ZIP", archive.len() as f64 / 1048576.0)
         }))
         .unwrap(),
     )
@@ -53,11 +63,54 @@ fn native_windows_release_checks_only_when_requested_and_can_retry() {
                 checks.join(format!("release-check-{index}")).exists(),
                 "unexpected automatic release request"
             );
-            respond(stream, response);
+            respond_metadata(stream, response, archive.len(), &digest, checksum.len());
+        }
+        let prefix = format!(
+            "/conclavio/w11term/releases/download/build-{}/w11term-windows-x64.zip",
+            &other[..12]
+        );
+        for stage in ["bad", "good", "cancel"] {
+            let stream = accept(&listener);
+            assert!(
+                checks.join(format!("release-download-{stage}")).exists(),
+                "unexpected release download"
+            );
+            let (mut stream, path, _) = request(stream);
+            assert_eq!(path, format!("{prefix}.sha256"));
+            response_head(&mut stream, "200 OK", checksum.len());
+            stream.write_all(checksum.as_bytes()).unwrap();
+            drop(stream);
+            let (mut stream, path, _) = request(accept(&listener));
+            assert_eq!(path, prefix);
+            response_head(&mut stream, "200 OK", archive.len());
+            match stage {
+                "bad" => {
+                    let mut corrupted = archive.clone();
+                    corrupted[0] ^= 1;
+                    stream.write_all(&corrupted).unwrap();
+                }
+                "good" => stream.write_all(&archive).unwrap(),
+                "cancel" => {
+                    let split = archive.len() / 2;
+                    stream.write_all(&archive[..split]).unwrap();
+                    fs::write(checks.join("release-download-cancel-ready"), []).unwrap();
+                    wait_for_file(&checks.join("release-download-cancelled"));
+                    let _ = stream.write_all(&archive[split..]);
+                }
+                _ => unreachable!(),
+            }
         }
     });
     drive_gui("windows-release-ui.ps1", root);
     server.join().unwrap();
+    let saved = root.join("verified releases").join("release 雪.zip");
+    assert_eq!(fs::read(&saved).unwrap(), expected_archive);
+    let mut zone = saved.into_os_string();
+    zone.push(":Zone.Identifier");
+    assert_eq!(
+        fs::read_to_string(&zone).unwrap(),
+        "[ZoneTransfer]\r\nZoneId=3\r\n"
+    );
 }
 
 fn accept(listener: &TcpListener) -> TcpStream {
@@ -75,7 +128,32 @@ fn accept(listener: &TcpListener) -> TcpStream {
     }
 }
 
-fn respond(mut stream: TcpStream, commit: Option<&str>) {
+fn fixture_zip() -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            "build.txt",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+    writer.write_all(&vec![b'x'; 1100 * 1024]).unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+fn wait_for_file(file: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !file.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "missing fixture signal {}",
+            file.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn request(mut stream: TcpStream) -> (TcpStream, String, bool) {
     stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -83,10 +161,13 @@ fn respond(mut stream: TcpStream, commit: Option<&str>) {
     let mut reader = BufReader::new(&mut stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
-    assert_eq!(
-        line.trim_end(),
-        "GET /repos/conclavio/w11term/releases/latest HTTP/1.1"
-    );
+    let path = line
+        .trim_end()
+        .strip_prefix("GET ")
+        .unwrap()
+        .strip_suffix(" HTTP/1.1")
+        .unwrap()
+        .to_owned();
     let mut git_api = false;
     loop {
         line.clear();
@@ -98,6 +179,26 @@ fn respond(mut stream: TcpStream, commit: Option<&str>) {
         assert!(!header.starts_with("authorization:") && !header.starts_with("cookie:"));
         git_api |= header.starts_with("accept: application/vnd.github+json");
     }
+    (stream, path, git_api)
+}
+
+fn response_head(stream: &mut TcpStream, status: &str, size: usize) {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+}
+
+fn respond_metadata(
+    stream: TcpStream,
+    commit: Option<&str>,
+    bytes: usize,
+    digest: &str,
+    checksum_bytes: usize,
+) {
+    let (mut stream, path, git_api) = request(stream);
+    assert_eq!(path, "/repos/conclavio/w11term/releases/latest");
     assert!(git_api);
     let (status, body) = match commit {
         Some(commit) => (
@@ -109,17 +210,14 @@ fn respond(mut stream: TcpStream, commit: Option<&str>) {
                 "draft": false,
                 "prerelease": false,
                 "assets": [
-                    {"name":"w11term-windows-x64.zip","state":"uploaded","size":45038313},
-                    {"name":"w11term-windows-x64.zip.sha256","state":"uploaded","size":90}
+                    {"name":"w11term-windows-x64.zip","state":"uploaded","size":bytes,"digest":format!("sha256:{digest}")},
+                    {"name":"w11term-windows-x64.zip.sha256","state":"uploaded","size":checksum_bytes}
                 ]
             }))
             .unwrap(),
         ),
         None => ("429 Too Many Requests", String::new()),
     };
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    ).unwrap();
+    response_head(&mut stream, status, body.len());
+    stream.write_all(body.as_bytes()).unwrap();
 }

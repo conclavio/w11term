@@ -45,6 +45,7 @@ pub(super) enum Purpose {
     DefaultDownloadFolder,
     DownloadFolder,
     Save(String),
+    SaveWindowsZip(String),
     SaveSearchResults,
     Scrollback,
     PaneImage,
@@ -695,6 +696,15 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 let suggested: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
+                None
+            }
+            Purpose::SaveWindowsZip(suggestion) => {
+                dialog.SetTitle(w!("Save verified Windows ZIP"))?;
+                let suggested: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
+                dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
+                dialog.SetDefaultExtension(w!("zip"))?;
+                options &= !FOS_OVERWRITEPROMPT;
+                options |= FOS_PATHMUSTEXIST | FOS_NOTESTFILECREATE | FOS_DONTADDTORECENT;
                 None
             }
             Purpose::SaveSearchResults => {
