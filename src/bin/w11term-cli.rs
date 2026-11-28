@@ -354,7 +354,12 @@ async fn main() -> ExitCode {
         );
         println!("\n{}", diagnostics::HELP);
         println!("\n{}", command_reference::HELP);
-        println!("\n{}\n{}", dotfiles::HELP, dotfiles::INSPECT_HELP);
+        println!(
+            "\n{}\n{}\n{}",
+            dotfiles::HELP,
+            dotfiles::INSPECT_HELP,
+            dotfiles::COMPARE_HELP
+        );
         println!("{}", command_reference::OPEN_HELP);
         return ExitCode::SUCCESS;
     }

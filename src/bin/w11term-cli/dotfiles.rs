@@ -18,6 +18,9 @@ pub(super) const HELP: &str = concat!(
 pub(super) const INSPECT_VERB: &str = "inspect-dotfiles-bundle";
 pub(super) const INSPECT_HELP: &str =
     "w11term-cli inspect-dotfiles-bundle BUNDLE [--shell bash|zsh|fish [--sha256 HEX]]";
+pub(super) const COMPARE_VERB: &str = "compare-dotfiles-bundles";
+pub(super) const COMPARE_HELP: &str =
+    "w11term-cli compare-dotfiles-bundles BEFORE AFTER [--shell bash|zsh|fish] [--include-text]";
 
 pub(super) fn save(args: &[String], output: &mut dyn Write) -> Result<()> {
     let mut shell = None;
@@ -171,6 +174,36 @@ pub(super) fn inspect(args: &[String], output: &mut dyn Write) -> Result<()> {
         .map(|(shell, digest)| json!({"shell": shell, "bundle_sha256": digest}))
         .collect();
     let reply = Reply::from_result(Ok(json!({"version": bundle.version, "shells": shells})));
+    serde_json::to_writer(&mut *output, &reply)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+pub(super) fn compare(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let [before_path, after_path, options @ ..] = args else {
+        bail!("Provide the before and after dotfiles bundle paths");
+    };
+    let mut options = options.iter();
+    let mut shell = None;
+    let mut include_text = false;
+    while let Some(flag) = options.next() {
+        match flag.as_str() {
+            "--shell" => {
+                ensure!(shell.is_none(), "specify --shell only once");
+                shell = Some(dotfile_shell(options.next().map(String::as_str))?);
+            }
+            "--include-text" => {
+                ensure!(!include_text, "specify --include-text only once");
+                include_text = true;
+            }
+            _ => bail!("unsupported dotfiles option {flag}"),
+        }
+    }
+    let before = DotfileBundle::load(Path::new(before_path))
+        .with_context(|| format!("Opening before dotfiles bundle {before_path}"))?;
+    let after = DotfileBundle::load(Path::new(after_path))
+        .with_context(|| format!("Opening after dotfiles bundle {after_path}"))?;
+    let reply = Reply::from_result(Ok(before.compare_local(&after, shell, include_text)?));
     serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;
     Ok(())

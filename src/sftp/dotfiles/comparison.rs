@@ -21,6 +21,80 @@ struct FragmentChange {
     after: Option<String>,
 }
 
+impl DotfileBundle {
+    pub fn compare_local(
+        &self,
+        after: &Self,
+        selected_shell: Option<DotfileShell>,
+        include_text: bool,
+    ) -> Result<Value> {
+        self.validate_for_editing()
+            .context("Validating the before dotfiles bundle")?;
+        after
+            .validate_for_editing()
+            .context("Validating the after dotfiles bundle")?;
+        let mut shells = Vec::new();
+        let mut changed = false;
+        for shell in DotfileShell::ALL {
+            if selected_shell.is_some_and(|selected| selected != shell) {
+                continue;
+            }
+            let before = self.has_fragments_for(shell).then(|| self.fragments(shell));
+            let after = after
+                .has_fragments_for(shell)
+                .then(|| after.fragments(shell));
+            if before.is_none() && after.is_none() {
+                continue;
+            }
+            let digest = |fragments: &Option<[String; 2]>| {
+                fragments
+                    .as_ref()
+                    .map(|[environment, prompt]| bundle_id(environment, prompt))
+            };
+            let before_digest = digest(&before);
+            let after_digest = digest(&after);
+            let change = match (&before_digest, &after_digest) {
+                (None, _) => "added",
+                (_, None) => "removed",
+                (Some(before), Some(after)) if before == after => "unchanged",
+                _ => "changed",
+            };
+            changed |= before_digest != after_digest;
+            let fragments: Vec<_> = FRAGMENT_ROLES
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, role)| {
+                    let before = before.as_ref().map(|fragments| fragments[index].as_str());
+                    let after = after.as_ref().map(|fragments| fragments[index].as_str());
+                    if before.unwrap_or_default() == after.unwrap_or_default() {
+                        return None;
+                    }
+                    Some(if include_text {
+                        json!({"role": role, "before": before, "after": after})
+                    } else {
+                        json!({"role": role})
+                    })
+                })
+                .collect();
+            shells.push(json!({
+                "shell": shell,
+                "change": change,
+                "before_bundle_sha256": before_digest,
+                "after_bundle_sha256": after_digest,
+                "changed_fragments": fragments,
+            }));
+        }
+        if let Some(shell) = selected_shell {
+            ensure!(
+                !shells.is_empty(),
+                "Neither bundle has fragments for {}",
+                shell.label()
+            );
+        }
+        Ok(json!({"changed": changed, "shells": shells}))
+    }
+}
+
 impl Engine {
     pub(super) async fn verified_dotfile_fragments(
         &self,

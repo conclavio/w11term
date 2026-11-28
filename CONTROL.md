@@ -1376,6 +1376,15 @@ $digest = $before.result.shells[0].bundle_sha256
 & $ctl inspect-dotfiles-bundle '.\candidate.json' --shell bash --sha256 $digest
 ```
 
+Use `compare-dotfiles-bundles BEFORE AFTER` to compare two local bundles. It reports `result.changed` and lists the shells present in either file in `result.shells`. Each entry has a `change` of `added`, `removed`, `changed`, or `unchanged` and the `before_bundle_sha256` and `after_bundle_sha256` values. A null digest means the bundle has no fragments for that shell. `changed_fragments` names the affected roles, `environment` and `prompt`.
+
+The comparison uses the normalized text w11term would install. JSON formatting, CRLF versus LF, and a missing final newline on nonempty text produce the same result. Select one shell with `--shell`. Add `--include-text` to see the exact normalized `before` and `after` text of each changed fragment. A successful comparison exits with code 0 even when it finds changes.
+
+```powershell
+$comparison = & $ctl compare-dotfiles-bundles '.\fleet.json' '.\candidate.json' --shell bash | ConvertFrom-Json
+$comparison.result.shells
+```
+
 From the full text preview of an SSH file, **Use in dotfiles editor** brings a snapshot into the connected profile's draft. It opens a new bundle draft if there is no editor open for that profile. Choose the first and last lines and use **Append SSH lines** to select the destination fragment. Select lines outside existing w11term startup blocks. Saving creates a local bundle. Using the bundle on login still requires profile approval and saving.
 
 Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.

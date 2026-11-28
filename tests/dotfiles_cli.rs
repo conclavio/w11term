@@ -20,6 +20,10 @@ fn inspect(directory: &Path, args: &[&str]) -> std::process::Output {
     cli(directory, "inspect-dotfiles-bundle", args)
 }
 
+fn compare(directory: &Path, args: &[&str]) -> std::process::Output {
+    cli(directory, "compare-dotfiles-bundles", args)
+}
+
 fn reply(output: std::process::Output) -> Value {
     assert!(output.status.success(), "{output:?}");
     serde_json::from_slice(&output.stdout).unwrap()
@@ -392,5 +396,143 @@ fn inspection_rejects_an_invalid_bundle_or_unavailable_shell() {
             inspect(root, &[path, "--shell", "bash"]).status.code(),
             Some(1)
         );
+    }
+}
+
+#[test]
+fn compares_the_profile_pin_and_changed_fragment_roles_for_each_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before_path = "old fleet.json";
+    let after_path = "revised fleet.json";
+    let old = json!({"version": 1, "environment": "export EDITOR=vi\r\n", "bash": "PS1=old"});
+    let new = json!({
+        "version": 1,
+        "environment": "export EDITOR=vi",
+        "bash": "PS1=new\r\n",
+        "fish": "set -g fish_greeting new",
+    });
+    fs::write(root.join(before_path), old.to_string()).unwrap();
+    fs::write(root.join(after_path), new.to_string()).unwrap();
+    let report = reply(compare(root, &[before_path, after_path]));
+    assert_eq!(report["result"]["changed"], true);
+    let profiles = |path: &str| reply(inspect(root, &[path]))["result"]["shells"].clone();
+    let (before_pins, after_pins) = (profiles(before_path), profiles(after_path));
+    assert_eq!(
+        report["result"]["shells"],
+        json!([
+            {
+                "shell": "bash",
+                "change": "changed",
+                "before_bundle_sha256": before_pins[0]["bundle_sha256"],
+                "after_bundle_sha256": after_pins[0]["bundle_sha256"],
+                "changed_fragments": [{"role": "prompt"}],
+            },
+            {
+                "shell": "zsh",
+                "change": "unchanged",
+                "before_bundle_sha256": before_pins[1]["bundle_sha256"],
+                "after_bundle_sha256": before_pins[1]["bundle_sha256"],
+                "changed_fragments": [],
+            },
+            {
+                "shell": "fish",
+                "change": "added",
+                "before_bundle_sha256": null,
+                "after_bundle_sha256": after_pins[2]["bundle_sha256"],
+                "changed_fragments": [{"role": "prompt"}],
+            },
+        ])
+    );
+    for fragment_text in ["EDITOR", "PS1", "fish_greeting"] {
+        assert!(!report.to_string().contains(fragment_text));
+    }
+    let zsh = reply(compare(root, &[before_path, after_path, "--shell", "zsh"]));
+    assert_eq!(zsh["result"]["changed"], false);
+    assert_eq!(
+        zsh["result"]["shells"],
+        json!([report["result"]["shells"][1]])
+    );
+}
+
+#[test]
+fn can_review_exact_normalized_changes_for_a_single_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = json!({"version": 1, "fish_environment": "set -gx EDITOR vi\r\n"});
+    let after = json!({"version": 1, "bash": "PS1=new"});
+    fs::write(root.join("before.json"), before.to_string()).unwrap();
+    fs::write(root.join("after.json"), after.to_string()).unwrap();
+    let fish = reply(compare(
+        root,
+        &[
+            "before.json",
+            "after.json",
+            "--shell",
+            "fish",
+            "--include-text",
+        ],
+    ));
+    assert_eq!(fish["result"]["shells"].as_array().unwrap().len(), 1);
+    let removed = &fish["result"]["shells"][0];
+    assert_eq!(removed["change"], "removed");
+    assert_eq!(removed["after_bundle_sha256"], Value::Null);
+    assert_eq!(
+        removed["changed_fragments"],
+        json!([
+            {"role": "environment", "before": "set -gx EDITOR vi\n", "after": null}
+        ])
+    );
+    let added = reply(compare(
+        root,
+        &[
+            "before.json",
+            "after.json",
+            "--shell",
+            "bash",
+            "--include-text",
+        ],
+    ));
+    assert_eq!(
+        added["result"]["shells"][0]["changed_fragments"],
+        json!([
+            {"role": "prompt", "before": null, "after": "PS1=new\n"}
+        ])
+    );
+}
+
+#[test]
+fn comparison_rejects_invalid_bundles_and_unavailable_shells() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fs::write(
+        root.join("valid.json"),
+        json!({"version": 1, "bash": "PS1=new"}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("bad.json"),
+        json!({"version": 2, "bash": "PS1=bad"}).to_string(),
+    )
+    .unwrap();
+    for (args, message) in [
+        (
+            &["bad.json", "valid.json"][..],
+            "Validating the before dotfiles bundle",
+        ),
+        (
+            &["valid.json", "bad.json"],
+            "Validating the after dotfiles bundle",
+        ),
+        (
+            &["valid.json", "valid.json", "--shell", "fish"],
+            "Neither bundle has fragments for Fish",
+        ),
+    ] {
+        let output = compare(root, args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(error["error"].as_str().unwrap().contains(message));
     }
 }

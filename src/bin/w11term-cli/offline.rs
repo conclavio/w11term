@@ -15,6 +15,7 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
         command_reference::VERB => (command_reference::HELP, command_reference::lookup),
         dotfiles::VERB => (dotfiles::HELP, dotfiles::save),
         dotfiles::INSPECT_VERB => (dotfiles::INSPECT_HELP, dotfiles::inspect),
+        dotfiles::COMPARE_VERB => (dotfiles::COMPARE_HELP, dotfiles::compare),
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
         syscall_capture::INSPECT_VERB => (
             syscall_capture::INSPECT_HELP,
