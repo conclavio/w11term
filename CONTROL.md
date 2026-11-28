@@ -1984,6 +1984,8 @@ Choose **Review CPU profile** to check the live process and verified SSH endpoin
 
 Choose **Repeat CPU profile…** on a completed capture to reuse its sampling settings, raw recording choice, and any command inputs. A recorded PID is filled in on its original SSH connection and checked against the original process start time at review. With another pane selected, enter a PID for that pane. Each repeat requires a fresh review and a new destination.
 
+After recording a repeat, choose **Compare with original profile** to open the original stacks as **Before** and the repeated run as **After**. The comparison uses the loaded stacks. **Back to flame graph** returns to the repeated result.
+
 Choose **Stop and save profile** during a recording to finish early and save the collected samples. For an attached PID, the target keeps running. For a profiled command, the remote wrapper stops the workload it started. The viewer and Diagnostics Activity show the stop reason. A requested raw `.perf.data` file uses the same verification and save path as a timed capture.
 
 Select **Keep raw perf recording** during review to save a `.perf.data` file beside the `.folded` file, for either capture target. The PID capture CLI accepts `--perf-data PATH` for a separate destination. w11term streams the raw file over the same SSH channel, checks its byte count and SHA-256, and saves it without replacing an existing file. The raw recording is capped at 32 MiB and can add up to 60 seconds for transfer. A verified raw file is saved even when folded stacks are unavailable.

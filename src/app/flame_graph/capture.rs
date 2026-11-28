@@ -1,4 +1,6 @@
-use super::{Action as ViewerAction, CapturedProfile, Outcome, Profile, message, text};
+use super::{
+    Action as ViewerAction, CapturedProfile, Outcome, Profile, ProfileSource, message, text,
+};
 use crate::app::*;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -46,6 +48,7 @@ pub struct Recording {
     review: Review,
     path: PathBuf,
     keep_raw: bool,
+    original: Option<ProfileSource>,
 }
 
 pub(super) struct Repeat {
@@ -81,6 +84,7 @@ pub(super) struct Form {
     keep_raw: bool,
     source: Option<Connection>,
     expected_process: Option<(Connection, u64)>,
+    original: Option<ProfileSource>,
     pub review: Option<Review>,
 }
 
@@ -94,6 +98,7 @@ impl Form {
             keep_raw: false,
             source: None,
             expected_process: None,
+            original: None,
             review: None,
         }
     }
@@ -326,9 +331,10 @@ impl Form {
 }
 
 impl Repeat {
-    fn draft(&self, active: Option<Connection>) -> Form {
+    fn draft(&self, active: Option<Connection>, original: ProfileSource) -> Form {
         let mut form = Form {
             keep_raw: self.keep_raw,
+            original: Some(original),
             ..Form::new()
         };
         let (seconds, frequency, mode) = match &self.review.plan {
@@ -480,11 +486,10 @@ impl TerminalApp {
             Action::Repeat => {
                 let active = self.profile_connection();
                 let panel = &mut self.flame_graph;
-                if let Some(capture) = panel
-                    .visible_graph()
-                    .and_then(|graph| graph.capture.as_ref())
+                if let Some(graph) = panel.visible_graph()
+                    && let Some(capture) = &graph.capture
                 {
-                    panel.capture = Some(capture.repeat.draft(active));
+                    panel.capture = Some(capture.repeat.draft(active, graph.source()));
                     panel.status = None;
                 }
             }
@@ -609,11 +614,12 @@ impl TerminalApp {
     }
 
     fn record_cpu_capture(&mut self, ctx: &ComponentContext<Self>) {
-        let Some((review, keep_raw)) = self
-            .flame_graph
-            .capture
-            .as_ref()
-            .and_then(|form| form.review.clone().map(|review| (review, form.keep_raw)))
+        let Some((review, keep_raw, original)) =
+            self.flame_graph.capture.as_ref().and_then(|form| {
+                form.review
+                    .clone()
+                    .map(|review| (review, form.keep_raw, form.original.clone()))
+            })
         else {
             return;
         };
@@ -658,6 +664,7 @@ impl TerminalApp {
                                     review,
                                     path: file.path,
                                     keep_raw,
+                                    original,
                                 }))
                             },
                         ),
@@ -676,6 +683,7 @@ impl TerminalApp {
             review,
             path,
             keep_raw,
+            original,
         } = recording;
         let (user, host, port) = match &review.plan {
             ReviewedTarget::Process(plan) => (&plan.user, &plan.host, plan.port),
@@ -721,6 +729,7 @@ impl TerminalApp {
                     let capture = Box::new(CapturedProfile {
                         summary,
                         repeat: Repeat { review, keep_raw },
+                        original,
                     });
                     Ok(Some(Outcome::Captured(Arc::new(profile), path, capture)))
                 })()

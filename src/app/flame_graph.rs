@@ -18,6 +18,7 @@ pub enum Action {
     Close,
     OpenFile(Option<PathBuf>),
     CompareFile,
+    CompareRepeat,
     Compare(compare::Action),
     Differential,
     DifferentialWidth(ProfileSide, Arc<()>),
@@ -55,6 +56,13 @@ pub enum Outcome {
 pub struct CapturedProfile {
     summary: CpuProfileSummary,
     repeat: capture::Repeat,
+    original: Option<ProfileSource>,
+}
+
+#[derive(Clone)]
+struct ProfileSource {
+    profile: Arc<Profile>,
+    path: PathBuf,
 }
 
 struct Loaded {
@@ -248,6 +256,19 @@ impl Panel {
                             .content("Repeat CPU profile…"),
                     ));
                 }
+                if loaded
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.original.is_some())
+                {
+                    fields.push(KeyedView::new(
+                        "compare-repeat",
+                        Button::new()
+                            .is_enabled(idle)
+                            .on_click(send(|| Action::CompareRepeat))
+                            .content("Compare with original profile"),
+                    ));
+                }
                 fields.push(KeyedView::new(
                     "compare",
                     Button::new()
@@ -272,6 +293,13 @@ impl Panel {
 }
 
 impl Loaded {
+    fn source(&self) -> ProfileSource {
+        ProfileSource {
+            profile: self.profile.clone(),
+            path: self.path.clone(),
+        }
+    }
+
     fn new(
         profile: Arc<Profile>,
         path: PathBuf,
@@ -739,6 +767,41 @@ impl TerminalApp {
                     }
                     panel.status = Some("Stop requested. Saving collected CPU samples…".into());
                 }
+            }
+            Action::CompareRepeat => {
+                if !panel.open || panel.pending.is_some() {
+                    return;
+                }
+                let Some(after) = panel.visible_graph() else {
+                    return;
+                };
+                let Some(before) = after
+                    .capture
+                    .as_ref()
+                    .and_then(|capture| capture.original.clone())
+                else {
+                    return;
+                };
+                let after = after.source();
+                let ticket = panel.begin("Comparing the original and repeated CPU profiles…");
+                let rejected = message(Action::Finished(
+                    ticket.clone(),
+                    Err("CPU comparison worker unavailable".into()),
+                ));
+                ctx.spawn_background_with_rejection(
+                    move |scope| {
+                        let outcome = (!scope.is_cancelled()).then(|| Outcome::Compared {
+                            view: Box::new(compare::ViewState::new(
+                                before.profile,
+                                after.profile,
+                                [before.path, after.path],
+                            )),
+                            install_baseline: false,
+                        });
+                        message(Action::Finished(ticket, Ok(outcome)))
+                    },
+                    rejected,
+                );
             }
             Action::OpenFile(_) | Action::CompareFile | Action::Export(_) => {
                 let export = matches!(action, Action::Export(_));
