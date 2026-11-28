@@ -1153,11 +1153,14 @@ try {
         $opened = $destination + '.opened'
         [IO.File]::Exists($opened) -and [IO.File]::ReadAllText($opened) -ceq '-r'
     }
-    $other = Join-Path (Split-Path -Parent $destination) 'packet-report-copy.pcap'
-    [IO.File]::Copy($destination, $other)
+    $other = Join-Path (Split-Path -Parent $destination) 'packet-report-empty.pcap'
+    Write-CaptureFixture $other 1 @()
     Select-Capture $other
     $null = Wait-Until 'switching the capture clears the previous report details' {
-        (Find-Element $other) -and !(Find-Element 'Details from capture report')
+        (Test-CaptureFile $other) -and
+            (Find-Element "PCAP${dot}24 bytes") -and
+            !(Find-Element 'Details from capture report') -and
+            !(Find-Element "Capture matches report${dot}64 bytes verified")
     }
 } finally {
     Close-FixtureApp $app

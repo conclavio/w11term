@@ -77,9 +77,5 @@ try {
 } catch {
     throw "$($_.Exception.Message)$([char]10)$($_.ScriptStackTrace)"
 } finally {
-    if (!$app.HasExited) {
-        $null = $app.CloseMainWindow()
-        if (!$app.WaitForExit(5000)) { $app.Kill(); $app.WaitForExit() }
-    }
-    $app.Dispose()
+    Close-FixtureApp $app
 }
