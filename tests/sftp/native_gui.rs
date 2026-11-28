@@ -85,6 +85,16 @@ async fn native_history_opens_the_source_platform_command_manual() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens platform manuals from a long selected SSH command and retains ordinary reference search"]
+async fn native_selected_terminal_command_resolves_a_subcommand_offline() {
+    let history = format!(
+        "sudo -n /usr/bin/git log -5 --note={}/end\r\nfleet outage\r\nselection-reference-ready\r\n",
+        "r".repeat(108)
+    );
+    run_palette_fixture("selected-command-reference-ui.ps1", b"", Some(&history)).await;
+}
+
 #[test]
 #[ignore = "saves an offline manual example and recalls it in a real PowerShell pane"]
 fn native_reference_examples_save_offline_and_require_explicit_shell_submit() {

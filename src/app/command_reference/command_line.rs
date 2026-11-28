@@ -6,8 +6,8 @@ pub(in crate::app) struct Lookup {
 }
 
 impl Lookup {
-    pub(super) fn new(line: &str, platform: Platform) -> Option<Self> {
-        let (executable, mut tail) = command_head(line, platform)?;
+    pub(super) fn new(line: &str, shell_platform: Platform, platform: Platform) -> Option<Self> {
+        let (executable, mut tail) = command_head(line, shell_platform)?;
         let mut names = vec![executable];
         let mut prefix = names[0].clone();
         while let Some((part, remaining)) = word(tail) {
@@ -180,11 +180,17 @@ mod tests {
 
     #[test]
     fn extracts_literal_linux_prefixes_and_stops_at_shell_punctuation() {
-        let lookup = Lookup::new(r#"LANG="C UTF-8" sudo -n -u operator env -i MODE=plain "/usr/bin/git" log -5 | sed argument"#, LINUX).unwrap();
+        let lookup = Lookup::new(
+            r#"LANG="C UTF-8" sudo -n -u operator env -i MODE=plain "/usr/bin/git" log -5 | sed argument"#,
+            LINUX,
+            WINDOWS,
+        )
+        .unwrap();
         assert_eq!(lookup.names, ["git", "git-log"]);
-        let lookup = Lookup::new("git log; curl example.com", LINUX).unwrap();
+        assert_eq!(lookup.platform(), WINDOWS);
+        let lookup = Lookup::new("git log; curl example.com", LINUX, LINUX).unwrap();
         assert_eq!(lookup.names, ["git", "git-log"]);
-        let lookup = Lookup::new("sudo --unknown command", LINUX).unwrap();
+        let lookup = Lookup::new("sudo --unknown command", LINUX, LINUX).unwrap();
         assert_eq!(lookup.names, ["sudo"]);
     }
 
@@ -193,13 +199,15 @@ mod tests {
         let lookup = Lookup::new(
             r#"& "C:\Program Files\Git\bin\git.EXE" worktree list"#,
             WINDOWS,
+            WINDOWS,
         )
         .unwrap();
         assert_eq!(lookup.names, ["git", "git-worktree", "git-worktree-list"]);
-        let lookup = Lookup::new("Get-ChildItem -LiteralPath 'C:\\report'", WINDOWS).unwrap();
+        let lookup =
+            Lookup::new("Get-ChildItem -LiteralPath 'C:\\report'", WINDOWS, WINDOWS).unwrap();
         assert_eq!(lookup.names, ["get-childitem"]);
-        assert!(Lookup::new("& $tool script", WINDOWS).is_none());
-        assert!(Lookup::new("\"unterminated", WINDOWS).is_none());
-        assert!(Lookup::new("git'log' arg", LINUX).is_none());
+        assert!(Lookup::new("& $tool script", WINDOWS, WINDOWS).is_none());
+        assert!(Lookup::new("\"unterminated", WINDOWS, WINDOWS).is_none());
+        assert!(Lookup::new("git'log' arg", LINUX, LINUX).is_none());
     }
 }
