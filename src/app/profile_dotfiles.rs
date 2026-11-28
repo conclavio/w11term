@@ -10,6 +10,7 @@ use w11term::{
 };
 
 mod bundle;
+mod review;
 
 const TITLE: &str = "SSH dotfiles";
 
@@ -89,6 +90,8 @@ pub enum Action {
     PinVersion(bool),
     Browse,
     Picked(Arc<()>, Result<Option<PathBuf>, String>),
+    Preview,
+    Previewed(Arc<()>, Result<Arc<review::Report>, String>),
     Approve,
     Reviewed(Arc<()>, Box<DotfileSync>, Result<Option<String>, String>),
     Bundle(bundle::Action),
@@ -108,6 +111,7 @@ pub(super) struct Editor {
     pin_version: bool,
     snapshot_version: Option<String>,
     checking: Option<Arc<()>>,
+    preview: review::Preview,
     browsing: Option<Arc<()>>,
     composer: Option<bundle::Editor>,
     error: Option<String>,
@@ -139,6 +143,7 @@ impl Editor {
         self.bundle = path;
         self.snapshot_version = None;
         self.checking = None;
+        self.preview = review::Preview::Closed;
         self.error = None;
     }
 
@@ -244,7 +249,8 @@ impl Editor {
         if let Some(composer) = &self.composer {
             return self.section(id, header, composer.view(id, ctx), ctx);
         }
-        let can_compose = self.browsing.is_none() && self.checking.is_none();
+        let can_compose =
+            self.browsing.is_none() && self.checking.is_none() && !self.preview.loading();
         let mut content = vec![
             KeyedView::new(
                 "bundle",
@@ -353,6 +359,14 @@ impl Editor {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
+        content.push(KeyedView::new(
+            "preview-button",
+            Button::new()
+                .is_enabled(can_compose && !self.bundle.trim().is_empty())
+                .on_click(send(Action::Preview))
+                .content("Preview dotfile changes"),
+        ));
+        self.preview.describe(&mut content);
         content.extend([
             KeyedView::new(
                 "pin-version",
@@ -373,7 +387,7 @@ impl Editor {
                     .spacing(8.0)
                     .children((
                         Button::new()
-                            .is_enabled(self.checking.is_none())
+                            .is_enabled(self.checking.is_none() && self.preview.can_approve())
                             .on_click(send(Action::Approve))
                             .content("Approve dotfiles sync"),
                         Button::new()
@@ -506,8 +520,61 @@ impl TerminalApp {
                 self.store.path(),
                 ctx,
             ),
+            Action::Preview => {
+                let editor = &mut draft.dotfiles;
+                if editor.checking.is_some()
+                    || editor.preview.loading()
+                    || editor.browsing.is_some()
+                    || editor.composer.is_some()
+                    || editor.bundle.trim().is_empty()
+                {
+                    return;
+                }
+                let path = base.join(editor.bundle.trim());
+                let shell = editor.shell;
+                let snapshot = editor.snapshot_version.clone();
+                let approved = editor.approved.clone().map(|mut settings| {
+                    settings.bundle = base.join(&settings.bundle);
+                    settings
+                });
+                let request = Arc::new(());
+                editor.preview = review::Preview::Loading(request.clone());
+                editor.error = None;
+                let rejected = Message::ProfileDotfiles(
+                    id,
+                    Action::Previewed(request.clone(), Err("Bundle preview unavailable".into())),
+                );
+                ctx.spawn_background_with_rejection(
+                    move |_| {
+                        let result = review::Report::read(
+                            &path,
+                            shell,
+                            snapshot.as_deref(),
+                            approved.as_deref(),
+                        )
+                        .map(Arc::new)
+                        .map_err(|err| format!("Previewing dotfile changes: {err:#}"));
+                        Message::ProfileDotfiles(id, Action::Previewed(request, result))
+                    },
+                    rejected,
+                );
+            }
+            Action::Previewed(request, result) => {
+                let editor = &mut draft.dotfiles;
+                if !matches!(&editor.preview, review::Preview::Loading(current) if Arc::ptr_eq(current, &request))
+                {
+                    return;
+                }
+                editor.preview = match result {
+                    Ok(report) => review::Preview::Ready(report),
+                    Err(error) => {
+                        editor.error = Some(error);
+                        review::Preview::Failed
+                    }
+                };
+            }
             Action::Approve => {
-                if draft.dotfiles.checking.is_some() {
+                if draft.dotfiles.checking.is_some() || !draft.dotfiles.preview.can_approve() {
                     return;
                 }
                 let settings = match draft.dotfiles.candidate(draft, base) {
@@ -519,6 +586,7 @@ impl TerminalApp {
                 };
                 let request = Arc::new(());
                 let snapshot_version = draft.dotfiles.snapshot_version.clone();
+                let preview_version = draft.dotfiles.preview.digest();
                 let pin_version = draft.dotfiles.pin_version;
                 draft.dotfiles.checking = Some(request.clone());
                 draft.dotfiles.error = None;
@@ -533,13 +601,24 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |_| {
                         let result = DotfileBundle::load(&settings.bundle)
-                            .and_then(|bundle| match (snapshot_version, pin_version) {
-                                (Some(version), pin) => {
-                                    bundle.verify_version(settings.shell, &version)?;
-                                    Ok(pin.then_some(version))
+                            .and_then(|bundle| {
+                                if let Some(version) = preview_version {
+                                    use anyhow::Context;
+                                    bundle.verify_version(settings.shell, &version).context(
+                                        "The bundle changed since the preview. Preview it again",
+                                    )?;
+                                    return Ok(pin_version.then_some(version));
                                 }
-                                (None, true) => bundle.content_version(settings.shell).map(Some),
-                                (None, false) => bundle.validate(settings.shell).map(|()| None),
+                                match (snapshot_version, pin_version) {
+                                    (Some(version), pin) => {
+                                        bundle.verify_version(settings.shell, &version)?;
+                                        Ok(pin.then_some(version))
+                                    }
+                                    (None, true) => {
+                                        bundle.content_version(settings.shell).map(Some)
+                                    }
+                                    (None, false) => bundle.validate(settings.shell).map(|()| None),
+                                }
                             })
                             .map_err(|err| format!("Checking the dotfiles bundle: {err:#}"));
                         Message::ProfileDotfiles(id, Action::Reviewed(request, settings, result))
@@ -568,6 +647,7 @@ impl TerminalApp {
                         settings.bundle_sha256 = version;
                         draft.dotfiles.approved = Some(settings);
                         draft.dotfiles.snapshot_version = None;
+                        draft.dotfiles.preview = review::Preview::Closed;
                         draft.dotfiles.error = None;
                         draft.saved = false;
                     }
@@ -645,6 +725,7 @@ impl TerminalApp {
                     if matches!(field, Field::Bundle) {
                         editor.browsing = None;
                         editor.snapshot_version = None;
+                        editor.preview = review::Preview::Closed;
                     }
                     editor.checking = None;
                     editor.error = None;
@@ -656,6 +737,7 @@ impl TerminalApp {
                 {
                     draft.dotfiles.shell = shell;
                     draft.dotfiles.snapshot_version = None;
+                    draft.dotfiles.preview = review::Preview::Closed;
                     draft.dotfiles.checking = None;
                     draft.dotfiles.error = None;
                 }
@@ -670,6 +752,7 @@ impl TerminalApp {
             Action::Disable => {
                 draft.dotfiles.approved = None;
                 draft.dotfiles.checking = None;
+                draft.dotfiles.preview = review::Preview::Closed;
                 draft.dotfiles.error = None;
                 draft.saved = false;
             }

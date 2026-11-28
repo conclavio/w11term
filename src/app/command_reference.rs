@@ -8,7 +8,7 @@ use w11term::events::{
 use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 
 mod command_line;
-mod dotfiles;
+pub(super) mod dotfiles;
 mod download;
 mod example;
 mod private_page;

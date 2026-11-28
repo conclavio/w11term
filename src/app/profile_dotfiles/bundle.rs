@@ -316,7 +316,11 @@ impl super::Editor {
         ctx: &ComponentContext<TerminalApp>,
     ) {
         if matches!(action, Action::Create | Action::Revise) {
-            if self.composer.is_some() || self.checking.is_some() || self.browsing.is_some() {
+            if self.composer.is_some()
+                || self.checking.is_some()
+                || self.browsing.is_some()
+                || self.preview.loading()
+            {
                 return;
             }
             let source = if matches!(action, Action::Revise) {

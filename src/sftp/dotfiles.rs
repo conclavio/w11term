@@ -223,6 +223,11 @@ impl DotfileBundle {
         Ok(self.content_sha256(shell))
     }
 
+    pub fn normalized_fragments(&self, shell: DotfileShell) -> Result<[String; 2]> {
+        self.validate(shell)?;
+        Ok(self.fragments(shell))
+    }
+
     pub fn content_versions(&self) -> Result<Vec<(DotfileShell, String)>> {
         self.validate_for_editing()?;
         Ok(DotfileShell::ALL

@@ -463,11 +463,38 @@ try {
     if ($saved.bash -cne $original.bash -or $saved.environment -cne $original.environment) {
         throw 'The Fish revision changed the original Bash fragments'
     }
+    Click 'Preview dotfile changes'
+    $null = Wait-Until 'the revision has no changes for the approved Bash shell' {
+        (Find-Element 'Compared with the approved bundle file on disk.') -and
+            (Find-Element 'No dotfile fragment lines changed.')
+    }
     Select-NativeComboItem 'Dotfiles shell' 'Fish'
     $fishDirectory = Wait-Until 'the profile shows the Fish configuration directory field' {
         Find-Element 'Fish configuration directory (optional)' $edit
     }
     $fishDirectory.GetCurrentPattern($value).SetValue('xdg settings/fish')
+    Click 'Preview dotfile changes'
+    $null = Wait-Until 'the new shell preview has no approved Fish baseline' {
+        Find-Element 'No bundle is approved for this shell. Showing proposed fragments.'
+    }
+    Expand-ReviewDetail 'Prompt fragment preview'
+    $null = Wait-Until 'the Fish prompt is shown as a proposed line' {
+        Get-NativeTextLabels | Where-Object { $_.Contains('Proposed line 1') -and $_.Contains($fishStartup) }
+    }
+    $fishContents = [IO.File]::ReadAllText($fishBundle)
+    [IO.File]::WriteAllText($fishBundle, $fishContents.Replace('fleet> ', 'edited> '))
+    $savedProfile = [IO.File]::ReadAllText($profiles)
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'approval rejects a change made after preview' {
+        Get-NativeTextLabels | Where-Object { $_.Contains('The bundle changed since the preview') }
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $savedProfile) { throw 'The stale preview changed the saved profile' }
+    [IO.File]::WriteAllText($fishBundle, $fishContents)
+    Click 'Preview dotfile changes'
+    $null = Wait-Until 'the Fish revision has a fresh preview' {
+        (Find-Element 'No bundle is approved for this shell. Showing proposed fragments.') -and
+            !(Get-NativeTextLabels | Where-Object { $_.Contains('The bundle changed since the preview') })
+    }
     Click 'Approve dotfiles sync'
     $null = Wait-Until 'the profile can approve its Fish settings' { Find-Element "Approved for ${target}${dot}/" }
     Save-ProfileEdit

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use w11term::events::DotfileSyncStatus;
 use w11term::sftp::{DotfileBundle, DotfileShell};
 
-mod comparison;
+pub(in crate::app) mod comparison;
 mod history;
 use comparison::{Comparison, code_details, diff_text};
 
