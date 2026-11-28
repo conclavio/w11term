@@ -93,7 +93,7 @@ In the private page editor, choose **Import Markdown…** to load a UTF-8 manual
 
 Choose **Export Markdown…** in the editor to save a UTF-8 copy of the current draft to a separate file. The draft stays open and the library keeps its saved version.
 
-Choose **Review private page removal…** in an existing manual’s editor to archive its saved Markdown and reveal the bundled manual when available. Recover it by importing the archived file from the path shown in Command reference.
+Choose **Review private page removal…** in an existing manual’s editor to archive its saved Markdown and reveal the bundled manual when available. Open that command and platform in the editor and choose **Archived versions…** to preview a saved version. **Use archived draft** loads it into the editor for review before **Save private page**.
 
 From the command palette, choose **Find saved manual…** and search by page title, command name, or platform. Press Enter to open the selected manual beside the current pane, or Esc to leave the search.
 

@@ -11,6 +11,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
 };
 
+mod recovery;
+
 pub enum Action {
     Open,
     Loaded(Arc<()>, Result<Document, String>),
@@ -26,6 +28,7 @@ pub enum Action {
     CancelRemoval,
     Remove,
     Removed(Arc<()>, Result<Removal, String>),
+    Recovery(recovery::Action),
     Cancel,
 }
 
@@ -56,6 +59,7 @@ pub(super) struct Editor {
     work: Option<Work>,
     input: ElementRef<TextBox>,
     status: Option<String>,
+    recovery: Option<recovery::Browser>,
 }
 
 fn message(action: Action) -> Message {
@@ -64,10 +68,13 @@ fn message(action: Action) -> Message {
 
 impl Editor {
     fn ready(&self) -> bool {
-        self.document.is_some() && self.mounted && self.work.is_none()
+        self.document.is_some() && self.mounted && self.work.is_none() && self.recovery.is_none()
     }
 
     pub(super) fn view(&self, ctx: &mut ViewContext<TerminalApp>) -> View {
+        if let Some(recovery) = &self.recovery {
+            return recovery.view(&self.key, ctx);
+        }
         let mut fields = vec![KeyedView::new(
             "target",
             TextBlock::new().text(format!("{} · {}", self.key.name, self.key.platform.1)),
@@ -150,6 +157,10 @@ impl Editor {
                             .is_enabled(self.ready())
                             .on_click(ctx.callback(|_| message(Action::Export)))
                             .content("Export Markdown…"),
+                        Button::new()
+                            .is_enabled(self.ready())
+                            .on_click(ctx.callback(|_| recovery::message(recovery::Action::Open)))
+                            .content("Archived versions…"),
                     )),
                 ));
                 if document.original.is_some() {
@@ -225,6 +236,7 @@ impl Panel {
                     work: None,
                     input: ElementRef::default(),
                     status: None,
+                    recovery: None,
                 });
                 self.draft = None;
                 ctx.spawn_background_with_rejection(
@@ -530,11 +542,16 @@ impl Panel {
                     }
                 }
             }
+            Action::Recovery(action) => {
+                if let Some(editor) = &mut self.private_page {
+                    editor.recovery_action(action, ctx);
+                }
+            }
             Action::Cancel => {
                 if self
                     .private_page
                     .as_ref()
-                    .is_some_and(|editor| editor.work.is_none())
+                    .is_some_and(|editor| editor.work.is_none() && editor.recovery.is_none())
                 {
                     self.private_page = None;
                     self.focus = self.focus.wrapping_add(1);
@@ -625,6 +642,10 @@ fn load_document(directory: &Path, key: &Key) -> Result<Document> {
 fn read_imported_draft(path: &Path) -> Result<String> {
     let file = File::open(path).context("Opening the selected Markdown file")?;
     ensure!(file.metadata()?.is_file(), "Choose a regular Markdown file");
+    read_draft(file)
+}
+
+fn read_draft(file: File) -> Result<String> {
     let text = catalog::read_page(file).context("Reading the selected Markdown file")?;
     let text = normalize_lines(text.trim_start_matches('\u{feff}'));
     parse_private_page(&text)?;
