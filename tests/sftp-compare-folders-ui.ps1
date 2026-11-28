@@ -13,10 +13,9 @@ $fixture = [IO.File]::ReadAllText((Join-Path $State 'fixture-root'))
 $button = [System.Windows.Automation.ControlType]::Button
 $edit = [System.Windows.Automation.ControlType]::Edit
 $combo = [System.Windows.Automation.ControlType]::ComboBox
-$listItem = [System.Windows.Automation.ControlType]::ListItem
 $value = [System.Windows.Automation.ValuePattern]::Pattern
 $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
-$selection = [System.Windows.Automation.SelectionItemPattern]::Pattern
+$selection = [System.Windows.Automation.SelectionPattern]::Pattern
 $dot = [char]0xb7
 $dash = [char]0x2013
 $reference = '/shell directory/archive'
@@ -40,12 +39,24 @@ function Set-Query([string]$Query) {
 }
 
 function Select-DifferenceType([string]$Name) {
-    $field = Wait-Until 'folder comparison filter' { Find-Element 'Folder comparison filter' $combo }
-    $field.GetCurrentPattern($expand).Expand()
-    $choice = Wait-Until "difference type '$Name'" { Find-Element $Name $listItem -Visible }
-    $choice.GetCurrentPattern($selection).Select()
-    $popup = (Find-Element 'Folder comparison filter' $combo).GetCurrentPattern($expand)
-    if ($popup.Current.ExpandCollapseState -eq 'Expanded') { $popup.Collapse() }
+    $filter = 'Folder comparison filter'
+    Select-NativeComboItem $filter $Name
+    $null = Wait-Until "the folder comparison uses '$Name'" {
+        try {
+            $field = Find-Element $filter $combo
+            if (!$field) { return }
+            $selected = $field.GetCurrentPattern($selection).Current.GetSelection()
+            if ($selected.Count -ne 1 -or $selected[0].Current.Name -cne $Name) { return }
+            $popup = $field.GetCurrentPattern($expand)
+            if ($popup.Current.ExpandCollapseState -eq 'Expanded') {
+                $popup.Collapse()
+            } else {
+                return $true
+            }
+        } catch [System.Windows.Automation.ElementNotAvailableException] {
+            # Changing the filter can replace the popup during layout.
+        }
+    }
 }
 
 function File-Digest([string]$Path) {
