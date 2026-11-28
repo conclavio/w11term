@@ -5,6 +5,7 @@ use std::{
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
 };
+use w11term::saved_reference_pages::valid_page_name as valid_name;
 
 const BUNDLED: &[u8] = include_bytes!("../../../assets/command-reference/tldr-pages.en.zip");
 pub(super) const MAX_ARCHIVE: usize = 16 * 1024 * 1024;
@@ -174,15 +175,6 @@ pub(super) fn query(text: &str) -> String {
         .collect::<Vec<_>>()
         .join("-")
         .to_ascii_lowercase()
-}
-
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && !matches!(name, "." | "..")
-        && !name
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\'))
 }
 
 #[derive(Debug)]

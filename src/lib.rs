@@ -23,6 +23,7 @@ pub mod prompts;
 pub mod recorder;
 pub mod saved_commands;
 pub mod saved_output_rules;
+pub mod saved_reference_pages;
 pub mod search;
 pub mod session;
 pub mod sftp;

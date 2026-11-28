@@ -9,6 +9,7 @@ mod catalog;
 mod dotfiles;
 mod download;
 mod private_page;
+mod saved_pages;
 mod tool_install;
 mod tool_removal;
 
@@ -34,6 +35,7 @@ pub enum Action {
     ListedTools(Arc<()>, Result<InstalledTools, String>),
     ToolPage(Arc<()>, usize),
     Private(private_page::Action),
+    SavedPage(saved_pages::Action),
     ToolInstall(tool_install::Action),
     ToolRemoval(tool_removal::Action),
     Dotfiles(dotfiles::Action),
@@ -94,9 +96,17 @@ struct Draft {
 
 struct Search {
     query: String,
-    exact: bool,
+    mode: SearchMode,
     platform: Platform,
     results: Vec<Key>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+enum SearchMode {
+    #[default]
+    Search,
+    PreferredExact,
+    Page(Key),
 }
 
 #[derive(Default)]
@@ -106,7 +116,7 @@ pub(super) struct Panel {
     library: Option<Loaded>,
     error: Option<String>,
     query: String,
-    exact: bool,
+    mode: SearchMode,
     platform: Option<Platform>,
     cached: RefCell<Option<Search>>,
     selected: usize,
@@ -116,6 +126,7 @@ pub(super) struct Panel {
     focus: u64,
     tools: Option<ToolLookup>,
     private_page: Option<private_page::Editor>,
+    saved_pages: saved_pages::State,
     tool_install: Option<tool_install::Installer>,
     tool_removal: Option<tool_removal::Panel>,
     dotfiles: Option<dotfiles::Installer>,
@@ -147,6 +158,7 @@ impl Panel {
         self.tool_install = None;
         self.tool_removal = None;
         self.dotfiles = None;
+        self.saved_pages.close();
         if let Some(lookup) = self.tools.take() {
             lookup.cancel.cancel();
         }
@@ -163,41 +175,55 @@ impl Panel {
         let text = text.chars().take(128).filter(|c| !c.is_control()).collect();
         if self.query != text {
             self.query = text;
-            self.exact = false;
+            self.mode = SearchMode::Search;
             self.selected = 0;
             self.draft = None;
         }
     }
 
+    fn show_page(&mut self, key: Key, auto: Platform) {
+        self.set_query(key.name.clone());
+        if self.platform.unwrap_or(auto) != key.platform {
+            self.platform = Some(key.platform);
+        }
+        self.mode = SearchMode::Page(key);
+        self.selected = 0;
+        self.draft = None;
+        self.focus = self.focus.wrapping_add(1);
+    }
+
     fn results(&self, platform: Platform) -> std::cell::Ref<'_, [Key]> {
         let previous = self.cached.borrow();
         if previous.as_ref().is_none_or(|search| {
-            search.query != self.query || search.platform != platform || search.exact != self.exact
+            search.query != self.query || search.platform != platform || search.mode != self.mode
         }) {
             drop(previous);
             let results = self
                 .library
                 .as_ref()
-                .map(|loaded| {
-                    if self.exact {
-                        loaded
-                            .catalog
-                            .exact(&self.query, platform)
-                            .into_iter()
-                            .collect()
-                    } else {
-                        loaded
-                            .catalog
-                            .search(&self.query, platform)
-                            .into_iter()
-                            .map(|(key, _)| key.clone())
-                            .collect()
-                    }
+                .map(|loaded| match &self.mode {
+                    SearchMode::Page(key) => loaded
+                        .catalog
+                        .page(key)
+                        .map(|_| key.clone())
+                        .into_iter()
+                        .collect(),
+                    SearchMode::PreferredExact => loaded
+                        .catalog
+                        .exact(&self.query, platform)
+                        .into_iter()
+                        .collect(),
+                    SearchMode::Search => loaded
+                        .catalog
+                        .search(&self.query, platform)
+                        .into_iter()
+                        .map(|(key, _)| key.clone())
+                        .collect(),
                 })
                 .unwrap_or_default();
             self.cached.replace(Some(Search {
                 query: self.query.clone(),
-                exact: self.exact,
+                mode: self.mode.clone(),
                 platform,
                 results,
             }));
@@ -291,6 +317,7 @@ impl Panel {
                 })
                 .text_wrapping(TextWrapping::Wrap),
         )];
+        pieces.push(self.saved_pages.section(self.library.as_ref(), ctx));
         if let Some(target) = tool_pane {
             pieces.push(KeyedView::new(
                 "installed-tools",
@@ -393,6 +420,9 @@ impl Panel {
                         .text_wrapping(TextWrapping::Wrap),
                 ),
             ]);
+            if let Some(key) = selected {
+                pieces.push(self.saved_pages.button(key, ctx));
+            }
         }
         if let (Some(target), Some(key), Some(_)) = (tool_pane, selected, page)
             && matches!(key.platform, LINUX | COMMON)
@@ -415,7 +445,9 @@ impl Panel {
         if let Some(Ok(installed)) = lookup.and_then(|lookup| lookup.result.as_ref()) {
             let command = match selected {
                 Some(key) if matches!(key.platform, LINUX | COMMON) => Some(key.name.as_str()),
-                None if self.exact && preferred == LINUX => Some(self.query.as_str()),
+                None if self.mode == SearchMode::PreferredExact && preferred == LINUX => {
+                    Some(self.query.as_str())
+                }
                 _ => None,
             };
             for tool in installed
@@ -856,6 +888,7 @@ impl TerminalApp {
                     panel.set_query(text);
                 }
                 if !was_open || panel.library.is_none() {
+                    panel.saved_pages.refresh(ctx);
                     self.start_reference_load(false, ctx);
                 }
             }
@@ -867,6 +900,9 @@ impl TerminalApp {
                     panel.platform = platform;
                     panel.selected = 0;
                     panel.draft = None;
+                    if matches!(panel.mode, SearchMode::Page(_)) {
+                        panel.mode = SearchMode::Search;
+                    }
                 }
             }
             Action::Platform(None) => {}
@@ -910,6 +946,7 @@ impl TerminalApp {
             Action::Link(link) => Self::open_link(&link),
             Action::Refresh => self.start_reference_load(true, ctx),
             Action::Private(action) => panel.author_private_page(action, auto, ctx),
+            Action::SavedPage(action) => panel.saved_page_action(action, auto, ctx),
             Action::ToolInstall(action) => self.tool_install_action(action, ctx),
             Action::ToolRemoval(action) => self.tool_removal_action(action, ctx),
             Action::Dotfiles(action) => self.reference_dotfiles_action(action, ctx),
@@ -930,7 +967,7 @@ impl TerminalApp {
                     && let Some(tool) = tools.tools.get(index)
                 {
                     panel.set_query(tool.name.clone());
-                    panel.exact = true;
+                    panel.mode = SearchMode::PreferredExact;
                     panel.platform = None;
                     panel.focus = panel.focus.wrapping_add(1);
                 }
