@@ -5,9 +5,40 @@ use crate::ssh::{
 };
 use std::num::NonZeroU64;
 
-pub(super) struct PacketCapturePaths {
+pub(super) struct CapturePaths {
     pub capture: PathBuf,
     pub report: Option<PathBuf>,
+}
+
+impl CapturePaths {
+    fn check_report_destination(&self, artifact: &str) -> Result<()> {
+        if let Some(report) = &self.report {
+            ensure!(
+                report != &self.capture,
+                "Choose separate capture and report files"
+            );
+            diagnostic_destination(report, artifact)?;
+        }
+        Ok(())
+    }
+}
+
+async fn append_capture_report(
+    result: &mut Value,
+    path: Option<PathBuf>,
+    artifact: &'static str,
+    save: impl FnOnce(&Path) -> Result<()> + Send + 'static,
+) {
+    let Some(path) = path else { return };
+    let destination = path.clone();
+    let saved = tokio::task::spawn_blocking(move || save(&destination))
+        .await
+        .with_context(|| format!("Writing the {artifact}"))
+        .and_then(|saved| saved);
+    match saved {
+        Ok(()) => result["report_path"] = json!(path),
+        Err(error) => result["report_error"] = json!(format!("{error:#}")),
+    }
 }
 
 impl Registry {
@@ -111,15 +142,22 @@ impl Registry {
         generation: NonZeroU64,
         review_id: &str,
         job_id: &str,
-        path: PathBuf,
+        paths: CapturePaths,
     ) -> Result<Value> {
+        paths.check_report_destination("syscall capture report")?;
         let target = self.diagnostic_target(pane, Some(generation)).await?;
         let capture = target
-            .capture_syscalls(pane, options, review_id, job_id, path)
+            .capture_syscalls(pane, options, review_id, job_id, paths.capture)
             .await?;
-        Ok(
-            json!({ "pane": pane, "connection_generation": generation, "job_id": job_id, "capture": capture }),
+        let mut result = json!({ "pane": pane, "connection_generation": generation, "job_id": job_id, "capture": &capture });
+        append_capture_report(
+            &mut result,
+            paths.report,
+            "syscall capture report",
+            move |path| capture.save_report(path),
         )
+        .await;
+        Ok(result)
     }
 
     pub(super) async fn stop_syscall_capture(
@@ -140,15 +178,9 @@ impl Registry {
         connection_generation: NonZeroU64,
         review_id: &str,
         job_id: Option<String>,
-        paths: PacketCapturePaths,
+        paths: CapturePaths,
     ) -> Result<Value> {
-        if let Some(report) = &paths.report {
-            ensure!(
-                report != &paths.capture,
-                "Choose separate capture and report files"
-            );
-            diagnostic_destination(report, "packet capture report")?;
-        }
+        paths.check_report_destination("packet capture report")?;
         let target = self
             .diagnostic_target(pane, Some(connection_generation))
             .await?;
@@ -169,17 +201,13 @@ impl Registry {
             "job_id": job_id,
             "capture": &capture,
         });
-        if let Some(path) = paths.report {
-            let destination = path.clone();
-            let saved = tokio::task::spawn_blocking(move || capture.save_report(&destination))
-                .await
-                .context("Writing the packet capture report")
-                .and_then(|saved| saved);
-            match saved {
-                Ok(()) => result["report_path"] = json!(path),
-                Err(error) => result["report_error"] = json!(format!("{error:#}")),
-            }
-        }
+        append_capture_report(
+            &mut result,
+            paths.report,
+            "packet capture report",
+            move |path| capture.save_report(path),
+        )
+        .await;
         Ok(result)
     }
 

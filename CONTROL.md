@@ -1865,6 +1865,14 @@ $plan = (& $ctl --pid 12345 preview-syscall-capture @traceOptions | ConvertFrom-
 
 The original PID-tagged trace includes per-call timing and decoded descriptor details. One byte budget covers the full stream across descendants. w11term checks the SFTP download's size and SHA-256 before acknowledging remote cleanup and saving a new local file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
 
+Add `--report-file '.\working report.json'` to `capture-syscalls` to save a JSON report alongside the trace. It records the reviewed SSH endpoint, the resolved executable and working directory, the literal strace arguments, the stop reason, and the trace's byte count and SHA-256. The reply gives `result.report_path` on success. If the report cannot be written after capture, the trace is still available and `result.report_error` explains the report failure.
+
+```powershell
+& $ctl verify-syscall-capture-report '.\working.strace' '.\working report.json'
+```
+
+Verification works offline and accepts a renamed trace with matching bytes. The verified JSON includes the saved capture details at `result.report`.
+
 Open **More → Diagnostics → Syscall trace viewer** to inspect a saved trace offline. Open one combined log or select the files from the same `strace -ff` run together. Names ending in `.PID` identify the process for those split logs. w11term merges files with epoch timestamps. It also merges short runs with ordered time-of-day timestamps that fit in a window under 12 hours. A merge across midnight requires at least one file to show the rollover in its record order. When timestamps are ambiguous or incomplete, the viewer keeps the files in their input order. Capture with `-ttt` to retain dates in longer runs. [strace timestamp formats](https://github.com/strace/strace/blob/master/doc/strace-log-merge.1.in)
 
 For a combined `strace -r` log, the viewer adds up the record deltas to show elapsed time from the first timed record. Resumed calls keep their entry time and contribute their resume delta to subsequent records. A missing delta on a trace event makes subsequent elapsed times unavailable. The viewer uses the absolute clock when both absolute and relative timestamps are present. Split files with relative timestamps alone keep their file order. [strace relative timestamps](https://github.com/strace/strace/blob/master/doc/strace.1.in)

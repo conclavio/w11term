@@ -97,6 +97,8 @@ pub enum Request {
         review_id: String,
         job_id: String,
         output_file: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_file: Option<PathBuf>,
     },
     StopSyscallCapture {
         pane: u64,
@@ -1514,6 +1516,7 @@ impl Registry {
                 review_id,
                 job_id,
                 output_file,
+                report_file,
             } => {
                 self.capture_syscalls(
                     pane,
@@ -1521,7 +1524,10 @@ impl Registry {
                     connection_generation,
                     &review_id,
                     &job_id,
-                    output_file,
+                    triage::CapturePaths {
+                        capture: output_file,
+                        report: report_file,
+                    },
                 )
                 .await
             }
@@ -1548,7 +1554,7 @@ impl Registry {
                     connection_generation,
                     &review_id,
                     job_id,
-                    triage::PacketCapturePaths {
+                    triage::CapturePaths {
                         capture: output_file,
                         report: report_file,
                     },

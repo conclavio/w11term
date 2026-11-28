@@ -2562,20 +2562,35 @@ async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
         .unwrap();
     let job = "1234567890abcdef1234567890abcdef";
     let output_file = local.path().join("raw.strace");
-    let request = |options| Request::CaptureSyscalls {
+    let report_file = local.path().join("syscall report.json");
+    let request = |options, report: &Path| Request::CaptureSyscalls {
         pane: 1,
         options,
         connection_generation: generation,
         review_id: plan["review_id"].as_str().unwrap().into(),
         job_id: job.into(),
         output_file: output_file.clone(),
+        report_file: Some(report.to_owned()),
     };
+    let error = registry
+        .execute(request(options.clone(), &output_file), callback.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Choose separate capture and report files"));
+    fs::write(&report_file, b"previous report").unwrap();
+    let error = registry
+        .execute(request(options.clone(), &report_file), callback.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("already exists"));
+    assert_eq!(fs::read(&report_file).unwrap(), b"previous report");
+    fs::remove_file(&report_file).unwrap();
     let mut edited = options.clone();
     edited.arguments.push("changed".into());
     fs::write(&settings, edited.settings_json().unwrap()).unwrap();
     let changed = control::SyscallOptions::load_settings(&settings).unwrap();
     let error = registry
-        .execute(request(changed), callback.clone())
+        .execute(request(changed, &report_file), callback.clone())
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("Review again"));
@@ -2586,7 +2601,7 @@ async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
         connection_generation: generation,
         job_id: job_id.into(),
     };
-    let capture = registry.execute(request(options), callback.clone());
+    let capture = registry.execute(request(options, &report_file), callback.clone());
     let stop = async {
         while !started.exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2606,7 +2621,35 @@ async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
     assert_eq!(stopped["stop_requested"], true);
     let capture = capture.unwrap();
     assert_eq!(capture["capture"]["stop_reason"], "stopped");
-    assert_eq!(fs::read(output_file).unwrap(), SYSCALL_FIXTURE);
+    assert_eq!(fs::read(&output_file).unwrap(), SYSCALL_FIXTURE);
+    assert_eq!(capture["report_path"], json!(report_file));
+    assert!(capture.get("report_error").is_none());
+    let report = w11term::ssh::verify_syscall_capture_report(&output_file, &report_file).unwrap();
+    assert_eq!(report.bytes, SYSCALL_FIXTURE.len() as u64);
+    assert_eq!(
+        report.sha256,
+        capture["capture"]["sha256"].as_str().unwrap()
+    );
+    assert_eq!(report.stop_reason, "stopped");
+    assert_eq!(report.file_name, "raw.strace");
+    assert_eq!(report.command_exit_status, None);
+    assert_eq!(report.reviewed.program, "/bin/sh");
+    assert_eq!(report.reviewed.directory, "/home/test");
+    assert_eq!(
+        serde_json::to_value(&report.reviewed.strace_arguments).unwrap(),
+        plan["strace_arguments"]
+    );
+    assert_eq!(
+        serde_json::to_value(&report.reviewed.options).unwrap(),
+        plan["options"]
+    );
+    let saved: Value = serde_json::from_slice(&fs::read(report_file).unwrap()).unwrap();
+    for field in ["host", "user", "port", "host_key_fingerprint"] {
+        assert_eq!(saved["reviewed"][field], plan[field], "{field}");
+    }
+    for field in ["review_id", "connection_generation", "identity", "job_id"] {
+        assert!(saved["reviewed"].get(field).is_none(), "{saved}");
+    }
     assert!(remote.path().join("syscall-verified").exists());
     server.abort();
 }

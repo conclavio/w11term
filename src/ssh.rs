@@ -44,7 +44,10 @@ pub use triage::packet_capture::{
     open_capture_interval_in_wireshark, open_capture_pair_in_wireshark,
     open_capture_transport_in_wireshark, verify_packet_capture_report,
 };
-pub use triage::syscall_capture::{Capture as SyscallCapture, Plan as SyscallCapturePlan};
+pub use triage::syscall_capture::{
+    Capture as SyscallCapture, Plan as SyscallCapturePlan, SyscallCaptureReport,
+    SyscallCaptureReportReview, verify_syscall_capture_report,
+};
 pub use triage::{
     Delta as TriageDelta, Finding as TriageFinding, Plan as TriagePlan, Report as TriageReport,
     Resource as TriageResource, SampleStatus as TriageSampleStatus, Target as TriageTarget,

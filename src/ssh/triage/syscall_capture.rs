@@ -11,6 +11,9 @@ use std::{
     time::Duration,
 };
 
+mod report;
+pub use report::{SyscallCaptureReport, SyscallCaptureReportReview, verify_syscall_capture_report};
+
 const SCRIPT: &str = include_str!("syscall-capture.sh");
 const REVIEW_DEADLINE: Duration = Duration::from_secs(8);
 pub(crate) const CONTROL_SECONDS: u64 = 155;
@@ -139,6 +142,8 @@ pub struct Capture {
     sha256: String,
     pub stop_reason: &'static str,
     pub command_exit_status: Option<u8>,
+    #[serde(skip)]
+    reviewed: Box<SyscallCaptureReportReview>,
 }
 
 impl Target {
@@ -395,6 +400,7 @@ async fn capture_and_download(
             sha256,
             stop_reason,
             command_exit_status,
+            reviewed: Box::new(plan.into()),
         },
     ))
 }

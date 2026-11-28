@@ -1,6 +1,86 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{fs, process::Command};
 use w11term::control::{SyscallFilter, SyscallOptions};
+
+#[test]
+fn verifies_a_renamed_syscall_trace_and_rejects_mismatched_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let trace = root.join("renamed trace.strace");
+    let report = root.join("capture report.json");
+    let recorded_trace = b"1234 1700000000.000000 close(3) = 0 <0.000001>\n";
+    fs::write(&trace, recorded_trace).unwrap();
+    let checksum: String = Sha256::digest(recorded_trace)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let mut recorded = json!({
+        "schema_version": 1, "kind": "syscall-capture", "file_name": "original.strace",
+        "bytes": recorded_trace.len(), "sha256": checksum.to_ascii_uppercase(),
+        "stop_reason": "command-exited", "command_exit_status": 0,
+        "reviewed": {
+            "host": "example.test", "user": "test", "port": 22, "host_key_fingerprint": "SHA256:fixture",
+            "program": "/bin/true", "directory": "/tmp", "strace_arguments": ["--", "/bin/true"],
+            "options": {"program": "true", "arguments": [], "directory": "/tmp", "seconds": 15,
+                        "max_mib": 1, "string_size": 128, "filter": "all"}
+        }
+    });
+    let save = |value: &Value| fs::write(&report, serde_json::to_vec(value).unwrap()).unwrap();
+    let verify = || {
+        Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+            .current_dir(root)
+            .env_remove("LOCALAPPDATA")
+            .args([
+                "verify-syscall-capture-report",
+                "renamed trace.strace",
+                "capture report.json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let reject = |expected: &str| {
+        let output = verify();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        let reply: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(
+            reply["error"].as_str().unwrap().contains(expected),
+            "{reply}"
+        );
+    };
+    save(&recorded);
+    let result = verify();
+    assert!(result.status.success(), "{result:?}");
+    let verified: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(verified["result"]["capture_path"], json!(trace));
+    assert_eq!(verified["result"]["report_path"], json!(report));
+    assert_eq!(verified["result"]["report"]["sha256"], checksum);
+    assert_eq!(verified["result"]["report"]["file_name"], "original.strace");
+    assert_eq!(
+        verified["result"]["report"]["reviewed"],
+        recorded["reviewed"]
+    );
+    fs::write(&trace, &recorded_trace[..recorded_trace.len() - 1]).unwrap();
+    reject("File byte count differs");
+    let mut edited = recorded_trace.to_vec();
+    edited[0] ^= 1;
+    fs::write(&trace, edited).unwrap();
+    reject("Trace SHA-256 differs");
+    recorded["schema_version"] = json!(2);
+    save(&recorded);
+    reject("Unsupported syscall capture report version");
+    recorded["schema_version"] = json!(1);
+    recorded["bytes"] = json!(2 * 1024 * 1024);
+    save(&recorded);
+    reject("invalid byte count");
+    recorded["bytes"] = json!(recorded_trace.len());
+    recorded["stop_reason"] = json!("stopped");
+    save(&recorded);
+    reject("invalid capture outcome");
+    fs::write(report, vec![b' '; 256 * 1024 + 1]).unwrap();
+    reject("Syscall capture report exceeds 256 KiB");
+}
 
 #[test]
 fn saves_portable_syscall_settings_with_literal_arguments_and_no_overwrite() {

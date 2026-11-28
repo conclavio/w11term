@@ -349,11 +349,12 @@ async fn main() -> ExitCode {
             packet_capture::VERIFY_REPORT_HELP
         );
         println!(
-            "\n{}\n{}\n{}\n{}",
+            "\n{}\n{}\n{}\n{}\n{}",
             syscall_capture::HELP,
             syscall_capture::INSPECT_HELP,
             syscall_capture::COMPARE_HELP,
             syscall_capture::SAVE_SETTINGS_HELP,
+            syscall_capture::VERIFY_REPORT_HELP,
         );
         println!("\n{}", diagnostics::HELP);
         println!("\n{}", command_reference::HELP);

@@ -2,18 +2,40 @@ use super::offline;
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::BTreeMap, io::Write, path, sync::Arc};
 use w11term::{
-    control::{Request, SyscallFilter, SyscallOptions},
+    control::{Reply, Request, SyscallFilter, SyscallOptions},
+    ssh::verify_syscall_capture_report,
     syscall_trace::{Comparison, SummarySort, Trace},
 };
 
 pub(super) const HELP: &str = concat!(
     "w11term-cli [--pid PID] preview-syscall-capture --pane ID (--program PROGRAM [TRACE OPTIONS] | --settings-file PATH)\n",
     "w11term-cli [--pid PID] capture-syscalls --pane ID (--program PROGRAM [TRACE OPTIONS] | --settings-file PATH) ",
-    "--connection-generation N --review-id ID --job-id HEX --output-file PATH\n",
+    "--connection-generation N --review-id ID --job-id HEX --output-file PATH [--report-file PATH]\n",
     "w11term-cli [--pid PID] stop-syscall-capture --pane ID --connection-generation N --job-id HEX\n",
     "TRACE OPTIONS: [--arg ARG ...] [--directory PATH] [--seconds N] [--max-mib N] ",
     "[--string-size N] [--filter all|files|processes|network]",
 );
+
+pub(super) const VERIFY_REPORT_VERB: &str = "verify-syscall-capture-report";
+pub(super) const VERIFY_REPORT_HELP: &str =
+    "w11term-cli verify-syscall-capture-report TRACE REPORT";
+
+pub(super) fn verify_report(args: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let [trace, report] = args else {
+        bail!("provide the trace path and its report path")
+    };
+    let trace = path::absolute(trace)?;
+    let report = path::absolute(report)?;
+    let verified = verify_syscall_capture_report(&trace, &report)?;
+    let reply = Reply::from_result(Ok(serde_json::json!({
+        "capture_path": trace,
+        "report_path": report,
+        "report": verified,
+    })));
+    serde_json::to_writer(&mut *stdout, &reply)?;
+    writeln!(stdout)?;
+    Ok(())
+}
 
 const TRACE_FLAGS: &[&str] = &[
     "--program",
@@ -191,7 +213,9 @@ pub(super) fn parse(
     } = read_flags(verb, args, |flag| {
         flag == "--pane"
             || !preview && matches!(flag, "--connection-generation" | "--job-id")
-            || !preview && !stop && matches!(flag, "--output-file" | "--review-id")
+            || !preview
+                && !stop
+                && matches!(flag, "--output-file" | "--report-file" | "--review-id")
             || !stop && (TRACE_FLAGS.contains(&flag) || flag == "--settings-file")
     })?;
     let explicit = flags
@@ -247,6 +271,10 @@ pub(super) fn parse(
                 .remove("--output-file")
                 .context("Provide --output-file")?,
         )?,
+        report_file: flags
+            .remove("--report-file")
+            .map(path::absolute)
+            .transpose()?,
     })
 }
 
@@ -387,6 +415,8 @@ mod tests {
                 "1234567890abcdef1234567890abcdef",
                 "--output-file",
                 "new.strace",
+                "--report-file",
+                "run report.json",
             ],
         )
         .unwrap();
@@ -396,6 +426,7 @@ mod tests {
             connection_generation,
             review_id,
             output_file,
+            report_file,
             ..
         } = result
         else {
@@ -405,6 +436,7 @@ mod tests {
         assert_eq!(connection_generation.get(), 6);
         assert_eq!(review_id, "fresh-review");
         assert!(output_file.ends_with("new.strace"));
+        assert!(report_file.unwrap().ends_with("run report.json"));
         assert_eq!(serde_json::to_value(capture).unwrap(), expected);
         for flag in TRACE_FLAGS {
             let error = call(
@@ -416,5 +448,12 @@ mod tests {
         }
         assert!(call("capture-syscalls", &["--settings-file", file]).is_err());
         assert!(call("stop-syscall-capture", &["--settings-file", file]).is_err());
+        assert!(
+            call(
+                "preview-syscall-capture",
+                &["--settings-file", file, "--report-file", "unused.json"]
+            )
+            .is_err()
+        );
     }
 }
