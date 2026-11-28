@@ -40,4 +40,5 @@ pub mod triage_comparison;
 pub mod wav;
 pub mod windows_appearance;
 mod windows_dirs;
+pub mod windows_release;
 pub mod workspace;

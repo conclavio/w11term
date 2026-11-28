@@ -25,6 +25,32 @@ function Click([string]$Name) {
         }
     })
 }
+function Save-RetainedDotfiles([string]$Path) {
+    $prefix = "Saved dotfile bundle${dot}"
+    Click 'Save selected dotfile bundle'
+    $dialog = Wait-OwnedDialog 'Save new dotfiles bundle'
+    $null = Wait-Until 'enter a draft retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, "$Path.draft") }
+    $null = Wait-Until 'choose the retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, $Path) }
+    $null = Wait-Until 'save the retained bundle' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'saved bundle is available at the selected Windows destination' {
+        if ([IO.File]::Exists($Path)) {
+            Get-NativeTextLabels | Where-Object {
+                $_.StartsWith($prefix) -and [FixtureDialog]::SameFile($Path, $_.Substring($prefix.Length))
+            }
+        }
+    }
+}
+function Save-ProfileEdit {
+    $saveProfile = Wait-Until 'enabled profile save action' {
+        $save = Find-Element 'Save profile changes' $button
+        if ($save -and $save.Current.IsEnabled) { $save }
+    }
+    if ($saveProfile.Current.IsOffscreen) {
+        $profileScroll = Find-NativeVerticalScroll $saveProfile
+        if ($profileScroll) { $profileScroll.SetScrollPercent(-1, 100) }
+    }
+    Click 'Save profile changes'
+}
 function Wait-Review {
     $null = Wait-Until 'dotfiles review is ready on the named account' {
         $apply = Find-Element 'Apply reviewed dotfiles' $button
@@ -218,25 +244,13 @@ try {
     $null = Control @('focus-pane','--pane',"$pane")
     Wait-Focus $pane
     $snapshot = Join-Path $State ('Retained shell bundle ' + [char]0x96ea + '.json')
-    $savedPrefix = "Saved dotfile bundle${dot}"
     Click 'Save selected dotfile bundle'
     $saveDialog = Wait-OwnedDialog 'Save new dotfiles bundle'
     $null = Wait-Until 'cancel the Windows bundle picker' { [FixtureDialog]::ClickButton($saveDialog, 2) }
     $null = Wait-Until 'cancel returns to the retained version' {
         (Find-Element "Selected version $first") -and !(Find-OwnedDialog 'Save new dotfiles bundle')
     }
-    Click 'Save selected dotfile bundle'
-    $saveDialog = Wait-OwnedDialog 'Save new dotfiles bundle'
-    $null = Wait-Until 'enter a draft retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($saveDialog, "$snapshot.draft") }
-    $null = Wait-Until 'choose the retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($saveDialog, $snapshot) }
-    $null = Wait-Until 'save the retained bundle' { [FixtureDialog]::ClickButton($saveDialog, 1) }
-    $null = Wait-Until 'saved bundle is available at the selected Windows destination' {
-        if ([IO.File]::Exists($snapshot)) {
-            Get-NativeTextLabels | Where-Object {
-                $_.StartsWith($savedPrefix) -and [FixtureDialog]::SameFile($snapshot, $_.Substring($savedPrefix.Length))
-            }
-        }
-    }
+    Save-RetainedDotfiles $snapshot
     $saved = [IO.File]::ReadAllText($snapshot) | ConvertFrom-Json
     if ($saved.version -ne 1 -or $saved.bash -cne "PS1='verified> '`n" -or
         $saved.environment -cne "export EDITOR=vi`n" -or $null -ne $saved.zsh) {
@@ -344,6 +358,81 @@ try {
     }
     if ([IO.File]::ReadAllText($selectorPath) -cne "$first`n") { throw 'Resuming changed the active version or left it held' }
     if ([IO.File]::ReadAllText($startup) -cne $installed) { throw 'Switching versions changed the startup hooks' }
+
+    Select-RetainedDotfile $pane $first
+    $profileSnapshot = Join-Path $State 'Profile dotfile snapshot.json'
+    Save-RetainedDotfiles $profileSnapshot
+    $beforeProfile = [IO.File]::ReadAllText($profiles)
+    $profileAction = 'Review saved dotfiles in this SSH profile'
+    $null = Control @('focus-pane','--pane',"$localPane")
+    Wait-Focus $localPane
+    $null = Wait-Until 'a different pane cannot use the saved dotfiles' {
+        $review = Find-Element $profileAction $button
+        $review -and !$review.Current.IsEnabled
+    }
+    $null = Control @('focus-pane','--pane',"$pane")
+    Wait-Focus $pane
+    Click $profileAction
+    $edit = [System.Windows.Automation.ControlType]::Edit
+    $value = [System.Windows.Automation.ValuePattern]::Pattern
+    $combo = [System.Windows.Automation.ControlType]::ComboBox
+    $selection = [System.Windows.Automation.SelectionPattern]::Pattern
+    $null = Wait-Until 'review shows the exported version and authenticated profile account' {
+        $bundleField = Find-Element 'Dotfiles bundle' $edit
+        $homeField = Find-Element 'Remote SFTP home' $edit
+        $keyField = Find-Element 'Dotfiles host-key fingerprint' $edit
+        $shell = Find-Element 'Dotfiles shell' $combo
+        if (!$bundleField -or !$homeField -or !$keyField -or !$shell) { return }
+        $chosen = $shell.GetCurrentPattern($selection).Current.GetSelection()
+        (Find-Element "Saved dotfile version $first") -and (Find-Element "Upload on connect to $target") -and
+            [FixtureDialog]::SameFile($profileSnapshot, $bundleField.GetCurrentPattern($value).Current.Value) -and
+            $homeField.GetCurrentPattern($value).Current.Value -ceq '/' -and
+            $keyField.GetCurrentPattern($value).Current.Value -ceq $account.host_key -and
+            $chosen.Count -eq 1 -and $chosen[0].Current.Name -ceq 'Bash'
+    }
+    $pinLabel = 'Pin approved dotfile version'
+    $null = Wait-CheckBox $pinLabel ([System.Windows.Automation.ToggleState]::On)
+    $originalSnapshot = [IO.File]::ReadAllText($profileSnapshot)
+    $editedSnapshot = $originalSnapshot.Replace('verified> ', 'modified> ')
+    if ($editedSnapshot -ceq $originalSnapshot) { throw 'The saved prompt was missing from the fixture' }
+    [IO.File]::WriteAllText($profileSnapshot, $editedSnapshot)
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'approval refuses an edited snapshot' {
+        Get-NativeTextLabels | Where-Object { $_.Contains("does not reproduce version $first") }
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $beforeProfile) { throw 'Opening the review changed the saved profile' }
+    [IO.File]::WriteAllText($profileSnapshot, $originalSnapshot)
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'the exact saved version is pinned in the draft' {
+        (Find-Element "Approved for ${target}${dot}/") -and (Find-Element "Pinned dotfile version $first")
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $beforeProfile) { throw 'Approval saved the profile before the user confirmed it' }
+    Save-ProfileEdit
+    $null = Wait-Until 'the exported manifest becomes the SSH profile dotfiles bundle' {
+        $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.dotfiles
+        $approved -and [FixtureDialog]::SameFile($profileSnapshot, $approved.bundle) -and
+            $approved.shell -ceq 'bash' -and $approved.bundle_sha256 -ceq $first -and $approved.home -ceq '/' -and
+            $approved.host -ceq $account.host -and $approved.user -ceq $account.user -and
+            $approved.port -eq $account.port -and $approved.fingerprint -ceq $account.host_key
+    }
+    (Wait-CheckBox $pinLabel ([System.Windows.Automation.ToggleState]::On)).Toggle()
+    $null = Wait-CheckBox $pinLabel ([System.Windows.Automation.ToggleState]::Off)
+    $null = Wait-Until 'clearing the pin requires approval' {
+        Find-Element 'Approve the edited dotfiles settings to update the saved approval'
+    }
+    $savedProfile = [IO.File]::ReadAllText($profiles)
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'approval follows the bundle without a pin' {
+        (Find-Element "Approved for ${target}${dot}/") -and !(Find-Element "Pinned dotfile version $first")
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $savedProfile) { throw 'Unpinning saved the profile before confirmation' }
+    Save-ProfileEdit
+    $null = Wait-Until 'the profile continues to approve edits to the same bundle' {
+        $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.dotfiles
+        $approved -and [FixtureDialog]::SameFile($profileSnapshot, $approved.bundle) -and
+            !$approved.PSObject.Properties['bundle_sha256']
+    }
+    if ([IO.File]::ReadAllText($selectorPath) -cne "$first`n") { throw 'Profile review changed the active remote version' }
 } finally {
     if ($app) { Close-FixtureApp $app }
 }

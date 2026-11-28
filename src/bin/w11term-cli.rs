@@ -302,6 +302,14 @@ fn read_limited(reader: impl Read) -> Result<Vec<u8>> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args == ["--version"] {
+        use w11term::windows_release::{VERSION, build_commit};
+        match build_commit() {
+            Some(commit) => println!("w11term-cli {VERSION} ({commit})"),
+            None => println!("w11term-cli {VERSION}"),
+        }
+        return ExitCode::SUCCESS;
+    }
     if args == ["--help"] || args == ["-h"] {
         println!(
             "{HELP}\n\n{}\n\n{}\n\n{}",
@@ -322,8 +330,9 @@ async fn main() -> ExitCode {
             packet_capture::CLIP_HELP
         );
         println!(
-            "\n{}\n{}",
+            "\n{}\n{}\n{}",
             syscall_capture::HELP,
+            syscall_capture::INSPECT_HELP,
             syscall_capture::COMPARE_HELP
         );
         println!("\n{}", diagnostics::HELP);

@@ -1,6 +1,9 @@
 #Requires -Version 7.0
 [CmdletBinding()]
-param([Parameter(Mandatory)][string] $ArchivePath)
+param(
+    [Parameter(Mandatory)][string] $ArchivePath,
+    [ValidatePattern('^[0-9a-f]{40}$')][string] $ExpectedCommit
+)
 
 $ErrorActionPreference = 'Stop'
 # list can report that the process has not yet opened its control pipe.
@@ -23,6 +26,13 @@ try {
     $hook = Get-FileHash -LiteralPath (Join-Path $app 'shell-integration.ps1') -Algorithm SHA256
     $expectedHook = Get-FileHash -LiteralPath (Join-Path $PSScriptRoot '../src/conpty/shell-integration.ps1') -Algorithm SHA256
     if ($hook.Hash -ne $expectedHook.Hash) { throw 'The packaged PowerShell integration script differs from this release.' }
+    $cli = Join-Path $app 'w11term-cli.exe'
+    if ($ExpectedCommit) {
+        $version = & $cli --version
+        if ($LASTEXITCODE -ne 0 -or $version -notlike "w11term-cli * ($ExpectedCommit)") {
+            throw "The packaged CLI did not identify the expected build $ExpectedCommit."
+        }
+    }
     $env:LOCALAPPDATA = $state
     $env:W11TERM_DATA_DIR = Join-Path $state 'app'
     $env:W11TERM_SETTINGS_PATH = Join-Path $state 'settings.json'
@@ -30,7 +40,6 @@ try {
     $gui = Start-Process -FilePath (Join-Path $app 'w11term.exe') -WorkingDirectory $state -PassThru `
         -WindowStyle Hidden -RedirectStandardError $diagnostics `
         -ArgumentList '--demo', '--cols', '72', '--rows', '26', '--profiles', 'profiles.json', '--smoke-seconds', '15'
-    $cli = Join-Path $app 'w11term-cli.exe'
     $startup = [Diagnostics.Stopwatch]::StartNew()
     do {
         if ($gui.HasExited) { throw "GUI exited before publishing its demo pane (exit $($gui.ExitCode))." }

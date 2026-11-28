@@ -194,6 +194,7 @@ enum Work {
 pub(super) struct Installer {
     target: ToolPane,
     account: String,
+    profile: Option<String>,
     bundle: Option<PathBuf>,
     shell: DotfileShell,
     zdotdir: String,
@@ -451,6 +452,7 @@ impl TerminalApp {
             self.command_reference.dotfiles = Some(Installer {
                 target,
                 account: format!("{}@{}:{}", ssh.user, ssh.host, ssh.port),
+                profile: live.profile_name.clone(),
                 bundle: settings.map(|settings| settings.bundle.clone()),
                 shell: settings.map_or(DotfileShell::Bash, |settings| settings.shell),
                 zdotdir: settings

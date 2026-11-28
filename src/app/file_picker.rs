@@ -24,6 +24,7 @@ pub(super) enum Purpose {
     CompareLocalFolder,
     SshConfig(PathBuf),
     DotfilesBundle(PathBuf),
+    DotfileFragment(PathBuf),
     SaveDotfilesBundle {
         current: PathBuf,
         suggestion: String,
@@ -44,6 +45,7 @@ pub(super) enum Purpose {
     DefaultDownloadFolder,
     DownloadFolder,
     Save(String),
+    SaveWindowsZip(String),
     SaveSearchResults,
     Scrollback,
     PaneImage,
@@ -261,6 +263,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::FlameGraph { export: false, .. }
                 | Purpose::SshConfig(_)
                 | Purpose::DotfilesBundle(_)
+                | Purpose::DotfileFragment(_)
                 | Purpose::ToolBundle(_)
                 | Purpose::ToolExecutable(_)
                 | Purpose::OpenSshHostList
@@ -589,6 +592,14 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
+            Purpose::DotfileFragment(current) => {
+                dialog.SetTitle(w!("Choose a shell fragment file"))?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if let Some(folder) = current.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
             Purpose::ToolExecutable(current) => {
                 dialog.SetTitle(w!("Choose a Linux executable"))?;
                 options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
@@ -685,6 +696,15 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 let suggested: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
+                None
+            }
+            Purpose::SaveWindowsZip(suggestion) => {
+                dialog.SetTitle(w!("Save verified Windows ZIP"))?;
+                let suggested: Vec<u16> = suggestion.encode_utf16().chain(Some(0)).collect();
+                dialog.SetFileName(PCWSTR(suggested.as_ptr()))?;
+                dialog.SetDefaultExtension(w!("zip"))?;
+                options &= !FOS_OVERWRITEPROMPT;
+                options |= FOS_PATHMUSTEXIST | FOS_NOTESTFILECREATE | FOS_DONTADDTORECENT;
                 None
             }
             Purpose::SaveSearchResults => {

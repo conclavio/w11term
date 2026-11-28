@@ -2004,6 +2004,7 @@ async fn approved_tool_sync_installs_before_shell_and_respects_manual_changes() 
     options.dotfiles = Some(Box::new(w11term::options::DotfileSync {
         bundle: dotfiles,
         shell: DotfileShell::Bash,
+        bundle_sha256: None,
         zdotdir: None,
         host: scope.host.clone(),
         user: scope.user.clone(),

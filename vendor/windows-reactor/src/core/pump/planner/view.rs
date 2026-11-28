@@ -38,6 +38,21 @@ fn validate_tree_nodes(nodes: &[TreeNode]) -> Result<(), PumpError> {
     Ok(())
 }
 
+// WinUI rejects a ListView index that does not exist in its current items.
+fn take_list_selection(plan: &mut UpdatePlan, start: usize, node: NodeId) -> Option<Command> {
+    let offset = plan.commands[start..].iter().position(|command| {
+        matches!(
+            command,
+            Command::SetProperty {
+                node: owner,
+                property: PropertyId::ListViewSelectedIndex,
+                ..
+            } if *owner == node
+        )
+    })?;
+    Some(plan.commands.remove(start + offset))
+}
+
 #[derive(Clone, Copy)]
 struct ChildListTarget {
     logical_parent: NodeId,
@@ -294,7 +309,9 @@ impl<R: NativeRuntime> Pump<R> {
                         plan,
                     );
                 }
+                let start = plan.commands.len();
                 Self::reconcile_shallow_control(tree, node, control, plan)?;
+                let selected_index = take_list_selection(plan, start, node);
                 let mut desired = collect_desired_slots(desired)?;
                 let slot_ids = slots(node_kind(tree, node)?);
                 if desired.keys().any(|slot| !slot_ids.contains(slot)) {
@@ -346,6 +363,9 @@ impl<R: NativeRuntime> Pump<R> {
                             return Err(PumpError::StructureUnsupported);
                         }
                     }
+                }
+                if let Some(command) = selected_index {
+                    plan.push(command);
                 }
                 Ok(node)
             }
@@ -2166,7 +2186,9 @@ impl<R: NativeRuntime> Pump<R> {
                 {
                     return Err(PumpError::StructureUnsupported);
                 }
+                let start = plan.commands.len();
                 let node = Self::mount_planned_element(tree, logical_parent, key, control, plan)?;
+                let selected_index = take_list_selection(plan, start, node);
                 for slot in slot_ids {
                     let slot_node = tree.insert(Some(node), NodeKind::NamedSlot(*slot));
                     if slot_is_collection(*slot) {
@@ -2236,6 +2258,9 @@ impl<R: NativeRuntime> Pump<R> {
                             });
                         }
                     }
+                }
+                if let Some(command) = selected_index {
+                    plan.push(command);
                 }
                 Ok((node, vec![node]))
             }

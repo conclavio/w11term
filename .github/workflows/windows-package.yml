@@ -21,10 +21,12 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
       - run: cargo build --locked --release --bins
+        env:
+          W11TERM_BUILD_COMMIT: ${{ github.sha }}
       - name: Package the GUI, CLI and Windows runtime
         run: ./scripts/package-windows.ps1 -BinaryDirectory "$PWD/target/release" -ArchivePath "$env:RUNNER_TEMP/$env:ARCHIVE"
       - name: Start the extracted app and drive it with the shipped CLI
-        run: ./scripts/test-release-package.ps1 -ArchivePath "$env:RUNNER_TEMP/$env:ARCHIVE"
+        run: ./scripts/test-release-package.ps1 -ArchivePath "$env:RUNNER_TEMP/$env:ARCHIVE" -ExpectedCommit $env:GITHUB_SHA
       - name: Checksum the verified ZIP
         working-directory: ${{ runner.temp }}
         run: |

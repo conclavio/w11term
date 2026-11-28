@@ -1324,15 +1324,23 @@ Direct pipe clients use `{"op":"list-dotfile-versions","shell":"bash"}` to list 
 
 Select an active or older version in **Dotfile versions** and choose **Save selected dotfile bundle** to write a new Windows JSON manifest. The manifest contains the verified environment and prompt fragments for the selected shell. Choose that shell when reviewing the saved manifest for another SSH account. The destination must be a new file.
 
+For the profile that opened the connected pane, choose **Review saved dotfiles in this SSH profile** after saving. The profile editor shows the saved digest, verified host-key fingerprint, SFTP home, shell, and optional Zsh startup directory. **Approve dotfiles sync** checks that the manifest still reproduces the saved version. This handoff selects **Pin approved dotfile version** by default. Choose **Save profile changes** to use it on the next connection.
+
 Scripts use `sftp --pane ID export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh`. The result includes `shell`, `home`, `bundle_sha256`, and the saved `local` path. Direct pipe clients send `"op":"export-dotfile-bundle"` with `shell`, `bundle_sha256`, and an absolute Windows `local` path.
 
 ### Sync dotfiles on SSH connect
 
 In **Settings → Edit profile → SSH dotfiles**, choose **Create dotfiles bundle** and enter a shared environment fragment, a Bash startup fragment, or a Zsh startup fragment. You can fill in more than one. **Save dotfiles bundle** writes a new local file and selects it in the profile. To change an existing bundle, select it and choose **Revise selected dotfiles bundle**. Save the revision to a new file. Profiles that use the original file continue to use it until you approve and save the revision for those profiles.
 
+In either editor, **Import shell fragment** appends a local UTF-8 file to the section you choose, including extensionless files such as `.profile`, `.bashrc`, and `.zshrc`. It accepts a UTF-8 BOM and converts CRLF to LF. Review or edit the combined text before saving. Each combined fragment can be up to 16 KiB.
+
+From the full text preview of an SSH file, **Use in dotfiles editor** brings a snapshot into the connected profile's draft. It opens a new bundle draft if there is no editor open for that profile. Choose the first and last lines and use **Append SSH lines** to select the destination fragment. Select lines outside existing w11term startup blocks. Saving creates a local bundle. Using the bundle on login still requires profile approval and saving.
+
 Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.
 
-The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. For Zsh with an alternate startup directory under the approved home, set `"zdotdir":"relative/directory"` or fill in the corresponding field in the editor.
+Select **Pin approved dotfile version** before approving to record the digest of the shared environment and the selected shell fragment. If the local bundle later produces a different digest, login sync skips the update and the SSH shell still opens. Approve and save the revised bundle to update the pin. Clear the checkbox, approve, and save to follow future edits to the local bundle. Existing approvals keep following the file until you pin them.
+
+The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. An optional `bundle_sha256` field stores the pin shown in the editor. For Zsh with an alternate startup directory under the approved home, set `"zdotdir":"relative/directory"` or fill in the corresponding field in the editor.
 
 ```json
 {
@@ -1651,6 +1659,14 @@ Open **More → Diagnostics → Syscall trace viewer** to inspect a saved trace 
 For a combined `strace -r` log, the viewer adds up the record deltas to show elapsed time from the first timed record. Resumed calls keep their entry time and contribute their resume delta to subsequent records. A missing delta on a trace event makes subsequent elapsed times unavailable. The viewer uses the absolute clock when both absolute and relative timestamps are present. Split files with relative timestamps alone keep their file order. [strace relative timestamps](https://github.com/strace/strace/blob/master/doc/strace.1.in)
 
 The viewer groups adjacent calls with the same process, syscall, resource, and outcome. Each group shows its count and available call duration. Select a group to review its original records, including the two lines for an unfinished and resumed call. Search by PID, name, resource, or errno, choose a filter, and select **Apply filters**. A missing absolute path is marked when the same process later succeeds on that path with the same syscall. The original error stays visible. w11term reads up to 64 MiB or one million records per selection. Very long lines are clipped in the preview and remain available in the source file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
+
+Choose **Syscall timing summary** to rank syscalls by total recorded duration, slowest single call, call count, or error count. The summary starts with all processes. Enter a PID and choose **Apply summary PID** to inspect one process. Select a row for the slowest call's original records. The counts show how many calls had a duration and how many were incomplete. An unfinished call matched to a resume counts once. Recorded durations come from `strace -T` and can overlap across threads or processes.
+
+Use `inspect-syscall-trace` for the same summary offline. Repeat `--trace` for the files of a split run. In the JSON, durations are decimal strings in nanoseconds or `null` when unavailable. The slowest call includes one-based file positions in argument order and original line numbers. Add `--output-file` to save the report to a new file.
+
+```powershell
+& $ctl inspect-syscall-trace --trace '.\trace.42' --trace '.\trace.43' --pid 42 --sort slowest
+```
 
 Choose **File descriptors** to follow open files, sockets and pipes. Search by path, `PID 123`, or `FD 4`. Reuse of the same descriptor number produces separate lifetimes. **Show related lifetimes** follows duplicates and inherited copies of the same open file description. Select a lifetime for the original calls that established, used, or closed it, including observed sharing of a descriptor table and close-on-exec. A lifetime first seen after open or still active when the available records end is labelled with the evidence available. Use the all-calls capture preset and retain timestamps when tracing several processes to capture more of these transitions. [Linux clone(2)](https://man7.org/linux/man-pages/man2/clone.2.html) · [Linux close(2)](https://man7.org/linux/man-pages/man2/close.2.html)
 

@@ -199,6 +199,13 @@ function Select-Viewer([switch]$FromComparison) {
     $null = Wait-Until 'enter the fixture viewer path' { [FixtureDialog]::SetFilename($dialog, $viewer, '') }
     $null = Wait-Until 'select the fixture viewer' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'viewer picker closed' { !(Find-OwnedDialog 'Choose Wireshark executable') }
+    $prefix = 'Wireshark executable '
+    $null = Wait-Until 'the fixture executable is active' {
+        foreach ($label in Get-NativeTextLabels) {
+            if ($label.StartsWith($prefix, [StringComparison]::Ordinal) -and
+                [FixtureDialog]::SameFile($viewer, $label.Substring($prefix.Length))) { return $true }
+        }
+    }
 }
 
 function Save-PacketComparison([string]$Path, [switch]$Json) {
@@ -309,7 +316,7 @@ try {
     }
     $expander = Open-PacketSection 'packet-timeline'
     $null = Wait-Until 'the timeline chart and its earliest peak are visible' {
-        (Find-Element 'Packet timeline chart' -Visible) -and
+        (Find-Element "Packet timeline chart${dot}selected +0.000 s" -Visible) -and
             (Find-Element 'Bucket width 0.008192 s' -Visible) -and
             (Find-Element "Peak 1 packet${dot}4 bytes${dot}+0.000 s from timeline start" -Visible)
     }
@@ -364,12 +371,10 @@ try {
     Select-Viewer
     if ([IO.File]::Exists($olderCapture + '.opened')) { throw 'Selecting the local file launched Wireshark' }
     $expander = Open-PacketSection 'packet-timeline'
-    $intervals = Wait-CaptureCombo 'Packet timeline intervals'
-    $intervals.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $interval = Wait-Until 'the second populated interval is available' {
-        Find-Element "+0.499712 s${dot}1 packet" ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    Select-CaptureComboItem 'Packet timeline intervals' "+0.499712 s${dot}1 packet"
+    $null = Wait-Until 'the timeline has applied the selected interval' {
+        Find-Element "Packet timeline chart${dot}selected +0.499712 s"
     }
-    $interval.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
     Click 'Open interval in Wireshark'
     $null = Wait-Until 'the original capture and exact UTC interval reach Wireshark' {
         $displayFilter = $olderCapture + '.filter'
@@ -804,6 +809,7 @@ try {
     }
     Click 'Back to capture'
     Select-Capture $manyIpCapture
+    $null = Wait-Until 'the many-IP capture is loaded' { Test-CaptureFile $manyIpCapture }
     $null = Open-PacketSection 'packet-ip-conversations'
     $null = Wait-Until 'standalone IP results have more than one page' {
         (Find-Element 'Page 1 of 2') -and (Find-Element 'Next IP page' $button)
@@ -831,6 +837,7 @@ try {
         (Find-Element 'Page 1 of 2') -and !(Find-Element 'Matching IP pairs 1 of 15')
     }
     Select-Capture $manyPortsCapture
+    $null = Wait-Until 'the many-port capture is loaded' { Test-CaptureFile $manyPortsCapture }
     $null = Open-PacketSection 'packet-transport-conversations'
     Click 'Next port pair page'
     $row = Wait-Until 'the second standalone port page displays lower-ranked results' {

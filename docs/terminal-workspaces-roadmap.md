@@ -293,6 +293,7 @@ The overview's **Activity** list follows jobs started from the app in the curren
 
 - Start a selected binary with explicit arguments and working directory under `strace`. Use `-f -o TRACE` to retain an original, PID-tagged stream across descendants. Its single sink enforces a strict total byte budget while retaining order for per-process views. Support importing separate `-ff` files for traces collected outside w11term. Use `-ttt` for timestamps, `-T` for syscall duration, `-yy` for descriptor details, and a bounded `-s` string length. Stop terminates the command and traced descendants, then saves the collected output. Offer file, process, and network presets and report incomplete output explicitly. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
 - Open completed traces or import existing traces into a Windows diagnostics tab. Group repetitive adjacent calls by process, syscall, resource, and outcome. Show counts and elapsed time, and expand groups to the original lines. Promote process transitions, file opens and closes, unusual delays, and errno results. Keep expected fallback errors visible and distinguish them from failures with no successful fallback in the observed trace.
+- Rank syscalls by cumulative or longest recorded duration, call count, and error count in the viewer and its offline CLI. Show timing coverage and link the slowest occurrence of each syscall to the source records. Scope the summary to one PID when needed.
 - Give each open handle a lifetime through `openat`, socket or pipe creation, duplication, inherited handles, and closure. Distinguish a reused descriptor number from the earlier handle. Track shared descriptor tables and close-on-exec. A file view should show which processes opened it, what they did with it, and where each handle was closed. Preserve unknown or incomplete events as such.
 
 ### Compare a working run with a failing run
@@ -333,6 +334,10 @@ Use a single SSH profile to bring your shell setup and tools to a Linux account.
 
 The SSH dotfiles editor can create a bundle locally or revise an existing bundle in a new file. It edits the shared environment and the Bash and Zsh fragments directly. Choosing the new file leaves the profile's saved approval in place until the new selection is approved and saved.
 
+**Import shell fragment** appends an existing local shell file to the selected editor section for review before saving a bundle. [Import local dotfiles](../CONTROL.md#sync-dotfiles-on-ssh-connect)
+
+From an SSH text preview, **Use in dotfiles editor** carries an excerpt to the connected profile's bundle draft. Select the line range and destination fragment before saving. [Import an SSH excerpt](../CONTROL.md#sync-dotfiles-on-ssh-connect)
+
 For an already connected SSH pane, **More → Command reference → Apply SSH dotfiles** reviews and applies a bundle on that connection. The review shows the target home, managed files, startup hooks, and conflicts. Open a new shell to use the installed fragments. [Reviewed dotfile installation](../CONTROL.md#preview-and-apply-ssh-dotfiles)
 
 Install and version reviews show which lines change in the managed environment and prompt fragments. The install review also shows the generated startup hooks it will add. [Dotfile content review](../CONTROL.md#preview-and-apply-ssh-dotfiles)
@@ -342,6 +347,10 @@ Install and version reviews show which lines change in the managed environment a
 **Dotfile versions** lists the active and retained versions for Bash or Zsh. Review and restore a previous version, or disable managed fragments for the account. Both pause automatic sync. Resume it from the same panel to let approved profiles sync on reconnect. [Dotfile version history](../CONTROL.md#restore-or-disable-ssh-dotfiles)
 
 Select a version and save its verified fragments as a Windows bundle for reuse in another SSH profile. [Save a retained version](../CONTROL.md#restore-or-disable-ssh-dotfiles)
+
+From the same pane, **Review saved dotfiles in this SSH profile** carries the saved bundle and authenticated target into the profile editor for approval. [Review a saved bundle](../CONTROL.md#restore-or-disable-ssh-dotfiles)
+
+Pin an approved dotfile version to keep reconnects on that shell's reviewed content. If the local bundle changes, the shell still opens and the login status explains why sync was skipped. [Pin a profile version](../CONTROL.md#sync-dotfiles-on-ssh-connect)
 
 From that pane, **More → Command reference** shows both login sync results for the current connection. **Apply SSH dotfiles** shows the reason when dotfiles sync was skipped or unconfirmed. The command manual can show the managed launcher path. With Bash or Zsh PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)
 

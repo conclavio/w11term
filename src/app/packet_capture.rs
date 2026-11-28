@@ -672,6 +672,10 @@ impl Panel {
                     } else {
                         "packets"
                     };
+                    let chart_name = format!(
+                        "Packet timeline chart · selected +{} s",
+                        seconds_text(width * selected as u128)
+                    );
                     files.push(KeyedView::new("local-timeline",
                         Expander::new().automation_name("Packet timeline").automation_id("packet-timeline")
                             .is_expanded(self.timeline_expanded)
@@ -681,7 +685,7 @@ impl Panel {
                             SlotView::new(ExpanderSlot::Content, StackPanel::new().spacing(6.0).children((
                                 TextBlock::new().text(format!("Bucket width {} s", seconds_text(width))),
                                 Border::new().height(CHART_HEIGHT).background(Color::rgb(44, 44, 48))
-                                    .automation_name("Packet timeline chart").content(bars),
+                                    .automation_name(chart_name).content(bars),
                                 TextBlock::new().text(format!("Peak {} {unit} · {} bytes · +{} s from timeline start",
                                     peak.packets, peak.captured_bytes, seconds_text(width * peak_index as u128)))
                                     .text_wrapping(TextWrapping::Wrap),
