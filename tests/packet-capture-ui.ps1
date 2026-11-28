@@ -1011,6 +1011,15 @@ try {
         @($settings.PSObject.Properties.Name).Count -ne 2) {
         throw 'The packet settings file changed the reviewed inputs or contained execution scope'
     }
+    $cliSettings = Join-Path $State 'scripted capture settings.json'
+    $created = & $Cli save-packet-capture-settings --interface lo --filter 'udp and dst port 4321' `
+        --snap-length 192 --seconds 15 --max-mib 1 --packet-limit 3 --rotate-files 2 --tmpfs `
+        --output-file $cliSettings | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or !$created.ok -or ![IO.File]::Exists($cliSettings) -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliSettings)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($settingsFile))) {
+        throw 'The CLI-generated capture settings differ from the Windows export'
+    }
 
     Set-Field 'Capture filter (optional)' 'udp and dst port 1234'
     Set-Field 'Duration in seconds' '10'
@@ -1018,7 +1027,7 @@ try {
     $null = Wait-Until 'changed inputs have their own review' {
         Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","3","-w","-","--","udp and dst port 1234"]'
     }
-    Select-Capture $settingsFile ('Load settings' + [char]0x2026) 'Open packet capture settings'
+    Select-Capture $cliSettings ('Load settings' + [char]0x2026) 'Open packet capture settings'
     $null = Wait-Until 'loading restores the original filter and clears the previous review' {
         $field = Find-Element 'Capture filter (optional)' $edit
         $duration = Find-Element 'Duration in seconds' $edit

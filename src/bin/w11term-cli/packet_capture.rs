@@ -31,7 +31,15 @@ const CAPTURE_FLAGS: &[&str] = &[
     "--packet-limit",
     "--rotate-files",
     "--scratch-directory",
+    "--tmpfs",
 ];
+
+pub(super) const SAVE_SETTINGS_VERB: &str = "save-packet-capture-settings";
+pub(super) const SAVE_SETTINGS_HELP: &str = concat!(
+    "w11term-cli save-packet-capture-settings --interface NAME [--filter EXPR] ",
+    "[--snap-length BYTES] [--seconds N] [--max-mib N] [--packet-limit N] ",
+    "[--rotate-files 2..16] [--scratch-directory PATH] [--tmpfs] [--output-file PATH]",
+);
 
 pub(super) const INSPECT_VERB: &str = "inspect-packet-capture";
 pub(super) const INSPECT_HELP: &str = concat!(
@@ -202,41 +210,19 @@ fn report_options<'a>(
 
 pub(super) fn parse(
     verb: &str,
-    mut args: impl Iterator<Item = String>,
+    args: impl Iterator<Item = String>,
     pane: Option<u64>,
 ) -> Result<(Request, Option<PathBuf>)> {
     let listing = verb == "list-packet-interfaces";
     let capture = verb == "capture-packets";
     let stop = verb == "stop-packet-capture";
-    let mut flags = BTreeMap::new();
-    let mut tmpfs = false;
-    while let Some(flag) = args.next() {
-        ensure!(
-            !listing || flag == "--pane",
-            "unsupported packet capture option {flag}"
-        );
-        if flag == "--tmpfs" {
-            ensure!(!stop && !tmpfs, "invalid --tmpfs for {verb}");
-            tmpfs = true;
-            continue;
-        }
-        let accepted = flag == "--pane"
-            || !stop && (flag == "--settings" || CAPTURE_FLAGS.contains(&flag.as_str()))
-            || (capture || stop) && matches!(flag.as_str(), "--connection-generation" | "--job-id")
-            || capture
-                && matches!(
-                    flag.as_str(),
-                    "--review-id" | "--output-file" | "--wireshark"
-                );
-        ensure!(accepted, "unsupported packet capture option {flag}");
-        let value = args
-            .next()
-            .with_context(|| format!("{flag} requires a value"))?;
-        ensure!(
-            flags.insert(flag.clone(), value).is_none(),
-            "specify {flag} only once"
-        );
-    }
+    let (mut flags, tmpfs) = read_flags(args, |flag| {
+        flag == "--pane"
+            || !listing
+                && (!stop && (flag == "--settings" || CAPTURE_FLAGS.contains(&flag))
+                    || (capture || stop) && matches!(flag, "--connection-generation" | "--job-id")
+                    || capture && matches!(flag, "--review-id" | "--output-file" | "--wireshark"))
+    })?;
     let pane_arg = flags
         .remove("--pane")
         .map(|value| value.parse())
@@ -302,6 +288,42 @@ pub(super) fn parse(
         .map(path::absolute)
         .transpose()?;
     Ok((request, wireshark))
+}
+
+pub(super) fn save_settings(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let (mut flags, tmpfs) = read_flags(args.iter().cloned(), |flag| {
+        CAPTURE_FLAGS.contains(&flag) || flag == "--output-file"
+    })?;
+    let json = capture_options(&mut flags, tmpfs)?.settings_json()?;
+    offline::write_report(
+        output,
+        flags.get("--output-file").map(String::as_str),
+        |writer| writer.write_all(json.as_bytes()),
+    )
+}
+
+fn read_flags(
+    mut args: impl Iterator<Item = String>,
+    accepts: impl Fn(&str) -> bool,
+) -> Result<(BTreeMap<String, String>, bool)> {
+    let mut flags = BTreeMap::new();
+    let mut tmpfs = false;
+    while let Some(flag) = args.next() {
+        ensure!(accepts(&flag), "unsupported packet capture option {flag}");
+        if flag == "--tmpfs" {
+            ensure!(!tmpfs, "specify --tmpfs only once");
+            tmpfs = true;
+            continue;
+        }
+        let value = args
+            .next()
+            .with_context(|| format!("{flag} requires a value"))?;
+        ensure!(
+            flags.insert(flag.clone(), value).is_none(),
+            "specify {flag} only once"
+        );
+    }
+    Ok((flags, tmpfs))
 }
 
 fn capture_options(

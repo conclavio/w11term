@@ -1,11 +1,7 @@
 use super::PacketCaptureOptions;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::File,
-    io::{Read, Write},
-    path::Path,
-};
+use std::{fs::File, io::Read, path::Path};
 
 const SETTINGS_VERSION: u8 = 1;
 const MAX_SETTINGS_BYTES: u64 = 16 * 1024;
@@ -42,16 +38,19 @@ impl PacketCaptureOptions {
         settings.options.validate()
     }
 
-    pub fn save_settings(self, path: &Path) -> Result<()> {
+    pub fn settings_json(self) -> Result<String> {
         let settings = Settings {
             schema_version: SETTINGS_VERSION,
             options: self.validate()?,
         };
-        crate::transcript::save_with(path, false, |file| {
-            serde_json::to_writer_pretty(&mut *file, &settings)?;
-            file.write_all(b"\n")
-        })
-        .context("Saving new packet capture settings")
+        let mut json = serde_json::to_string_pretty(&settings)?;
+        json.push('\n');
+        Ok(json)
+    }
+
+    pub fn save_settings(self, path: &Path) -> Result<()> {
+        crate::transcript::save(path, &self.settings_json()?, false)
+            .context("Saving new packet capture settings")
     }
 }
 

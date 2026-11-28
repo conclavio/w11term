@@ -124,6 +124,67 @@ fn classic_capture() -> Vec<u8> {
 }
 
 #[test]
+fn creates_reusable_capture_settings_offline_and_preserves_existing_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let save_settings = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+            .current_dir(root)
+            .env_remove("LOCALAPPDATA")
+            .args([
+                "save-packet-capture-settings",
+                "--interface",
+                "lo",
+                "--filter",
+                "udp and dst port 4321",
+                "--tmpfs",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    let output = save_settings(&[]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({
+            "schema_version": 1,
+            "options": {
+                "interface": "lo", "filter": "udp and dst port 4321", "snap_length": 192,
+                "seconds": 15, "max_mib": 16, "packet_limit": null,
+                "scratch_directory": "/dev/shm", "require_tmpfs": true
+            }
+        })
+    );
+    let file_name = "capture settings.json";
+    let result = save_settings(&["--output-file", file_name]);
+    assert!(result.status.success(), "{result:?}");
+    let reply: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let path = Path::new(reply["result"]["path"].as_str().unwrap());
+    assert_eq!(reply["ok"], true);
+    assert_eq!(path, root.join(file_name));
+    assert_eq!(fs::read(path).unwrap(), output.stdout);
+    let loaded = w11term::control::PacketCaptureOptions::load_settings(path).unwrap();
+    assert!(loaded.require_tmpfs);
+    assert_eq!(loaded.filter, "udp and dst port 4321");
+
+    let collision = save_settings(&["--seconds", "20", "--output-file", file_name]);
+    assert!(!collision.status.success());
+    assert!(collision.stdout.is_empty());
+    assert_eq!(fs::read(path).unwrap(), output.stdout);
+    for bad in [&["--seconds", "61"][..], &["--pane", "7"], &["--tmpfs"]] {
+        let output = save_settings(&[bad, &["--output-file", "invalid.json"]].concat());
+        assert!(!output.status.success(), "{bad:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["ok"], false);
+        assert!(!root.join("invalid.json").exists());
+    }
+}
+
+#[test]
 fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();

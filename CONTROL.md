@@ -1576,8 +1576,11 @@ Expand **Capture settings files** to save the current inputs as a new JSON file 
 
 Use `--settings PATH` in place of the capture option flags in both CLI commands. Pass the pane, review ID, connection generation, and output path as usual. Both commands read the settings file when called. If its capture options change after preview, run the review again.
 
+Use `save-packet-capture-settings` to create the same JSON from the capture flags without launching w11term or connecting to SSH. With `--output-file`, it saves a new file and returns its path in the JSON reply. Omit the option to print the settings to stdout.
+
 ```powershell
 $settings = '.\packet-capture-settings.json'
+& $ctl save-packet-capture-settings --interface lo --filter 'udp and port 4321' --seconds 15 --output-file $settings
 $plan = (& $ctl --pid 12345 preview-packet-capture --pane 1 --settings $settings | ConvertFrom-Json).result.plan
 & $ctl --pid 12345 capture-packets --pane 1 --settings $settings --connection-generation $plan.connection_generation --review-id $plan.review_id --output-file '.\after.pcap'
 ```
