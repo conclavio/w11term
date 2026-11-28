@@ -313,6 +313,22 @@ try {
             $left -and $right -and $left.Contains('read(3</tmp/data>, "b"') -and
             $right.Contains('No corresponding call')
     }
+    $missing = Find-Element 'Open failing evidence' $button
+    if (!$missing -or $missing.Current.IsEnabled) {
+        throw 'The missing counterpart offered a source jump'
+    }
+    Click 'Open working evidence'
+    $null = Wait-Until 'working source marks the excess read next to the earlier read' {
+        $raw = Raw-Text
+        (Find-TraceGroup '*PID 21*read*/tmp/data*') -and
+            $raw -and $raw.Contains('read(3</tmp/data>, "a"') -and
+            ($raw -match "Comparison evidence\s+working diag.strace${dot}Line 6\s+[^\r\n]+read\(3</tmp/data>, ") -and
+            $raw.Contains('read(3</tmp/data>, "b"') -and !(Raw-Text $workingId)
+    }
+    Press-Key 0x79 # F10 closes the source tab.
+    $null = Wait-Until 'comparison restores the selected excess sample' {
+        (Find-Element 'Evidence 2 of 2') -and (Raw-Text $workingId) -and (Raw-Text $failingId)
+    }
     Click 'Previous comparison evidence'
     $null = Wait-Until 'the aligned reads show each original descriptor number' {
         $left = Raw-Text $workingId
@@ -321,6 +337,19 @@ try {
             $right.Contains('read(8</tmp/data>, "a"') -and
             $left.Contains('+3.000 ms from timing reference') -and
             $right.Contains('+3.000 ms from timing reference')
+    }
+    Click 'Open failing evidence'
+    $null = Wait-Until 'failing source opens at the corresponding read' {
+        $raw = Raw-Text
+        (Find-TraceGroup '*PID 77*read*/tmp/data*') -and
+            $raw -and ($raw -match "Comparison evidence\s+failing diag.strace${dot}Line 4\s+") -and
+            $raw.Contains('read(8</tmp/data>, "a"') -and !(Raw-Text $failingId)
+    }
+    Press-Key 0x79
+    $null = Wait-Until 'comparison retains the prior selection and timing reference' {
+        $left = Raw-Text $workingId
+        (Find-Element 'Evidence 1 of 2') -and (Find-Element "1 matching change row${dot}Page 1 of 1") -and
+            $left -and $left.Contains('+3.000 ms from timing reference')
     }
     $anchorButton = Find-Element 'Use selected pair as time zero' $button
     if (!$anchorButton -or $anchorButton.Current.IsEnabled) {

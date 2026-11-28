@@ -18,6 +18,7 @@ pub enum Action {
     Select(TabId, Arc<Comparison>, usize),
     Page(TabId, bool),
     Evidence(TabId, bool),
+    OpenEvidence(TabId, usize),
     SetTimingAnchor(TabId),
     ClearTimingAnchor(TabId),
     Timing(TabId, bool),
@@ -158,6 +159,7 @@ impl TerminalApp {
                     state.sample = step(state.sample, row.evidence_count(), next);
                 }
             }
+            Action::OpenEvidence(tab, side) => self.open_syscall_evidence(tab, side, ctx),
             Action::SetTimingAnchor(tab) => {
                 if let Some(state) = self.comparison_input(tab)
                     && let Some(anchor) = state.selected_timing_anchor()
@@ -229,6 +231,24 @@ impl TerminalApp {
     fn comparison_input(&mut self, tab: TabId) -> Option<&mut ViewState> {
         let page = self.syscall_page(tab)?;
         (page.comparison.open && page.pending.is_none()).then_some(&mut page.comparison)
+    }
+
+    fn open_syscall_evidence(&mut self, tab: TabId, side: usize, ctx: &ComponentContext<Self>) {
+        if self.tabs.active_id() != Some(tab) {
+            return;
+        }
+        let Some((trace, event)) = self.comparison_input(tab).and_then(|state| {
+            let (comparison, row) = state.current()?;
+            let trace = comparison.traces().get(side)?.clone();
+            let event = comparison.event(row, side, state.sample)?;
+            Some((trace, event))
+        }) else {
+            return;
+        };
+        let mut page = Box::<PageState>::default();
+        if page.load_evidence(trace, event).is_some() {
+            self.new_syscall_viewer(page, ctx);
+        }
     }
 
     fn filter_trace_comparison(&mut self, tab: TabId, ctx: &ComponentContext<Self>) {
@@ -780,19 +800,22 @@ impl ViewState {
                     .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
                     .column_spacing(12.0)
                     .children((
-                        self.evidence_column(compare, current, 0),
+                        self.evidence_column(tab, compare, current, 0, idle, ctx),
                         Border::new()
                             .grid_column(1)
-                            .content(self.evidence_column(compare, current, 1)),
+                            .content(self.evidence_column(tab, compare, current, 1, idle, ctx)),
                     )),
             ))
     }
 
     fn evidence_column(
         &self,
+        tab: TabId,
         compare: &Comparison,
         row: Option<&ComparisonRow>,
         side: usize,
+        idle: bool,
+        ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let trace = &compare.traces()[side];
         let first = trace.first_path();
@@ -806,18 +829,28 @@ impl ViewState {
         } else {
             "comparison-failing-original"
         };
+        let can_open = row.is_some_and(|row| compare.event(row, side, self.sample).is_some());
         let evidence = row.map_or_else(String::new, |row| {
             evidence_text(compare, row, side, self.sample, self.anchor)
         });
         Grid::new()
-            .rows([GridLength::Auto, GridLength::Star(1.0)])
+            .rows([GridLength::Auto, GridLength::Auto, GridLength::Star(1.0)])
             .row_spacing(6.0)
             .children((
                 TextBlock::new()
                     .font_size(16.0)
                     .text(format!("{label} · {}", safe_text(&name)))
                     .text_wrapping(TextWrapping::Wrap),
-                ScrollViewer::new().grid_row(1).content(
+                Button::new()
+                    .grid_row(1)
+                    .is_enabled(idle && can_open)
+                    .on_click(ctx.callback(move |_| message(Action::OpenEvidence(tab, side))))
+                    .content(if side == 0 {
+                        "Open working evidence"
+                    } else {
+                        "Open failing evidence"
+                    }),
+                ScrollViewer::new().grid_row(2).content(
                     TextBlock::new()
                         .automation_id(automation_id)
                         .is_text_selection_enabled(true)

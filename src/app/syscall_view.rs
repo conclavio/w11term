@@ -44,6 +44,7 @@ pub(super) struct PageState {
     group_page: usize,
     raw_page: usize,
     selected: Option<usize>,
+    evidence_event: Option<usize>,
     descriptors: handles::ViewState,
     timing: summary::ViewState,
     comparison: compare::ViewState,
@@ -305,7 +306,21 @@ impl PageState {
         self.comparison = Default::default();
         self.report = Default::default();
         self.capture.reset_for_loaded_trace();
+        self.evidence_event = None;
         self.reset_position();
+    }
+
+    fn load_evidence(&mut self, trace: Arc<Trace>, event: usize) -> Option<()> {
+        let group = trace
+            .groups()
+            .partition_point(|group| group.range.end <= event);
+        let start = trace.groups().get(group)?.range.start;
+        self.load(trace);
+        self.selected = Some(group);
+        self.group_page = group / GROUPS_PER_PAGE;
+        self.raw_page = (event - start) / CALLS_PER_PAGE;
+        self.evidence_event = Some(event);
+        Some(())
     }
 
     fn begin(&mut self, status: &str) -> Arc<()> {
@@ -542,11 +557,13 @@ impl PageState {
         let start = group.range.start + self.raw_page * CALLS_PER_PAGE;
         let end = (start + CALLS_PER_PAGE).min(group.range.end);
         let mut original = String::new();
-        for raw in trace.events()[start..end]
-            .iter()
-            .flat_map(|event| event.originals())
-        {
-            append_raw(&mut original, trace, raw);
+        for (offset, event) in trace.events()[start..end].iter().enumerate() {
+            if self.evidence_event == Some(start + offset) {
+                original.push_str("Comparison evidence\n");
+            }
+            for raw in event.originals() {
+                append_raw(&mut original, trace, raw);
+            }
         }
         let detail = format!(
             "Calls {}–{} of {}",
@@ -664,4 +681,27 @@ fn safe_text(text: &str) -> String {
         }
     }
     safe
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evidence_selects_later_group_and_record_pages() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut records = "42 getpid() = 42\n42 getppid() = 41\n".repeat(32);
+        records.push_str("42 getpid() = 42\n");
+        records.push_str(&"42 read(3</tmp/data>, \"a\", 1) = 1\n".repeat(25));
+        std::fs::write(file.path(), records).unwrap();
+        let trace = Arc::new(Trace::open(vec![file.path().to_owned()]).unwrap());
+        let event = 87;
+        let mut page = PageState::default();
+        page.load_evidence(trace, event).unwrap();
+
+        assert_eq!(page.group_page, 1);
+        assert_eq!(page.selection().unwrap().range, 65..90);
+        assert_eq!(page.raw_page, 1);
+        assert_eq!(page.evidence_event, Some(event));
+    }
 }
