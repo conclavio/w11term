@@ -1418,6 +1418,8 @@ Both steps use the normal profile catalog unless you supply `--profiles PATH`. T
 
 In the Windows editor, select the revision under **SSH dotfiles** and choose **Roll out to saved profiles**. Check the saved profiles you intend to update. **Review selected rollout profiles** shows their accounts, previous bundle paths and pins, proposed shell digests, and expandable environment and prompt line changes. If the baseline is missing or no longer matches its pin, the review shows the proposed lines. **Apply reviewed rollout** saves that selection with the same stale-input checks as the CLI.
 
+While the Windows rollout result is open, **Review rollback** lists the bundle paths and pins the rollback would restore. **Apply reviewed rollback** restores the batch together. Each selected approval must still match the completed rollout. If a bundle changes after the rollback preview, review it again before confirming.
+
 To keep a CLI rollout reversible, save the JSON reply from the successful apply. `rollback-dotfiles-profiles` previews the previous bundle paths and pins for the profiles that rollout changed. It uses the catalog recorded in the reply and rejects the whole batch if any of those approvals have since changed. The preview reports whether each previous bundle is available and whether it matches its saved pin. Rollback restores the prior approvals even if a previous bundle is missing. Login sync checks the restored approval and bundle when a new SSH session opens.
 
 ```powershell

@@ -1,7 +1,10 @@
 use super::*;
 use crate::app::command_reference::dotfiles::comparison::{code_details, diff_text};
 use std::collections::BTreeSet;
-use w11term::profiles::{DotfileRolloutBaseline, DotfileRolloutReport, ProfileStore};
+use w11term::profiles::{
+    DotfileRestoreStatus, DotfileRollbackReport, DotfileRolloutBaseline, DotfileRolloutReport,
+    ProfileStore,
+};
 
 type Targets = Vec<(String, DotfileSync)>;
 
@@ -15,6 +18,9 @@ pub enum Action {
     Back(Arc<()>),
     Apply(Arc<()>),
     Completed(Arc<()>, Result<Arc<ReviewedRollout>, String>),
+    ReviewRollback(Arc<()>),
+    ApplyRollback(Arc<()>),
+    RollbackCompleted(Arc<()>, Result<Arc<DotfileRollbackReport>, String>),
     Close(Arc<()>),
 }
 
@@ -25,7 +31,19 @@ enum Work {
     Reviewing,
     Reviewed(Arc<ReviewedRollout>),
     Applying,
-    Applied(usize),
+    Applied(Arc<ReviewedRollout>),
+    Rollback {
+        applied: Arc<ReviewedRollout>,
+        state: Undo,
+    },
+    RolledBack(usize),
+}
+
+#[derive(Clone)]
+enum Undo {
+    Reviewing,
+    Reviewed(Arc<DotfileRollbackReport>),
+    Applying,
 }
 
 #[derive(Clone)]
@@ -122,6 +140,41 @@ impl Panel {
         );
     }
 
+    fn request_rollback(
+        &mut self,
+        id: TabId,
+        applied: Arc<ReviewedRollout>,
+        review: Option<String>,
+        ctx: &ComponentContext<TerminalApp>,
+    ) {
+        let state = if review.is_some() {
+            Undo::Applying
+        } else {
+            Undo::Reviewing
+        };
+        self.work = Work::Rollback {
+            applied: applied.clone(),
+            state,
+        };
+        self.error = None;
+        let ticket = self.ticket.clone();
+        let rejected = message(
+            id,
+            Action::RollbackCompleted(ticket.clone(), Err("Dotfile rollback unavailable".into())),
+        );
+        ctx.spawn_background_with_rejection(
+            move |_| {
+                let result = applied
+                    .report
+                    .rollback(review.as_deref())
+                    .map(Arc::new)
+                    .map_err(|error| format!("{error:#}"));
+                message(id, Action::RollbackCompleted(ticket, result))
+            },
+            rejected,
+        );
+    }
+
     pub(super) fn view(&self, id: TabId, ctx: &ViewContext<TerminalApp>) -> View {
         let send = |action: Action| ctx.callback(move |_| message(id, action.clone()));
         let mut fields = vec![
@@ -132,9 +185,83 @@ impl Panel {
             Work::Loading => fields.push(label("status", "Reading saved SSH profiles…")),
             Work::Reviewing => fields.push(label("status", "Checking the selected profiles…")),
             Work::Applying => fields.push(label("status", "Saving the reviewed rollout…")),
-            Work::Applied(count) => fields.push(label(
+            Work::Applied(applied) => {
+                fields.push(label(
+                    "status",
+                    format!(
+                        "Updated dotfiles in {} saved SSH profiles.",
+                        applied.report.changed_profiles
+                    ),
+                ));
+                fields.push(KeyedView::new(
+                    "review-rollback",
+                    Button::new()
+                        .on_click(send(Action::ReviewRollback(self.ticket.clone())))
+                        .content("Review rollback"),
+                ));
+            }
+            Work::Rollback { state, .. } => match state {
+                Undo::Reviewing => {
+                    fields.push(label("status", "Checking the previous dotfile approvals…"))
+                }
+                Undo::Applying => {
+                    fields.push(label("status", "Restoring the reviewed dotfile approvals…"))
+                }
+                Undo::Reviewed(rollback) => {
+                    for entry in &rollback.profiles {
+                        let restore = &entry.restore;
+                        let policy = restore.bundle_sha256.as_deref().map_or_else(
+                            || "Follows the bundle file".into(),
+                            |pin| format!("Restore pin {pin}"),
+                        );
+                        let status = match entry.restore_status {
+                            DotfileRestoreStatus::BundleUnavailable => {
+                                "The previous bundle is unavailable for this shell."
+                            }
+                            DotfileRestoreStatus::FollowsFile => {
+                                "The previous bundle is available."
+                            }
+                            DotfileRestoreStatus::MatchesPin => {
+                                "The previous bundle matches its pin."
+                            }
+                            DotfileRestoreStatus::PinMismatch => {
+                                "The previous bundle differs from its restored pin."
+                            }
+                        };
+                        fields.push(KeyedView::new(
+                            format!("rollback-{}", entry.profile),
+                            StackPanel::new().spacing(3.0).children((
+                                TextBlock::new()
+                                    .text(profile_label(&entry.profile, restore))
+                                    .text_wrapping(TextWrapping::Wrap),
+                                TextBlock::new()
+                                    .text(format!("Restore {}", restore.bundle.display()))
+                                    .text_wrapping(TextWrapping::Wrap),
+                                TextBlock::new()
+                                    .text(policy)
+                                    .text_wrapping(TextWrapping::Wrap),
+                                TextBlock::new()
+                                    .text(status)
+                                    .text_wrapping(TextWrapping::Wrap),
+                            )),
+                        ));
+                    }
+                    fields.push(KeyedView::new(
+                        "rollback-actions",
+                        StackPanel::new().spacing(6.0).children((
+                            Button::new()
+                                .on_click(send(Action::ApplyRollback(self.ticket.clone())))
+                                .content("Apply reviewed rollback"),
+                            Button::new()
+                                .on_click(send(Action::Back(self.ticket.clone())))
+                                .content("Back to rollout result"),
+                        )),
+                    ));
+                }
+            },
+            Work::RolledBack(count) => fields.push(label(
                 "status",
-                format!("Updated dotfiles in {count} saved SSH profiles."),
+                format!("Restored dotfiles in {count} saved SSH profiles."),
             )),
             Work::Reviewed(review) => {
                 let report = &review.report;
@@ -271,7 +398,14 @@ impl Panel {
         fields.push(KeyedView::new(
             "close",
             Button::new()
-                .is_enabled(!matches!(self.work, Work::Applying))
+                .is_enabled(!matches!(
+                    self.work,
+                    Work::Applying
+                        | Work::Rollback {
+                            state: Undo::Applying,
+                            ..
+                        }
+                ))
                 .on_click(send(Action::Close(self.ticket.clone())))
                 .content("Close dotfile rollout"),
         ));
@@ -355,6 +489,9 @@ impl TerminalApp {
             | Action::Back(ticket)
             | Action::Apply(ticket)
             | Action::Completed(ticket, _)
+            | Action::ReviewRollback(ticket)
+            | Action::ApplyRollback(ticket)
+            | Action::RollbackCompleted(ticket, _)
             | Action::Close(ticket) => ticket,
             Action::Open => unreachable!(),
         };
@@ -380,6 +517,15 @@ impl TerminalApp {
             Action::Back(_) if matches!(panel.work, Work::Reviewed(_)) => {
                 panel.work = Work::Editing
             }
+            Action::Back(_) => {
+                if let Work::Rollback {
+                    applied,
+                    state: Undo::Reviewed(_),
+                } = &panel.work
+                {
+                    panel.work = Work::Applied(applied.clone());
+                }
+            }
             Action::Review(_)
                 if matches!(panel.work, Work::Editing) && !panel.selected.is_empty() =>
             {
@@ -397,8 +543,21 @@ impl TerminalApp {
             {
                 match result {
                     Ok(review) if review.report.applied => {
-                        panel.work = Work::Applied(review.report.changed_profiles);
-                        self.refresh_rollout_origin(id, &review.report);
+                        panel.work = Work::Applied(review.clone());
+                        self.refresh_dotfile_origin(
+                            id,
+                            review
+                                .report
+                                .profiles
+                                .iter()
+                                .filter(|entry| entry.changed)
+                                .map(|entry| {
+                                    let mut after = entry.previous.clone();
+                                    after.bundle = review.report.candidate_path.clone();
+                                    after.bundle_sha256 = entry.next_pin.clone();
+                                    (entry.profile.as_str(), &entry.previous, after)
+                                }),
+                        );
                         self.refresh_profiles();
                     }
                     Ok(review) => panel.work = Work::Reviewed(review),
@@ -408,33 +567,90 @@ impl TerminalApp {
                     }
                 }
             }
-            Action::Close(_) if !matches!(panel.work, Work::Applying) => editor.rollout = None,
+            Action::ReviewRollback(_) => {
+                if let Work::Applied(applied) = &panel.work {
+                    panel.request_rollback(id, applied.clone(), None, ctx);
+                }
+            }
+            Action::ApplyRollback(_) => {
+                if let Work::Rollback {
+                    applied,
+                    state: Undo::Reviewed(rollback),
+                } = &panel.work
+                {
+                    panel.request_rollback(id, applied.clone(), Some(rollback.review.clone()), ctx);
+                }
+            }
+            Action::RollbackCompleted(_, result) => {
+                let Work::Rollback {
+                    applied,
+                    state: Undo::Reviewing | Undo::Applying,
+                } = &panel.work
+                else {
+                    return;
+                };
+                match result {
+                    Ok(rollback) if rollback.applied => {
+                        panel.work = Work::RolledBack(rollback.changed_profiles);
+                        self.refresh_dotfile_origin(
+                            id,
+                            rollback.profiles.iter().map(|entry| {
+                                (
+                                    entry.profile.as_str(),
+                                    &entry.current,
+                                    entry.restore.clone(),
+                                )
+                            }),
+                        );
+                        self.refresh_profiles();
+                    }
+                    Ok(rollback) => {
+                        panel.work = Work::Rollback {
+                            applied: applied.clone(),
+                            state: Undo::Reviewed(rollback),
+                        }
+                    }
+                    Err(error) => {
+                        panel.work = Work::Applied(applied.clone());
+                        panel.error = Some(error);
+                    }
+                }
+            }
+            Action::Close(_)
+                if !matches!(
+                    panel.work,
+                    Work::Applying
+                        | Work::Rollback {
+                            state: Undo::Applying,
+                            ..
+                        }
+                ) =>
+            {
+                editor.rollout = None
+            }
             _ => {}
         }
     }
 
-    fn refresh_rollout_origin(&mut self, id: TabId, report: &DotfileRolloutReport) {
+    fn refresh_dotfile_origin<'a>(
+        &mut self,
+        id: TabId,
+        mut changes: impl Iterator<Item = (&'a str, &'a DotfileSync, DotfileSync)>,
+    ) {
         let Some(Page::NewProfile(draft)) = self.tabs.get_mut(id).map(|tab| &mut tab.page) else {
             return;
         };
         let Some(base) = draft.origin.editing() else {
             return;
         };
-        let Some(entry) = report
-            .profiles
-            .iter()
-            .find(|entry| entry.changed && entry.profile == base.name)
-        else {
+        let Some((_, before, after)) = changes.find(|(name, _, _)| *name == base.name) else {
             return;
         };
-        if base.options.dotfiles.as_deref() != Some(&entry.previous) {
+        if base.options.dotfiles.as_deref() != Some(before) {
             return;
         }
         let mut expected = base.options.clone();
-        let mut approval = entry.previous.clone();
-        approval.bundle = report.candidate_path.clone();
-        approval.bundle_sha256 = entry.next_pin.clone();
-        expected.dotfiles = Some(Box::new(approval));
+        expected.dotfiles = Some(Box::new(after));
         let Ok((_, saved)) = self.store.inspect_catalog(&base.name) else {
             return;
         };
@@ -442,6 +658,12 @@ impl TerminalApp {
             return;
         }
         if draft.dotfiles.approved == base.options.dotfiles {
+            let base_dir = self.store.path().parent().unwrap_or(Path::new("."));
+            if base_dir.join(draft.dotfiles.bundle.trim()) == before.bundle
+                && let Some(restored) = saved.options.dotfiles.as_ref()
+            {
+                draft.dotfiles.bundle = restored.bundle.to_string_lossy().into_owned();
+            }
             draft.dotfiles.approved = saved.options.dotfiles.clone();
             draft.dotfiles.snapshot_version = None;
             draft.dotfiles.preview = review::Preview::Closed;

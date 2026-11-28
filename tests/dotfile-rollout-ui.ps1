@@ -8,9 +8,12 @@ $value = [System.Windows.Automation.ValuePattern]::Pattern
 $on = [System.Windows.Automation.ToggleState]::On
 $off = [System.Windows.Automation.ToggleState]::Off
 $candidate = Join-Path $State 'revision.json'
+$previous = Join-Path $State 'previous.json'
 $oldCatalog = [IO.File]::ReadAllText($profiles)
 $oldCandidate = [IO.File]::ReadAllText($candidate)
+$oldBundle = [IO.File]::ReadAllText($previous)
 $digest = ((& $Cli inspect-dotfiles-bundle $candidate --shell bash | ConvertFrom-Json).result.shells[0]).bundle_sha256
+$oldPin = ((& $Cli inspect-dotfiles-bundle $previous --shell bash | ConvertFrom-Json).result.shells[0]).bundle_sha256
 
 function Wait-Control([string]$Name, $Type = $button) {
     $search = @{ scroll = $null }
@@ -76,9 +79,36 @@ try {
             $saved.West.dotfiles.bundle -ceq $candidate -and !$saved.West.dotfiles.bundle_sha256 -and
             $saved.Other.dotfiles.bundle -ceq 'previous.json'
     }
+    $rolledOut = [IO.File]::ReadAllText($profiles)
+    Click 'Review rollback'
+    $null = Wait-Until 'the rollback preview shows the old pin and unavailable Fish bundle' {
+        (Find-Element "Restore pin $oldPin") -and
+            (Find-Element 'The previous bundle matches its pin.') -and
+            (Find-Element 'The previous bundle is unavailable for this shell.')
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $rolledOut) { throw 'Rollback preview changed the catalog' }
+    [IO.File]::WriteAllText($previous, $oldBundle.Replace('PS1=before', 'PS1=changed'))
+    Click 'Apply reviewed rollback'
+    $null = Wait-Until 'rollback rejects a changed previous bundle' {
+        Find-Element 'The rollback files or approvals changed. Preview the rollback again.'
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $rolledOut) { throw 'Stale rollback changed the catalog' }
+    [IO.File]::WriteAllText($previous, $oldBundle)
+    Click 'Review rollback'
+    Click 'Apply reviewed rollback'
+    $null = Wait-Until 'the previous approvals were restored together' { Find-Element 'Restored dotfiles in 2 saved SSH profiles.' }
+    $saved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles
+    if ($saved.East.dotfiles.bundle -cne $previous -or $saved.East.dotfiles.bundle_sha256 -cne $oldPin -or
+        $saved.West.dotfiles.bundle -cne $previous -or $saved.West.dotfiles.bundle_sha256 -or
+        $saved.Other.dotfiles.bundle -cne 'previous.json') {
+        throw 'The rollback did not restore the selected approvals while preserving the unchecked profile'
+    }
     Click 'Close dotfile rollout'
-    $null = Wait-Until 'the initiating draft shows its refreshed pin' { Find-Element "Pinned dotfile version $digest" }
-    Click 'Save profile changes'
+    $null = Wait-Until 'the initiating draft shows its restored pin' { Find-Element "Pinned dotfile version $oldPin" }
+    Invoke-Button (Wait-Until 'the profile save action is enabled' {
+        $save = Find-Element 'Save profile changes' $button
+        if ($save -and $save.Current.IsEnabled) { $save }
+    })
     $null = Wait-Until 'the initiating draft can still be saved' { Find-Element 'Changes saved.' }
 } finally {
     if ($app) { Close-FixtureApp $app }

@@ -121,7 +121,8 @@ pub(super) fn rollback(args: &[String], output: &mut dyn Write) -> Result<()> {
         [path, flag, token] if flag == "--review" => (path, Some(token.as_str())),
         _ => bail!("Provide the saved rollout reply and optionally --review TOKEN"),
     };
-    let reply = Reply::from_result(Ok(rollback_dotfile_rollout(Path::new(path), review)?));
+    let report = rollback_dotfile_rollout(Path::new(path), review)?;
+    let reply = Reply::from_result(Ok(serde_json::to_value(report)?));
     serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;
     Ok(())

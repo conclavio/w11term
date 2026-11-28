@@ -1,6 +1,5 @@
 use super::*;
 use serde::Deserialize;
-use serde_json::json;
 use std::{fs::File, io::Read};
 
 const MAX_RECEIPT_BYTES: usize = 1024 * 1024;
@@ -53,30 +52,35 @@ impl Receipt {
             receipt.version == crate::control::VERSION && receipt.ok,
             "Choose a successful dotfile rollout reply"
         );
-        let mut receipt = receipt
+        receipt
             .result
-            .filter(|result| result.applied)
-            .context("Choose the reply from an applied dotfile rollout")?;
+            .context("Choose the reply from an applied dotfile rollout")?
+            .checked()
+    }
+
+    fn checked(mut self) -> Result<Self> {
         ensure!(
-            receipt.profiles_path.is_absolute() && receipt.candidate_path.is_absolute(),
+            self.applied,
+            "Choose the reply from an applied dotfile rollout"
+        );
+        ensure!(
+            self.profiles_path.is_absolute() && self.candidate_path.is_absolute(),
             "The rollout receipt must identify the original catalog and bundle paths"
         );
-        receipt.profiles.retain(|entry| entry.changed);
+        self.profiles.retain(|entry| entry.changed);
         ensure!(
-            !receipt.profiles.is_empty(),
+            !self.profiles.is_empty(),
             "The rollout did not change any profiles"
         );
-        receipt
-            .profiles
+        self.profiles
             .sort_unstable_by(|a, b| a.profile.cmp(&b.profile));
         ensure!(
-            receipt
-                .profiles
+            self.profiles
                 .windows(2)
                 .all(|pair| pair[0].profile != pair[1].profile),
             "A profile appears more than once in the receipt"
         );
-        for entry in &receipt.profiles {
+        for entry in &self.profiles {
             let previous = &entry.previous;
             let candidate = &entry.candidate_bundle_sha256;
             ensure!(
@@ -95,23 +99,40 @@ impl Receipt {
                 entry.profile
             );
             ensure!(
-                previous.bundle != receipt.candidate_path
-                    || previous.bundle_sha256 != entry.next_pin,
+                previous.bundle != self.candidate_path || previous.bundle_sha256 != entry.next_pin,
                 "The receipt marks an unchanged profile as updated"
             );
         }
-        Ok(receipt)
+        Ok(self)
     }
 }
 
 #[derive(Serialize)]
-struct RestoreProfile<'a> {
-    profile: &'a str,
-    current: DotfileSync,
-    restore: &'a DotfileSync,
-    current_bundle_sha256: Option<String>,
-    restored_bundle_sha256: Option<String>,
-    restore_status: &'static str,
+pub struct DotfileRollbackProfile {
+    pub profile: String,
+    pub current: DotfileSync,
+    pub restore: DotfileSync,
+    pub current_bundle_sha256: Option<String>,
+    pub restored_bundle_sha256: Option<String>,
+    pub restore_status: DotfileRestoreStatus,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DotfileRestoreStatus {
+    BundleUnavailable,
+    FollowsFile,
+    MatchesPin,
+    PinMismatch,
+}
+
+#[derive(Serialize)]
+pub struct DotfileRollbackReport {
+    pub profiles_path: PathBuf,
+    pub profiles: Vec<DotfileRollbackProfile>,
+    pub changed_profiles: usize,
+    pub applied: bool,
+    pub review: String,
 }
 
 type Versions = Vec<(DotfileShell, String)>;
@@ -131,10 +152,10 @@ fn observed_digest(
         .find_map(|(shell, digest)| (*shell == settings.shell).then(|| digest.clone()))
 }
 
-fn plan<'a>(
-    receipt: &'a Receipt,
+fn plan(
+    receipt: &Receipt,
     profiles: &BTreeMap<String, SshOptions>,
-) -> Result<Vec<RestoreProfile<'a>>> {
+) -> Result<Vec<DotfileRollbackProfile>> {
     let mut files = BTreeMap::new();
     receipt
         .profiles
@@ -158,15 +179,15 @@ fn plan<'a>(
                 restored_bundle_sha256.as_deref(),
                 entry.previous.bundle_sha256.as_deref(),
             ) {
-                (None, _) => "bundle-unavailable",
-                (Some(_), None) => "follows-file",
-                (Some(digest), Some(pin)) if digest == pin => "matches-pin",
-                (Some(_), Some(_)) => "pin-mismatch",
+                (None, _) => DotfileRestoreStatus::BundleUnavailable,
+                (Some(_), None) => DotfileRestoreStatus::FollowsFile,
+                (Some(digest), Some(pin)) if digest == pin => DotfileRestoreStatus::MatchesPin,
+                (Some(_), Some(_)) => DotfileRestoreStatus::PinMismatch,
             };
-            Ok(RestoreProfile {
-                profile: &entry.profile,
+            Ok(DotfileRollbackProfile {
+                profile: entry.profile.clone(),
                 current: current.clone(),
-                restore: &entry.previous,
+                restore: entry.previous.clone(),
                 current_bundle_sha256: observed_digest(current, &mut files),
                 restored_bundle_sha256,
                 restore_status,
@@ -175,15 +196,45 @@ fn plan<'a>(
         .collect()
 }
 
-fn review_token(catalog: &Path, profiles: &[RestoreProfile<'_>]) -> Result<String> {
+fn review_token(catalog: &Path, profiles: &[DotfileRollbackProfile]) -> Result<String> {
     let mut digest = Sha256::new_with_prefix(b"w11term-dotfiles-rollout-rollback-v1\0");
     digest.update(serde_json::to_vec(&(catalog, profiles))?);
     Ok(digest_hex(digest))
 }
 
-pub fn rollback_dotfile_rollout(receipt: &Path, review: Option<&str>) -> Result<Value> {
+pub fn rollback_dotfile_rollout(
+    receipt: &Path,
+    review: Option<&str>,
+) -> Result<DotfileRollbackReport> {
+    rollback(Receipt::load(receipt)?, review)
+}
+
+impl DotfileRolloutReport {
+    pub fn rollback(&self, review: Option<&str>) -> Result<DotfileRollbackReport> {
+        let receipt = Receipt {
+            profiles_path: self.profiles_path.clone(),
+            candidate_path: self.candidate_path.clone(),
+            applied: self.applied,
+            profiles: self
+                .profiles
+                .iter()
+                .filter(|entry| entry.changed)
+                .map(|entry| ReceiptProfile {
+                    profile: entry.profile.clone(),
+                    previous: entry.previous.clone(),
+                    candidate_bundle_sha256: entry.candidate_bundle_sha256.clone(),
+                    next_pin: entry.next_pin.clone(),
+                    changed: entry.changed,
+                })
+                .collect(),
+        }
+        .checked()?;
+        rollback(receipt, review)
+    }
+}
+
+fn rollback(receipt: Receipt, review: Option<&str>) -> Result<DotfileRollbackReport> {
     const STALE: &str = "The rollback files or approvals changed. Preview the rollback again.";
-    let receipt = Receipt::load(receipt)?;
     let store = ProfileStore::new(receipt.profiles_path.clone())?;
     let rows = plan(&receipt, &store.load()?)?;
     let token = review_token(store.path(), &rows)?;
@@ -196,7 +247,7 @@ pub fn rollback_dotfile_rollout(receipt: &Path, review: Option<&str>) -> Result<
             for entry in &current {
                 write_binding(
                     values,
-                    entry.profile,
+                    &entry.profile,
                     &entry.restore.bundle,
                     entry.restore.bundle_sha256.as_deref(),
                 )?;
@@ -204,8 +255,11 @@ pub fn rollback_dotfile_rollout(receipt: &Path, review: Option<&str>) -> Result<
             Ok(CatalogEdit::default())
         })?;
     }
-    Ok(json!({
-        "profiles_path": store.path(), "profiles": rows,
-        "changed_profiles": rows.len(), "applied": review.is_some(), "review": token,
-    }))
+    Ok(DotfileRollbackReport {
+        profiles_path: store.path().to_owned(),
+        changed_profiles: rows.len(),
+        profiles: rows,
+        applied: review.is_some(),
+        review: token,
+    })
 }

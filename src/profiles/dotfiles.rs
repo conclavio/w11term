@@ -14,7 +14,7 @@ use std::{
 };
 
 mod rollback;
-pub use rollback::rollback_dotfile_rollout;
+pub use rollback::{DotfileRestoreStatus, DotfileRollbackReport, rollback_dotfile_rollout};
 
 #[derive(Serialize)]
 struct Rollout<'a> {
