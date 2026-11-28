@@ -38,10 +38,11 @@ pub use dotfiles::{
 pub(crate) use utilities::sync_login_tools;
 pub use utilities::{
     InstalledTool, InstalledTools, LocalUtilityBundle, LocalUtilityExecutable, RetainedToolVersion,
-    ToolBundlePreset, ToolBundleVersions, UtilityArchitecture, UtilityBuild, UtilityBundle,
-    UtilityDownload, UtilityTool, builtin_tool_bundle, builtin_tool_names,
-    export_builtin_tool_bundle, fetch_tool_bundle, fetch_tool_bundle_cancellable,
-    prepare_builtin_tool_bundle,
+    ToolArchitectureAudit, ToolBundlePreset, ToolBundleVersions, ToolCommandAudit,
+    ToolExecutableAudit, ToolExecutableSource, ToolExecutableStatus, UtilityArchitecture,
+    UtilityBuild, UtilityBundle, UtilityDownload, UtilityTool, builtin_tool_bundle,
+    builtin_tool_names, export_builtin_tool_bundle, fetch_tool_bundle,
+    fetch_tool_bundle_cancellable, prepare_builtin_tool_bundle,
 };
 mod group_download;
 pub use group_download::{GroupDownloadFolder, group_download_name, group_download_paths};

@@ -1,7 +1,9 @@
 use super::*;
 use crate::app::command_reference::dotfiles::comparison::code_details;
 use std::path::PathBuf;
-use w11term::profiles::{ToolProfileAudit, ToolProfileAuditRow, ToolProfileAuditStatus};
+use w11term::profiles::{
+    ToolProfileAudit, ToolProfileAuditRow, ToolProfileAuditStatus, ToolProfileBuildChecks,
+};
 
 pub enum Action {
     Open,
@@ -35,7 +37,7 @@ fn load(catalog: PathBuf, id: TabId, ctx: &ComponentContext<TerminalApp>) -> Sta
     ctx.spawn_background_with_rejection(
         move |_| {
             let result = ProfileStore::new(catalog)
-                .and_then(|store| store.audit_tool_profiles(None))
+                .and_then(|store| store.audit_tool_profiles(None, ToolProfileBuildChecks::Skip))
                 .map_err(|error| format!("{error:#}"));
             Message::ToolProfileAudit(id, Action::Loaded(request, result))
         },

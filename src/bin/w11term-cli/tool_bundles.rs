@@ -3,6 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{io::Write, path::Path};
 use w11term::control::Reply;
+use w11term::profiles::ToolProfileBuildChecks;
 use w11term::sftp::{
     ToolBundlePreset, UtilityArchitecture, UtilityBundle, export_builtin_tool_bundle,
     fetch_tool_bundle,
@@ -11,17 +12,24 @@ use w11term::sftp::{
 pub const HELP: &str = "w11term-cli fetch-tool-bundle BUNDLE.json [--architecture x86_64|aarch64]\n\
 w11term-cli fetch-tool-bundle --example NEW_BUNDLE.json [--preset essentials|admin | --tools rg,jq,mdd]";
 pub(super) const AUDIT_VERB: &str = "audit-tool-profiles";
-pub(super) const AUDIT_HELP: &str =
-    "w11term-cli audit-tool-profiles [--profiles CATALOG] [--profile NAME]";
+pub(super) const AUDIT_HELP: &str = "w11term-cli audit-tool-profiles [--profiles CATALOG] [--profile NAME] [--verify-builds [--architecture x86_64|aarch64]]";
 
 pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
     let mut catalog = None;
     let mut profile = None;
+    let mut verify = false;
+    let mut architecture = None;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
+        if flag == "--verify-builds" {
+            ensure!(!verify, "specify --verify-builds only once");
+            verify = true;
+            continue;
+        }
         let target = match flag.as_str() {
             "--profiles" => &mut catalog,
             "--profile" => &mut profile,
+            "--architecture" => &mut architecture,
             _ => bail!("unsupported tool profile audit option {flag}"),
         };
         let value = args
@@ -32,7 +40,16 @@ pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
             "specify {flag} only once"
         );
     }
-    let audit = profile_store(catalog)?.audit_tool_profiles(profile)?;
+    ensure!(
+        verify || architecture.is_none(),
+        "--architecture requires --verify-builds"
+    );
+    let checks = if verify {
+        ToolProfileBuildChecks::Verify(architecture.map(parse_architecture).transpose()?)
+    } else {
+        ToolProfileBuildChecks::Skip
+    };
+    let audit = profile_store(catalog)?.audit_tool_profiles(profile, checks)?;
     let reply = Reply::from_result(Ok(serde_json::to_value(audit)?));
     serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;
@@ -63,14 +80,17 @@ pub fn run(args: &[String]) -> Result<Value> {
         }
         [file] if !file.starts_with("--") => fetch(file, None),
         [file, flag, raw] if !file.starts_with("--") && flag == "--architecture" => {
-            let architecture = match raw.as_str() {
-                "x86_64" => UtilityArchitecture::X86_64,
-                "aarch64" => UtilityArchitecture::Aarch64,
-                _ => bail!("--architecture requires x86_64 or aarch64"),
-            };
-            fetch(file, Some(architecture))
+            fetch(file, Some(parse_architecture(raw)?))
         }
         _ => bail!("{HELP}"),
+    }
+}
+
+fn parse_architecture(value: &str) -> Result<UtilityArchitecture> {
+    match value {
+        "x86_64" => Ok(UtilityArchitecture::X86_64),
+        "aarch64" => Ok(UtilityArchitecture::Aarch64),
+        _ => bail!("--architecture requires x86_64 or aarch64"),
     }
 }
 

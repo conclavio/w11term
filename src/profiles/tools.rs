@@ -1,5 +1,8 @@
 use super::ProfileStore;
-use crate::{options::SshOptions, sftp::UtilityBundle};
+use crate::{
+    options::SshOptions,
+    sftp::{ToolArchitectureAudit, UtilityArchitecture, UtilityBundle},
+};
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use std::{collections::HashMap, path::PathBuf};
@@ -26,6 +29,8 @@ pub struct ToolProfileAuditRow {
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_checks: Option<Vec<ToolArchitectureAudit>>,
 }
 
 #[derive(Serialize)]
@@ -41,10 +46,26 @@ pub enum ToolProfileAuditStatus {
     FollowsFile,
 }
 
-type ManifestCache = HashMap<PathBuf, Result<(UtilityBundle, String), String>>;
+#[derive(Clone, Copy)]
+pub enum ToolProfileBuildChecks {
+    Skip,
+    Verify(Option<UtilityArchitecture>),
+}
+
+struct Manifest {
+    bundle: UtilityBundle,
+    digest: String,
+    build_checks: Option<Vec<ToolArchitectureAudit>>,
+}
+
+type ManifestCache = HashMap<PathBuf, Result<Manifest, String>>;
 
 impl ProfileStore {
-    pub fn audit_tool_profiles(&self, selected: Option<&str>) -> Result<ToolProfileAudit> {
+    pub fn audit_tool_profiles(
+        &self,
+        selected: Option<&str>,
+        checks: ToolProfileBuildChecks,
+    ) -> Result<ToolProfileAudit> {
         let profiles = self.load()?;
         if let Some(profile) = selected {
             ensure!(
@@ -56,7 +77,7 @@ impl ProfileStore {
         let profiles = profiles
             .iter()
             .filter(|(name, _)| selected.is_none_or(|selected| selected == name.as_str()))
-            .map(|(name, profile)| audit_profile(name, profile, &mut manifests))
+            .map(|(name, profile)| audit_profile(name, profile, checks, &mut manifests))
             .collect();
         Ok(ToolProfileAudit {
             profiles_path: self.path().to_owned(),
@@ -68,6 +89,7 @@ impl ProfileStore {
 fn audit_profile(
     name: &str,
     profile: &SshOptions,
+    checks: ToolProfileBuildChecks,
     manifests: &mut ManifestCache,
 ) -> ToolProfileAuditRow {
     use ToolProfileAuditStatus::*;
@@ -86,6 +108,7 @@ fn audit_profile(
         manifest_sha256: None,
         detail: None,
         path_error: None,
+        build_checks: None,
     };
     let Some(settings) = settings else {
         return row;
@@ -111,8 +134,13 @@ fn audit_profile(
             .err()
             .map(|error| format!("{error:#}"))
     });
-    let (bundle, digest) = match manifests.entry(settings.bundle.clone()).or_insert_with(|| {
+    let manifest = match manifests.entry(settings.bundle.clone()).or_insert_with(|| {
         UtilityBundle::load_with_manifest_sha256(&settings.bundle)
+            .map(|(bundle, digest)| Manifest {
+                bundle,
+                digest,
+                build_checks: None,
+            })
             .map_err(|error| format!("{error:#}"))
     }) {
         Ok(manifest) => manifest,
@@ -122,10 +150,10 @@ fn audit_profile(
             return row;
         }
     };
-    row.manifest_sha256 = Some(digest.clone());
-    row.status = if pin.as_deref().is_some_and(|pin| pin != digest.as_str()) {
+    row.manifest_sha256 = Some(manifest.digest.clone());
+    row.status = if pin.as_deref().is_some_and(|pin| pin != manifest.digest) {
         PinMismatch
-    } else if let Err(error) = settings.validate_manifest_destination(bundle) {
+    } else if let Err(error) = settings.validate_manifest_destination(&manifest.bundle) {
         row.detail = Some(format!("{error:#}"));
         ManifestScopeMismatch
     } else if pin.is_some() {
@@ -133,5 +161,13 @@ fn audit_profile(
     } else {
         FollowsFile
     };
+    if matches!(row.status, MatchesPin | FollowsFile)
+        && let ToolProfileBuildChecks::Verify(architecture) = checks
+    {
+        let verification = manifest
+            .build_checks
+            .get_or_insert_with(|| manifest.bundle.audit_executables(architecture));
+        row.build_checks = Some(verification.clone());
+    }
     row
 }

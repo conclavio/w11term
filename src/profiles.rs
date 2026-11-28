@@ -21,7 +21,9 @@ pub use group_file::{decode_group_file, encode_group_file, read_group_file, rema
 mod sftp_searches;
 pub use sftp_searches::SavedSftpSearch;
 mod tools;
-pub use tools::{ToolProfileAudit, ToolProfileAuditRow, ToolProfileAuditStatus};
+pub use tools::{
+    ToolProfileAudit, ToolProfileAuditRow, ToolProfileAuditStatus, ToolProfileBuildChecks,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileSnapshot {

@@ -3,11 +3,16 @@ use super::*;
 use crate::options::ToolSync;
 use std::{collections::BTreeSet, io::Read};
 
+mod audit;
 mod build;
 mod downloads;
 mod install;
 mod local;
 mod login;
+pub use audit::{
+    ToolArchitectureAudit, ToolCommandAudit, ToolExecutableAudit, ToolExecutableSource,
+    ToolExecutableStatus,
+};
 use build::{LibcVersion, Verified};
 pub use downloads::{
     ToolBundlePreset, UtilityDownload, builtin_tool_bundle, builtin_tool_names,

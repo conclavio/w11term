@@ -1608,6 +1608,15 @@ $audit = & $ctl audit-tool-profiles | ConvertFrom-Json
 $audit.result.profiles | Where-Object status -eq 'pin-mismatch'
 ```
 
+Add `--verify-builds` to verify the pinned SHA-256 and Linux ELF format and architecture of local executables and cached downloads. It checks the architectures declared in each approved manifest. Add `--architecture x86_64` or `--architecture aarch64` to target one architecture, including one absent from the manifest. Each `build_checks` entry reports whether every command has at least one verified build for that architecture. An empty build list means that command has no matching build. Individual builds report `verified`, `missing`, or `error` in manifest order. The check uses the installation budget of 256 MiB per architecture per manifest. It opens no SSH connections and fetches no assets. Login checks remote interpreter and library availability.
+
+```powershell
+$audit = & $ctl audit-tool-profiles --verify-builds --architecture aarch64 | ConvertFrom-Json
+$audit.result.profiles | Where-Object {
+    $_.build_checks | Where-Object { !$_.locally_available }
+}
+```
+
 On an ordinary SSH connect or reconnect, w11term checks the verified endpoint and SFTP home, syncs the approved bundle, and then opens the shell. An unavailable or unconfirmed sync still allows login. The 20-second deadline covers the bundle and PATH work together. The `tool-bundle-sync` event reports the bundle outcome and, when configured, the PATH outcome. Bash and Zsh use the login and interactive startup files. Fish uses one block in the selected `config.fish` and retains the command order of the existing PATH list. An edited block requires a fresh review. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths. [Fish PATH variables](https://fishshell.com/docs/current/tutorial.html#path)
 
 **More → Command reference** shows the last login sync for the selected SSH connection. Open **Install SSH tools** for the PATH result and any error detail. Manual installs and rollbacks show their own results in the installer and version history.
