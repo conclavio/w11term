@@ -363,6 +363,7 @@ async fn main() -> ExitCode {
             dotfiles::COMPARE_HELP
         );
         println!("{}", dotfile_profiles::HELP);
+        println!("{}", dotfile_profiles::ROLLOUT_HELP);
         println!("{}", command_reference::OPEN_HELP);
         return ExitCode::SUCCESS;
     }

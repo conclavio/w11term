@@ -678,3 +678,150 @@ fn audits_profile_settings_and_can_select_one_saved_ssh_profile() {
         );
     }
 }
+
+fn rollout(root: &Path, args: &[&str]) -> std::process::Output {
+    let mut options = vec![
+        "--profiles",
+        "profiles.json",
+        "--candidate",
+        "revision.json",
+    ];
+    options.extend_from_slice(args);
+    cli(root, "rollout-dotfiles-profiles", &options)
+}
+
+#[test]
+fn reviewed_rollout_updates_only_named_approvals_and_retains_pin_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let catalog = root.join("profiles.json");
+    let candidate = root.join("revision.json");
+    let pin = "a".repeat(64);
+    let mut east = ssh_profile("bash", "original.json", Some(&pin));
+    east["local_custom_field"] = json!({"keep": true});
+    let mut west = ssh_profile("fish", "original.json", None);
+    west["dotfiles"]
+        .as_object_mut()
+        .unwrap()
+        .remove("bundle_sha256");
+    west["dotfiles"]["fish_config_dir"] = json!("settings/fish");
+    let original = json!({
+        "profiles": {
+            "East": east,
+            "West": west,
+            "Other": ssh_profile("zsh", "original.json", Some(&pin)),
+        },
+        "ssh_host_groups": {"Fleet": ["West", "East", "Other"]},
+        "local_custom_metadata": "retain",
+    });
+    fs::write(&catalog, original.to_string()).unwrap();
+    fs::write(
+        &candidate,
+        json!({"version": 1, "bash": "PS1=revision", "fish": "set -g fish_greeting revision"})
+            .to_string(),
+    )
+    .unwrap();
+    let preview = reply(rollout(root, &["--profile", "West", "--profile", "East"]));
+    let result = &preview["result"];
+    assert_eq!(result["applied"], false);
+    assert_eq!(result["changed_profiles"], 2);
+    assert_eq!(result["profiles"][0]["profile"], "East");
+    let expected_pin = DotfileBundle::load(&candidate)
+        .unwrap()
+        .content_version(DotfileShell::Bash)
+        .unwrap();
+    assert_eq!(result["profiles"][0]["next_pin"], expected_pin);
+    assert_eq!(result["profiles"][1]["next_pin"], Value::Null);
+    let token = result["review"].as_str().unwrap();
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), original.to_string());
+
+    let applied = reply(rollout(
+        root,
+        &["--profile", "East", "--profile", "West", "--review", token],
+    ));
+    assert_eq!(applied["result"]["applied"], true);
+    assert_eq!(applied["result"]["changed_profiles"], 2);
+    let mut expected = original.clone();
+    let path = &result["candidate_path"];
+    expected["profiles"]["East"]["dotfiles"]["bundle"] = path.clone();
+    expected["profiles"]["West"]["dotfiles"]["bundle"] = path.clone();
+    expected["profiles"]["East"]["dotfiles"]["bundle_sha256"] = json!(expected_pin);
+    let after = fs::read_to_string(&catalog).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&after).unwrap(), expected);
+
+    let unchanged = reply(rollout(root, &["--profile", "East", "--profile", "West"]));
+    assert_eq!(unchanged["result"]["changed_profiles"], 0);
+    let current_token = unchanged["result"]["review"].as_str().unwrap();
+    reply(rollout(
+        root,
+        &[
+            "--profile",
+            "East",
+            "--profile",
+            "West",
+            "--review",
+            current_token,
+        ],
+    ));
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), after);
+}
+
+#[test]
+fn rollout_rejects_stale_inputs_ineligible_profiles_and_concurrent_writers() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let catalog = root.join("profiles.json");
+    let candidate = root.join("revision.json");
+    let mut disabled = ssh_profile("bash", "original.json", None);
+    disabled.as_object_mut().unwrap().remove("dotfiles");
+    let original = json!({"profiles": {
+        "East": ssh_profile("bash", "original.json", None),
+        "Fish": ssh_profile("fish", "original.json", None),
+        "Disabled": disabled,
+    }});
+    let original_bundle = json!({"version": 1, "bash": "PS1=revision"}).to_string();
+    fs::write(&catalog, original.to_string()).unwrap();
+    fs::write(&candidate, &original_bundle).unwrap();
+    for (args, expected) in [
+        (&[][..], "Choose at least one SSH profile"),
+        (&["--profile", "East", "--profile", "East"], "only once"),
+        (&["--profile", "Disabled"], "no dotfiles approval"),
+        (
+            &["--profile", "East", "--profile", "Fish"],
+            "no fragments for Fish",
+        ),
+    ] {
+        let result = rollout(root, args);
+        assert_eq!(result.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&result.stderr).contains(expected));
+    }
+    let plan = reply(rollout(root, &["--profile", "East"]));
+    let token = plan["result"]["review"].as_str().unwrap();
+    let apply = || rollout(root, &["--profile", "East", "--review", token]);
+    fs::write(
+        &candidate,
+        json!({"version": 1, "bash": "PS1=stale"}).to_string(),
+    )
+    .unwrap();
+    let stale_bundle = apply();
+    assert_eq!(stale_bundle.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&stale_bundle.stderr).contains("Preview the rollout again"));
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), original.to_string());
+
+    fs::write(&candidate, original_bundle).unwrap();
+    let mut moved = original.clone();
+    moved["profiles"]["East"]["dotfiles"]["home"] = json!("/home/moved");
+    fs::write(&catalog, moved.to_string()).unwrap();
+    let stale_target = apply();
+    assert_eq!(stale_target.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&stale_target.stderr).contains("Preview the rollout again"));
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), moved.to_string());
+
+    fs::write(&catalog, original.to_string()).unwrap();
+    let lock = fs::File::create(root.join("profiles.json.w11term.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let busy = apply();
+    assert_eq!(busy.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&busy.stderr).contains("Another window is updating profiles"));
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), original.to_string());
+}

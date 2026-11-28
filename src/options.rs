@@ -500,13 +500,40 @@ pub struct DotfileSync {
 }
 
 impl DotfileSync {
-    pub(crate) fn approves(&self, endpoint: (&str, &str, u16, &str)) -> bool {
-        (
-            self.host.as_str(),
-            self.user.as_str(),
-            self.port,
-            self.fingerprint.as_str(),
-        ) == endpoint
+    fn approves_account(&self, host: &str, user: &str, port: u16) -> bool {
+        (self.host.as_str(), self.user.as_str(), self.port) == (host, user, port)
+    }
+
+    pub(crate) fn approves(
+        &self,
+        (host, user, port, fingerprint): (&str, &str, u16, &str),
+    ) -> bool {
+        self.approves_account(host, user, port) && self.fingerprint == fingerprint
+    }
+
+    pub fn validate_profile(&self, profile: &SshOptions) -> Result<()> {
+        ensure!(
+            self.approves_account(&profile.host, &profile.user, profile.port),
+            "The dotfiles approval names a different SSH account"
+        );
+        ensure!(
+            matches!(self.fingerprint.parse::<Fingerprint>(), Ok(fingerprint @ Fingerprint::Sha256(_)) if fingerprint.to_string() == self.fingerprint),
+            "The dotfiles approval needs a SHA256 host-key fingerprint"
+        );
+        ensure!(
+            profile
+                .host_key
+                .as_deref()
+                .is_none_or(|pin| pin == self.fingerprint),
+            "The dotfiles approval differs from the profile's host-key pin"
+        );
+        crate::sftp::validate_dotfiles_home(&self.home)?;
+        crate::sftp::select_startup_directory(
+            self.shell,
+            self.zdotdir.as_deref(),
+            self.fish_config_dir.as_deref(),
+        )?;
+        Ok(())
     }
 }
 

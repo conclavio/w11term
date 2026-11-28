@@ -20,6 +20,9 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
         dotfiles::INSPECT_VERB => (dotfiles::INSPECT_HELP, dotfiles::inspect),
         dotfiles::COMPARE_VERB => (dotfiles::COMPARE_HELP, dotfiles::compare),
         dotfile_profiles::VERB => (dotfile_profiles::HELP, dotfile_profiles::audit),
+        dotfile_profiles::ROLLOUT_VERB => {
+            (dotfile_profiles::ROLLOUT_HELP, dotfile_profiles::rollout)
+        }
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
         syscall_capture::INSPECT_VERB => (
             syscall_capture::INSPECT_HELP,

@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, bail, ensure};
-use russh::keys::ssh_key::Fingerprint;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -8,13 +7,15 @@ use std::{
 };
 use w11term::{
     control::Reply,
-    options::{DotfileSync, SshOptions, default_profiles_path},
+    options::{SshOptions, default_profiles_path},
     profiles::ProfileStore,
-    sftp::{DotfileBundle, DotfileShell, select_startup_directory, validate_dotfiles_home},
+    sftp::{DotfileBundle, DotfileShell},
 };
 
 pub(super) const VERB: &str = "audit-dotfiles-profiles";
 pub(super) const HELP: &str = "w11term-cli audit-dotfiles-profiles [--profiles CATALOG] [--profile NAME] [--candidate BUNDLE]";
+pub(super) const ROLLOUT_VERB: &str = "rollout-dotfiles-profiles";
+pub(super) const ROLLOUT_HELP: &str = "w11term-cli rollout-dotfiles-profiles --candidate BUNDLE --profile NAME [--profile NAME ...] [--profiles CATALOG] [--review TOKEN]";
 
 type Versions = Vec<(DotfileShell, String)>;
 type BundleCache = HashMap<PathBuf, Result<Versions, String>>;
@@ -40,18 +41,8 @@ pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
         );
     }
 
-    let catalog = match catalog {
-        Some(path) => path::absolute(path)?,
-        None => default_profiles_path()?,
-    };
-    ensure!(
-        catalog
-            .metadata()
-            .with_context(|| format!("Opening profile catalog {}", catalog.display()))?
-            .is_file(),
-        "The profile catalog must be a regular file"
-    );
-    let profiles = ProfileStore::new(catalog.clone())?.load()?;
+    let store = profile_store(catalog)?;
+    let profiles = store.load()?;
     if let Some(profile) = profile {
         ensure!(
             profiles.contains_key(profile),
@@ -76,13 +67,61 @@ pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
         .map(|(name, profile)| profile_report(name, profile, candidate.as_deref(), &mut bundles))
         .collect();
     let reply = Reply::from_result(Ok(json!({
-        "profiles_path": catalog,
+        "profiles_path": store.path(),
         "candidate_path": candidate_path,
         "profiles": profiles,
     })));
     serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;
     Ok(())
+}
+
+pub(super) fn rollout(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let mut catalog = None;
+    let mut candidate = None;
+    let mut review = None;
+    let mut profiles = Vec::new();
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let value = args
+            .next()
+            .with_context(|| format!("{flag} requires a value"))?;
+        let target = match flag.as_str() {
+            "--profiles" => &mut catalog,
+            "--candidate" => &mut candidate,
+            "--review" => &mut review,
+            "--profile" => {
+                profiles.push(value.clone());
+                continue;
+            }
+            _ => bail!("unsupported dotfiles rollout option {flag}"),
+        };
+        ensure!(
+            target.replace(value.as_str()).is_none(),
+            "specify {flag} only once"
+        );
+    }
+    let candidate =
+        path::absolute(candidate.context("Choose a dotfiles bundle with --candidate")?)?;
+    let result = profile_store(catalog)?.rollout_dotfiles(&profiles, &candidate, review)?;
+    serde_json::to_writer(&mut *output, &Reply::from_result(Ok(result)))?;
+    writeln!(output)?;
+    Ok(())
+}
+
+fn profile_store(catalog: Option<&str>) -> Result<ProfileStore> {
+    let catalog = match catalog {
+        Some(path) => path::absolute(path)?,
+        None => default_profiles_path()?,
+    };
+    ensure!(
+        catalog
+            .metadata()
+            .with_context(|| format!("Opening profile catalog {}", catalog.display()))?
+            .is_file(),
+        "The profile catalog must be a regular file"
+    );
+    ProfileStore::new(catalog)
 }
 
 fn versions(path: &Path) -> Result<Versions> {
@@ -93,35 +132,6 @@ fn digest_for(versions: &[(DotfileShell, String)], shell: DotfileShell) -> Optio
     versions
         .iter()
         .find_map(|(available, digest)| (*available == shell).then_some(digest.as_str()))
-}
-
-fn validate_settings(profile: &SshOptions, settings: &DotfileSync) -> Result<()> {
-    ensure!(
-        (
-            settings.host.as_str(),
-            settings.user.as_str(),
-            settings.port
-        ) == (profile.host.as_str(), profile.user.as_str(), profile.port),
-        "The dotfiles approval names a different SSH account"
-    );
-    ensure!(
-        matches!(settings.fingerprint.parse::<Fingerprint>(), Ok(fingerprint @ Fingerprint::Sha256(_)) if fingerprint.to_string() == settings.fingerprint),
-        "The dotfiles approval needs a SHA256 host-key fingerprint"
-    );
-    ensure!(
-        profile
-            .host_key
-            .as_deref()
-            .is_none_or(|pin| pin == settings.fingerprint),
-        "The dotfiles approval differs from the profile's host-key pin"
-    );
-    validate_dotfiles_home(&settings.home)?;
-    select_startup_directory(
-        settings.shell,
-        settings.zdotdir.as_deref(),
-        settings.fish_config_dir.as_deref(),
-    )?;
-    Ok(())
 }
 
 fn profile_report(
@@ -146,7 +156,7 @@ fn profile_report(
         return row;
     }
     let pin = settings.bundle_sha256.as_deref();
-    let current = match validate_settings(profile, settings) {
+    let current = match settings.validate_profile(profile) {
         Err(error) => Err(("invalid-settings", format!("{error:#}"))),
         Ok(()) => bundles
             .entry(settings.bundle.clone())
