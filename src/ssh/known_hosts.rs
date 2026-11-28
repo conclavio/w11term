@@ -126,6 +126,22 @@ pub(super) fn has_authority(path: &Path, host: &str, port: u16) -> Result<bool> 
     Ok(found)
 }
 
+/// Key algorithms already recorded for this host, in file order.
+///
+/// OpenSSH asks for these first so a host known by one key type is not judged
+/// against a different key the server also holds.
+pub(super) fn recorded_algorithms(path: &Path, host: &str, port: u16) -> Result<Vec<Algorithm>> {
+    let mut found = Vec::new();
+    matching_keys(path, host, port, |marker, key, _| {
+        let algorithm = key.algorithm();
+        if marker == Marker::Host && !found.contains(&algorithm) {
+            found.push(algorithm);
+        }
+        Ok(())
+    })?;
+    Ok(found)
+}
+
 fn allowed_ca_signature(algorithm: Algorithm) -> bool {
     matches!(
         algorithm,

@@ -86,6 +86,12 @@ pub use drop_source::{DropSource, classify_drop};
 pub const CHUNK: usize = 32 * 1024;
 pub const TEXT_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 pub const DEFAULT_TIMEOUT: u64 = 600;
+/// Ceiling for interactive transfers, which the user can stop at any time.
+///
+/// Every SFTP request already has its own reply timeout, so a stalled link is
+/// still detected promptly. A short total deadline would instead cut off large
+/// files and folders that are making steady progress.
+pub const TRANSFER_TIMEOUT: u64 = 24 * 60 * 60;
 pub use permissions::{PERMISSIONS_OUTCOME_UNKNOWN, PermissionReview};
 
 pub const RENAME_OUTCOME_UNKNOWN: &str = "Rename outcome unknown; refresh to check";

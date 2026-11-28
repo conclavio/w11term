@@ -1046,8 +1046,10 @@ pub(super) async fn key_exchange(
     let (name, port) = host_key_target(options);
     let trust_host_ca = super::known_hosts::has_authority(&known_hosts, name, port)
         .map_err(|error| stop(format!("reading host certificate authorities: {error:#}")))?;
+    let recorded = super::known_hosts::recorded_algorithms(&known_hosts, name, port)
+        .map_err(|error| stop(format!("reading recorded host keys: {error:#}")))?;
     let config = Arc::new(client::Config {
-        preferred: super::negotiation::preferred(trust_host_ca),
+        preferred: super::negotiation::preferred(trust_host_ca, &recorded),
         nodelay: true,
         keepalive_interval: options.keepalive.interval(),
         keepalive_max: options.keepalive.max_unanswered.get() as usize,
