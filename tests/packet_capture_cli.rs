@@ -150,6 +150,7 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
             "file_bytes": 62,
             "packets": 2,
             "captured_bytes": 6,
+            "original_bytes": 12,
             "truncated_packets": 1,
             "timestamped_packets": 2,
             "timestamp_span_ns": "1250000000",
@@ -182,6 +183,7 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
                 "capture_statistics": null,
                 "packets": 2,
                 "captured_bytes": 6,
+                "original_bytes": 12,
                 "truncated_packets": 1,
                 "timestamped_packets": 2,
                 "timestamp_span_ns": "1250000000"
@@ -498,7 +500,7 @@ fn compares_beyond_the_ranked_summary_and_keeps_direction_only_changes() {
     assert_eq!(report["before"]["timestamp_span_ns"], "11000000000");
     assert_eq!(
         report["totals_delta"],
-        json!({"packets": 1, "captured_bytes": 20, "truncated_packets": 0})
+        json!({"packets": 1, "captured_bytes": 20, "original_bytes": 20, "truncated_packets": 0})
     );
     let changes = report["conversation_changes"].as_array().unwrap();
     assert_eq!(changes.len(), 2);
@@ -746,15 +748,18 @@ fn compares_average_rates_over_the_full_window_and_reports_rate_only_conversatio
     assert_eq!(
         report["average_rates"],
         json!({
-            "before": {"packets_per_second": 1.5, "captured_bytes_per_second": 42.0},
-            "after": {"packets_per_second": 0.75, "captured_bytes_per_second": 21.0},
-            "delta": {"packets_per_second": -0.75, "captured_bytes_per_second": -21.0}
+            "before": {"packets_per_second": 1.5, "captured_bytes_per_second": 42.0, "original_bytes_per_second": 42.0},
+            "after": {"packets_per_second": 0.75, "captured_bytes_per_second": 21.0, "original_bytes_per_second": 21.0},
+            "delta": {"packets_per_second": -0.75, "captured_bytes_per_second": -21.0, "original_bytes_per_second": -21.0}
         })
     );
     assert_eq!(report["conversation_changes"], json!([]));
     assert_eq!(report["transport_changes"], json!([]));
     let ip = &report["rate_only_changes"]["ip_conversations"][0];
-    assert_eq!(ip["average_rates"], report["average_rates"]);
+    assert_eq!(
+        ip["average_rates"]["delta"],
+        json!({"packets_per_second": -0.75, "captured_bytes_per_second": -21.0})
+    );
     let pairs = report["rate_only_changes"]["transport_conversations"]
         .as_array()
         .unwrap();
@@ -787,6 +792,91 @@ fn compares_average_rates_over_the_full_window_and_reports_rate_only_conversatio
     assert_eq!(
         zero_span["rate_only_changes"]["transport_conversations"],
         json!([])
+    );
+}
+
+#[test]
+fn compares_recorded_packet_lengths_across_different_snap_lengths() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = "short.pcap";
+    let after = "full.pcapng";
+    let mut pcap = classic_capture()[..24].to_vec();
+    pcap[16..20].copy_from_slice(&4_u32.to_le_bytes());
+    for (seconds, fraction, original) in [(10_u32, 250_000, 4), (11, 500_000, 8)] {
+        pcap.extend(
+            [seconds, fraction, 4, original]
+                .into_iter()
+                .flat_map(u32::to_le_bytes),
+        );
+        pcap.extend([0; 4]);
+    }
+    fs::write(root.join(before), pcap).unwrap();
+
+    let mut pcapng: Vec<_> = [
+        0x0A0D0D0A_u32,
+        28,
+        0x1A2B3C4D,
+        1,
+        u32::MAX,
+        u32::MAX,
+        28,
+        1,
+        20,
+        1,
+        64,
+        20,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    // Preserve all the data. The first record has a legacy length below its captured length.
+    for (timestamp, captured, original) in [(10_250_000_u32, 4_u32, 3_u32), (11_500_000, 8, 8)] {
+        let block_bytes = 32 + captured;
+        pcapng.extend(
+            [6, block_bytes, 0, 0, timestamp, captured, original]
+                .into_iter()
+                .flat_map(u32::to_le_bytes),
+        );
+        pcapng.extend(std::iter::repeat_n(0, captured as usize));
+        pcapng.extend(block_bytes.to_le_bytes());
+    }
+    fs::write(root.join(after), pcapng).unwrap();
+
+    let whole = compare(root, before, after, &[]);
+    assert!(whole.status.success(), "{whole:?}");
+    let report: Value = serde_json::from_slice(&whole.stdout).unwrap();
+    assert_eq!(report["before"]["original_bytes"], 12);
+    assert_eq!(report["after"]["original_bytes"], 12);
+    assert_eq!(
+        report["totals_delta"],
+        json!({"packets": 0, "captured_bytes": 4, "original_bytes": 0, "truncated_packets": -1})
+    );
+    let delta = &report["average_rates"]["delta"];
+    assert_eq!(delta["captured_bytes_per_second"], 3.2);
+    assert_eq!(delta["original_bytes_per_second"], 0.0);
+    assert_eq!(
+        report["average_rates"]["after"]["original_bytes_per_second"],
+        9.6
+    );
+
+    let interval = compare(
+        root,
+        before,
+        after,
+        &["--elapsed-ns", "1250000000:1250000001"],
+    );
+    assert!(interval.status.success(), "{interval:?}");
+    let report: Value = serde_json::from_slice(&interval.stdout).unwrap();
+    assert_eq!(report["before"]["original_bytes"], 8);
+    assert_eq!(report["after"]["original_bytes"], 8);
+    assert_eq!(
+        report["average_rates"]["before"]["original_bytes_per_second"],
+        8e9
+    );
+    assert_eq!(
+        report["average_rates"]["delta"]["original_bytes_per_second"],
+        0.0
     );
 }
 

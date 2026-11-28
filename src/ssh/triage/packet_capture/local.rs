@@ -111,6 +111,7 @@ struct CountersReport<'a> {
 struct StatsReport {
     packets: u32,
     captured_bytes: u64,
+    original_bytes: u64,
     truncated_packets: u32,
     timestamped_packets: u32,
     timestamp_span_ns: Option<String>,
@@ -121,6 +122,7 @@ impl From<&PacketStats> for StatsReport {
         Self {
             packets: stats.packets,
             captured_bytes: stats.captured_bytes,
+            original_bytes: stats.original_bytes,
             truncated_packets: stats.truncated_packets,
             timestamped_packets: stats.timestamped_packets,
             // Use a decimal string to preserve precision outside 53-bit JSON readers.

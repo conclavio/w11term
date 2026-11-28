@@ -296,10 +296,10 @@ try {
     Select-Capture $olderCapture
     $null = Wait-Until 'an earlier capture opens before any SSH connection' {
         (Find-Element "PCAPNG${dot}292 bytes") -and
-            (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated") -and
+            (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated${dot}16 original bytes") -and
             (Find-Element "Timestamp span 0.500 s${dot}2 of 3 packets timestamped") -and
             (Find-Element "Interfaces 2${dot}Ethernet, Linux cooked v2") -and
-            (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated") -and
+            (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated${dot}12 original bytes") -and
             (Find-Element "Reported${dot}Received 12") -and
             (Find-Element "Reported${dot}Interface drops 1")
     }
@@ -313,17 +313,18 @@ try {
     Select-NativeComboItem 'Saved capture interfaces' "Section 1${dot}Interface 1${dot}wireless"
     $null = Wait-Until 'the selected interface shows its own capture totals and snap length' {
         (Find-Element "wireless${dot}Linux cooked v2${dot}Unlimited snap length") -and
-            (Find-Element "Interface packets 1${dot}4 captured bytes${dot}0 truncated") -and
+            (Find-Element "Interface packets 1${dot}4 captured bytes${dot}0 truncated${dot}4 original bytes") -and
             (Find-Element "Reported${dot}Received 100") -and
             (Find-Element "Reported${dot}Interface drops 0${dot}OS drops 5")
     }
     $summary = & $Cli inspect-packet-capture $olderCapture | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or !$summary.complete -or $summary.format -cne 'pcapng' -or
         $summary.file_bytes -ne 292 -or $summary.packets -ne 3 -or $summary.captured_bytes -ne 12 -or
-        $summary.truncated_packets -ne 1 -or $summary.timestamped_packets -ne 2 -or
+        $summary.original_bytes -ne 16 -or $summary.truncated_packets -ne 1 -or $summary.timestamped_packets -ne 2 -or
         $summary.timestamp_span_ns -cne '500000000' -or $summary.interfaces -ne 2 -or
         $summary.link_types.Count -ne 2 -or $summary.link_types[0] -ne 1 -or $summary.link_types[1] -ne 276 -or
         $summary.interface_details[0].name -cne 'wired' -or $summary.interface_details[0].packets -ne 2 -or
+        $summary.interface_details[0].original_bytes -ne 12 -or
         $summary.interface_details[1].name -cne 'wireless' -or $summary.interface_details[1].packets -ne 1 -or
         $summary.interface_details[1].snap_length -ne $null -or
         $summary.interface_details[0].capture_statistics.os_dropped -ne $null -or
@@ -348,7 +349,7 @@ try {
     Click ('Reopen ' + [IO.Path]::GetFileName($olderCapture))
     $null = Wait-Until 'recent packet capture reopens and is validated again' {
         (Find-Element "PCAPNG${dot}292 bytes") -and
-        (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated") -and
+        (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated${dot}12 original bytes") -and
         !(Find-Element 'Choose a PCAP or PCAPNG capture file') -and
         !(Find-Element 'Diagnostics overview panel')
     }
@@ -386,7 +387,7 @@ try {
         $open = Find-Element 'Open in Wireshark' $button
         $open -and $open.Current.IsEnabled -and
             (Find-Element "Partial packet summary${dot}Incomplete or invalid PCAPNG block length") -and
-            (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated")
+            (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated${dot}16 original bytes")
     }
     $partial = & $Cli inspect-packet-capture $partialCapture | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or $partial.complete -or $partial.packets -ne 3 -or
@@ -443,7 +444,7 @@ try {
     $null = Wait-Until 'comparison shows both files, signed capture changes, and the changed IP pair' {
         (Find-Element "Before${dot}IP conversations.pcap${dot}PCAP") -and
         (Find-Element "After${dot}older capture.pcapng${dot}PCAPNG") -and
-        (Find-Element "Capture change${dot}-4 packets${dot}-330 captured bytes${dot}+1 truncated") -and
+        (Find-Element "Capture change${dot}-4 packets${dot}-330 captured bytes${dot}+1 truncated${dot}-326 original bytes") -and
         (Find-Element "After average${dot}Unavailable") -and
         (Find-Element 'IP conversation changes 3') -and
         (Find-Element "192.0.2.1 $bothDirections 192.0.2.2") -and
@@ -505,10 +506,10 @@ try {
     }
     Select-Capture $slowerCapture $compareCaptureLabel 'Choose after packet capture'
     $null = Wait-Until 'equal packet counts show slower rates across the longer capture window' {
-        (Find-Element "Capture change${dot}+0 packets${dot}+0 captured bytes${dot}+0 truncated") -and
-        (Find-Element "Before average${dot}1.167 packets/s, 57.000 captured bytes/s") -and
-        (Find-Element "After average${dot}0.583 packets/s, 28.500 captured bytes/s") -and
-        (Find-Element "Average change${dot}-0.583 packets/s, -28.500 captured bytes/s") -and
+        (Find-Element "Capture change${dot}+0 packets${dot}+0 captured bytes${dot}+0 truncated${dot}+0 original bytes") -and
+        (Find-Element "Before average${dot}1.167 packets/s, 57.000 captured bytes/s, 57.000 original bytes/s") -and
+        (Find-Element "After average${dot}0.583 packets/s, 28.500 captured bytes/s, 28.500 original bytes/s") -and
+        (Find-Element "Average change${dot}-0.583 packets/s, -28.500 captured bytes/s, -28.500 original bytes/s") -and
         (Find-Element 'IP conversation changes 3') -and
         (Find-Element "Average change${dot}-0.250 packets/s, -12.167 captured bytes/s")
     }
@@ -583,7 +584,7 @@ try {
     Click 'Compare selected interval'
     $null = Wait-Until 'the comparison counts only packets within the selected interval' {
         (Find-Element "Comparing elapsed interval${dot}+0.786432 to +1.048576 s") -and
-        (Find-Element "Capture change${dot}-1 packets${dot}-38 captured bytes${dot}+0 truncated") -and
+        (Find-Element "Capture change${dot}-1 packets${dot}-38 captured bytes${dot}+0 truncated${dot}-38 original bytes") -and
         (Find-Element 'Average rates over the selected elapsed interval') -and
         (Find-Element 'IP conversation changes 1')
     }
@@ -629,7 +630,7 @@ try {
     Click 'Compare selected interval'
     $null = Wait-Until 'the report compares the complete selected range' {
         (Find-Element "Comparing elapsed interval${dot}+0.786432 to +3.145728 s") -and
-        (Find-Element "Capture change${dot}-2 packets${dot}-68 captured bytes${dot}+0 truncated") -and
+        (Find-Element "Capture change${dot}-2 packets${dot}-68 captured bytes${dot}+0 truncated${dot}-68 original bytes") -and
         (Find-Element 'IP conversation changes 1') -and
         (Find-Element "2001:db8::1 $bothDirections 2001:db8::2")
     }

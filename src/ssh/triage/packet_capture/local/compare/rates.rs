@@ -15,11 +15,28 @@ pub struct AverageRateComparison {
 pub struct TrafficRate {
     pub packets_per_second: f64,
     pub captured_bytes_per_second: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_bytes_per_second: Option<f64>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RateSample {
+    pub traffic: Traffic,
+    pub original_bytes: Option<u64>,
+}
+
+impl From<Traffic> for RateSample {
+    fn from(traffic: Traffic) -> Self {
+        Self {
+            traffic,
+            original_bytes: None,
+        }
+    }
 }
 
 impl AverageRateComparison {
     pub(super) fn new(
-        observations: [Option<Traffic>; 2],
+        observations: [Option<RateSample>; 2],
         spans_ns: [Option<NonZeroU128>; 2],
     ) -> Self {
         let [before, after] = observations;
@@ -53,11 +70,15 @@ impl AverageRateComparison {
             let value = rate.map_or_else(
                 || "Unavailable".to_owned(),
                 |rate| {
-                    format!(
+                    let mut value = format!(
                         "{} packets/s, {} captured bytes/s",
                         number(rate.packets_per_second, signed),
                         number(rate.captured_bytes_per_second, signed),
-                    )
+                    );
+                    if let Some(original) = rate.original_bytes_per_second {
+                        value.push_str(&format!(", {} original bytes/s", number(original, signed)));
+                    }
+                    value
                 },
             );
             format!("{label} · {value}")
@@ -66,18 +87,19 @@ impl AverageRateComparison {
 }
 
 impl TrafficRate {
-    fn new(traffic: Traffic, span: NonZeroU128) -> Self {
+    fn new(sample: RateSample, span: NonZeroU128) -> Self {
         let span = span.get();
         Self {
-            packets_per_second: per_second(u64::from(traffic.packets), span),
-            captured_bytes_per_second: per_second(traffic.captured_bytes, span),
+            packets_per_second: per_second(u64::from(sample.traffic.packets), span),
+            captured_bytes_per_second: per_second(sample.traffic.captured_bytes, span),
+            original_bytes_per_second: sample.original_bytes.map(|bytes| per_second(bytes, span)),
         }
     }
 
     fn difference(
         ((before, before_span), (after, after_span)): (
-            (Traffic, NonZeroU128),
-            (Traffic, NonZeroU128),
+            (RateSample, NonZeroU128),
+            (RateSample, NonZeroU128),
         ),
     ) -> Self {
         let before_span = before_span.get();
@@ -96,8 +118,18 @@ impl TrafficRate {
             }
         };
         Self {
-            packets_per_second: difference(u64::from(before.packets), u64::from(after.packets)),
-            captured_bytes_per_second: difference(before.captured_bytes, after.captured_bytes),
+            packets_per_second: difference(
+                u64::from(before.traffic.packets),
+                u64::from(after.traffic.packets),
+            ),
+            captured_bytes_per_second: difference(
+                before.traffic.captured_bytes,
+                after.traffic.captured_bytes,
+            ),
+            original_bytes_per_second: before
+                .original_bytes
+                .zip(after.original_bytes)
+                .map(|(before, after)| difference(before, after)),
         }
     }
 }

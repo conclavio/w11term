@@ -448,8 +448,11 @@ impl Comparison {
                 text(
                     "counts",
                     format!(
-                        "Packets {} · {} captured bytes · {} truncated",
-                        capture.packets, capture.captured_bytes, capture.truncated_packets,
+                        "Packets {} · {} captured bytes · {} truncated · {} original bytes",
+                        capture.packets,
+                        capture.captured_bytes,
+                        capture.truncated_packets,
+                        capture.original_bytes,
                     ),
                 ),
                 text("time", span),
@@ -497,13 +500,7 @@ impl Comparison {
             ));
         }
         if let Some(delta) = &model.totals_delta {
-            fields.push(text(
-                "total-delta",
-                format!(
-                    "Capture change · {:+} packets · {:+} captured bytes · {:+} truncated",
-                    delta.packets, delta.captured_bytes, delta.truncated_packets,
-                ),
-            ));
+            fields.push(text("total-delta", delta.summary()));
         } else {
             fields.push(text(
                 "total-delta",

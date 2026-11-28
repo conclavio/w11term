@@ -568,8 +568,11 @@ impl Panel {
                 text(
                     "local-packet-counts",
                     format!(
-                        "Packets {} · {} captured bytes · {} truncated",
-                        stats.packets, stats.captured_bytes, stats.truncated_packets
+                        "Packets {} · {} captured bytes · {} truncated · {} original bytes",
+                        stats.packets,
+                        stats.captured_bytes,
+                        stats.truncated_packets,
+                        stats.original_bytes
                     ),
                 ),
             ]);
@@ -850,8 +853,8 @@ impl Panel {
                     files.push(text(
                         "saved-interface-counts",
                         format!(
-                            "Interface packets {} · {} captured bytes · {} truncated",
-                            stats.packets, stats.captured_bytes, stats.truncated_packets
+                            "Interface packets {} · {} captured bytes · {} truncated · {} original bytes",
+                            stats.packets, stats.captured_bytes, stats.truncated_packets, stats.original_bytes
                         ),
                     ));
                     if let Some(span) = stats.span_ns() {
