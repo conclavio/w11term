@@ -107,6 +107,13 @@ function Import-ShellFragment([string]$Destination, [string]$Source) {
         $control -and $control.Current.IsEnabled -and !(Find-OwnedDialog $title)
     }
 }
+function Add-ShellSetup([string]$Mode) {
+    $setup = 'Add shell setup'
+    $search = @{ scroll = $null }
+    Invoke-Button (Get-NativeMenuAction $setup $Mode -VisibleItem -Reveal {
+        Move-NativeControlIntoView (Find-Element $setup $button) $search
+    })
+}
 function Save-DotfilesBundle([string]$Action, [string]$Path) {
     Invoke-Button (Wait-DotfileControl $Action $button)
     $dialog = Wait-Until 'owned dotfiles bundle save dialog' { Find-OwnedDialog 'Save new dotfiles bundle' }
@@ -233,13 +240,21 @@ try {
     Set-DotfileFragment 'Shared environment fragment' $shared
     Set-DotfileFragment 'Bash startup fragment' $bash
     Set-DotfileFragment 'Zsh startup fragment' $zsh
+    $fish = 'function fish_prompt; printf "fleet> "; end'
+    Set-DotfileFragment 'Fish startup fragment' $fish
+    Add-ShellSetup 'Fish directory reporting only'
+    $fishDirectory = Wait-Until 'the Fish draft includes directory reporting after the existing prompt' {
+        $text = Dotfile-Fragment 'Fish startup fragment'
+        if ($text.StartsWith("$fish`n# >>> w11term shell setup >>>") -and
+            $text.Contains('__w11term_report_fish_directory') -and !$text.Contains('__w11term_fish_preexec')) { $text }
+    }
     $created = Join-Path $State 'Authored dotfiles.json'
     Save-DotfilesBundle 'Save dotfiles bundle' $created
     $originalHash = File-Sha256 $created
     $initial = [IO.File]::ReadAllText($created) | ConvertFrom-Json
     if ($initial.version -ne 1 -or $initial.environment -cne $shared -or
-        $initial.bash -cne $bash -or $initial.zsh -cne $zsh) {
-        throw 'The authored dotfiles did not preserve all three multiline fragments'
+        $initial.bash -cne $bash -or $initial.zsh -cne $zsh -or $initial.fish -cne $fishDirectory) {
+        throw 'The authored dotfiles did not preserve the original fragments and added Fish setup'
     }
     Invoke-Button (Wait-DotfileControl 'Revise selected dotfiles bundle' $button)
     if ((Dotfile-Fragment 'Bash startup fragment') -cne $bash -or
@@ -270,12 +285,24 @@ try {
     $null = Wait-Until 'the Bash editor shows the appended UTF-8 text' {
         (Dotfile-Fragment 'Bash startup fragment') -ceq $revisedBash
     }
+    Add-ShellSetup 'Fish directory and prompt integration'
+    $fishIntegration = Wait-Until 'the full Fish integration replaces the directory-only block' {
+        $text = Dotfile-Fragment 'Fish startup fragment'
+        if ($text.StartsWith("$fish`n# >>> w11term shell setup >>>") -and
+            $text.Contains('__w11term_report_fish_directory') -and $text.Contains('__w11term_fish_preexec') -and
+            [regex]::Matches($text, '# >>> w11term shell setup >>>').Count -eq 1) { $text }
+    }
+    Add-ShellSetup 'Fish directory and prompt integration'
+    $null = Wait-Until 'reselecting the same integration leaves the draft unchanged' {
+        (Find-Element 'Fish startup fragment already includes this setup.') -and
+            (Dotfile-Fragment 'Fish startup fragment') -ceq $fishIntegration
+    }
     $revision = Join-Path $State 'Revised dotfiles.json'
     Save-DotfilesBundle 'Save dotfiles revision' $revision
     $updated = [IO.File]::ReadAllText($revision) | ConvertFrom-Json
     $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles.bundle
     if ($updated.environment -cne $shared -or $updated.bash -cne $revisedBash -or
-        $updated.zsh -cne $zsh -or (File-Sha256 $created) -cne $originalHash -or
+        $updated.zsh -cne $zsh -or $updated.fish -cne $fishIntegration -or (File-Sha256 $created) -cne $originalHash -or
         (File-Sha256 $bashSource) -cne $importHash -or
         ![FixtureDialog]::SameFile($bundle, $approved)) {
         throw 'Revising a bundle changed its source, another fragment, or the saved approval'

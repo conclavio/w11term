@@ -299,7 +299,7 @@ impl DotfileBundle {
     fn validate_fragments(&self) -> Result<()> {
         ensure!(self.version == 1, "Unsupported dotfiles bundle version");
         for fragment in self.all_fragments().into_iter().flatten() {
-            validate_fragment(fragment)?;
+            Self::validate_fragment(fragment)?;
         }
         Ok(())
     }
@@ -325,31 +325,31 @@ impl DotfileBundle {
     fn fragments(&self, shell: DotfileShell) -> [String; 2] {
         self.selected_fragments(shell).map(payload)
     }
+
+    pub fn validate_fragment(fragment: &str) -> Result<()> {
+        ensure!(
+            fragment.len() <= MAX_FRAGMENT_BYTES
+                && !fragment.contains('\0')
+                && !fragment.starts_with('\u{feff}'),
+            "Dotfile fragments must be at most 16 KiB of UTF-8 without NUL or a BOM"
+        );
+        ensure!(
+            !fragment.replace("\r\n", "\n").contains('\r'),
+            "Dotfile fragments must use LF or CRLF line endings"
+        );
+        Ok(())
+    }
 }
 
 fn append_fragment(existing: &str, imported: &str) -> Result<String> {
-    validate_fragment(imported)?;
+    DotfileBundle::validate_fragment(imported)?;
     let mut appended = existing.to_owned();
     if !appended.is_empty() && !appended.ends_with('\n') {
         appended.push('\n');
     }
     appended.push_str(imported);
-    validate_fragment(&appended)?;
+    DotfileBundle::validate_fragment(&appended)?;
     Ok(appended)
-}
-
-fn validate_fragment(fragment: &str) -> Result<()> {
-    ensure!(
-        fragment.len() <= MAX_FRAGMENT_BYTES
-            && !fragment.contains('\0')
-            && !fragment.starts_with('\u{feff}'),
-        "Dotfile fragments must be at most 16 KiB of UTF-8 without NUL or a BOM"
-    );
-    ensure!(
-        !fragment.replace("\r\n", "\n").contains('\r'),
-        "Dotfile fragments must use LF or CRLF line endings"
-    );
-    Ok(())
 }
 
 pub fn validate_zdotdir(shell: DotfileShell, zdotdir: Option<&str>) -> Result<()> {

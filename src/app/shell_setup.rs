@@ -1,3 +1,4 @@
+use w11term::sftp::DotfileShell;
 use windows_reactor::MenuItem;
 
 #[derive(Clone, Copy)]
@@ -16,7 +17,7 @@ impl Setup {
         Self::ZshIntegration,
         Self::FishIntegration,
     ];
-    const ALL: [Self; 6] = [
+    pub(super) const ALL: [Self; 6] = [
         Self::BashDirectory,
         Self::ZshDirectory,
         Self::FishDirectory,
@@ -24,6 +25,25 @@ impl Setup {
         Self::ZshIntegration,
         Self::FishIntegration,
     ];
+
+    pub(super) fn shell(self) -> DotfileShell {
+        match self {
+            Self::BashDirectory | Self::BashIntegration => DotfileShell::Bash,
+            Self::ZshDirectory | Self::ZshIntegration => DotfileShell::Zsh,
+            Self::FishDirectory | Self::FishIntegration => DotfileShell::Fish,
+        }
+    }
+
+    pub(super) fn bundle_label(self) -> &'static str {
+        match self {
+            Self::BashDirectory => "Bash directory reporting only",
+            Self::ZshDirectory => "Zsh directory reporting only",
+            Self::FishDirectory => "Fish directory reporting only",
+            Self::BashIntegration => "Bash directory and prompt integration",
+            Self::ZshIntegration => "Zsh directory and prompt integration",
+            Self::FishIntegration => "Fish directory and prompt integration",
+        }
+    }
 
     pub(super) fn label(self) -> &'static str {
         match self {
@@ -55,7 +75,11 @@ impl Setup {
     }
 
     pub(super) fn copy(self) -> anyhow::Result<()> {
-        let setup = match self {
+        w11term::clipboard::write(self.script().trim_end())
+    }
+
+    pub(super) fn script(self) -> &'static str {
+        match self {
             Self::BashDirectory => include_str!("bash-directory.sh"),
             Self::ZshDirectory => include_str!("zsh-directory.zsh"),
             Self::FishDirectory => include_str!("fish-directory.fish"),
@@ -74,7 +98,6 @@ impl Setup {
                 "\n",
                 include_str!("fish-integration.fish")
             ),
-        };
-        w11term::clipboard::write(setup.trim_end())
+        }
     }
 }
