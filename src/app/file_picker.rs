@@ -80,6 +80,7 @@ pub(super) enum Purpose {
     CompareTriageReport(PathBuf),
     SaveTriageReport(PathBuf),
     SaveCpuProfile(PathBuf),
+    VerifyRawPerfData(PathBuf),
     OpenPacketCapture(PathBuf),
     ComparePacketCapture(PathBuf),
     SavePacketCapture(PathBuf),
@@ -288,6 +289,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::OpenRecording
                 | Purpose::OpenDiagnostic { .. }
                 | Purpose::OpenTriageReport(_)
+                | Purpose::VerifyRawPerfData(_)
                 | Purpose::CompareTriageReport(_)
                 | Purpose::OpenPacketCapture(_)
                 | Purpose::CaptureReport { save: false, .. }
@@ -569,6 +571,25 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 dialog.SetFileName(w!("cpu-profile.folded"))?;
                 options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT | FOS_NOTESTFILECREATE;
                 options &= !FOS_OVERWRITEPROMPT;
+                if let Some(folder) = path.parent() {
+                    local_folder(&dialog, folder);
+                }
+                None
+            }
+            Purpose::VerifyRawPerfData(path) => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                options |= FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST | FOS_DONTADDTORECENT;
+                dialog.SetTitle(w!("Choose raw perf recording"))?;
+                dialog.SetFileTypes(&[
+                    COMDLG_FILTERSPEC {
+                        pszName: w!("Raw perf recordings"),
+                        pszSpec: w!("*.data"),
+                    },
+                    COMDLG_FILTERSPEC {
+                        pszName: w!("All files"),
+                        pszSpec: w!("*.*"),
+                    },
+                ])?;
                 if let Some(folder) = path.parent() {
                     local_folder(&dialog, folder);
                 }

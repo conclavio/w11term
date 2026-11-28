@@ -22,19 +22,19 @@ enum Kind {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Review {
-    host: String,
-    user: String,
-    port: u16,
-    host_key_fingerprint: String,
-    event: String,
-    target: Target,
-    raw_perf_data_requested: bool,
+pub struct Review {
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub host_key_fingerprint: String,
+    pub event: String,
+    pub target: Target,
+    pub raw_perf_data_requested: bool,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
-enum Target {
+pub enum Target {
     Process {
         process_name: String,
         process_start_ticks: u64,
@@ -89,10 +89,10 @@ impl Review {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Artifact {
-    file_name: String,
-    bytes: u64,
-    sha256: String,
+pub struct Artifact {
+    pub file_name: String,
+    pub bytes: u64,
+    pub sha256: String,
 }
 
 impl Artifact {
@@ -117,7 +117,7 @@ impl Artifact {
         Ok(())
     }
 
-    fn verify(&mut self, path: &Path, label: &str) -> Result<()> {
+    fn verify(&self, path: &Path, label: &str) -> Result<String> {
         let expected =
             normalize_sha256(&self.sha256).with_context(|| format!("Invalid {label} SHA-256"))?;
         let found = local_sha256_with_size(path, Some(self.bytes), &TransferCancel::default())
@@ -126,8 +126,7 @@ impl Artifact {
             found == expected,
             "{label} SHA-256 differs from the CPU profile report"
         );
-        self.sha256 = found;
-        Ok(())
+        Ok(found)
     }
 }
 
@@ -136,16 +135,16 @@ impl Artifact {
 pub struct CpuProfileCaptureReport {
     schema_version: u8,
     kind: Kind,
-    folded: Artifact,
-    reviewed: Review,
-    samples: u64,
-    distinct_stacks: usize,
-    unresolved_frames: u64,
-    stopped_by_user: bool,
+    pub folded: Artifact,
+    pub reviewed: Review,
+    pub samples: u64,
+    pub distinct_stacks: usize,
+    pub unresolved_frames: u64,
+    pub stopped_by_user: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    workload: Option<CpuWorkloadOutcome>,
+    pub workload: Option<CpuWorkloadOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    raw_perf_data: Option<Artifact>,
+    pub raw_perf_data: Option<Artifact>,
 }
 
 impl CpuProfileCaptureReport {
@@ -217,6 +216,16 @@ impl CpuProfileCaptureReport {
         );
         crate::transcript::save(path, &contents, false).context("Saving new CPU profile report")
     }
+
+    /// Check a raw recording against the digest stored in the selected report.
+    pub fn verify_raw_recording(&self, path: &Path) -> Result<()> {
+        let artifact = self
+            .raw_perf_data
+            .as_ref()
+            .context("The CPU profile report has no saved raw perf recording")?;
+        artifact.validate("Raw perf recording", raw::MAX_BYTES as u64)?;
+        artifact.verify(path, "Raw perf recording").map(|_| ())
+    }
 }
 
 /// Verify the bytes of the selected folded profile and, when supplied, its raw recording.
@@ -241,13 +250,13 @@ pub fn verify_cpu_profile_report(
     let mut report: CpuProfileCaptureReport =
         serde_json::from_slice(&contents).context("Reading the CPU profile report JSON")?;
     report.validate()?;
-    report.folded.verify(profile, "Folded profile")?;
+    report.folded.sha256 = report.folded.verify(profile, "Folded profile")?;
     if let Some(path) = perf_data {
-        report
+        let artifact = report
             .raw_perf_data
             .as_mut()
-            .context("The CPU profile report has no saved raw perf recording")?
-            .verify(path, "Raw perf recording")?;
+            .context("The CPU profile report has no saved raw perf recording")?;
+        artifact.sha256 = artifact.verify(path, "Raw perf recording")?;
     }
     Ok(report)
 }

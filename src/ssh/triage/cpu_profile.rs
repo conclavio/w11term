@@ -32,7 +32,10 @@ mod raw;
 mod report;
 pub use launch::CpuWorkloadOutcome;
 pub use raw::PerfDataArtifact;
-pub use report::{CpuProfileCaptureReport, verify_cpu_profile_report};
+pub use report::{
+    Artifact as CpuProfileReportArtifact, CpuProfileCaptureReport,
+    Review as CpuProfileReportReview, Target as CpuProfileReportTarget, verify_cpu_profile_report,
+};
 pub const PERF_DATA_TRANSFER_SECONDS: u64 = 60;
 pub(crate) const CONTROL_TIMEOUT_SECONDS: u64 =
     MAX_SECONDS as u64 + EXTRA_WORK_SECONDS + SSH_MARGIN_SECONDS + 20;
