@@ -26,6 +26,7 @@ pub(super) enum Purpose {
     DotfilesBundle(PathBuf),
     DotfileFragment(PathBuf),
     PrivatePageMarkdown,
+    SavePrivatePageMarkdown(String),
     SaveDotfilesBundle {
         current: PathBuf,
         suggestion: String,
@@ -743,7 +744,8 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 options |= FOS_PATHMUSTEXIST | FOS_NOTESTFILECREATE;
                 None
             }
-            Purpose::Scrollback
+            Purpose::SavePrivatePageMarkdown(_)
+            | Purpose::Scrollback
             | Purpose::PaneImage
             | Purpose::CommandOutput(_)
             | Purpose::CommandOutputDiff(_)
@@ -767,6 +769,11 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     options |= FOS_DONTADDTORECENT;
                 }
                 let (title, suggestion, extension) = match &purpose {
+                    Purpose::SavePrivatePageMarkdown(suggestion) => (
+                        w!("Export private page Markdown"),
+                        suggestion.as_str(),
+                        w!("md"),
+                    ),
                     Purpose::PaneImage => (w!("Save pane image"), "terminal.png", w!("png")),
                     Purpose::CommandOutput(suggestion) => (
                         w!("Save command output as text"),
@@ -850,6 +857,13 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                     _ => (w!("Save scrollback as text"), "terminal.txt", w!("txt")),
                 };
                 dialog.SetTitle(title)?;
+                if matches!(purpose, Purpose::SavePrivatePageMarkdown(_)) {
+                    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                    dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                        pszName: w!("Markdown (*.md)"),
+                        pszSpec: w!("*.md"),
+                    }])?;
+                }
                 if comparison_formats {
                     use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
                     dialog.SetFileTypes(&[

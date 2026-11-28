@@ -18,6 +18,8 @@ pub enum Action {
     Text(Arc<()>, String),
     Import,
     Imported(Arc<()>, Result<Option<String>, String>),
+    Export,
+    Exported(Arc<()>, Result<Option<PathBuf>, String>),
     Save,
     Saved(Arc<()>, Result<String, String>),
     Cancel,
@@ -31,6 +33,7 @@ pub struct Document {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Work {
     Import,
+    Export,
     Save,
 }
 
@@ -41,7 +44,7 @@ pub(super) struct Editor {
     mounted: bool,
     work: Option<Work>,
     input: ElementRef<TextBox>,
-    error: Option<String>,
+    status: Option<String>,
 }
 
 fn message(action: Action) -> Message {
@@ -92,11 +95,12 @@ impl Editor {
         }
         let status = match self.work {
             Some(Work::Import) => Some("Loading Markdown draft…"),
+            Some(Work::Export) => Some("Exporting Markdown draft…"),
             Some(Work::Save) => Some("Saving private page…"),
-            None if self.document.is_none() && self.error.is_none() => {
+            None if self.document.is_none() && self.status.is_none() => {
                 Some("Loading private page…")
             }
-            None => self.error.as_deref(),
+            None => self.status.as_deref(),
         };
         if let Some(status) = status {
             fields.push(KeyedView::new(
@@ -108,11 +112,17 @@ impl Editor {
         }
         if self.document.is_some() {
             fields.push(KeyedView::new(
-                "import-markdown",
-                Button::new()
-                    .is_enabled(self.ready())
-                    .on_click(ctx.callback(|_| message(Action::Import)))
-                    .content("Import Markdown…"),
+                "markdown-files",
+                StackPanel::new().spacing(4.0).children((
+                    Button::new()
+                        .is_enabled(self.ready())
+                        .on_click(ctx.callback(|_| message(Action::Import)))
+                        .content("Import Markdown…"),
+                    Button::new()
+                        .is_enabled(self.ready())
+                        .on_click(ctx.callback(|_| message(Action::Export)))
+                        .content("Export Markdown…"),
+                )),
             ));
         }
         fields.push(KeyedView::new(
@@ -175,7 +185,7 @@ impl Panel {
                     mounted: false,
                     work: None,
                     input: ElementRef::default(),
-                    error: None,
+                    status: None,
                 });
                 self.draft = None;
                 ctx.spawn_background_with_rejection(
@@ -196,7 +206,7 @@ impl Panel {
                 {
                     match result {
                         Ok(document) => editor.document = Some(document),
-                        Err(error) => editor.error = Some(error),
+                        Err(error) => editor.status = Some(error),
                     }
                 }
             }
@@ -214,10 +224,10 @@ impl Panel {
                     && let Some(document) = &mut editor.document
                 {
                     if text.len() > MAX_PAGE && normalize_lines(&text).len() > MAX_PAGE {
-                        editor.error = Some("The private page exceeds 64 KiB".into());
+                        editor.status = Some("The private page exceeds 64 KiB".into());
                     } else {
                         document.draft = text;
-                        editor.error = None;
+                        editor.status = None;
                     }
                 }
             }
@@ -261,10 +271,75 @@ impl Panel {
                     match result {
                         Ok(Some(draft)) => {
                             document.draft = draft;
-                            editor.error = None;
+                            editor.status = None;
                         }
                         Ok(None) => {}
-                        Err(error) => editor.error = Some(error),
+                        Err(error) => editor.status = Some(error),
+                    }
+                }
+            }
+            Action::Export => {
+                let Some(owner) = owner else { return };
+                let Some(editor) = self.private_page.as_mut().filter(|editor| editor.ready())
+                else {
+                    return;
+                };
+                let Some(document) = &editor.document else {
+                    return;
+                };
+                let draft = document.draft.clone();
+                let filename = format!("{}.md", editor.key.name);
+                let ticket = editor.ticket.clone();
+                editor.work = Some(Work::Export);
+                let rejected = message(Action::Exported(
+                    ticket.clone(),
+                    Err("Markdown file picker unavailable".into()),
+                ));
+                ctx.spawn_background_with_rejection(
+                    move |scope| {
+                        let export = || -> Result<Option<PathBuf>> {
+                            if scope.is_cancelled() {
+                                return Ok(None);
+                            }
+                            let Some(selected) = file_picker::pick(
+                                owner,
+                                file_picker::Purpose::SavePrivatePageMarkdown(filename),
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            if scope.is_cancelled() {
+                                return Ok(None);
+                            }
+                            export_draft(
+                                &catalog::directory()?,
+                                &selected.path,
+                                selected.overwrite,
+                                &draft,
+                            )?;
+                            Ok(Some(selected.path))
+                        };
+                        message(Action::Exported(
+                            ticket,
+                            export().map_err(|err| format!("{err:#}")),
+                        ))
+                    },
+                    rejected,
+                );
+            }
+            Action::Exported(ticket, result) => {
+                if let Some(editor) = &mut self.private_page
+                    && Arc::ptr_eq(&editor.ticket, &ticket)
+                    && editor.work == Some(Work::Export)
+                {
+                    editor.work = None;
+                    match result {
+                        Ok(Some(path)) => {
+                            editor.status =
+                                Some(format!("Exported Markdown to {}", path.display()));
+                        }
+                        Ok(None) => {}
+                        Err(error) => editor.status = Some(error),
                     }
                 }
             }
@@ -285,7 +360,7 @@ impl Panel {
                     Err("Private page save unavailable".into()),
                 ));
                 editor.work = Some(Work::Save);
-                editor.error = None;
+                editor.status = None;
                 ctx.spawn_background_with_rejection(
                     move |_| {
                         let result = catalog::directory().and_then(|directory| {
@@ -318,7 +393,7 @@ impl Panel {
                     }
                     Err(error) => {
                         editor.work = None;
-                        editor.error = Some(error);
+                        editor.status = Some(error);
                     }
                 }
             }
@@ -421,6 +496,24 @@ fn read_imported_draft(path: &Path) -> Result<String> {
     let text = normalize_lines(text.trim_start_matches('\u{feff}'));
     parse_private_page(&text)?;
     Ok(text.replace('\n', "\r"))
+}
+
+fn export_draft(directory: &Path, path: &Path, overwrite: bool, draft: &str) -> Result<()> {
+    let filename = path.file_name().context("Choose a Markdown filename")?;
+    let parent = path
+        .parent()
+        .context("Choose a folder for the Markdown file")?
+        .canonicalize()
+        .context("Opening the selected export folder")?;
+    match directory.join("pages").canonicalize() {
+        Ok(library) => ensure!(
+            !parent.starts_with(library),
+            "Choose a location outside the command reference library. Use Save private page to update a manual."
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("Checking the command reference library"),
+    }
+    w11term::transcript::save(&parent.join(filename), &normalize_lines(draft), overwrite)
 }
 
 fn parse_private_page(text: &str) -> Result<Page> {
@@ -559,6 +652,29 @@ mod tests {
             fs::write(&source, contents).unwrap();
             assert!(read_imported_draft(&source).is_err());
         }
+    }
+
+    #[test]
+    fn exports_an_importable_copy_without_writing_the_library() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = directory.path().join("catalog");
+        let exported = directory.path().join("copy.md");
+        let draft = "# Draft\r\r> Review the route.\r";
+        export_draft(&catalog, &exported, false, draft).unwrap();
+        assert_eq!(
+            fs::read(&exported).unwrap(),
+            b"# Draft\n\n> Review the route.\n"
+        );
+        assert_eq!(read_imported_draft(&exported).unwrap(), draft);
+        assert!(!catalog.exists());
+
+        let key = key("route-review");
+        save_document(&catalog, &key, None, "# Saved").unwrap();
+        let manual = page_path(&catalog, &key, false).unwrap().unwrap();
+        assert!(export_draft(&catalog, &manual, true, draft).is_err());
+        assert_eq!(fs::read_to_string(manual).unwrap(), "# Saved");
+        assert!(export_draft(&catalog, &exported, false, "# Other").is_err());
+        assert_eq!(read_imported_draft(&exported).unwrap(), draft);
     }
 
     #[test]

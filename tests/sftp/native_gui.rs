@@ -136,6 +136,17 @@ async fn native_private_manual_import_edits_only_the_draft_until_save() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "exports a private manual draft through the Windows Save dialog without updating the catalog"]
+async fn native_private_manual_export_keeps_the_saved_manual_and_draft() {
+    run_palette_fixture(
+        "export-private-manual-ui.ps1",
+        b"",
+        Some("private-manual-export-ready\r\n"),
+    )
+    .await;
+}
+
 #[test]
 #[ignore = "saves an offline manual example and recalls it in a real PowerShell pane"]
 fn native_reference_examples_save_offline_and_require_explicit_shell_submit() {

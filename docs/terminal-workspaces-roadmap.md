@@ -366,6 +366,8 @@ English tldr-pages are bundled for offline lookup. The platform defaults to Wind
 
 Use **Import Markdown…** in the private page editor to review a local manual as a draft and save it for the chosen command and platform.
 
+Use **Export Markdown…** to share a copy of the current private manual draft as UTF-8 Markdown.
+
 **Find saved manual…** searches saved page titles, commands, and platforms from the command palette. Opening a result restores that exact page beside the current pane.
 
 Save an edited example to the shared **Saved commands** library from Command reference. Open the example editor offline, choose a name for the exact line, and recall it from the palette or a group later.
