@@ -944,6 +944,7 @@ impl TerminalApp {
         if matches!(action, Action::Open | Action::Selection(_)) {
             self.set_diagnostics_drawer(None);
         }
+        let owner = self.keyboard.hwnd().map(|window| window.0 as usize);
         let panel = &mut self.command_reference;
         match action {
             Action::Open | Action::Selection(_) => {
@@ -1005,7 +1006,7 @@ impl TerminalApp {
             }
             Action::Link(link) => Self::open_link(&link),
             Action::Refresh => self.start_reference_load(true, ctx),
-            Action::Private(action) => panel.author_private_page(action, auto, ctx),
+            Action::Private(action) => panel.author_private_page(action, auto, owner, ctx),
             Action::SavedPage(action) => panel.saved_page_action(action, auto, ctx),
             Action::Related(action) => panel.related_action(action, auto),
             Action::ToolInstall(action) => self.tool_install_action(action, ctx),

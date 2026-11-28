@@ -16,6 +16,8 @@ pub enum Action {
     Loaded(Arc<()>, Result<Document, String>),
     Mounted(Arc<()>),
     Text(Arc<()>, String),
+    Import,
+    Imported(Arc<()>, Result<Option<String>, String>),
     Save,
     Saved(Arc<()>, Result<String, String>),
     Cancel,
@@ -26,12 +28,18 @@ pub struct Document {
     draft: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Work {
+    Import,
+    Save,
+}
+
 pub(super) struct Editor {
     key: Key,
     ticket: Arc<()>,
     document: Option<Document>,
     mounted: bool,
-    saving: bool,
+    work: Option<Work>,
     input: ElementRef<TextBox>,
     error: Option<String>,
 }
@@ -41,6 +49,10 @@ fn message(action: Action) -> Message {
 }
 
 impl Editor {
+    fn ready(&self) -> bool {
+        self.document.is_some() && self.mounted && self.work.is_none()
+    }
+
     pub(super) fn view(&self, ctx: &mut ViewContext<TerminalApp>) -> View {
         let mut fields = vec![KeyedView::new(
             "target",
@@ -51,10 +63,11 @@ impl Editor {
             let sender = ctx.sender();
             let input = self.input.clone();
             let mounted = self.mounted;
-            ctx.use_effect("private manual text box", mounted, move || {
-                if mounted {
+            let ready = self.ready();
+            ctx.use_effect("private manual text box", (mounted, ready), move || {
+                if ready {
                     let _ = input.request_focus();
-                } else {
+                } else if !mounted {
                     sender.send(message(Action::Mounted(ticket)));
                 }
                 None
@@ -69,7 +82,7 @@ impl Editor {
                     .text_wrapping(TextWrapping::Wrap)
                     .min_height(230.0)
                     .max_height(420.0)
-                    .is_enabled(self.mounted && !self.saving)
+                    .is_enabled(self.ready())
                     // Apply the seed after mounting, once WinUI has enabled multiline input.
                     .text_optional(self.mounted.then(|| document.draft.clone()))
                     .on_text_changed(
@@ -77,21 +90,29 @@ impl Editor {
                     ),
             ));
         }
-        if let Some(error) = &self.error {
+        let status = match self.work {
+            Some(Work::Import) => Some("Loading Markdown draft…"),
+            Some(Work::Save) => Some("Saving private page…"),
+            None if self.document.is_none() && self.error.is_none() => {
+                Some("Loading private page…")
+            }
+            None => self.error.as_deref(),
+        };
+        if let Some(status) = status {
             fields.push(KeyedView::new(
-                "error",
+                "status",
                 TextBlock::new()
-                    .text(error)
+                    .text(status)
                     .text_wrapping(TextWrapping::Wrap),
             ));
-        } else if self.saving || self.document.is_none() {
+        }
+        if self.document.is_some() {
             fields.push(KeyedView::new(
-                "progress",
-                TextBlock::new().text(if self.saving {
-                    "Saving private page…"
-                } else {
-                    "Loading private page…"
-                }),
+                "import-markdown",
+                Button::new()
+                    .is_enabled(self.ready())
+                    .on_click(ctx.callback(|_| message(Action::Import)))
+                    .content("Import Markdown…"),
             ));
         }
         fields.push(KeyedView::new(
@@ -101,11 +122,11 @@ impl Editor {
                 .spacing(8.0)
                 .children((
                     Button::new()
-                        .is_enabled(self.mounted && !self.saving)
+                        .is_enabled(self.ready())
                         .on_click(ctx.callback(|_| message(Action::Save)))
                         .content("Save private page"),
                     Button::new()
-                        .is_enabled(!self.saving)
+                        .is_enabled(self.work.is_none())
                         .on_click(ctx.callback(|_| message(Action::Cancel)))
                         .content("Cancel private page edit"),
                 )),
@@ -131,6 +152,7 @@ impl Panel {
         &mut self,
         action: Action,
         auto: Platform,
+        owner: Option<usize>,
         ctx: &ComponentContext<TerminalApp>,
     ) {
         match action {
@@ -151,7 +173,7 @@ impl Panel {
                     ticket: ticket.clone(),
                     document: None,
                     mounted: false,
-                    saving: false,
+                    work: None,
                     input: ElementRef::default(),
                     error: None,
                 });
@@ -188,8 +210,7 @@ impl Panel {
             Action::Text(ticket, text) => {
                 if let Some(editor) = &mut self.private_page
                     && Arc::ptr_eq(&editor.ticket, &ticket)
-                    && editor.mounted
-                    && !editor.saving
+                    && editor.ready()
                     && let Some(document) = &mut editor.document
                 {
                     if text.len() > MAX_PAGE && normalize_lines(&text).len() > MAX_PAGE {
@@ -200,11 +221,55 @@ impl Panel {
                     }
                 }
             }
+            Action::Import => {
+                let Some(owner) = owner else { return };
+                let Some(editor) = self.private_page.as_mut().filter(|editor| editor.ready())
+                else {
+                    return;
+                };
+                let ticket = editor.ticket.clone();
+                editor.work = Some(Work::Import);
+                let rejected = message(Action::Imported(
+                    ticket.clone(),
+                    Err("Markdown file picker unavailable".into()),
+                ));
+                ctx.spawn_background_with_rejection(
+                    move |scope| {
+                        let result = if scope.is_cancelled() {
+                            Ok(None)
+                        } else {
+                            file_picker::pick(owner, file_picker::Purpose::PrivatePageMarkdown)
+                                .and_then(|file| {
+                                    file.map(|file| read_imported_draft(&file.path)).transpose()
+                                })
+                        };
+                        message(Action::Imported(
+                            ticket,
+                            result.map_err(|err| format!("{err:#}")),
+                        ))
+                    },
+                    rejected,
+                );
+            }
+            Action::Imported(ticket, result) => {
+                if let Some(editor) = &mut self.private_page
+                    && Arc::ptr_eq(&editor.ticket, &ticket)
+                    && editor.work == Some(Work::Import)
+                    && let Some(document) = &mut editor.document
+                {
+                    editor.work = None;
+                    match result {
+                        Ok(Some(draft)) => {
+                            document.draft = draft;
+                            editor.error = None;
+                        }
+                        Ok(None) => {}
+                        Err(error) => editor.error = Some(error),
+                    }
+                }
+            }
             Action::Save => {
-                let Some(editor) = self
-                    .private_page
-                    .as_mut()
-                    .filter(|editor| editor.mounted && !editor.saving)
+                let Some(editor) = self.private_page.as_mut().filter(|editor| editor.ready())
                 else {
                     return;
                 };
@@ -219,7 +284,7 @@ impl Panel {
                     ticket.clone(),
                     Err("Private page save unavailable".into()),
                 ));
-                editor.saving = true;
+                editor.work = Some(Work::Save);
                 editor.error = None;
                 ctx.spawn_background_with_rejection(
                     move |_| {
@@ -235,11 +300,9 @@ impl Panel {
                 );
             }
             Action::Saved(ticket, result) => {
-                let Some(editor) = self
-                    .private_page
-                    .as_mut()
-                    .filter(|editor| Arc::ptr_eq(&editor.ticket, &ticket))
-                else {
+                let Some(editor) = self.private_page.as_mut().filter(|editor| {
+                    Arc::ptr_eq(&editor.ticket, &ticket) && editor.work == Some(Work::Save)
+                }) else {
                     return;
                 };
                 match result {
@@ -254,7 +317,7 @@ impl Panel {
                         self.private_page = None;
                     }
                     Err(error) => {
-                        editor.saving = false;
+                        editor.work = None;
                         editor.error = Some(error);
                     }
                 }
@@ -263,7 +326,7 @@ impl Panel {
                 if self
                     .private_page
                     .as_ref()
-                    .is_some_and(|editor| !editor.saving)
+                    .is_some_and(|editor| editor.work.is_none())
                 {
                     self.private_page = None;
                     self.focus = self.focus.wrapping_add(1);
@@ -349,6 +412,15 @@ fn load_document(directory: &Path, key: &Key) -> Result<Document> {
         original,
         draft: draft.replace('\n', "\r"),
     })
+}
+
+fn read_imported_draft(path: &Path) -> Result<String> {
+    let file = File::open(path).context("Opening the selected Markdown file")?;
+    ensure!(file.metadata()?.is_file(), "Choose a regular Markdown file");
+    let text = catalog::read_page(file).context("Reading the selected Markdown file")?;
+    let text = normalize_lines(text.trim_start_matches('\u{feff}'));
+    parse_private_page(&text)?;
+    Ok(text.replace('\n', "\r"))
 }
 
 fn parse_private_page(text: &str) -> Result<Page> {
@@ -465,6 +537,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read_to_string(file).unwrap(), "# Reopened draft");
+    }
+
+    #[test]
+    fn imports_only_bounded_utf8_manuals_and_normalizes_the_draft() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("runbook.md");
+        let source_text = "\u{feff}# Caf\u{e9} runbook\r\n\r\n> Report status.\r\n";
+        fs::write(&source, source_text).unwrap();
+        assert_eq!(
+            read_imported_draft(&source).unwrap(),
+            "# Caf\u{e9} runbook\r\r> Report status.\r"
+        );
+        assert_eq!(fs::read_to_string(&source).unwrap(), source_text);
+        for contents in [
+            b"missing heading".to_vec(),
+            b"# Heading\n\0".to_vec(),
+            b"# \xff".to_vec(),
+            vec![b'x'; MAX_PAGE + 1],
+        ] {
+            fs::write(&source, contents).unwrap();
+            assert!(read_imported_draft(&source).is_err());
+        }
     }
 
     #[test]

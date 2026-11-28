@@ -125,6 +125,17 @@ async fn native_related_command_reference_preserves_platform_and_search() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "uses the Windows Markdown picker to review and save a private command manual"]
+async fn native_private_manual_import_edits_only_the_draft_until_save() {
+    run_palette_fixture(
+        "import-private-manual-ui.ps1",
+        b"",
+        Some("private-manual-ready\r\n"),
+    )
+    .await;
+}
+
 #[test]
 #[ignore = "saves an offline manual example and recalls it in a real PowerShell pane"]
 fn native_reference_examples_save_offline_and_require_explicit_shell_submit() {

@@ -25,6 +25,7 @@ pub(super) enum Purpose {
     SshConfig(PathBuf),
     DotfilesBundle(PathBuf),
     DotfileFragment(PathBuf),
+    PrivatePageMarkdown,
     SaveDotfilesBundle {
         current: PathBuf,
         suggestion: String,
@@ -264,6 +265,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::SshConfig(_)
                 | Purpose::DotfilesBundle(_)
                 | Purpose::DotfileFragment(_)
+                | Purpose::PrivatePageMarkdown
                 | Purpose::ToolBundle(_)
                 | Purpose::ToolExecutable(_)
                 | Purpose::OpenSshHostList
@@ -598,6 +600,16 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 if let Some(folder) = current.parent() {
                     local_folder(&dialog, folder);
                 }
+                None
+            }
+            Purpose::PrivatePageMarkdown => {
+                use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+                dialog.SetTitle(w!("Open private page Markdown"))?;
+                options |= FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                    pszName: w!("Markdown files"),
+                    pszSpec: w!("*.md;*.markdown"),
+                }])?;
                 None
             }
             Purpose::ToolExecutable(current) => {
