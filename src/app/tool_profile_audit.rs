@@ -8,6 +8,7 @@ use w11term::sftp::{
     ToolArchitectureAudit, ToolExecutableSource, ToolExecutableStatus, UtilityArchitecture,
 };
 
+mod prepare;
 mod rollout;
 
 const CHECKS: [(&str, ToolProfileBuildChecks); 4] = [
@@ -34,6 +35,9 @@ pub enum Action {
     Filter(String),
     IssuesOnly(bool),
     Edit(String),
+    Prepare(String),
+    StopPreparing,
+    Prepared(Arc<()>, Result<usize, String>),
     Rollout(rollout::Action),
     Back,
 }
@@ -44,12 +48,20 @@ pub(super) struct AuditPage {
     checks: ToolProfileBuildChecks,
     state: State,
     rollout: Option<Box<rollout::Panel>>,
+    preparation_result: Option<String>,
 }
 
 enum State {
     Loading(Arc<()>, ComponentTask),
+    Preparing(prepare::Work),
     Ready(ToolProfileAudit),
     Failed(String),
+}
+
+impl AuditPage {
+    fn busy(&self) -> bool {
+        matches!(self.state, State::Loading(..) | State::Preparing(_))
+    }
 }
 
 impl Drop for AuditPage {
@@ -108,6 +120,7 @@ impl TerminalApp {
                 checks,
                 state: load(self.store.path().to_owned(), id, checks, ctx),
                 rollout: None,
+                preparation_result: None,
             }));
             return;
         }
@@ -118,14 +131,16 @@ impl TerminalApp {
             return;
         }
         match action {
-            Action::Refresh if !matches!(page.state, State::Loading(..)) => {
+            Action::Refresh if !page.busy() => {
+                page.preparation_result = None;
                 page.state = load(self.store.path().to_owned(), id, page.checks, ctx);
             }
-            Action::SelectChecks(Some(index)) if !matches!(page.state, State::Loading(..)) => {
+            Action::SelectChecks(Some(index)) if !page.busy() => {
                 if let Some(&(_, checks)) = CHECKS.get(index)
                     && checks != page.checks
                 {
                     page.checks = checks;
+                    page.preparation_result = None;
                     page.state = load(self.store.path().to_owned(), id, checks, ctx);
                 }
             }
@@ -137,6 +152,47 @@ impl TerminalApp {
             }
             Action::Filter(filter) => page.filter = filter,
             Action::IssuesOnly(issues_only) => page.issues_only = issues_only,
+            Action::Prepare(name) => {
+                if let State::Ready(report) = &page.state
+                    && let ToolProfileBuildChecks::Verify(architecture) = page.checks
+                    && let Some(entry) = report.profiles.iter().find(|entry| entry.profile == name)
+                    && prepare::has_downloads(entry)
+                    && let Some(digest) = &entry.manifest_sha256
+                {
+                    page.preparation_result = None;
+                    page.state = State::Preparing(prepare::Work::start(
+                        id,
+                        self.store.path().to_owned(),
+                        entry,
+                        digest.clone(),
+                        architecture,
+                        ctx,
+                    ));
+                }
+            }
+            Action::StopPreparing => {
+                if let State::Preparing(work) = &page.state {
+                    work.stop();
+                }
+            }
+            Action::Prepared(ticket, result) => {
+                if let State::Preparing(work) = &page.state
+                    && Arc::ptr_eq(&work.ticket, &ticket)
+                {
+                    page.preparation_result = Some(match result {
+                        Ok(count) => format!(
+                            "Prepared {count} pinned build{} for {}.",
+                            if count == 1 { "" } else { "s" },
+                            work.profile,
+                        ),
+                        Err(_) if work.stopping() => "SSH tool preparation cancelled.".into(),
+                        Err(error) => {
+                            format!("Could not prepare downloads for {}. {error}", work.profile)
+                        }
+                    });
+                    page.state = load(self.store.path().to_owned(), id, page.checks, ctx);
+                }
+            }
             Action::Edit(name) => {
                 self.edit_profile(name, ctx);
                 if let Some(id) = self.tabs.active_id() {
@@ -157,7 +213,7 @@ pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) 
     if let Some(rollout) = &page.rollout {
         return rollout.view(id, ctx);
     }
-    let loading = matches!(page.state, State::Loading(..));
+    let busy = page.busy();
     let mut fields = vec![
         KeyedView::new(
             "title",
@@ -177,7 +233,7 @@ pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) 
                         )
                         .content("Back to settings"),
                     Button::new()
-                        .is_enabled(!loading)
+                        .is_enabled(!busy)
                         .on_click(
                             ctx.callback(move |_| Message::ToolProfileAudit(id, Action::Refresh)),
                         )
@@ -191,13 +247,13 @@ pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) 
                 .spacing(8.0)
                 .children((
                     Button::new()
-                        .is_enabled(!loading)
+                        .is_enabled(!busy)
                         .on_click(ctx.callback(move |_| {
                             Message::ToolProfileAudit(id, Action::Rollout(rollout::Action::Open))
                         }))
                         .content("Roll out tool manifest"),
                     Button::new()
-                        .is_enabled(!loading)
+                        .is_enabled(!busy)
                         .on_click(ctx.callback(move |_| {
                             Message::ToolProfileAudit(
                                 id,
@@ -213,7 +269,7 @@ pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) 
                 TextBlock::new().text("Audit scope"),
                 ComboBox::new()
                     .automation_name("SSH tool audit scope")
-                    .is_enabled(!loading)
+                    .is_enabled(!busy)
                     .items_source(CHECKS.iter().map(|(label, _)| *label))
                     .selected_index(CHECKS.iter().position(|(_, checks)| *checks == page.checks))
                     .on_selection_changed(ctx.callback(move |index| {
@@ -242,6 +298,9 @@ pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) 
                 .content("Show only tool sync issues"),
         ),
     ];
+    if let Some(result) = &page.preparation_result {
+        fields.push(note("preparation-result", result));
+    }
     match &page.state {
         State::Loading(..) => fields.push(note(
             "status",
@@ -250,6 +309,26 @@ pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) 
                 ToolProfileBuildChecks::Verify(_) => "Verifying local and cached SSH tools…",
             },
         )),
+        State::Preparing(work) => {
+            let stopping = work.stopping();
+            fields.push(note(
+                "status",
+                if stopping {
+                    format!("Stopping tool preparation for {}…", work.profile)
+                } else {
+                    format!("Preparing pinned downloads for {}…", work.profile)
+                },
+            ));
+            fields.push(KeyedView::new(
+                "stop-preparing",
+                Button::new()
+                    .is_enabled(!stopping)
+                    .on_click(
+                        ctx.callback(move |_| Message::ToolProfileAudit(id, Action::StopPreparing)),
+                    )
+                    .content("Stop preparing tools"),
+            ));
+        }
         State::Failed(error) => fields.push(note("error", error)),
         State::Ready(report) => {
             let query = profile_query::Query::new(&page.filter);
@@ -384,6 +463,18 @@ fn row(
             format!("builds-{architecture}"),
             &format!("{architecture} builds for {}", entry.profile),
             &build_details(check),
+        ));
+    }
+    if prepare::has_downloads(entry) {
+        let profile = entry.profile.clone();
+        fields.push(KeyedView::new(
+            "prepare",
+            Button::new()
+                .automation_name(format!("Prepare pinned downloads for {profile}"))
+                .on_click(ctx.callback(move |_| {
+                    Message::ToolProfileAudit(id, Action::Prepare(profile.clone()))
+                }))
+                .content("Prepare pinned downloads"),
         ));
     }
     KeyedView::new(

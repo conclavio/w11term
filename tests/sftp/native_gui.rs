@@ -4626,7 +4626,7 @@ fn native_dotfile_rollout_updates_reviewed_saved_profiles() {
 }
 
 #[test]
-#[ignore = "audits saved SSH tool approvals and opens an existing Windows profile draft"]
+#[ignore = "audits saved SSH tool approvals, prepares pinned downloads and opens an existing Windows profile draft"]
 fn native_tool_profile_audit_filters_refreshes_and_preserves_a_draft() {
     let state = tempfile::tempdir().unwrap();
     let root = state.path();
@@ -4634,6 +4634,9 @@ fn native_tool_profile_audit_filters_refreshes_and_preserves_a_draft() {
     let manifest = |sha256: String| {
         json!({"version": 1, "name": "fleet", "tools": [{"name": "rg", "builds": [{
             "architecture": "x86_64", "path": "rg", "sha256": sha256,
+        }, {
+            "architecture": "x86_64", "sha256": sha256,
+            "download": {"format": "raw", "url": "https://tools.example.test/rg"},
         }]}]})
         .to_string()
     };

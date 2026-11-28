@@ -474,7 +474,7 @@ impl TerminalApp {
         };
         if matches!(action, Action::Open | Action::OpenReceipt) {
             if page.rollout.is_none()
-                && !matches!(page.state, State::Loading(..))
+                && !page.busy()
                 && let Some(owner) = owner
             {
                 let picker = if matches!(action, Action::OpenReceipt) {

@@ -49,6 +49,7 @@ try {
             (Find-Element 'Manifest differs from its pin') -and
             (Find-Element 'Manifest could not be loaded')
     }
+    if (Find-Element 'Prepare pinned downloads for East' $button) { throw 'The audit offered a download before selecting the architecture scope' }
     (Wait-CheckBox 'Show only tool sync issues' $off).Toggle()
     $null = Wait-Until 'issues include invalid PATH settings on a following profile' {
         (Find-Element 'Showing 3 of 4 SSH profiles.') -and
@@ -99,6 +100,7 @@ try {
     $null = Wait-Until 'ARM64 verification shows the unavailable command' {
         Find-Element "ARM64${dot}0 of 1 commands ready locally"
     }
+    if (Find-Element 'Prepare pinned downloads for West' $button) { throw 'The audit offered x86-64 downloads in ARM64 scope' }
     Set-NativeExpansion 'ARM64 builds for West' $true
     $null = Wait-Until 'the ARM64 details explain that no build was listed' {
         Find-Element "rg${dot}No build in manifest"
@@ -134,6 +136,33 @@ try {
         Get-NativeTextLabels | Where-Object {
             $_.Contains('Missing local file') -and $_.Contains($westExecutable)
         }
+    }
+    $reviewedBytes = [IO.File]::ReadAllBytes($westManifest)
+    [IO.File]::WriteAllBytes($westManifest, [byte[]]($reviewedBytes + 10))
+    Click 'Prepare pinned downloads for West'
+    $null = Wait-Until 'preparation rejects a manifest edited since the audit' {
+        Find-Element 'Could not prepare downloads for West. The tool manifest or its pin changed. Refresh the audit before preparing downloads.'
+    }
+    [IO.File]::WriteAllBytes($westManifest, $reviewedBytes)
+    Click 'Refresh audit'
+    $null = Wait-Until 'the refreshed profile can prepare its x86-64 downloads' {
+        (Find-Element 'Prepare pinned downloads for West' $button) -and
+            (Find-Element "x86-64${dot}0 of 1 commands ready locally")
+    }
+    # Seed the exact bytes after the audit so the explicit action verifies the cached download
+    # while the local build stays missing. The fixture needs no network service.
+    $cache = Join-Path $env:W11TERM_DATA_DIR 'tools/cache/v1'
+    $null = [IO.Directory]::CreateDirectory($cache)
+    $cached = Join-Path $cache $approvedBuild.sha256
+    [IO.File]::Copy((Join-Path $State 'moved-rg'), $cached)
+    Click 'Prepare pinned downloads for West'
+    $null = Wait-Until 'preparation verifies the download and refreshes the executable audit' {
+        (Find-Element 'Prepared 1 pinned build for West.') -and
+            (Find-Element "x86-64${dot}1 of 1 commands ready locally")
+    }
+    if ([IO.File]::Exists($westExecutable) -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($westManifest)) -cne [Convert]::ToBase64String($reviewedBytes)) {
+        throw 'Preparing a pinned download changed a local build or manifest'
     }
     Click 'Back to settings'
     $null = Wait-Until 'the regular Settings page is restored' {
