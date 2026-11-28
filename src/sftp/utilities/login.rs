@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    events::{ToolBundleSyncStatus, ToolPathSyncStatus},
-    options::ToolSync,
-};
+use crate::events::{ToolBundleSyncStatus, ToolPathSyncStatus};
 
 pub(crate) struct ToolSyncResult {
     pub status: ToolBundleSyncStatus,
@@ -24,14 +21,7 @@ pub(crate) async fn sync_login_tools(
     session: &russh::client::Handle<crate::ssh::Handler>,
     settings: &ToolSync,
 ) -> Result<ToolSyncResult> {
-    ensure!(
-        safe_component(&settings.name) && !settings.name.starts_with('.'),
-        "Invalid approved tool bundle name"
-    );
-    ensure!(
-        valid_bin_directory(&settings.bin_directory),
-        "Invalid approved tool bin directory"
-    );
+    settings.validate_bundle_destination()?;
     let engine = Engine::connect(session).await?;
     let home = engine.dotfile_home().await?;
     ensure!(
@@ -59,16 +49,13 @@ pub(crate) async fn sync_login_tools(
         tokio::task::spawn_blocking(move || UtilityBundle::load_with_manifest_sha256(&path))
             .await?
             .context("Reading the configured tool bundle")?;
-    if let Some(pin) = &settings.manifest_sha256 {
+    if let Some(pin) = settings.manifest_pin()? {
         ensure!(
-            digest == normalize_sha256(pin).context("Invalid tool manifest SHA-256 pin")?,
+            digest == pin,
             "The tool manifest changed after approval. Review and approve it again."
         );
     }
-    ensure!(
-        bundle.name == settings.name && bundle.bin_directory == settings.bin_directory,
-        "The manifest name or bin directory changed. Approve the tool bundle again."
-    );
+    settings.validate_manifest_destination(&bundle)?;
     let plan = engine
         .utility_plan(session, bundle, InstallMode::Sync)
         .await?;

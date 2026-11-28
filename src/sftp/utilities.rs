@@ -1,5 +1,6 @@
 use super::dotfiles::under_home;
 use super::*;
+use crate::options::ToolSync;
 use std::{collections::BTreeSet, io::Read};
 
 mod build;
@@ -106,6 +107,28 @@ pub(super) fn managed_tool_store(home: &str, bundle: &str) -> Result<String> {
 
 fn valid_command_name(name: &str) -> bool {
     safe_component(name) && !name.starts_with(['.', '-'])
+}
+
+impl ToolSync {
+    pub(crate) fn validate_bundle_destination(&self) -> Result<()> {
+        ensure!(
+            safe_component(&self.name) && !self.name.starts_with('.'),
+            "Invalid approved tool bundle name"
+        );
+        ensure!(
+            valid_bin_directory(&self.bin_directory),
+            "Invalid approved tool bin directory"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_manifest_destination(&self, bundle: &UtilityBundle) -> Result<()> {
+        ensure!(
+            bundle.name == self.name && bundle.bin_directory == self.bin_directory,
+            "The manifest name or bin directory changed. Approve the tool bundle again."
+        );
+        Ok(())
+    }
 }
 
 impl UtilityBundle {

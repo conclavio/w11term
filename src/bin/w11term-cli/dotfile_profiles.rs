@@ -1,3 +1,4 @@
+use super::offline::profile_store;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -7,8 +8,8 @@ use std::{
 };
 use w11term::{
     control::Reply,
-    options::{SshOptions, default_profiles_path},
-    profiles::{ProfileStore, rollback_dotfile_rollout},
+    options::SshOptions,
+    profiles::rollback_dotfile_rollout,
     sftp::{DotfileBundle, DotfileShell},
 };
 
@@ -126,21 +127,6 @@ pub(super) fn rollback(args: &[String], output: &mut dyn Write) -> Result<()> {
     serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;
     Ok(())
-}
-
-fn profile_store(catalog: Option<&str>) -> Result<ProfileStore> {
-    let catalog = match catalog {
-        Some(path) => path::absolute(path)?,
-        None => default_profiles_path()?,
-    };
-    ensure!(
-        catalog
-            .metadata()
-            .with_context(|| format!("Opening profile catalog {}", catalog.display()))?
-            .is_file(),
-        "The profile catalog must be a regular file"
-    );
-    ProfileStore::new(catalog)
 }
 
 fn versions(path: &Path) -> Result<Versions> {

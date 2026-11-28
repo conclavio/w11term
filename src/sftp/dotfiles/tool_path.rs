@@ -100,15 +100,7 @@ impl Engine {
         settings: &ToolPath,
         mode: PathEdit,
     ) -> Result<PathPlan> {
-        let startup_directory = select_startup_directory(
-            settings.shell,
-            settings.zdotdir.as_deref(),
-            settings.fish_config_dir.as_deref(),
-        )?;
-        ensure!(
-            !home.contains(':'),
-            "The account home contains a PATH separator"
-        );
+        let startup_directory = settings.startup_directory(home)?;
         ensure!(
             valid_bin_directory(bin),
             "Invalid approved tool bin directory"

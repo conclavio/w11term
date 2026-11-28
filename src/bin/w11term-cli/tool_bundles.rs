@@ -1,6 +1,8 @@
-use anyhow::{Context, Result, bail};
+use super::offline::profile_store;
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{io::Write, path::Path};
+use w11term::control::Reply;
 use w11term::sftp::{
     ToolBundlePreset, UtilityArchitecture, UtilityBundle, export_builtin_tool_bundle,
     fetch_tool_bundle,
@@ -8,6 +10,34 @@ use w11term::sftp::{
 
 pub const HELP: &str = "w11term-cli fetch-tool-bundle BUNDLE.json [--architecture x86_64|aarch64]\n\
 w11term-cli fetch-tool-bundle --example NEW_BUNDLE.json [--preset essentials|admin | --tools rg,jq,mdd]";
+pub(super) const AUDIT_VERB: &str = "audit-tool-profiles";
+pub(super) const AUDIT_HELP: &str =
+    "w11term-cli audit-tool-profiles [--profiles CATALOG] [--profile NAME]";
+
+pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let mut catalog = None;
+    let mut profile = None;
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let target = match flag.as_str() {
+            "--profiles" => &mut catalog,
+            "--profile" => &mut profile,
+            _ => bail!("unsupported tool profile audit option {flag}"),
+        };
+        let value = args
+            .next()
+            .with_context(|| format!("{flag} requires a value"))?;
+        ensure!(
+            target.replace(value.as_str()).is_none(),
+            "specify {flag} only once"
+        );
+    }
+    let audit = profile_store(catalog)?.audit_tool_profiles(profile)?;
+    let reply = Reply::from_result(Ok(serde_json::to_value(audit)?));
+    serde_json::to_writer(&mut *output, &reply)?;
+    writeln!(output)?;
+    Ok(())
+}
 
 pub fn run(args: &[String]) -> Result<Value> {
     match args {

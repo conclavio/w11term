@@ -1599,6 +1599,13 @@ Set the optional `manifest_sha256` to the SHA-256 of the entire manifest file to
 }
 ```
 
+Run `audit-tool-profiles` to check saved SSH tool approvals offline. It uses the normal profile catalog unless you pass `--profiles CATALOG`. Add `--profile NAME` to check one saved SSH profile. The report includes the pinned and current manifest digests. Its statuses are `matches-pin`, `pin-mismatch`, `follows-file`, `manifest-error`, `manifest-scope-mismatch`, `invalid-settings`, `disabled`, and `not-run`. A separate `path_error` flags locally detectable errors in the optional Shell PATH approval. The command exits successfully when it can produce a report, even when rows contain problems. The audit reads the catalog and manifests. Login checks the authenticated account, remote home, executable builds, and startup files.
+
+```powershell
+$audit = & $ctl audit-tool-profiles | ConvertFrom-Json
+$audit.result.profiles | Where-Object status -eq 'pin-mismatch'
+```
+
 On an ordinary SSH connect or reconnect, w11term checks the verified endpoint and SFTP home, syncs the approved bundle, and then opens the shell. An unavailable or unconfirmed sync still allows login. The 20-second deadline covers the bundle and PATH work together. The `tool-bundle-sync` event reports the bundle outcome and, when configured, the PATH outcome. Bash and Zsh use the login and interactive startup files. Fish uses one block in the selected `config.fish` and retains the command order of the existing PATH list. An edited block requires a fresh review. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths. [Fish PATH variables](https://fishshell.com/docs/current/tutorial.html#path)
 
 **More → Command reference** shows the last login sync for the selected SSH connection. Open **Install SSH tools** for the PATH result and any error detail. Manual installs and rollbacks show their own results in the installer and version history.

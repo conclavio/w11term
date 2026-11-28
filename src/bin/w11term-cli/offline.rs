@@ -1,14 +1,14 @@
 use super::{
     command_reference, cpu_profile, dotfile_profiles, dotfiles, packet_capture, syscall_capture,
-    triage,
+    tool_bundles, triage,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::{
     io::{self, Write},
     path,
     process::ExitCode,
 };
-use w11term::{control::Reply, transcript};
+use w11term::{control::Reply, options::default_profiles_path, profiles::ProfileStore, transcript};
 
 type OfflineCommand = fn(&[String], &mut dyn Write) -> Result<()>;
 
@@ -26,6 +26,7 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
         dotfile_profiles::ROLLBACK_VERB => {
             (dotfile_profiles::ROLLBACK_HELP, dotfile_profiles::rollback)
         }
+        tool_bundles::AUDIT_VERB => (tool_bundles::AUDIT_HELP, tool_bundles::audit),
         cpu_profile::COMPARE_VERB => (cpu_profile::COMPARE_HELP, cpu_profile::compare_files),
         syscall_capture::INSPECT_VERB => (
             syscall_capture::INSPECT_HELP,
@@ -65,6 +66,21 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
             Some(ExitCode::FAILURE)
         }
     }
+}
+
+pub(super) fn profile_store(catalog: Option<&str>) -> Result<ProfileStore> {
+    let catalog = match catalog {
+        Some(path) => path::absolute(path)?,
+        None => default_profiles_path()?,
+    };
+    ensure!(
+        catalog
+            .metadata()
+            .with_context(|| format!("Opening profile catalog {}", catalog.display()))?
+            .is_file(),
+        "The profile catalog must be a regular file"
+    );
+    ProfileStore::new(catalog)
 }
 
 pub(super) fn write_report(
