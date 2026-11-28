@@ -63,14 +63,33 @@ function Wait-Platform([string]$Name) {
 }
 function Select-InstalledTool([string]$Name) {
     Click 'Installed SSH tools'
-    $tools = Wait-Until 'active remote tools offered lookup' { Find-Element 'Installed SSH commands' $combo }
-    $tools.SetFocus()
+    $label = "${Name}${dot}portable"
+    $item = [System.Windows.Automation.ControlType]::ListItem
     $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
-    $tools.GetCurrentPattern($expand).Expand()
-    $choice = Wait-Until "installed $Name from the portable bundle" {
-        Find-Element "${Name}${dot}portable" ([System.Windows.Automation.ControlType]::ListItem) -Visible
+    $select = [System.Windows.Automation.SelectionItemPattern]::Pattern
+    $search = @{ scroll = $null }
+    $null = Wait-Until "select installed $Name from the portable bundle" {
+        try {
+            $tools = Find-Element 'Installed SSH commands' $combo
+            if (!$tools -or !$tools.Current.IsEnabled) { return }
+            if ($tools.Current.IsOffscreen) {
+                Move-NativeControlIntoView $tools $search
+                return
+            }
+            $popup = $tools.GetCurrentPattern($expand)
+            if ($popup.Current.ExpandCollapseState -eq 'Collapsed') {
+                $popup.Expand()
+                return
+            }
+            $choice = Find-Element $label $item -Visible
+            if ($choice) {
+                $choice.GetCurrentPattern($select).Select()
+                return $true
+            }
+        } catch [System.Windows.Automation.ElementNotAvailableException] {
+            # WinUI can replace the controls while it lays out the dropdown.
+        }
     }
-    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
 }
 function Select-ToolVersion([string]$Id, [string]$Suffix = '') {
     $label = "portable${dot}$($Id.Substring(0,12))$Suffix"
