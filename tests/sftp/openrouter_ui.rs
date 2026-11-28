@@ -27,6 +27,8 @@ async fn native_openrouter_requires_an_explicit_review_and_never_submits_the_rep
     let wire = remote.path().join("keyboard-input.bin");
     fs::write(&wire, []).unwrap();
     let state = tempfile::tempdir().unwrap();
+    write_packet_capture(&state.path().join("private before.pcap"), &[10]);
+    write_packet_capture(&state.path().join("private after.pcap"), &[900, 902]);
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     fs::write(state.path().join("openrouter-port"), port.to_string()).unwrap();
@@ -38,10 +40,56 @@ async fn native_openrouter_requires_an_explicit_review_and_never_submits_the_rep
     ssh_server.abort();
 }
 
+fn write_packet_capture(path: &Path, timestamps: &[u32]) {
+    let payload = b"private fixture packet payload";
+    let mut frame = vec![
+        0x45,
+        0,
+        0,
+        (28 + payload.len()) as u8,
+        0,
+        0,
+        0,
+        0,
+        64,
+        17,
+        0,
+        0,
+        192,
+        0,
+        2,
+        41,
+        198,
+        51,
+        100,
+        72,
+        0xc0,
+        0,
+        0x10,
+        0xe1,
+        0,
+        (8 + payload.len()) as u8,
+        0,
+        0,
+    ];
+    frame.extend(payload);
+    let mut capture = vec![
+        0xd4, 0xc3, 0xb2, 0xa1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 101, 0, 0, 0,
+    ];
+    let length = frame.len() as u32;
+    for &timestamp in timestamps {
+        for field in [timestamp, 0, length, length] {
+            capture.extend(field.to_le_bytes());
+        }
+        capture.extend(&frame);
+    }
+    fs::write(path, capture).unwrap();
+}
+
 fn serve(listener: TcpListener, directory: &Path) {
     listener.set_nonblocking(true).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
-    for index in 0..7 {
+    for index in 0..8 {
         let mut client = loop {
             match listener.accept() {
                 Ok((client, _)) => break client,
@@ -111,6 +159,26 @@ fn serve(listener: TcpListener, directory: &Path) {
                 assert!(prompt.contains("quoted diagnostic evidence"));
                 assert!(prompt.contains("percentage-point deltas"));
                 assert!(prompt.contains("latency or absolute CPU time"));
+            } else if index == 7 {
+                let expected = fs::read_to_string(directory.join("approved-packets")).unwrap();
+                assert_eq!(text, expected);
+                assert!(text.contains("Scope · Whole captures"));
+                assert!(text.contains("Selected UDP pair · Endpoint A port [redacted]"));
+                assert!(text.contains("Before · A to B 1 packets"));
+                assert!(text.contains("After · A to B 2 packets"));
+                for excluded in [
+                    "192.0.2.41",
+                    "198.51.100.72",
+                    "49152",
+                    "private before.pcap",
+                    "private after.pcap",
+                    "private fixture packet payload",
+                ] {
+                    assert!(!text.contains(excluded), "{excluded}");
+                }
+                let prompt = request["messages"][0]["content"].as_str().unwrap();
+                assert!(prompt.contains("quoted diagnostic evidence"));
+                assert!(prompt.contains("unequal durations, truncation, and incomplete coverage"));
             } else {
                 assert_eq!(
                     text,
@@ -161,9 +229,13 @@ fn serve(listener: TcpListener, directory: &Path) {
                 "200 OK",
                 json!({"choices": [{"message": {"content": "reviewed the syscall evidence"}}]}),
             ),
-            _ => (
+            6 => (
                 "200 OK",
                 json!({"choices": [{"message": {"content": "reviewed the CPU profile changes"}}]}),
+            ),
+            _ => (
+                "200 OK",
+                json!({"choices": [{"message": {"content": "reviewed the packet capture changes"}}]}),
             ),
         };
         let body = serde_json::to_string(&reply).unwrap();

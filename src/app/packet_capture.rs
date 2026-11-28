@@ -1166,7 +1166,16 @@ impl TerminalApp {
     }
 
     pub(super) fn with_packet_capture(&self, content: View, ctx: &ViewContext<Self>) -> View {
-        let width = (self.width * 0.4).clamp(285.0, 520.0);
+        let review_visible = self.packet_capture.comparison.is_some()
+            && self
+                .tabs
+                .active()
+                .is_some_and(|tab| matches!(tab.page, Page::OpenRouter(_)));
+        let width = if review_visible {
+            (self.width * 0.5).clamp(285.0, 850.0)
+        } else {
+            (self.width * 0.4).clamp(285.0, 520.0)
+        };
         let panel = self.packet_capture.view(
             self.profile_connection(),
             self.export.pending.is_none(),
@@ -1323,6 +1332,15 @@ impl TerminalApp {
                 });
             }
             Action::CompareCapture => self.choose_capture_file(FileChoice::Compare, ctx),
+            Action::Comparison(revision, compare::Change::OpenRouter) => {
+                if let Some(evidence) = panel
+                    .comparison
+                    .as_ref()
+                    .and_then(|comparison| comparison.openrouter_preview(&revision))
+                {
+                    self.review_packet_comparison_with_openrouter(evidence, ctx);
+                }
+            }
             Action::Comparison(revision, compare::Change::Export) => {
                 if let Some(comparison) = panel
                     .comparison

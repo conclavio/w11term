@@ -1777,6 +1777,8 @@ In a syscall comparison, select a change and its evidence pair, then choose **Re
 
 In a CPU profile comparison, select a stack and choose **Review comparison with OpenRouter…**. The comparison stays beside the draft. The preview includes the two sample totals, the selected stack, and up to ten other stacks ranked by change in sample share within the applied filter. It uses symbol names and sample counts while leaving the local source names in the comparison. The review interprets shifts in sample share as relative measurements.
 
+In a packet capture comparison, choose **Review comparison with OpenRouter…** to draft a summary of the whole captures or the elapsed interval currently being compared. The draft includes packet counts, rates, coverage, and the largest recorded protocol changes. Selecting a conversation adds directional counts and, for TCP or UDP, the two port numbers. IP addresses, filenames, and packet contents stay in the local files and viewer. The original comparison remains beside the editable draft.
+
 Edit the preview to remove any details you want to keep local. The preview accepts up to 16 KiB of text. **Review OpenRouter request** shows the destination, model, and privacy policy. **Send reviewed request** submits the displayed text.
 
 The response appears as selectable text. **Copy response** puts it on the Windows clipboard for manual use. Token usage appears when OpenRouter returns it. **Stop waiting** discards the eventual response in w11term. A request already sent can still finish at OpenRouter.

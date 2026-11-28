@@ -210,6 +210,50 @@ function Review-CpuComparison {
     }
 }
 
+function Review-PacketComparison {
+    $before = Join-Path $State 'private before.pcap'
+    $after = Join-Path $State 'private after.pcap'
+    $windowId = ((Control @('list-windows')).windows | Select-Object -First 1).window_id
+    $null = Control @('open-diagnostic','--window',"$windowId",'--kind','packet-capture','--file',$before,'--compare-with',$after)
+    Select-NativeComboItem 'Conversation type' 'TCP and UDP ports'
+    Set-Field 'Filter conversations' '192.0.2.41'
+    $dot = ' ' + [char]0xb7 + ' '
+    $arrow = ' ' + [char]0x2194 + ' '
+    $pairLabel = "UDP${dot}192.0.2.41:49152${arrow}198.51.100.72:4321"
+    $pair = Wait-Until 'the capture comparison shows the selected UDP endpoints' {
+        Find-Element $pairLabel ([System.Windows.Automation.ControlType]::ListItem)
+    }
+    $pair.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    $null = Wait-Until 'the comparison has committed the UDP selection' {
+        $action = Find-Element 'Open conversation in Wireshark' $button
+        $action -and $action.Current.IsEnabled
+    }
+    Click ('Review comparison with OpenRouter' + [char]0x2026)
+    $seed = Wait-Until 'the packet review shows only aggregates and the selected pair beside the comparison' {
+        $field = Find-Element $preview $edit
+        if ($field -and $field.Current.IsEnabled -and (Find-Element $pairLabel)) {
+            $text = $field.GetCurrentPattern($value).Current.Value
+            if ($text.Contains("Scope${dot}Whole captures") -and
+                $text.Contains("Selected UDP pair${dot}Endpoint A port 49152${dot}Endpoint B port 4321") -and
+                $text.Contains("Before${dot}A to B 1 packets") -and $text.Contains("After${dot}A to B 2 packets")) { $text }
+        }
+    }
+    foreach ($excluded in @('192.0.2.41','198.51.100.72','private before.pcap','private after.pcap','private fixture packet payload')) {
+        if ($seed.Contains($excluded)) { throw "Packet review unexpectedly included '$excluded'" }
+    }
+    Confirm-NoRequest 7
+    $edited = $seed.Replace("`r`n", "`r").Replace("`n", "`r").Replace('49152', '[redacted]')
+    Set-Field $preview $edited
+    Click 'Review OpenRouter request'
+    $null = Wait-Until 'the edited packet evidence is ready to send' { Find-Element 'Send reviewed request' $button }
+    Confirm-NoRequest 7
+    [IO.File]::WriteAllText((Join-Path $State 'approved-packets'), $edited.Replace("`r", "`n"))
+    Click 'Send reviewed request'
+    $null = Wait-Until 'the packet response and source comparison are both visible' {
+        (Find-Element 'reviewed the packet capture changes') -and (Find-Element $pairLabel)
+    }
+}
+
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles', ('"' + $profiles + '"'), '--profile', '"Palette PowerShell"', '--cols', '120', '--rows', '24') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
@@ -273,6 +317,7 @@ try {
     Review-VisibleSshPane
     Review-SyscallComparison
     Review-CpuComparison
+    Review-PacketComparison
     Click 'Remove OpenRouter key'
     $null = Wait-Until 'saved key is removed' { Find-Element 'Saved OpenRouter API key removed' }
     if ((Find-Element 'late fixture reply') -or (Test-Path -LiteralPath $credential)) {

@@ -1,6 +1,7 @@
 use super::*;
 use w11term::ssh::{PacketConversationChange, PacketConversationQuery};
 
+mod review;
 mod timeline;
 
 const ROWS_PER_PAGE: usize = 12;
@@ -49,6 +50,7 @@ pub enum Change {
     Open(ConversationSelection),
     SaveConversationExcerpt(ConversationSelection),
     Export,
+    OpenRouter,
 }
 
 #[derive(Clone)]
@@ -162,6 +164,16 @@ impl Comparison {
         self.elapsed_model
             .as_ref()
             .map_or(&self.model, |(_, model)| model)
+    }
+
+    pub(super) fn openrouter_preview(&self, revision: &Arc<()>) -> Option<String> {
+        if !Arc::ptr_eq(revision, &self.revision) {
+            return None;
+        }
+        let selected = self
+            .selected
+            .and_then(|row| self.row(self.page * ROWS_PER_PAGE + row));
+        Some(review::preview(self.visible_model(), selected))
     }
 
     pub(super) fn elapsed_request(
@@ -405,6 +417,13 @@ impl Comparison {
                     .is_enabled(idle && export_idle)
                     .on_click(action(Change::Export))
                     .content("Export comparison…"),
+            ),
+            KeyedView::new(
+                "openrouter",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(action(Change::OpenRouter))
+                    .content("Review comparison with OpenRouter…"),
             ),
         ];
         if let Some(status) = status {

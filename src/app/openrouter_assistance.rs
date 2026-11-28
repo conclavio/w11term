@@ -152,10 +152,19 @@ impl TerminalApp {
         self.show_openrouter(Task::CpuComparison, Evidence::Text(evidence), ctx);
     }
 
+    pub(super) fn review_packet_comparison_with_openrouter(
+        &mut self,
+        evidence: String,
+        ctx: &ComponentContext<Self>,
+    ) {
+        self.show_openrouter(Task::PacketComparison, Evidence::Text(evidence), ctx);
+    }
+
     fn show_openrouter(&mut self, task: Task, evidence: Evidence, ctx: &ComponentContext<Self>) {
         self.set_diagnostics_drawer(match task {
             Task::Triage | Task::TriageComparison => Some(diagnostics::Drawer::Triage),
             Task::CpuComparison => Some(diagnostics::Drawer::FlameGraph),
+            Task::PacketComparison => Some(diagnostics::Drawer::PacketCapture),
             _ => None,
         });
         self.command_reference.close();
@@ -603,6 +612,7 @@ impl PageState {
                     Task::TriageComparison => "Review Linux performance changes",
                     Task::SyscallComparison => "Review syscall comparison evidence",
                     Task::CpuComparison => "Review CPU profile changes",
+                    Task::PacketComparison => "Review packet capture changes",
                 },
             ),
             KeyedView::new(
