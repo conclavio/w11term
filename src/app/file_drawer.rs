@@ -161,6 +161,7 @@ pub enum FileAction {
     ),
     DismissComparison(u64, u64, u64),
     TextReference(u64, u64, preview::ReferenceAction),
+    UseDotfilePreview(u64, u64, u64),
     Permissions(u64, u64, u64, preview::PermissionsAction),
     StartTextEditor(u64, u64, u64),
     ResumeTextEditor(u64, u64),
@@ -1685,6 +1686,7 @@ impl FileDrawer {
         &self,
         pane: u64,
         ssh: &SshOptions,
+        named_profile: bool,
         export: &text_export::Export,
         context: &ViewContext<TerminalApp>,
     ) -> Option<View> {
@@ -1692,7 +1694,7 @@ impl FileDrawer {
             return Some(editor.dialog(pane, self.generation, context));
         }
         if let Some(preview) = &self.preview {
-            return Some(preview.dialog(pane, self, context));
+            return Some(preview.dialog(pane, self, named_profile, context));
         }
         if let Some(space) = &self.folder_report {
             let progress = self
@@ -3448,6 +3450,7 @@ impl TerminalApp {
             | ComparisonReady(id, ..)
             | DismissComparison(id, ..)
             | TextReference(id, ..)
+            | UseDotfilePreview(id, ..)
             | Permissions(id, ..)
             | StartTextEditor(id, ..)
             | ResumeTextEditor(id, ..)
@@ -3618,6 +3621,7 @@ impl TerminalApp {
             files.cached.borrow_mut().take();
         }
         let mut outcome = TransferOutcome::Failed;
+        let mut dotfile_excerpt = None;
         let result = (|| -> Result<()> {
             match action {
                 Search(_, generation, action)
@@ -3710,6 +3714,16 @@ impl TerminalApp {
                 TextReference(_, generation, action) => {
                     if may_open_dialog && generation == files.generation {
                         files.reference_action(pane, action, session, context)?;
+                    }
+                }
+                UseDotfilePreview(_, generation, serial) => {
+                    if may_open_dialog
+                        && generation == files.generation
+                        && let Some(profile) = &tab.profile_name
+                        && let Some(connection) = session.ssh_connection_at(generation)
+                        && let Some((path, text)) = files.dotfile_preview(serial)
+                    {
+                        dotfile_excerpt = Some((profile.clone(), connection, path, text));
                     }
                 }
                 ShowFullPreview(_, _, serial, full) => files.show_full_preview(serial, full),
@@ -4543,6 +4557,15 @@ impl TerminalApp {
             if return_to_terminal {
                 self.keyboard.finish_drawer_edit();
             }
+        }
+        if let Some((profile, connection, path, text)) = dotfile_excerpt {
+            self.open_profile_dotfile_excerpt(
+                &profile,
+                connection.verified_endpoint(),
+                path,
+                text,
+                context,
+            );
         }
     }
 }

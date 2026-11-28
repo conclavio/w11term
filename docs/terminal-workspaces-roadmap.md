@@ -335,6 +335,8 @@ The SSH dotfiles editor can create a bundle locally or revise an existing bundle
 
 **Import shell fragment** appends an existing local shell file to the selected editor section for review before saving a bundle. [Import local dotfiles](../CONTROL.md#sync-dotfiles-on-ssh-connect)
 
+From an SSH text preview, **Use in dotfiles editor** carries an excerpt to the connected profile's bundle draft. Select the line range and destination fragment before saving. [Import an SSH excerpt](../CONTROL.md#sync-dotfiles-on-ssh-connect)
+
 For an already connected SSH pane, **More → Command reference → Apply SSH dotfiles** reviews and applies a bundle on that connection. The review shows the target home, managed files, startup hooks, and conflicts. Open a new shell to use the installed fragments. [Reviewed dotfile installation](../CONTROL.md#preview-and-apply-ssh-dotfiles)
 
 Install and version reviews show which lines change in the managed environment and prompt fragments. The install review also shows the generated startup hooks it will add. [Dotfile content review](../CONTROL.md#preview-and-apply-ssh-dotfiles)

@@ -245,14 +245,27 @@ impl DotfileBundle {
             !imported.is_empty(),
             "The selected shell fragment file is empty"
         );
-        validate_fragment(&imported)?;
-        let mut appended = existing.to_owned();
-        if !appended.is_empty() && !appended.ends_with('\n') {
-            appended.push('\n');
-        }
-        appended.push_str(&imported);
-        validate_fragment(&appended)?;
-        Ok(appended)
+        append_fragment(existing, &imported)
+    }
+
+    pub fn append_startup_excerpt(
+        existing: &str,
+        source: &str,
+        range: std::ops::Range<usize>,
+    ) -> Result<String> {
+        let excerpt = source
+            .get(range.clone())
+            .context("Invalid shell excerpt range")?;
+        let markers = format!("{BEGIN}\n{END}\n");
+        ensure!(
+            !hooks::managed_block(source, &markers)
+                .is_some_and(|block| range.start < block.end && block.start < range.end)
+                && !excerpt
+                    .lines()
+                    .any(|line| hooks::candidate_marker(line, [BEGIN, END])),
+            "Choose lines outside the w11term-managed startup block"
+        );
+        append_fragment(existing, excerpt)
     }
 
     fn validate_fragments(&self) -> Result<()> {
@@ -279,6 +292,17 @@ impl DotfileBundle {
             payload(self.prompt(shell)),
         ]
     }
+}
+
+fn append_fragment(existing: &str, imported: &str) -> Result<String> {
+    validate_fragment(imported)?;
+    let mut appended = existing.to_owned();
+    if !appended.is_empty() && !appended.ends_with('\n') {
+        appended.push('\n');
+    }
+    appended.push_str(imported);
+    validate_fragment(&appended)?;
+    Ok(appended)
 }
 
 fn validate_fragment(fragment: &str) -> Result<()> {
@@ -1030,6 +1054,27 @@ fn remote_parent(path: &str) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_excerpt_rejects_lines_inside_the_managed_hook_even_without_the_markers() {
+        let prefix = "export EDITOR=vi\n";
+        let body = "source managed-dotfiles\n";
+        let suffix = "alias ll='ls -l'\n";
+        let source = format!("{prefix}{BEGIN}\n{body}{END}\n{suffix}");
+        let start = prefix.len() + BEGIN.len() + 1;
+        assert!(
+            DotfileBundle::append_startup_excerpt("", &source, start..start + body.len()).is_err()
+        );
+        assert_eq!(
+            DotfileBundle::append_startup_excerpt(
+                "",
+                &source,
+                source.len() - suffix.len()..source.len()
+            )
+            .unwrap(),
+            suffix
+        );
+    }
 
     #[test]
     fn imports_utf8_shell_fragments_on_a_new_line_without_changing_the_source() {

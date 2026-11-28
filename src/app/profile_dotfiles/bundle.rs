@@ -2,6 +2,8 @@ use super::*;
 use anyhow::Context;
 use std::cell::OnceCell;
 
+mod remote_excerpt;
+
 const FRAGMENTS: [&str; 3] = [
     "Shared environment fragment",
     "Bash startup fragment",
@@ -21,9 +23,18 @@ pub enum Action {
     Text(Arc<()>, usize, String),
     Import(Arc<()>, usize),
     Imported(Arc<()>, Result<Option<String>, String>),
+    Excerpt(Arc<()>, Arc<()>, ExcerptAction),
     Save(Arc<()>),
     Saved(Arc<()>, Result<Option<String>, String>),
     Cancel(Arc<()>),
+}
+
+#[derive(Clone)]
+pub enum ExcerptAction {
+    First(String),
+    Last(String),
+    Append(usize),
+    Close,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -40,6 +51,7 @@ pub(super) struct Editor {
     source: Option<PathBuf>,
     fragments: [Option<String>; 3],
     import_menu: OnceCell<Menu>,
+    remote: Option<Box<remote_excerpt::Source>>,
     phase: Phase,
     error: Option<String>,
 }
@@ -68,6 +80,7 @@ impl Editor {
             source,
             fragments: Default::default(),
             import_menu: OnceCell::new(),
+            remote: None,
             phase,
             error: None,
         }
@@ -123,6 +136,12 @@ impl Editor {
             ));
         }
         if self.phase != Phase::Loading {
+            if let Some(remote) = &self.remote {
+                views.push(KeyedView::new(
+                    "remote-excerpt",
+                    remote.view(id, &self.ticket, self.phase == Phase::Ready, ctx),
+                ));
+            }
             let menu = self.import_menu.get_or_init(|| {
                 let ticket = self.ticket.clone();
                 Menu::new(
@@ -206,6 +225,30 @@ impl Editor {
 }
 
 impl super::Editor {
+    pub(super) fn stage_remote_excerpt(
+        &mut self,
+        endpoint: &str,
+        path: String,
+        text: String,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.checking.is_none()
+                && self.browsing.is_none()
+                && self
+                    .composer
+                    .as_ref()
+                    .is_none_or(|editor| editor.phase == Phase::Ready),
+            "Finish the open dotfiles operation before importing SSH text"
+        );
+        let remote = remote_excerpt::Source::new(endpoint, path, text)?;
+        let editor = self.composer.get_or_insert_with(|| Editor::new(None));
+        editor.remote = Some(Box::new(remote));
+        editor.error = None;
+        self.error = None;
+        self.expanded = true;
+        Ok(())
+    }
+
     pub(super) fn edit_bundle(
         &mut self,
         id: TabId,
@@ -264,6 +307,7 @@ impl super::Editor {
             | Action::Text(ticket, ..)
             | Action::Import(ticket, _)
             | Action::Imported(ticket, _)
+            | Action::Excerpt(ticket, ..)
             | Action::Save(ticket)
             | Action::Saved(ticket, _)
             | Action::Cancel(ticket) => ticket,
@@ -331,6 +375,17 @@ impl super::Editor {
                         Ok(Some(text)) => editor.fragments[index] = Some(editor_text(&text)),
                         Ok(None) => {}
                         Err(error) => editor.error = Some(error),
+                    }
+                }
+            }
+            Action::Excerpt(_, source, action) if editor.phase == Phase::Ready => {
+                if let Some(remote) = &mut editor.remote
+                    && Arc::ptr_eq(&remote.ticket, &source)
+                {
+                    if matches!(action, ExcerptAction::Close) {
+                        editor.remote = None;
+                    } else {
+                        remote.edit(action, &mut editor.fragments);
                     }
                 }
             }

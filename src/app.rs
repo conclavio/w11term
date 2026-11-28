@@ -8740,9 +8740,13 @@ impl Component for TerminalApp {
             && self.disconnect_review.is_none()
             && tab.session.frames.load().prompt.is_none()
             && let Source::Ssh(ssh) = &tab.source
-            && let Some(dialog) =
-                tab.files
-                    .entry_dialog(tab.session.pane_id, ssh, &self.export, context)
+            && let Some(dialog) = tab.files.entry_dialog(
+                tab.session.pane_id,
+                ssh,
+                tab.profile_name.is_some(),
+                &self.export,
+                context,
+            )
         {
             views.push(KeyedView::new("sftp-name-editor", dialog));
         }

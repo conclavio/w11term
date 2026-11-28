@@ -36,16 +36,23 @@ pub(super) fn approved_fingerprint(entered: &str, profile_pin: &str) -> anyhow::
 pub(super) fn snapshot_fingerprint(
     draft: &ProfileDraft,
     home: &str,
+    endpoint: (&str, &str, u16, &str),
+) -> anyhow::Result<String> {
+    let fingerprint = profile_fingerprint(draft, endpoint)?;
+    validate_dotfiles_home(home)?;
+    Ok(fingerprint)
+}
+
+fn profile_fingerprint(
+    draft: &ProfileDraft,
     (host, user, port, fingerprint): (&str, &str, u16, &str),
 ) -> anyhow::Result<String> {
     let account = parse_ssh_address(&draft.host, &draft.user, &draft.port)?;
     anyhow::ensure!(
         (account.0.as_str(), account.1.as_str(), account.2) == (host, user, port),
-        "This profile's SSH account differs from the connection that saved the bundle"
+        "This profile's SSH account differs from the verified connection"
     );
-    let fingerprint = approved_fingerprint(fingerprint, &draft.fingerprint)?;
-    validate_dotfiles_home(home)?;
-    Ok(fingerprint)
+    approved_fingerprint(fingerprint, &draft.fingerprint)
 }
 
 #[derive(Clone, Copy)]
@@ -418,6 +425,27 @@ impl TerminalApp {
         if let Err(error) =
             Editor::stage_snapshot(draft, saved, zdotdir, connection.verified_endpoint())
         {
+            draft.error = Some(format!("{error:#}"));
+        }
+    }
+
+    pub(super) fn open_profile_dotfile_excerpt(
+        &mut self,
+        profile: &str,
+        endpoint: (&str, &str, u16, &str),
+        path: String,
+        text: String,
+        ctx: &ComponentContext<Self>,
+    ) {
+        let Some((_, draft)) = self.open_profile_for_snapshot(profile, ctx) else {
+            return;
+        };
+        let (host, user, port, _) = endpoint;
+        if let Err(error) = profile_fingerprint(draft, endpoint).and_then(|_| {
+            draft
+                .dotfiles
+                .stage_remote_excerpt(&format!("{user}@{host}:{port}"), path, text)
+        }) {
             draft.error = Some(format!("{error:#}"));
         }
     }

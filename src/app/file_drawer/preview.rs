@@ -364,10 +364,27 @@ impl EntryPreview {
             .is_some_and(|task| task.result.is_none())
     }
 
+    fn dotfile_text(&self) -> Option<&str> {
+        if !self.editable()
+            || (!self.full_text
+                && self
+                    .text_match
+                    .as_ref()
+                    .is_some_and(|hits| !hits.lines.is_empty()))
+        {
+            return None;
+        }
+        match &self.content {
+            Contents::Ready(text) if !text.is_empty() => Some(text),
+            _ => None,
+        }
+    }
+
     pub(super) fn dialog(
         &self,
         pane: u64,
         files: &FileDrawer,
+        named_profile: bool,
         context: &ViewContext<TerminalApp>,
     ) -> View {
         let generation = files.generation;
@@ -595,6 +612,19 @@ impl EntryPreview {
                                 ))
                             }))
                             .content("Edit"),
+                    ));
+                }
+                if named_profile && self.dotfile_text().is_some() {
+                    fields.push(KeyedView::new(
+                        "dotfiles-draft",
+                        Button::new()
+                            .is_enabled(!picking)
+                            .on_click(context.callback(move |_| {
+                                Message::Files(FileAction::UseDotfilePreview(
+                                    pane, generation, serial,
+                                ))
+                            }))
+                            .content("Use in dotfiles editor"),
                     ));
                 }
                 if self.editable() {
@@ -844,6 +874,18 @@ impl EntryPreview {
 }
 
 impl FileDrawer {
+    pub(super) fn dotfile_preview(&self, serial: u64) -> Option<(String, String)> {
+        if !self.open || self.picking.is_some() {
+            return None;
+        }
+        let preview = self
+            .preview
+            .as_ref()
+            .filter(|preview| preview.serial == serial)?;
+        let path = self.checked_target_path(&preview.target).ok()?;
+        Some((path, preview.dotfile_text()?.to_owned()))
+    }
+
     pub(super) fn take_preview_for_edit(&mut self, serial: u64) -> Option<(FileTarget, String)> {
         let preview = self.preview.as_ref()?;
         if !self.open

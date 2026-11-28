@@ -3461,8 +3461,17 @@ async fn native_sftp_text_preview_follows_selection_and_keeps_both_shells_live()
     let name = "build 雪.txt";
     let outer = "first 雪\r\n\tsecond café\r\n\r\nlast line";
     let inner = "different directory\r\ninner 雪";
+    let startup = concat!(
+        "\u{feff}export VISUAL=nano\r\n",
+        "alias ll='ls -l' # 雪\r\n",
+        "# >>> w11term dotfiles >>>\r\n",
+        "source managed-dotfiles\r\n",
+        "# <<< w11term dotfiles <<<\r\n",
+        "export OMIT_ME=1\r\n",
+    );
     let binary = b"private header\0raw body";
     fs::write(parent.join(name), outer.as_bytes()).unwrap();
+    fs::write(parent.join(".bashrc"), startup.as_bytes()).unwrap();
     fs::write(child.join(name), inner.as_bytes()).unwrap();
     fs::write(child.join("binary.dat"), binary).unwrap();
     image::RgbaImage::from_pixel(64, 32, image::Rgba([35, 150, 190, 255]))
@@ -3476,6 +3485,10 @@ async fn native_sftp_text_preview_follows_selection_and_keeps_both_shells_live()
     let state = tempfile::tempdir().unwrap();
     drive_mixed_gui("sftp-text-preview-ui.ps1", &ssh, state.path());
     assert_eq!(fs::read(parent.join(name)).unwrap(), outer.as_bytes());
+    assert_eq!(
+        fs::read(parent.join(".bashrc")).unwrap(),
+        startup.as_bytes()
+    );
     assert_eq!(fs::read(child.join(name)).unwrap(), inner.as_bytes());
     assert_eq!(fs::read(child.join("binary.dat")).unwrap(), binary);
     let transfers = fs::read_to_string(trace).unwrap();

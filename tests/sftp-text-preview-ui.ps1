@@ -3,6 +3,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
       [Parameter(Mandatory)][string]$State)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'support/native-ui.ps1')
+Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $env:W11TERM_DATA_DIR = Join-Path $State 'data'
 $env:W11TERM_SETTINGS_PATH = Join-Path $State 'appearance.json'
 $profiles = Join-Path $State 'profiles.json'
@@ -167,6 +168,60 @@ try {
     Wait-Focus $localPane
     Type-Line 'if ($previewPid -eq $PID) { "ps-preview-" + "still-alive" }'
     $null = Control @('wait-for-text','--pane',"$localPane",'--timeout','15','ps-preview-still-alive')
+
+    $null = Control @('focus-pane','--pane',"$remote")
+    Wait-Focus $remote
+    Run-Palette 'Open files here'
+    Click '.bashrc'
+    Invoke-SftpEntryAction $preview
+    Click 'Use in dotfiles editor'
+    $edit = [System.Windows.Automation.ControlType]::Edit
+    $value = [System.Windows.Automation.ValuePattern]::Pattern
+    $before = [IO.File]::ReadAllText($profiles)
+    $null = Wait-Until 'the profile editor shows the verified SSH excerpt source' {
+        $label = Get-NativeTextLabels | Where-Object {
+            $_.StartsWith('SSH excerpt from ') -and $_.Contains('/shell directory/.bashrc')
+        }
+        $label -and (Find-Element 'First SSH line' $edit) -and (Find-Element 'Last SSH line' $edit)
+    }
+    Invoke-Button (Get-ScrollableMenuAction 'Append SSH lines' 'Append to Bash fragment' -VisibleItem)
+    $null = Wait-Until 'the managed startup block cannot be imported into itself' {
+        Find-Element 'Choose lines outside the w11term-managed startup block'
+    }
+    foreach ($field in @('First SSH line','Last SSH line')) {
+        (Find-Element $field $edit).GetCurrentPattern($value).SetValue('2')
+    }
+    $snippet = "alias ll='ls -l' # $snow`n"
+    $null = Wait-Until 'the staged preview has only line two selected' {
+        $text = Find-Element 'Selected SSH lines'
+        if ($text) {
+            (Preview-Text $text.GetCurrentPattern($textPattern).DocumentRange) -ceq "2  $snippet"
+        }
+    }
+    Invoke-Button (Get-ScrollableMenuAction 'Append SSH lines' 'Append to Bash fragment' -VisibleItem)
+    $null = Wait-Until 'only the chosen SSH excerpt is in the Bash fragment' {
+        $field = Find-Element 'Bash startup fragment' $edit
+        if ($field) {
+            ($field.GetCurrentPattern($value).Current.Value -replace '\r\n?', "`n") -ceq $snippet
+        }
+    }
+    Click 'Close SSH excerpt'
+    Click 'Save dotfiles bundle'
+    $sessionBundle = Join-Path $State 'Imported SSH excerpt.json'
+    $dialog = Wait-OwnedDialog 'Save new dotfiles bundle'
+    $null = Wait-Until 'enter a destination for the imported fragment' {
+        [FixtureDialog]::SetCommonDialogFilename($dialog, $sessionBundle)
+    }
+    $null = Wait-Until 'save the imported fragment' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the local bundle has only the reviewed excerpt' {
+        if ([IO.File]::Exists($sessionBundle)) {
+            $bundle = [IO.File]::ReadAllText($sessionBundle) | ConvertFrom-Json
+            $bundle.bash -ceq $snippet -and $null -eq $bundle.zsh -and $null -eq $bundle.environment
+        }
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $before) { throw 'Importing an excerpt saved the SSH profile' }
+    $stillConnected = (Control @('list')).sessions | Where-Object id -eq $remote
+    if ($stillConnected.connection_generation -ne $generation) { throw 'Import changed the SSH connection' }
 } finally {
     if (!$app.HasExited) {
         $null = $app.CloseMainWindow()
