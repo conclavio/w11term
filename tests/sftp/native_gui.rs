@@ -4626,6 +4626,52 @@ fn native_dotfile_rollout_updates_reviewed_saved_profiles() {
 }
 
 #[test]
+#[ignore = "audits saved SSH tool approvals and opens an existing Windows profile draft"]
+fn native_tool_profile_audit_filters_refreshes_and_preserves_a_draft() {
+    let state = tempfile::tempdir().unwrap();
+    let root = state.path();
+    let key = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let manifest = |sha256: String| {
+        json!({"version": 1, "name": "fleet", "tools": [{"name": "rg", "builds": [{
+            "architecture": "x86_64", "path": "rg", "sha256": sha256,
+        }]}]})
+        .to_string()
+    };
+    let previous = manifest("a".repeat(64));
+    let current = manifest("b".repeat(64));
+    let previous_pin = super::utilities::tool_sha256(previous.as_bytes());
+    let current_pin = super::utilities::tool_sha256(current.as_bytes());
+    fs::write(root.join("previous-tools.json"), previous).unwrap();
+    fs::write(root.join("west-tools.json"), &current).unwrap();
+    fs::write(root.join("east-tools.json"), current).unwrap();
+    let profile = |host: &str, bundle: &str, pin: Option<&str>| {
+        json!({
+            "host": host, "user": "ops", "auth": "agent", "host_key": key,
+            "tool_bundle": {
+                "host": host, "user": "ops", "port": 22, "fingerprint": key, "home": "/home/ops",
+                "name": "fleet", "bin_directory": ".local/bin", "bundle": bundle,
+                "manifest_sha256": pin,
+            },
+        })
+    };
+    let mut north = profile("north.example.test", "east-tools.json", None);
+    north["tool_bundle"]["add_to_path"] = json!({"shell": "fish", "fish_config_dir": "../fish"});
+    fs::write(
+        root.join("profiles.json"),
+        json!({"profiles": {
+            "East": profile("east.example.test", "east-tools.json", Some(&current_pin)),
+            "West": profile("west.example.test", "west-tools.json", Some(&previous_pin)),
+            "North": north,
+            "Missing": profile("missing.example.test", "missing.json", None),
+            "Fixture local": {"backend": "local", "executable": "powershell.exe"},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    drive_gui("tool-profile-audit-ui.ps1", root);
+}
+
+#[test]
 #[ignore = "selects SSH key, dotfiles and tool bundles through native dialogs and saves a profile"]
 fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
     let state = tempfile::tempdir().unwrap();
