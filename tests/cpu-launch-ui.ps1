@@ -286,6 +286,26 @@ try {
     $null = Wait-Until 'the saved pair shows both verified settings and their difference' {
         (Find-Element 'After capture report verified') -and (Find-SamplingComparison)
     }
+    $comparisonPath = Join-Path $State 'comparison with capture context.json'
+    Click-LaunchButton ('Export comparison' + [char]0x2026)
+    $dialog = Wait-OwnedDialog 'Save CPU profile comparison'
+    $null = Wait-Until 'enter the comparison destination' {
+        [FixtureDialog]::SetFilename($dialog, $comparisonPath, 'cpu-profile-comparison.json')
+    }
+    $null = Wait-Until 'save the comparison with capture context' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'comparison JSON is published' { [IO.File]::Exists($comparisonPath) }
+    $savedComparison = [IO.File]::ReadAllText($comparisonPath) | ConvertFrom-Json
+    if ($savedComparison.before.capture_report.reviewed.target.options.frequency -ne 73 -or
+        $savedComparison.after.capture_report.reviewed.target.options.frequency -ne 79 -or
+        ($savedComparison.sampling_differences -join ',') -cne 'frequency') {
+        throw 'The comparison export did not retain both verified capture reports and the frequency difference'
+    }
+    $cliComparison = Join-Path $State 'offline comparison with capture context.json'
+    $null = & $Cli compare-cpu-profiles $folded $repeated --before-report $reportPath --after-report $repeatedReport --output-file $cliComparison
+    if ($LASTEXITCODE -ne 0 -or [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliComparison)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($comparisonPath))) {
+        throw 'The offline and Windows comparison exports differ for the same verified reports'
+    }
     Click-LaunchButton 'Back to flame graph'
 
     $changedRaw = Join-Path $State 'changed raw.data'

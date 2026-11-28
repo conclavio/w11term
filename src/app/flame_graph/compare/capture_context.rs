@@ -87,20 +87,11 @@ impl Context {
 }
 
 fn compare_sampling(before: &CpuProfileCaptureReport, after: &CpuProfileCaptureReport) -> String {
-    let before = report::Sampling::of(before);
-    let after = report::Sampling::of(after);
-    let changed: Vec<_> = [
-        (before.event != after.event, "event"),
-        (before.seconds != after.seconds, "duration"),
-        (before.frequency != after.frequency, "frequency"),
-        (before.call_graph != after.call_graph, "unwind mode"),
-    ]
-    .into_iter()
-    .filter_map(|(different, field)| different.then_some(field))
-    .collect();
+    let changed = before.sampling().differences(&after.sampling());
     if changed.is_empty() {
         "Sampling settings match".into()
     } else {
-        format!("Sampling settings differ · {}", changed.join(", "))
+        let names: Vec<_> = changed.iter().map(ToString::to_string).collect();
+        format!("Sampling settings differ · {}", names.join(", "))
     }
 }

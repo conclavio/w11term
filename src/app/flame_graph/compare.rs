@@ -50,6 +50,10 @@ impl ViewState {
         self.capture_context.expanded = expanded;
     }
 
+    pub(super) fn capture_reports(&self) -> [Option<Arc<CpuProfileCaptureReport>>; 2] {
+        self.capture_context.reports.clone()
+    }
+
     pub(super) fn attach_report(
         &mut self,
         side: ProfileSide,

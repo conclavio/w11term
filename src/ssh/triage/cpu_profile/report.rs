@@ -1,15 +1,15 @@
 use super::{
-    CpuProfileOptions, CpuProfileSummary, CpuWorkloadOutcome, EVENT,
+    CpuCallGraph, CpuProfileOptions, CpuProfileSummary, CpuWorkloadOutcome, EVENT,
     launch::{CpuLaunchOptions, CpuLaunchPlan},
     raw,
 };
 use crate::{
-    cpu_profile::MAX_FILE_BYTES,
+    cpu_profile::{MAX_FILE_BYTES, Profile},
     sftp::{TransferCancel, local_sha256_with_size, normalize_sha256},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::Read, path::Path};
+use std::{fmt, fs::File, io::Read, path::Path};
 
 const SCHEMA_VERSION: u8 = 1;
 const MAX_REPORT_BYTES: u64 = 256 * 1024;
@@ -147,7 +147,72 @@ pub struct CpuProfileCaptureReport {
     pub raw_perf_data: Option<Artifact>,
 }
 
+pub struct Sampling<'a> {
+    pub seconds: u8,
+    pub frequency: u8,
+    pub call_graph: CpuCallGraph,
+    pub event: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SamplingField {
+    Event,
+    Duration,
+    Frequency,
+    UnwindMode,
+}
+
+impl fmt::Display for SamplingField {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output.write_str(match self {
+            Self::Event => "event",
+            Self::Duration => "duration",
+            Self::Frequency => "frequency",
+            Self::UnwindMode => "unwind mode",
+        })
+    }
+}
+
+impl Sampling<'_> {
+    pub fn differences(&self, other: &Self) -> Vec<SamplingField> {
+        [
+            (self.event != other.event, SamplingField::Event),
+            (self.seconds != other.seconds, SamplingField::Duration),
+            (self.frequency != other.frequency, SamplingField::Frequency),
+            (
+                self.call_graph != other.call_graph,
+                SamplingField::UnwindMode,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(changed, field)| changed.then_some(field))
+        .collect()
+    }
+}
+
 impl CpuProfileCaptureReport {
+    pub fn matches_profile(&self, profile: &Profile) -> bool {
+        profile.loaded_sha256() == Some(self.folded.sha256.as_str())
+    }
+
+    pub fn sampling(&self) -> Sampling<'_> {
+        let (seconds, frequency, call_graph) = match &self.reviewed.target {
+            Target::Process { options, .. } => {
+                (options.seconds, options.frequency, options.call_graph)
+            }
+            Target::Command { options, .. } => {
+                (options.seconds, options.frequency, options.call_graph)
+            }
+        };
+        Sampling {
+            seconds,
+            frequency,
+            call_graph,
+            event: &self.reviewed.event,
+        }
+    }
+
     pub(super) fn new(folded: Artifact, reviewed: Review, summary: &CpuProfileSummary) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,

@@ -34,7 +34,9 @@ pub use launch::CpuWorkloadOutcome;
 pub use raw::PerfDataArtifact;
 pub use report::{
     Artifact as CpuProfileReportArtifact, CpuProfileCaptureReport,
-    Review as CpuProfileReportReview, Target as CpuProfileReportTarget, verify_cpu_profile_report,
+    Review as CpuProfileReportReview, Sampling as CpuProfileSampling,
+    SamplingField as CpuProfileSamplingField, Target as CpuProfileReportTarget,
+    verify_cpu_profile_report,
 };
 pub const PERF_DATA_TRANSFER_SECONDS: u64 = 60;
 pub(crate) const CONTROL_TIMEOUT_SECONDS: u64 =
