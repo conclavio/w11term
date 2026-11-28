@@ -31,7 +31,10 @@ pub use local::{
     CaptureComparison, CaptureExcerpt, CaptureExcerptPlan, ConversationChange,
     ConversationEndpoints, ConversationQuery, LocalCapture, ip_protocol_label,
 };
-pub use report::{CaptureReportVerification, verify_packet_capture_report};
+pub use report::{
+    CaptureReportDetails, CaptureReportReview, CaptureReportVerification,
+    verify_packet_capture_report,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -215,7 +218,7 @@ fn parse_interfaces(bytes: &[u8]) -> CaptureInterfaces {
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 pub struct Rotation {
     pub files: u8,
     pub bytes_per_file: u64,
@@ -253,10 +256,10 @@ pub struct Capture {
     pub stop_reason: &'static str,
     pub diagnostics: Vec<String>,
     #[serde(skip)]
-    reviewed: Box<report::Reviewed>,
+    reviewed: Box<CaptureReportReview>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct RotationResult {
     pub retained_files: usize,
     pub overwritten_files: u64,
@@ -757,7 +760,7 @@ async fn capture_and_download(
                 .map(crate::events::display_field)
                 .filter(|line| !line.is_empty())
                 .collect(),
-            reviewed: Box::new(report::Reviewed::from(plan)),
+            reviewed: Box::new(CaptureReportReview::from(plan)),
         },
     ))
 }

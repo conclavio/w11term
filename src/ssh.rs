@@ -35,8 +35,8 @@ pub use triage::cpu_profile::{
 pub use triage::packet_capture::{
     Capture as PacketCapture, CaptureComparison as PacketCaptureComparison,
     CaptureExcerpt as PacketCaptureExcerpt, CaptureExcerptPlan as PacketCaptureExcerptPlan,
-    CaptureInterfaces as PacketCaptureInterfaces, CaptureReportVerification,
-    ConversationChange as PacketConversationChange,
+    CaptureInterfaces as PacketCaptureInterfaces, CaptureReportDetails, CaptureReportReview,
+    CaptureReportVerification, ConversationChange as PacketConversationChange,
     ConversationEndpoints as PacketConversationEndpoints,
     ConversationQuery as PacketConversationQuery, LocalCapture as LocalPacketCapture,
     Plan as PacketCapturePlan, ip_protocol_label, open_capture_conversation_in_wireshark,

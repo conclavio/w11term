@@ -178,6 +178,7 @@ fn verifies_renamed_captures_and_reports_distinct_size_and_checksum_mismatches()
     assert_eq!(reply["result"]["sha256"], sha256);
     assert_eq!(reply["result"]["capture_path"], json!(capture));
     assert_eq!(reply["result"]["report_path"], json!(report));
+    assert_eq!(reply["result"]["details"], Value::Null);
 
     fs::write(&capture, &original[..original.len() - 1]).unwrap();
     error("File byte count differs");

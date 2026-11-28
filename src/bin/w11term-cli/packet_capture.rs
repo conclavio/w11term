@@ -74,6 +74,7 @@ pub(super) fn verify_report(args: &[String], stdout: &mut dyn Write) -> Result<(
         "report_path": report,
         "bytes": verified.bytes,
         "sha256": verified.sha256,
+        "details": verified.details,
     })));
     serde_json::to_writer(&mut *stdout, &reply)?;
     writeln!(stdout)?;

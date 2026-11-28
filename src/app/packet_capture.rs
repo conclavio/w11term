@@ -6,11 +6,11 @@ use std::{
 use w11term::{
     control::PacketCaptureOptions,
     ssh::{
-        CaptureStop, LocalPacketCapture, PacketCapture, PacketCaptureComparison,
-        PacketCaptureExcerpt, PacketCaptureExcerptPlan, PacketCaptureInterfaces, PacketCapturePlan,
-        PacketConversationEndpoints, ip_protocol_label, open_capture_in_wireshark,
-        open_capture_interval_in_wireshark, open_capture_pair_in_wireshark,
-        verify_packet_capture_report,
+        CaptureReportDetails, CaptureReportVerification, CaptureStop, LocalPacketCapture,
+        PacketCapture, PacketCaptureComparison, PacketCaptureExcerpt, PacketCaptureExcerptPlan,
+        PacketCaptureInterfaces, PacketCapturePlan, PacketConversationEndpoints, ip_protocol_label,
+        open_capture_in_wireshark, open_capture_interval_in_wireshark,
+        open_capture_pair_in_wireshark, verify_packet_capture_report,
     },
 };
 
@@ -79,7 +79,7 @@ pub enum Outcome {
     Destination(PathBuf),
     Saved(PacketCapture),
     ReportSaved(PathBuf),
-    ReportVerified(u64),
+    ReportVerified(PathBuf, CaptureReportVerification),
     SettingsLoaded(PathBuf, PacketCaptureOptions),
     SettingsSaved(PathBuf),
     ExcerptSaved(PacketCaptureExcerpt),
@@ -248,6 +248,7 @@ pub(super) struct Panel {
     interfaces: Option<(flame_graph::Connection, PacketCaptureInterfaces)>,
     review: Option<Review>,
     loaded: Option<LoadedCapture>,
+    verified_report: Option<(PathBuf, Box<CaptureReportDetails>)>,
     comparison: Option<compare::Comparison>,
     saved_interface: usize,
     timeline_expanded: bool,
@@ -266,8 +267,8 @@ fn message(action: Action) -> Message {
     Message::PacketCapture(action)
 }
 
-fn stop_reason(saved: &PacketCapture) -> &'static str {
-    match saved.stop_reason {
+fn stop_reason(reason: &str) -> &'static str {
+    match reason {
         "stopped" => "Stopped by request",
         "time-limit" => "Time limit reached",
         "packet-limit" => "Packet limit reached",
@@ -285,6 +286,101 @@ fn text(key: &str, value: impl Into<String>) -> KeyedView {
     )
 }
 
+fn report_text(value: &str) -> String {
+    let mut chars = value.chars();
+    let mut display = chars
+        .by_ref()
+        .take(1024)
+        .map(|ch| match ch {
+            '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}' => '�',
+            ch if ch.is_control() => '�',
+            ch => ch,
+        })
+        .collect::<String>();
+    if chars.next().is_some() {
+        display.push('…');
+    }
+    display
+}
+
+fn verified_report_view(path: &Path, details: &CaptureReportDetails) -> Vec<KeyedView> {
+    let review = &details.reviewed;
+    let options = &review.options;
+    let mut rows = vec![
+        text("capture-report-heading", "Details from capture report"),
+        text(
+            "capture-report-file",
+            format!(
+                "{}\nOriginal capture {}",
+                path.display(),
+                report_text(&details.file_name)
+            ),
+        ),
+        text(
+            "capture-report-endpoint",
+            format!(
+                "Recorded SSH {}@{}:{}\nHost key {}",
+                report_text(&review.user),
+                report_text(&review.host),
+                review.port,
+                report_text(&review.host_key_fingerprint)
+            ),
+        ),
+        text(
+            "capture-report-settings",
+            format!(
+                "Interface {} · {}-byte snap length · {} seconds · {} MiB",
+                report_text(&options.interface),
+                options.snap_length,
+                options.seconds,
+                options.max_mib
+            ),
+        ),
+        text(
+            "capture-report-filter",
+            if options.filter.is_empty() {
+                "Capture filter · none".into()
+            } else {
+                format!("Capture filter · {}", report_text(&options.filter))
+            },
+        ),
+        text(
+            "capture-report-count",
+            format!(
+                "{} · {} packets saved",
+                stop_reason(&details.stop_reason),
+                details.packets
+            ),
+        ),
+    ];
+    let counts = [
+        details
+            .received_by_filter
+            .map(|count| format!("Packets received by filter {count}")),
+        details
+            .dropped_by_kernel
+            .map(|count| format!("Packets dropped by kernel {count}")),
+    ];
+    let counts = counts.into_iter().flatten().collect::<Vec<_>>();
+    if !counts.is_empty() {
+        rows.push(text("capture-report-counters", counts.join(" · ")));
+    }
+    if let Some(rotation) = &details.rotation {
+        rows.push(text(
+            "capture-report-rotation",
+            format!(
+                "Rolling capture · {} captured · {} files kept · {} overwritten",
+                rotation.captured_packets, rotation.retained_files, rotation.overwritten_files
+            ),
+        ));
+    }
+    rows
+}
+
 impl Panel {
     fn begin(&mut self, status: &str) -> Arc<()> {
         let ticket = Arc::new(());
@@ -295,6 +391,7 @@ impl Panel {
 
     fn install_local(&mut self, capture: Arc<LocalPacketCapture>) {
         self.loaded = Some(LoadedCapture::Local(capture));
+        self.verified_report = None;
         self.comparison = None;
         self.saved_interface = 0;
         self.timeline_expanded = false;
@@ -585,7 +682,7 @@ impl Panel {
             files.push(text("status", status));
         }
         if let Some(LoadedCapture::Captured(saved)) = &self.loaded {
-            let reason = stop_reason(saved);
+            let reason = stop_reason(saved.stop_reason);
             let packets = if saved.rotation.is_some() {
                 "Packets retained"
             } else {
@@ -995,6 +1092,9 @@ impl Panel {
                     }),
                 ),
             ]);
+        }
+        if let Some((path, details)) = &self.verified_report {
+            files.extend(verified_report_view(path, details));
         }
         files.append(&mut fields);
         Grid::new()
@@ -1577,6 +1677,7 @@ impl TerminalApp {
         let panel = &mut self.packet_capture;
         let Some(capture) = &panel.loaded else { return };
         let capture = capture.path().to_owned();
+        panel.verified_report = None;
         let ticket = panel.begin("Choosing a packet capture report to verify…");
         work(ctx, ticket, move || {
             let purpose = file_picker::Purpose::OpenPacketCaptureReport(capture.clone());
@@ -1584,7 +1685,7 @@ impl TerminalApp {
                 return Ok(None);
             };
             let verified = verify_packet_capture_report(&capture, &file.path)?;
-            Ok(Some(Outcome::ReportVerified(verified.bytes)))
+            Ok(Some(Outcome::ReportVerified(file.path, verified)))
         });
     }
 
@@ -1610,7 +1711,7 @@ impl TerminalApp {
             activity.finish(&ticket, &result, |outcome| match outcome {
                 Outcome::Saved(capture) => Some(format!(
                     "Saved packet capture\n{}\n{}",
-                    stop_reason(capture),
+                    stop_reason(capture.stop_reason),
                     capture.path.display(),
                 )),
                 _ => None,
@@ -1641,6 +1742,7 @@ impl TerminalApp {
             Ok(Some(Outcome::Saved(capture))) => {
                 let path = capture.path.clone();
                 panel.loaded = Some(LoadedCapture::Captured(capture));
+                panel.verified_report = None;
                 panel.comparison = None;
                 panel.status = Some("Saved packet capture".into());
                 self.remember_diagnostic(
@@ -1652,8 +1754,10 @@ impl TerminalApp {
             Ok(Some(Outcome::ReportSaved(path))) => {
                 panel.status = Some(format!("Saved packet capture report · {}", path.display()));
             }
-            Ok(Some(Outcome::ReportVerified(bytes))) => {
+            Ok(Some(Outcome::ReportVerified(path, verified))) => {
+                let bytes = verified.bytes;
                 panel.status = Some(format!("Capture matches report · {bytes} bytes verified"));
+                panel.verified_report = verified.details.map(|details| (path, details));
             }
             Ok(Some(Outcome::SettingsLoaded(path, settings))) => {
                 panel.inputs = settings.into();

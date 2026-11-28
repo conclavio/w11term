@@ -1121,8 +1121,13 @@ try {
         throw 'The saved report does not describe the verified packet capture and its reviewed settings'
     }
     $verified = & $Cli verify-packet-capture-report $destination $reportPath | ConvertFrom-Json
-    if ($LASTEXITCODE -ne 0 -or !$verified.ok -or $verified.result.sha256 -cne $digest -or $verified.result.bytes -ne 64) {
-        throw 'The CLI could not verify the Windows capture and report'
+    $details = $verified.result.details
+    if ($LASTEXITCODE -ne 0 -or !$verified.ok -or $verified.result.sha256 -cne $digest -or $verified.result.bytes -ne 64 -or
+        $details.file_name -cne $report.file_name -or $details.stop_reason -cne 'stopped' -or
+        $null -eq $details.dropped_by_kernel -or $details.dropped_by_kernel -ne 0 -or
+        $details.rotation.overwritten_files -ne 1 -or $details.reviewed.host_key_fingerprint -cne $plan.host_key_fingerprint -or
+        $details.reviewed.options.snap_length -ne 192 -or $details.reviewed.options.filter -cne 'udp and dst port 4321') {
+        throw 'The CLI did not verify the Windows capture with the recorded report details'
     }
     Select-Capture $destination
     $null = Wait-Until 'the saved packet file reopens in offline inspection' {
@@ -1136,7 +1141,10 @@ try {
     }
     $null = Wait-Until 'verify the selected report' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'the offline viewer verifies the matching report' {
-        Find-Element "Capture matches report${dot}64 bytes verified"
+        (Find-Element "Capture matches report${dot}64 bytes verified") -and
+            (Find-Element 'Details from capture report') -and
+            (Find-Element "Capture filter${dot}udp and dst port 4321") -and
+            (Find-Element "Stopped by request${dot}2 packets saved")
     }
     Select-Viewer
     if ([IO.File]::Exists($destination + '.opened')) { throw 'Selecting a viewer opened it without activation' }
@@ -1144,6 +1152,12 @@ try {
     $null = Wait-Until 'viewer receives the saved path and -r flag' {
         $opened = $destination + '.opened'
         [IO.File]::Exists($opened) -and [IO.File]::ReadAllText($opened) -ceq '-r'
+    }
+    $other = Join-Path (Split-Path -Parent $destination) 'packet-report-copy.pcap'
+    [IO.File]::Copy($destination, $other)
+    Select-Capture $other
+    $null = Wait-Until 'switching the capture clears the previous report details' {
+        (Find-Element $other) -and !(Find-Element 'Details from capture report')
     }
 } finally {
     Close-FixtureApp $app
