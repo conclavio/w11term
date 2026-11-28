@@ -110,6 +110,16 @@ fn valid_command_name(name: &str) -> bool {
 
 impl UtilityBundle {
     pub fn load(manifest: &Path) -> Result<Self> {
+        Self::load_manifest(manifest).map(|(bundle, _)| bundle)
+    }
+
+    /// Load the manifest and hash the exact bytes used to build it.
+    pub fn load_with_manifest_sha256(manifest: &Path) -> Result<(Self, String)> {
+        let (bundle, bytes) = Self::load_manifest(manifest)?;
+        Ok((bundle, digest_hex(Sha256::new_with_prefix(bytes))))
+    }
+
+    fn load_manifest(manifest: &Path) -> Result<(Self, Vec<u8>)> {
         let manifest = std::path::absolute(manifest)?;
         let mut bytes = Vec::new();
         let file = std::fs::File::open(&manifest)?;
@@ -134,7 +144,7 @@ impl UtilityBundle {
             }
         }
         bundle.validate()?;
-        Ok(bundle)
+        Ok((bundle, bytes))
     }
 
     pub fn validate(&self) -> Result<()> {

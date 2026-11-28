@@ -1764,6 +1764,7 @@ fn approved_login(source: Source, local: &std::path::Path) -> SshOptions {
     };
     options.tool_bundle = Some(Box::new(ToolSync {
         bundle: "fleet.json".into(),
+        manifest_sha256: None,
         name: "portable".into(),
         bin_directory: ".local/bin".into(),
         host: options.host.clone(),
@@ -1889,6 +1890,53 @@ fn connect_tools(options: &SshOptions) -> Session {
             ..Default::default()
         },
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_tool_manifest_requires_reapproval_before_updating_on_login() {
+    let (source, remote, _, server) = fixture_connections(false, 3).await;
+    let root = remote.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(root, "x86_64", "/", "/usr/bin");
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("utility-shell-probe"), []).unwrap();
+    let manifest = local.path().join("fleet.json");
+    save_login_manifest(local.path(), 1);
+    let mut options = approved_login(source, local.path());
+    let pin = || tool_sha256(&fs::read(&manifest).unwrap());
+    options.tool_bundle.as_mut().unwrap().manifest_sha256 = Some(pin().to_uppercase());
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("updated")).await;
+    drop(pane);
+
+    let selector = root.join(".local/share/w11term/tools/portable/current");
+    let before = fs::read(&selector).unwrap();
+    let startup = root.join(".bashrc");
+    let hook = fs::read(&startup).unwrap();
+    let launcher = root.join(".local/bin/rg");
+    let command = fs::read(&launcher).unwrap();
+    save_login_manifest(local.path(), 2);
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "skipped", None).await;
+    assert!(
+        pane.events
+            .tool_bundle_sync(1)
+            .unwrap()
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("The tool manifest changed after approval")
+    );
+    assert_eq!(fs::read(&selector).unwrap(), before);
+    assert_eq!(fs::read(&startup).unwrap(), hook);
+    assert_eq!(fs::read(&launcher).unwrap(), command);
+    drop(pane);
+
+    options.tool_bundle.as_mut().unwrap().manifest_sha256 = Some(pin());
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("current")).await;
+    assert_ne!(fs::read(&selector).unwrap(), before);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

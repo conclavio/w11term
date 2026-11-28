@@ -541,6 +541,8 @@ impl DotfileSync {
 #[serde(deny_unknown_fields)]
 pub struct ToolSync {
     pub bundle: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_sha256: Option<String>,
     pub name: String,
     pub bin_directory: String,
     pub host: String,

@@ -55,9 +55,16 @@ pub(crate) async fn sync_login_tools(
         "Choose a Windows tool bundle manifest"
     );
     let path = settings.bundle.clone();
-    let bundle = tokio::task::spawn_blocking(move || UtilityBundle::load(&path))
-        .await?
-        .context("Reading the configured tool bundle")?;
+    let (bundle, digest) =
+        tokio::task::spawn_blocking(move || UtilityBundle::load_with_manifest_sha256(&path))
+            .await?
+            .context("Reading the configured tool bundle")?;
+    if let Some(pin) = &settings.manifest_sha256 {
+        ensure!(
+            digest == normalize_sha256(pin).context("Invalid tool manifest SHA-256 pin")?,
+            "The tool manifest changed after approval. Review and approve it again."
+        );
+    }
     ensure!(
         bundle.name == settings.name && bundle.bin_directory == settings.bin_directory,
         "The manifest name or bin directory changed. Approve the tool bundle again."

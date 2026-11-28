@@ -361,13 +361,19 @@ try {
     if ($modePopup.Current.ExpandCollapseState -eq 'Expanded') { $modePopup.Collapse() }
     Click 'Review tool bundle'
     $review = 'portable ' + [char]0x2192 + ' test@example.test:22 ' + [char]0x00b7 + ' /home/test/.local/bin'
-    $null = Wait-Until 'tool bundle and launcher directory reviewed' { Find-Element $review }
+    $manifestHash = File-Sha256 $toolBundle
+    $null = Wait-Until 'tool bundle, launcher directory and manifest digest reviewed' {
+        (Find-Element $review) -and (Find-Element "Reviewed manifest SHA-256 $manifestHash")
+    }
     Click 'Approve tool sync'
-    $null = Wait-Until 'tool sync approved' { Find-Element 'Approved tool bundle: portable' }
+    $null = Wait-Until 'tool sync approved with a pinned manifest' {
+        (Find-Element 'Approved tool bundle: portable') -and (Find-Element "Pinned manifest SHA-256 $manifestHash")
+    }
     Click 'Save profile changes'
     $null = Wait-Until 'tool approvals persisted' {
         $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
         $tools.name -ceq 'portable' -and $tools.bin_directory -ceq '.local/bin' -and
+            $tools.manifest_sha256 -ceq $manifestHash -and
             $tools.host -ceq 'example.test' -and $tools.home -ceq '/home/test' -and
             $tools.fingerprint -ceq $fingerprint -and $tools.add_to_path.shell -ceq 'bash' -and
             [FixtureDialog]::SameFile($toolBundle, $tools.bundle)
@@ -535,7 +541,21 @@ try {
     Click 'Save profile changes'
     $null = Wait-Until 'revision approval saved' {
         $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
-        [FixtureDialog]::SameFile($revision, $tools.bundle)
+        [FixtureDialog]::SameFile($revision, $tools.bundle) -and $tools.manifest_sha256 -ceq (File-Sha256 $revision)
+    }
+    $checked = [System.Windows.Automation.ToggleState]::On
+    $unchecked = [System.Windows.Automation.ToggleState]::Off
+    (Wait-CheckBox 'Follow changes to the tool manifest' $unchecked).Toggle()
+    $null = Wait-CheckBox 'Follow changes to the tool manifest' $checked
+    Click 'Review tool bundle'
+    Click 'Approve tool sync'
+    $null = Wait-Until 'the tool approval follows the manifest' {
+        Find-Element 'Tool sync follows changes to the manifest file.'
+    }
+    Click 'Save profile changes'
+    $null = Wait-Until 'follow-manifest approval is saved without a pin' {
+        $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+        [FixtureDialog]::SameFile($revision, $tools.bundle) -and !$tools.manifest_sha256
     }
 } finally {
     if (!$app.HasExited) {
