@@ -156,7 +156,118 @@ fn refuses_edited_blocks_and_invalid_options_before_writing() {
         &["--shell", "sh", "--setup", "full"],
         &["--shell", "zsh", "--setup", "full", "--setup", "directory"],
         &["--shell", "zsh", "--setup"],
+        &["--setup", "full"],
+        &["--shell", "fish"],
+        &["--bash-file"],
+        &["--output-file", "new.json"],
     ] {
         assert!(!save(root, invalid).status.success(), "{invalid:?}");
+    }
+}
+
+#[test]
+fn imports_local_files_into_all_five_fragments_in_the_requested_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    for (path, contents) in [
+        (".profile", "\u{feff}export EDITOR=vi\r\n"),
+        (".bashrc", "PS1='ops> '"),
+        ("team aliases.sh", "alias gs='git status'\r\n"),
+        (".zshrc", "PROMPT='zsh> '\r\n"),
+        ("environment.fish", "set -gx EDITOR vi\r\n"),
+        ("config.fish", "set -g fish_greeting ''\r\n"),
+    ] {
+        fs::write(root.join(path), contents).unwrap();
+    }
+    let bundle = reply(save(
+        root,
+        &[
+            "--bash-file",
+            ".bashrc",
+            "--environment-file",
+            ".profile",
+            "--zsh-file",
+            ".zshrc",
+            "--bash-file",
+            "team aliases.sh",
+            "--fish-environment-file",
+            "environment.fish",
+            "--fish-file",
+            "config.fish",
+        ],
+    ));
+    assert_eq!(
+        bundle,
+        json!({
+            "version": 1,
+            "environment": "export EDITOR=vi\n",
+            "bash": "PS1='ops> '\nalias gs='git status'\n",
+            "zsh": "PROMPT='zsh> '\n",
+            "fish_environment": "set -gx EDITOR vi\n",
+            "fish": "set -g fish_greeting ''\n",
+        })
+    );
+}
+
+#[test]
+fn appends_imports_to_a_revision_and_inserts_setup_after_the_prompt() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let original = br##"{"version":1,"bash":"export PAGER=less\r\n","zsh":"# keep CRLF\r\n"}"##;
+    fs::write(root.join("fleet.json"), original).unwrap();
+    fs::write(root.join(".bashrc"), "PS1='ops> '\r\n").unwrap();
+    let bundle = reply(save(
+        root,
+        &[
+            "--from-bundle",
+            "fleet.json",
+            "--shell",
+            "bash",
+            "--setup",
+            "full",
+            "--bash-file",
+            ".bashrc",
+        ],
+    ));
+    let bash = bundle["bash"].as_str().unwrap();
+    assert!(bash.starts_with("export PAGER=less\nPS1='ops> '\n"));
+    assert!(bash.contains("__w11term_enable_bash_integration"));
+    assert_eq!(bundle["zsh"], "# keep CRLF\r\n");
+    assert_eq!(fs::read(root.join("fleet.json")).unwrap(), original);
+}
+
+#[test]
+fn failed_import_leaves_no_bundle_or_partial_stdout() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    // At the limit for a single fragment. The second valid file pushes it over.
+    fs::write(root.join("full.sh"), vec![b'#'; 16 * 1024]).unwrap();
+    fs::write(root.join("extra.sh"), "# more\n").unwrap();
+    fs::write(root.join("invalid.sh"), [0xff]).unwrap();
+    for (first, second, expected_error) in [
+        ("full.sh", "extra.sh", "at most 16 KiB"),
+        ("extra.sh", "invalid.sh", "must use UTF-8"),
+        (
+            "extra.sh",
+            "missing.sh",
+            "Importing shell fragment missing.sh",
+        ),
+    ] {
+        let output = save(
+            root,
+            &[
+                "--bash-file",
+                first,
+                "--bash-file",
+                second,
+                "--output-file",
+                "fleet.json",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(error["error"].as_str().unwrap().contains(expected_error));
+        assert!(!root.join("fleet.json").exists());
     }
 }

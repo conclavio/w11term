@@ -1359,10 +1359,13 @@ In either editor, **Import shell fragment** appends a local UTF-8 file to the se
 
 Use **Add shell setup** to append the bundled Bash, Zsh, or Fish setup after the existing startup fragment. Choose **Directory reporting only** when your prompt already emits semantic markers, or choose **Directory and prompt integration** to enable directory reporting, prompt navigation, command history, and completion alerts. The inserted code stays editable. Selecting another mode for the same shell replaces an intact generated block. Saving writes a new bundle that you can review and approve for SSH sync.
 
-Use `save-dotfiles-bundle --shell bash|zsh|fish --setup directory|full` to draft the same setup offline. Pass `--from-bundle PATH` to revise an existing bundle. The command uses LF line endings in the updated startup fragment and keeps the other fragments. With `--output-file PATH` it saves a new file and returns its absolute path. Omit that option to print the bundle JSON. Review the result before approving it for an account.
+Use `save-dotfiles-bundle` to build the same bundles offline. `--environment-file` imports into the shared Bash and Zsh environment. `--bash-file`, `--zsh-file`, `--fish-environment-file`, and `--fish-file` import into the corresponding fragments. Repeat a file option to append multiple files to that fragment in order. The importer accepts UTF-8 with an optional BOM, normalizes CRLF to LF, and applies the same combined 16 KiB limit as the editor.
+
+Pass `--from-bundle PATH` to start from an existing bundle. Imports append to its selected fragments, and the command preserves untouched fragments. You can also request `--shell bash|zsh|fish --setup directory|full` with or without imports. The CLI inserts or updates that setup block after reading the requested files. With `--output-file PATH` it saves a new file and returns its absolute path. Omit that option to print the bundle JSON. Review the result before approving it for an account.
 
 ```powershell
-& $ctl save-dotfiles-bundle --shell fish --setup full --from-bundle '.\fleet.json' --output-file '.\fleet-with-fish-setup.json'
+& $ctl save-dotfiles-bundle --environment-file '.\.profile' --bash-file '.\.bashrc' --zsh-file '.\.zshrc' --output-file '.\fleet.json'
+& $ctl save-dotfiles-bundle --fish-file '.\config.fish' --shell fish --setup full --from-bundle '.\fleet.json' --output-file '.\fleet-with-fish-setup.json'
 ```
 
 From the full text preview of an SSH file, **Use in dotfiles editor** brings a snapshot into the connected profile's draft. It opens a new bundle draft if there is no editor open for that profile. Choose the first and last lines and use **Append SSH lines** to select the destination fragment. Select lines outside existing w11term startup blocks. Saving creates a local bundle. Using the bundle on login still requires profile approval and saving.
