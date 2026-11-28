@@ -2,6 +2,8 @@ use super::*;
 use clipboard_paste::Origin;
 use w11term::saved_commands::{Entry, valid_command_text};
 
+mod template;
+
 pub enum Action {
     Edit(Key, usize, Option<Origin>),
     Text(String),
@@ -11,6 +13,11 @@ pub enum Action {
     Name(String),
     Save,
     CancelSave,
+    BeginFill,
+    FillText(usize, String),
+    FillOption(usize, usize),
+    ApplyFill,
+    CancelFill,
 }
 
 pub(super) struct Draft {
@@ -19,6 +26,8 @@ pub(super) struct Draft {
     text: String,
     name: Option<String>,
     status: Option<String>,
+    template: Option<template::Form>,
+    filling: Option<template::Form>,
 }
 
 fn message(action: Action) -> Message {
@@ -27,16 +36,27 @@ fn message(action: Action) -> Message {
 
 impl Draft {
     fn insertion_target(&self, origin: Option<Origin>) -> Option<Origin> {
-        self.origin
-            .filter(|&target| Some(target) == origin && catalog::insertable(&self.text))
+        self.origin.filter(|&target| {
+            self.filling.is_none() && Some(target) == origin && catalog::insertable(&self.text)
+        })
+    }
+
+    pub(super) fn focus_option(&self) -> bool {
+        self.filling
+            .as_ref()
+            .is_some_and(template::Form::options_only)
     }
 
     pub(super) fn view(
         &self,
         origin: Option<Origin>,
         field: &ElementRef<TextBox>,
+        option_field: &ElementRef<ComboBox>,
         ctx: &ViewContext<TerminalApp>,
     ) -> View {
+        if let Some(form) = &self.filling {
+            return form.view(field, option_field, ctx);
+        }
         let target = self.insertion_target(origin);
         let mut rows = vec![
             KeyedView::new(
@@ -78,6 +98,14 @@ impl Draft {
                 ),
             ));
         } else {
+            if self.template.is_some() {
+                rows.push(KeyedView::new(
+                    "fill",
+                    Button::new()
+                        .on_click(ctx.callback(|_| message(Action::BeginFill)))
+                        .content("Fill placeholders…"),
+                ));
+            }
             rows.push(KeyedView::new(
                 "start-save",
                 Button::new()
@@ -131,6 +159,8 @@ impl TerminalApp {
                     text: example.command.clone(),
                     name: None,
                     status: None,
+                    template: template::Form::parse(&example.command),
+                    filling: None,
                 });
                 panel.focus = panel.focus.wrapping_add(1);
             }
@@ -144,11 +174,12 @@ impl TerminalApp {
             return;
         };
         match action {
-            Action::Text(text) => {
+            Action::Text(text) if draft.filling.is_none() => {
                 let text = text.chars().take(4096).collect();
                 if text != draft.text {
                     draft.text = text;
                     draft.status = None;
+                    draft.template = None;
                 }
             }
             Action::Insert(target) if draft.insertion_target(origin) == Some(target) => {
@@ -157,7 +188,11 @@ impl TerminalApp {
                 self.paste_saved_text(target, text, ctx);
             }
             Action::Cancel => panel.draft = None,
-            Action::StartSave if draft.name.is_none() && valid_command_text(&draft.text) => {
+            Action::StartSave
+                if draft.filling.is_none()
+                    && draft.name.is_none()
+                    && valid_command_text(&draft.text) =>
+            {
                 draft.name = Some(String::new());
                 draft.status = None;
             }
@@ -187,6 +222,34 @@ impl TerminalApp {
             Action::CancelSave => {
                 draft.name = None;
                 draft.status = None;
+            }
+            Action::BeginFill if draft.filling.is_none() && draft.name.is_none() => {
+                if let Some(form) = &draft.template {
+                    draft.filling = Some(form.clone());
+                    panel.focus = panel.focus.wrapping_add(1);
+                }
+            }
+            Action::FillText(index, text) => {
+                if let Some(form) = &mut draft.filling {
+                    form.set_text(index, text);
+                }
+            }
+            Action::FillOption(index, choice) => {
+                if let Some(form) = &mut draft.filling {
+                    form.set_option(index, choice);
+                }
+            }
+            Action::ApplyFill => {
+                if let Some(text) = draft.filling.as_ref().and_then(template::Form::preview) {
+                    draft.text = text;
+                    draft.template = draft.filling.take();
+                    draft.status = None;
+                    panel.focus = panel.focus.wrapping_add(1);
+                }
+            }
+            Action::CancelFill if draft.filling.is_some() => {
+                draft.filling = None;
+                panel.focus = panel.focus.wrapping_add(1);
             }
             _ => {}
         }

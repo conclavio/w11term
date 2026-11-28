@@ -118,6 +118,7 @@ pub(super) struct Panel {
     draft: Option<example::Draft>,
     query_field: ElementRef<TextBox>,
     draft_field: ElementRef<TextBox>,
+    draft_option: ElementRef<ComboBox>,
     focus: u64,
     tools: Option<ToolLookup>,
     private_page: Option<private_page::Editor>,
@@ -287,8 +288,15 @@ impl Panel {
         } else {
             self.query_field.clone()
         };
+        let option = draft
+            .filter(|draft| draft.focus_option())
+            .map(|_| self.draft_option.clone());
         ctx.use_effect("focus command reference", self.focus, move || {
-            let _ = target.request_focus();
+            if let Some(option) = option {
+                let _ = option.request_focus();
+            } else {
+                let _ = target.request_focus();
+            }
             None
         });
         let page = selected.and_then(|key| {
@@ -488,7 +496,7 @@ impl Panel {
             if let Some(draft) = draft {
                 pieces.push(KeyedView::new(
                     "draft",
-                    draft.view(origin, &self.draft_field, ctx),
+                    draft.view(origin, &self.draft_field, &self.draft_option, ctx),
                 ));
             }
             for (index, example) in page.examples.iter().enumerate() {

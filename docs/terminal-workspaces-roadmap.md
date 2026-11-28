@@ -368,6 +368,8 @@ English tldr-pages are bundled for offline lookup. The platform defaults to Wind
 
 Save an edited example to the shared **Saved commands** library from Command reference. Open the example editor offline, choose a name for the exact line, and recall it from the palette or a group later.
 
+Fill named values and choose flag spellings in a manual example. A repeated placeholder uses one value across the command. Review the preview and apply it to the editable draft before saving or inserting the example.
+
 **Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
 
 ## Managed SSH utilities
