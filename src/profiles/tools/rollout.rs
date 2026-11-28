@@ -2,7 +2,9 @@ use super::Manifest;
 use crate::{
     options::{SshOptions, ToolSync},
     profiles::{CatalogEdit, ProfileStore},
-    sftp::{UtilityBundle, digest_hex, normalize_sha256},
+    sftp::{
+        ToolArchitectureAudit, UtilityArchitecture, UtilityBundle, digest_hex, normalize_sha256,
+    },
 };
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -19,10 +21,26 @@ pub struct ToolRolloutReport {
     pub candidate_path: PathBuf,
     pub candidate_manifest_sha256: String,
     pub candidate_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_builds: Option<ToolRolloutBuildReport>,
     pub profiles: Vec<ToolRolloutProfile>,
     pub changed_profiles: usize,
     pub applied: bool,
     pub review: String,
+}
+
+#[derive(Clone, Copy, Serialize)]
+pub struct ToolRolloutBuildPolicy {
+    pub architecture: Option<UtilityArchitecture>,
+    pub require_ready: bool,
+}
+
+#[derive(Serialize)]
+pub struct ToolRolloutBuildReport {
+    #[serde(flatten)]
+    policy: ToolRolloutBuildPolicy,
+    pub ready: bool,
+    pub checks: Vec<ToolArchitectureAudit>,
 }
 
 #[derive(Serialize)]
@@ -58,6 +76,8 @@ struct Plan<'a> {
     candidate: &'a Path,
     candidate_manifest_sha256: String,
     candidate_commands: Vec<String>,
+    #[serde(skip)]
+    candidate_bundle: UtilityBundle,
     profiles: Vec<ToolRolloutProfile>,
 }
 
@@ -134,17 +154,57 @@ impl<'a> Plan<'a> {
             candidate_commands: proposed
                 .bundle
                 .tools
-                .into_iter()
-                .map(|tool| tool.name)
+                .iter()
+                .map(|tool| tool.name.clone())
                 .collect(),
+            candidate_bundle: proposed.bundle,
             profiles: revisions,
         })
     }
 
-    fn review(&self) -> Result<String> {
+    fn review(&self, policy: Option<ToolRolloutBuildPolicy>) -> Result<String> {
         let mut digest = Sha256::new_with_prefix(b"w11term-tools-rollout-v1\0");
         digest.update(serde_json::to_vec(self)?);
+        if let Some(policy) = policy {
+            digest.update(b"\0candidate-build-policy-v1\0");
+            digest.update(serde_json::to_vec(&policy)?);
+        }
         Ok(digest_hex(digest))
+    }
+
+    fn check_builds(
+        &self,
+        policy: Option<ToolRolloutBuildPolicy>,
+        applying: bool,
+    ) -> Result<Option<ToolRolloutBuildReport>> {
+        let Some(policy) = policy else {
+            return Ok(None);
+        };
+        let checks = self
+            .candidate_bundle
+            .audit_executables(policy.architecture, &|| false)?;
+        let ready = checks.iter().all(|check| check.locally_available);
+        if applying && policy.require_ready && !ready {
+            let missing: Vec<_> = checks
+                .iter()
+                .flat_map(|check| {
+                    check
+                        .commands
+                        .iter()
+                        .filter(|command| !command.locally_available)
+                        .map(|command| format!("{} ({:?})", command.name, check.architecture))
+                })
+                .collect();
+            anyhow::bail!(
+                "Candidate builds are missing or invalid for {}. Prepare the builds and try again.",
+                missing.join(", ")
+            );
+        }
+        Ok(Some(ToolRolloutBuildReport {
+            policy,
+            ready,
+            checks,
+        }))
     }
 
     fn apply(&self, entries: &mut Map<String, Value>) -> Result<()> {
@@ -259,6 +319,16 @@ impl ProfileStore {
         candidate: &Path,
         review: Option<&str>,
     ) -> Result<ToolRolloutReport> {
+        self.rollout_tools_with_builds(profiles, candidate, review, None)
+    }
+
+    pub fn rollout_tools_with_builds(
+        &self,
+        profiles: &[String],
+        candidate: &Path,
+        review: Option<&str>,
+        policy: Option<ToolRolloutBuildPolicy>,
+    ) -> Result<ToolRolloutReport> {
         ensure!(
             candidate.is_absolute(),
             "Choose an absolute candidate tool manifest path"
@@ -273,28 +343,39 @@ impl ProfileStore {
             "Choose each SSH profile only once"
         );
         let plan = Plan::build(self.path(), candidate, &selected, &self.load()?)?;
-        let token = plan.review()?;
+        let token = plan.review(policy)?;
         let changed = plan.profiles.iter().filter(|entry| entry.changed).count();
-        if let Some(review) = review {
-            const STALE: &str =
-                "The candidate, baseline, or profile approvals changed. Preview the rollout again.";
+        let candidate_builds = if let Some(review) = review {
+            let stale = if policy.is_some() {
+                "The candidate, baseline, profile approvals, or build policy changed. Preview the rollout again."
+            } else {
+                "The candidate, baseline, or profile approvals changed. Preview the rollout again."
+            };
             let review = normalize_sha256(review)?;
-            ensure!(token == review, STALE);
+            ensure!(token == review, stale);
             if changed > 0 {
+                let mut checks = None;
                 self.modify(|entries, catalog| {
                     let current =
                         Plan::build(self.path(), candidate, &selected, &catalog.profiles)?;
-                    ensure!(current.review()? == review, STALE);
+                    ensure!(current.review(policy)? == review, stale);
+                    checks = current.check_builds(policy, true)?;
                     current.apply(entries)?;
                     Ok(CatalogEdit::default())
                 })?;
+                checks
+            } else {
+                plan.check_builds(policy, true)?
             }
-        }
+        } else {
+            plan.check_builds(policy, false)?
+        };
         Ok(ToolRolloutReport {
             profiles_path: plan.catalog.to_owned(),
             candidate_path: plan.candidate.to_owned(),
             candidate_manifest_sha256: plan.candidate_manifest_sha256,
             candidate_commands: plan.candidate_commands,
+            candidate_builds,
             profiles: plan.profiles,
             changed_profiles: changed,
             applied: review.is_some(),

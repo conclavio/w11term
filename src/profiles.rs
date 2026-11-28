@@ -25,8 +25,8 @@ mod tools;
 pub use tools::{
     ToolManifestBaseline, ToolManifestChanges, ToolProfileAudit, ToolProfileAuditRow,
     ToolProfileAuditStatus, ToolProfileBuildChecks, ToolProfilePreparation, ToolRestoreStatus,
-    ToolRollbackProfile, ToolRollbackReport, ToolRolloutProfile, ToolRolloutReport,
-    rollback_tool_rollout,
+    ToolRollbackProfile, ToolRollbackReport, ToolRolloutBuildPolicy, ToolRolloutBuildReport,
+    ToolRolloutProfile, ToolRolloutReport, rollback_tool_rollout,
 };
 
 #[derive(Clone, Debug, PartialEq)]

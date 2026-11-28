@@ -18,7 +18,8 @@ pub use rollback::{
     ToolRestoreStatus, ToolRollbackProfile, ToolRollbackReport, rollback_tool_rollout,
 };
 pub use rollout::{
-    ToolManifestBaseline, ToolManifestChanges, ToolRolloutProfile, ToolRolloutReport,
+    ToolManifestBaseline, ToolManifestChanges, ToolRolloutBuildPolicy, ToolRolloutBuildReport,
+    ToolRolloutProfile, ToolRolloutReport,
 };
 
 #[derive(Serialize)]

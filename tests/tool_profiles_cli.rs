@@ -482,6 +482,7 @@ fn reviewed_tool_rollout_updates_only_the_selected_manifest_bindings() {
         "In place",
     ];
     let preview = reply(rollout(root, &args));
+    assert!(preview.get("candidate_builds").is_none());
     assert_eq!(preview["applied"], false);
     assert_eq!(preview["changed_profiles"], 4);
     assert_eq!(preview["candidate_manifest_sha256"], next_pin);
@@ -524,6 +525,164 @@ fn reviewed_tool_rollout_updates_only_the_selected_manifest_bindings() {
     );
     assert_eq!(
         fs::read_to_string(root.join("new tools.json")).unwrap(),
+        candidate
+    );
+}
+
+#[test]
+fn reviewed_rollout_checks_candidate_builds_and_binds_the_apply_gate_to_the_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = fleet_manifest(&[("rg", 'a')]);
+    let x86 = tool_elf::executable(UtilityArchitecture::X86_64, None);
+    let executable = root.join("release-rg");
+    fs::write(&executable, &x86).unwrap();
+    let candidate = json!({"version": 1, "name": "fleet", "tools": [{"name": "rg", "builds": [
+        {"architecture": "x86_64", "path": "missing-rg", "sha256": "b".repeat(64)},
+        {"architecture": "x86_64", "path": "release-rg", "sha256": sha256(&x86)},
+        {"architecture": "aarch64", "sha256": "d".repeat(64),
+         "download": {"format": "raw", "url": "https://tools.example.test/rg"}},
+    ]}]})
+    .to_string();
+    fs::write(root.join("current.json"), &before).unwrap();
+    fs::write(root.join("next.json"), &candidate).unwrap();
+    let catalog = root.join("profiles.json");
+    let original = json!({"profiles": {
+        "East": profile("current.json", Some(&sha256(&before))),
+        "West": profile("current.json", None),
+    }});
+    let original_text = original.to_string();
+    fs::write(&catalog, &original_text).unwrap();
+    let run = |profile: &str, flags: &[&str]| {
+        let mut args = vec!["--candidate", "next.json", "--profile", profile];
+        args.extend_from_slice(flags);
+        rollout(root, &args)
+    };
+    let reject = |flags: &[&str], expected: &str| {
+        let failed = run("East", flags);
+        assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+        assert!(failed.stdout.is_empty());
+        let response: Value = serde_json::from_slice(&failed.stderr).unwrap();
+        assert!(
+            response["error"].as_str().unwrap().contains(expected),
+            "{response}"
+        );
+        assert_eq!(fs::read_to_string(&catalog).unwrap(), original_text);
+    };
+
+    let all = reply(run("East", &["--require-ready"]));
+    let builds = &all["candidate_builds"];
+    assert_eq!(builds["require_ready"], true);
+    assert!(builds["architecture"].is_null());
+    assert_eq!(builds["ready"], false);
+    assert_eq!(builds["checks"][0]["locally_available"], true);
+    assert_eq!(builds["checks"][1]["locally_available"], false);
+    assert_eq!(
+        builds["checks"][1]["commands"][0]["builds"][0]["status"],
+        "missing"
+    );
+    reject(
+        &[
+            "--require-ready",
+            "--review",
+            all["review"].as_str().unwrap(),
+        ],
+        "Candidate builds are missing or invalid for rg (Aarch64)",
+    );
+    let scoped = reply(run(
+        "East",
+        &["--require-ready", "--architecture", "x86_64"],
+    ));
+    let token = scoped["review"].as_str().unwrap();
+    assert_eq!(scoped["candidate_builds"]["ready"], true);
+    assert_eq!(scoped["candidate_builds"]["architecture"], "x86_64");
+    assert_eq!(
+        scoped["candidate_builds"]["checks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    reject(&["--review", token], "Preview the rollout again");
+    reject(
+        &[
+            "--require-ready",
+            "--architecture",
+            "aarch64",
+            "--review",
+            token,
+        ],
+        "build policy changed",
+    );
+    reject(
+        &[
+            "--verify-builds",
+            "--architecture",
+            "x86_64",
+            "--review",
+            token,
+        ],
+        "build policy changed",
+    );
+    reject(
+        &["--architecture", "x86_64"],
+        "requires --verify-builds or --require-ready",
+    );
+    reject(
+        &["--verify-builds", "--require-ready"],
+        "Choose either --verify-builds or --require-ready once",
+    );
+
+    let apply = [
+        "--require-ready",
+        "--architecture",
+        "x86_64",
+        "--review",
+        token,
+    ];
+    fs::write(&executable, b"changed after preview").unwrap();
+    reject(
+        &apply,
+        "Candidate builds are missing or invalid for rg (X86_64)",
+    );
+    fs::write(&executable, &x86).unwrap();
+    let applied = run("East", &apply);
+    let receipt = "verified rollout.json";
+    fs::write(root.join(receipt), &applied.stdout).unwrap();
+    let applied = reply(applied);
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["candidate_builds"]["ready"], true);
+    let rollback = reply(cli(root, "rollback-tool-profiles", &[receipt]));
+    assert_eq!(rollback["profiles"][0]["profile"], "East");
+    assert_eq!(rollback["profiles"][0]["restore_status"], "matches-pin");
+
+    let verify = reply(run("West", &["--verify-builds"]));
+    assert_eq!(verify["candidate_builds"]["ready"], false);
+    let applied = reply(run(
+        "West",
+        &[
+            "--verify-builds",
+            "--review",
+            verify["review"].as_str().unwrap(),
+        ],
+    ));
+    assert_eq!(applied["applied"], true);
+    assert_eq!(applied["candidate_builds"]["ready"], false);
+    assert_eq!(applied["candidate_builds"]["require_ready"], false);
+    let saved: Value = serde_json::from_slice(&fs::read(catalog).unwrap()).unwrap();
+    for name in ["East", "West"] {
+        assert_eq!(
+            saved["profiles"][name]["tool_bundle"]["bundle"],
+            json!(root.join("next.json"))
+        );
+    }
+    assert_eq!(
+        saved["profiles"]["East"]["tool_bundle"]["manifest_sha256"],
+        sha256(&candidate)
+    );
+    assert!(saved["profiles"]["West"]["tool_bundle"]["manifest_sha256"].is_null());
+    assert_eq!(
+        fs::read_to_string(root.join("next.json")).unwrap(),
         candidate
     );
 }

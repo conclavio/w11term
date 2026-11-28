@@ -1646,6 +1646,17 @@ $preview.result.profiles
 
 Use `--profiles CATALOG` to select another catalog. The apply step rechecks the candidate, readable baselines, and selected approvals before writing the entire batch. It changes the manifest bindings in the catalog. The revised tools sync when those profiles open a new ordinary SSH connection.
 
+Add `--verify-builds` to include local executable and cache readiness under `candidate_builds`. Use `--require-ready` to make apply require at least one verified build per command in the chosen scope. Omit `--architecture` to check every architecture declared by the candidate. Pass the same policy and architecture flags for preview and apply. If a build needs repair, prepare its bytes and retry with the same review token while the manifests and saved approvals still match.
+
+```powershell
+$rollout += @('--require-ready', '--architecture', 'x86_64')
+$preview = & $ctl @rollout | ConvertFrom-Json
+$preview.result.candidate_builds
+if ($preview.result.candidate_builds.ready) {
+    & $ctl @rollout --review $preview.result.review
+}
+```
+
 To undo the batch, pass the saved apply reply to `rollback-tool-profiles`. It previews only the profiles the rollout changed and uses the catalog recorded in the receipt. The review lists the previous manifest and pin and shows whether the file is available, still matches its pin, and names the approved launcher destination. A reviewed rollback can restore a binding whose old file is missing. The command rejects the batch if a selected approval no longer matches the applied rollout or a reviewed manifest changes before confirmation.
 
 ```powershell

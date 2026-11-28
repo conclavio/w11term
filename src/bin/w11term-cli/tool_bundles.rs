@@ -1,9 +1,9 @@
-use super::offline::{profile_rollout, profile_store, rollback_args};
+use super::offline::{profile_rollout_with, profile_store, rollback_args};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{io::Write, path::Path, process::ExitCode};
 use w11term::control::Reply;
-use w11term::profiles::{ToolProfileBuildChecks, rollback_tool_rollout};
+use w11term::profiles::{ToolProfileBuildChecks, ToolRolloutBuildPolicy, rollback_tool_rollout};
 use w11term::sftp::{
     ToolBundlePreset, UtilityArchitecture, UtilityBundle, export_builtin_tool_bundle,
     fetch_tool_bundle,
@@ -16,7 +16,7 @@ pub(super) const AUDIT_HELP: &str = "w11term-cli audit-tool-profiles [--profiles
 pub(super) const PREPARE_VERB: &str = "prepare-tool-profiles";
 pub(super) const PREPARE_HELP: &str = "w11term-cli prepare-tool-profiles --profile NAME [--profile NAME ...] [--profiles CATALOG] [--architecture x86_64|aarch64]";
 pub(super) const ROLLOUT_VERB: &str = "rollout-tool-profiles";
-pub(super) const ROLLOUT_HELP: &str = "w11term-cli rollout-tool-profiles --candidate MANIFEST --profile NAME [--profile NAME ...] [--profiles CATALOG] [--review TOKEN]";
+pub(super) const ROLLOUT_HELP: &str = "w11term-cli rollout-tool-profiles --candidate MANIFEST --profile NAME [--profile NAME ...] [--profiles CATALOG] [--verify-builds|--require-ready] [--architecture x86_64|aarch64] [--review TOKEN]";
 pub(super) const ROLLBACK_VERB: &str = "rollback-tool-profiles";
 pub(super) const ROLLBACK_HELP: &str =
     "w11term-cli rollback-tool-profiles ROLLOUT-REPLY.json [--review TOKEN]";
@@ -64,10 +64,44 @@ pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
 }
 
 pub(super) fn rollout(args: &[String], output: &mut dyn Write) -> Result<()> {
-    let args = profile_rollout(args, "Choose a tool manifest with --candidate")?;
-    let result = args
-        .store
-        .rollout_tools(&args.profiles, &args.candidate, args.review)?;
+    let mut require_ready = None;
+    let mut architecture = None;
+    let args = profile_rollout_with(
+        args,
+        "Choose a tool manifest with --candidate",
+        |flag, args| {
+            match flag {
+                "--verify-builds" | "--require-ready" => {
+                    ensure!(
+                        require_ready.replace(flag == "--require-ready").is_none(),
+                        "Choose either --verify-builds or --require-ready once"
+                    );
+                }
+                "--architecture" => {
+                    ensure!(architecture.is_none(), "specify --architecture only once");
+                    architecture = Some(parse_architecture(
+                        args.next().context("--architecture requires a value")?,
+                    )?);
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        },
+    )?;
+    ensure!(
+        require_ready.is_some() || architecture.is_none(),
+        "--architecture requires --verify-builds or --require-ready"
+    );
+    let policy = require_ready.map(|require_ready| ToolRolloutBuildPolicy {
+        architecture,
+        require_ready,
+    });
+    let result = args.store.rollout_tools_with_builds(
+        &args.profiles,
+        &args.candidate,
+        args.review,
+        policy,
+    )?;
     let reply = Reply::from_result(Ok(serde_json::to_value(result)?));
     serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;

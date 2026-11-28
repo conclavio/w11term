@@ -113,12 +113,23 @@ pub(super) fn profile_rollout<'a>(
     args: &'a [String],
     missing_candidate: &'static str,
 ) -> Result<ProfileRollout<'a>> {
+    profile_rollout_with(args, missing_candidate, |_, _| Ok(false))
+}
+
+pub(super) fn profile_rollout_with<'a>(
+    args: &'a [String],
+    missing_candidate: &'static str,
+    mut extra: impl FnMut(&str, &mut std::slice::Iter<'a, String>) -> Result<bool>,
+) -> Result<ProfileRollout<'a>> {
     let mut catalog = None;
     let mut candidate = None;
     let mut review = None;
     let mut profiles = Vec::new();
     let mut args = args.iter();
     while let Some(flag) = args.next() {
+        if extra(flag, &mut args)? {
+            continue;
+        }
         let value = args
             .next()
             .with_context(|| format!("{flag} requires a value"))?;
