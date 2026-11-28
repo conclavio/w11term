@@ -40,6 +40,28 @@ pub fn client_extent(hwnd: HWND, scale: f32) -> Option<(f64, f64)> {
     ))
 }
 
+pub fn valid_client_extent((width, height): (f64, f64)) -> bool {
+    width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0
+}
+
+pub fn corrected_client_extent(
+    current: (f64, f64),
+    client: (f64, f64),
+    delta: (f64, f64),
+    first: bool,
+) -> Option<(f64, f64)> {
+    if !valid_client_extent(client) {
+        return None;
+    }
+    let estimate = (client.0 + delta.0, client.1 + delta.1);
+    let corrected = if first && estimate != current {
+        estimate
+    } else {
+        (current.0 + delta.0, current.1 + delta.1)
+    };
+    valid_client_extent(corrected).then_some(corrected)
+}
+
 impl RequestedGrid {
     pub fn new(target: Option<(usize, usize)>) -> Self {
         let value = Self::default();
@@ -324,6 +346,32 @@ impl Windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_correction_rejects_minimized_and_invalid_extents() {
+        let current = (1100.0, 780.0);
+        let delta = (20.0, -30.0);
+        assert_eq!(
+            corrected_client_extent(current, (0.0, 0.0), delta, true),
+            None
+        );
+        assert_eq!(
+            corrected_client_extent(current, (1090.0, 29.0), delta, true),
+            None
+        );
+        assert_eq!(
+            corrected_client_extent(current, (f64::NAN, 700.0), delta, false),
+            None
+        );
+        assert_eq!(
+            corrected_client_extent(current, (1090.0, 800.0), delta, true),
+            Some((1110.0, 770.0))
+        );
+        assert_eq!(
+            corrected_client_extent(current, (1090.0, 800.0), delta, false),
+            Some((1120.0, 750.0))
+        );
+    }
     #[test]
     fn saving_after_a_sibling_preserves_its_placements_and_profile_renames() {
         let dir = tempfile::tempdir().unwrap();

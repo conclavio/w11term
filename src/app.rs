@@ -8179,6 +8179,9 @@ impl Component for TerminalApp {
             }
             Message::WindowsTextSizeChanged => {}
             Message::WindowSize(size) => {
+                if !crate::window_state::valid_client_extent((size.width, size.height)) {
+                    return;
+                }
                 self.width = size.width;
                 self.window_height = size.height;
                 if !self.window_restored {
@@ -8225,12 +8228,14 @@ impl Component for TerminalApp {
                     // requested through ResizeClient with a custom title bar.
                     // After the first resize, apply the remaining error to the
                     // last request, or the same caption offset would recur.
-                    let estimate = (client.0 + delta.0, client.1 + delta.1);
-                    self.client_size = if first && estimate != self.client_size {
-                        estimate
-                    } else {
-                        (self.client_size.0 + delta.0, self.client_size.1 + delta.1)
-                    };
+                    if let Some(corrected) = crate::window_state::corrected_client_extent(
+                        self.client_size,
+                        client,
+                        delta,
+                        first,
+                    ) {
+                        self.client_size = corrected;
+                    }
                     if first {
                         context.spawn_background_with_rejection(
                             move |_| {

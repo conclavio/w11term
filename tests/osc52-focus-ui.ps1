@@ -10,6 +10,7 @@ function Send-Osc52([int]$Pane, [string]$Token) {
     # Space requests beyond the process-wide clipboard rate limit so a denied write
     # cannot pass the test merely because another request used its time slot.
     Start-Sleep -Milliseconds 280
+    if ([FixtureMessages]::GetForegroundWindow() -ne $window) { throw 'The OSC 52 fixture lost foreground before sending' }
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Token))
     $wire = "$([char]27)]52;c;$encoded$([char]7)`r`nseen-$Token"
     $packet = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($wire))
@@ -32,19 +33,41 @@ function Expect-NoChange([string]$Token) {
     if (!(Clipboard-Equals $Token)) { throw "A disallowed OSC 52 request replaced '$Token'" }
 }
 
+function Focus-TerminalWindow {
+    if ([FixtureMessages]::GetForegroundWindow() -ne $window -and
+        ![FixtureMessages]::SetForegroundWindow($window)) {
+        # Restore the fixture on its own GUI thread if Windows declines activation.
+        $null = [FixtureMessages]::ShowWindowAsync($window, 7)
+        $null = Wait-Until 'fixture window to minimize' { [FixtureMessages]::IsIconic($window) }
+        $null = [FixtureMessages]::ShowWindowAsync($window, 9)
+    }
+    $null = Wait-Until 'foreground terminal window' {
+        [FixtureMessages]::GetForegroundWindow() -eq $window -and ![FixtureMessages]::IsIconic($window)
+    }
+}
+
 function Toggle-Setting([string]$Name, [string]$From, [string]$Property, [bool]$Value) {
     $byName = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, $Name)
     $toggleable = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::IsTogglePatternAvailableProperty, $true)
     $condition = [System.Windows.Automation.AndCondition]::new($byName, $toggleable)
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
-    $toggle = Wait-Until "setting '$Name' currently $From" {
-        $item = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-        if ($item) {
+    $search = @{ scroll = $null }
+    $null = Wait-Until "toggle visible setting '$Name' from $From" {
+        try {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
+            $item = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+            if (!$item -or !$item.Current.IsEnabled) { return }
+            if ($item.Current.IsOffscreen) {
+                Move-NativeControlIntoView $item $search
+                return
+            }
             $pattern = $item.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
-            if ($pattern.Current.ToggleState -eq $From) { $pattern }
+            if ($pattern.Current.ToggleState -ne $From) { return }
+            $pattern.Toggle()
+            return $true
+        } catch [System.Windows.Automation.ElementNotAvailableException] {
+            $search.scroll = $null
         }
     }
-    $toggle.Toggle()
     $null = Wait-Until "persisted setting '$Name'" {
         $state = Get-Content -LiteralPath $env:W11TERM_SETTINGS_PATH -Raw | ConvertFrom-Json
         $state.interaction -and $state.interaction.$Property -eq $Value
@@ -54,13 +77,17 @@ function Toggle-Setting([string]$Name, [string]$From, [string]$Property, [bool]$
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','palette-ssh','--cols','132','--rows','36') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
 try {
     $window = Wait-InputWindow
-    $null = Wait-Until 'foreground terminal window' { [FixtureMessages]::GetForegroundWindow() -eq $window }
     $null = Wait-Until 'fixture control pipe' { Test-Path -LiteralPath (Get-ControlManifestPath $app.Id) }
     $first = @(Sessions)[0].id
     Wait-Text $first 'ready'
     $second = (Control @('open','--profile','palette-ssh')).pane
     Wait-Focus $first
     Wait-Text $second 'ready'
+    Focus-TerminalWindow
+    Press-Key 0x78 # F9 selects the second SSH tab.
+    Wait-Focus $second
+    Press-Key 0x77 # F8 selects the first SSH tab.
+    Wait-Focus $first
     # Default policy restricts OSC 52 writes to the foreground pane.
     Send-Osc52 $first 'default-foreground'
     Expect-Clipboard 'default-foreground'
