@@ -437,7 +437,7 @@ try {
         }
         $field.GetCurrentPattern($value).SetValue($fragment[1])
     }
-    Click 'Save dotfiles bundle'
+    Click 'Save dotfiles revision'
     $fishBundle = Join-Path $State 'Fish profile bundle.json'
     $dialog = Wait-OwnedDialog 'Save new dotfiles bundle'
     $null = Wait-Until 'select the Fish bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, $fishBundle) }
