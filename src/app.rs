@@ -123,6 +123,7 @@ mod text_size;
 mod title_tools;
 mod triage;
 mod visual_bell;
+mod windows_release;
 pub use tab_windows::WindowLaunch;
 mod workspace_view;
 use pane_view::PaneSurface;
@@ -1366,6 +1367,7 @@ pub struct TerminalApp {
     text_size: Option<text_size::Monitor>,
     fonts: Vec<String>,
     appearance_error: Option<String>,
+    windows_release: windows_release::Panel,
     saved_commands: w11term::saved_commands::Commands,
     command_reference: command_reference::Panel,
     diagnostics_open: bool,
@@ -1565,6 +1567,7 @@ pub enum Message {
     PacketCapture(packet_capture::Action),
     SyscallView(syscall_view::Action),
     OpenRouter(openrouter_assistance::Action),
+    WindowsRelease(windows_release::Action),
     WordDelimiters(word_delimiters::Edit),
     Workspace(workspace_view::WorkspaceAction),
     ImportConfig(config_import::Action),
@@ -2668,6 +2671,7 @@ impl TerminalApp {
             Button::new().on_click(context.callback(|_| Message::OpenRouter(openrouter_assistance::Action::Show(
                     w11term::openrouter::Task::Draft,
                 )))).content(openrouter_assistance::LABEL),
+            self.windows_release.view(context),
             TextBlock::new().text("Terminal font").font_size(18.0).into(),
             ComboBox::new().width(360.0).automation_name("Terminal font")
                 .items_source(self.fonts.iter().cloned())
@@ -5972,6 +5976,7 @@ impl Component for TerminalApp {
             text_size,
             fonts,
             appearance_error,
+            windows_release: Default::default(),
             saved_commands: Default::default(),
             command_reference: Default::default(),
             diagnostics_open: false,
@@ -7831,6 +7836,7 @@ impl Component for TerminalApp {
             Message::PacketCapture(action) => self.packet_capture_action(action, context),
             Message::SyscallView(action) => self.syscall_view_action(action, context),
             Message::OpenRouter(action) => self.openrouter_action(action, context),
+            Message::WindowsRelease(action) => self.windows_release.update(action, context),
             Message::WordDelimiters(edit) => self.edit_word_delimiters(edit),
             Message::WindowActivation(false) => {
                 self.refresh_notification_visibility();

@@ -20,6 +20,8 @@ mod shared;
 mod sort_ui;
 #[path = "upload_folder_ui.rs"]
 mod upload_folder_ui;
+#[path = "windows_release_ui.rs"]
+mod windows_release_ui;
 use shared::run_gui;
 #[path = "properties_ui.rs"]
 mod properties_ui;
