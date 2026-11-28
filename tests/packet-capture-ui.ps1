@@ -1120,6 +1120,24 @@ try {
         $report.reviewed.options.rotate_files -ne 2 -or $report.reviewed.scratch_filesystem -cne 'tmpfs') {
         throw 'The saved report does not describe the verified packet capture and its reviewed settings'
     }
+    $verified = & $Cli verify-packet-capture-report $destination $reportPath | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or !$verified.ok -or $verified.result.sha256 -cne $digest -or $verified.result.bytes -ne 64) {
+        throw 'The CLI could not verify the Windows capture and report'
+    }
+    Select-Capture $destination
+    $null = Wait-Until 'the saved packet file reopens in offline inspection' {
+        (Find-Element "PCAP${dot}64 bytes") -and !(Find-Element ('Save capture report' + [char]0x2026) $button)
+    }
+    Click ('Verify capture report' + [char]0x2026)
+    $dialog = Wait-Until 'owned packet capture verification picker' { Find-OwnedDialog 'Open packet capture report' }
+    $null = Wait-Until 'select the matching report path' {
+        [FixtureDialog]::SetFilename($dialog, $reportPath, [IO.Path]::GetFileName($reportPath)) -or
+            [FixtureDialog]::SetFilename($dialog, $reportPath, '')
+    }
+    $null = Wait-Until 'verify the selected report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the offline viewer verifies the matching report' {
+        Find-Element "Capture matches report${dot}64 bytes verified"
+    }
     Select-Viewer
     if ([IO.File]::Exists($destination + '.opened')) { throw 'Selecting a viewer opened it without activation' }
     Click 'Open in Wireshark'

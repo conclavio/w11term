@@ -69,6 +69,7 @@ mod resume_download;
 use resume_download::ResumeDownload;
 mod checksum;
 pub use checksum::local_sha256;
+pub(crate) use checksum::local_sha256_with_size;
 mod permissions;
 mod remote_copy;
 mod symbolic_link;

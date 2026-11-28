@@ -30,6 +30,10 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
             (packet_capture::COMPARE_HELP, packet_capture::compare_files)
         }
         packet_capture::CLIP_VERB => (packet_capture::CLIP_HELP, packet_capture::clip_file),
+        packet_capture::VERIFY_REPORT_VERB => (
+            packet_capture::VERIFY_REPORT_HELP,
+            packet_capture::verify_report,
+        ),
         packet_capture::SAVE_SETTINGS_VERB => (
             packet_capture::SAVE_SETTINGS_HELP,
             packet_capture::save_settings,

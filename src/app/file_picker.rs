@@ -79,6 +79,7 @@ pub(super) enum Purpose {
     ComparePacketCapture(PathBuf),
     SavePacketCapture(PathBuf),
     SavePacketCaptureReport(PathBuf),
+    OpenPacketCaptureReport(PathBuf),
     OpenPacketCaptureSettings(PathBuf),
     SavePacketCaptureSettings(PathBuf),
     SavePacketExcerpt(PathBuf, &'static str),
@@ -262,6 +263,7 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 | Purpose::OpenTriageReport(_)
                 | Purpose::CompareTriageReport(_)
                 | Purpose::OpenPacketCapture(_)
+                | Purpose::OpenPacketCaptureReport(_)
                 | Purpose::OpenPacketCaptureSettings(_)
                 | Purpose::ComparePacketCapture(_)
                 | Purpose::WiresharkExecutable(_)
@@ -444,20 +446,26 @@ fn show(owner: usize, purpose: Purpose, initial_folder: Option<PathBuf>) -> Resu
                 }
                 None
             }
-            Purpose::SavePacketCaptureReport(path) => {
+            Purpose::SavePacketCaptureReport(path) | Purpose::OpenPacketCaptureReport(path) => {
                 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-                dialog.SetTitle(w!("Save packet capture report"))?;
+                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT;
+                if clsid == FileOpenDialog {
+                    dialog.SetTitle(w!("Open packet capture report"))?;
+                    options |= FOS_FILEMUSTEXIST;
+                } else {
+                    dialog.SetTitle(w!("Save packet capture report"))?;
+                    dialog.SetDefaultExtension(w!("json"))?;
+                    options &= !FOS_OVERWRITEPROMPT;
+                    options |= FOS_NOTESTFILECREATE;
+                }
                 dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
                     pszName: w!("Packet capture report"),
                     pszSpec: w!("*.json"),
                 }])?;
-                dialog.SetDefaultExtension(w!("json"))?;
                 let mut suggestion = path.file_name().unwrap_or_default().to_os_string();
                 suggestion.push(".json");
                 let wide: Vec<_> = suggestion.encode_wide().chain(Some(0)).collect();
                 dialog.SetFileName(PCWSTR(wide.as_ptr()))?;
-                options &= !FOS_OVERWRITEPROMPT;
-                options |= FOS_PATHMUSTEXIST | FOS_DONTADDTORECENT | FOS_NOTESTFILECREATE;
                 if let Some(folder) = path.parent() {
                     local_folder(&dialog, folder);
                 }

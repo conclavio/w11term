@@ -10,6 +10,7 @@ use w11term::control::{PacketCaptureOptions, Reply, Request};
 use w11term::ssh::{
     LocalPacketCapture, PacketCaptureComparison, PacketCaptureExcerptPlan,
     PacketConversationEndpoints, PacketConversationQuery, open_capture_in_wireshark,
+    verify_packet_capture_report,
 };
 
 pub(super) const HELP: &str = concat!(
@@ -56,6 +57,28 @@ pub(super) const CLIP_HELP: &str = concat!(
     "w11term-cli clip-packet-capture FILE [--elapsed-ns START:END] ",
     "[--ip-pair A,B | --tcp-pair A:PORT,B:PORT | --udp-pair A:PORT,B:PORT] --output-file PATH",
 );
+
+pub(super) const VERIFY_REPORT_VERB: &str = "verify-packet-capture-report";
+pub(super) const VERIFY_REPORT_HELP: &str =
+    "w11term-cli verify-packet-capture-report CAPTURE REPORT";
+
+pub(super) fn verify_report(args: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let [capture, report] = args else {
+        bail!("provide the capture path and its report path");
+    };
+    let capture = path::absolute(capture)?;
+    let report = path::absolute(report)?;
+    let verified = verify_packet_capture_report(&capture, &report)?;
+    let reply = Reply::from_result(Ok(serde_json::json!({
+        "capture_path": capture,
+        "report_path": report,
+        "bytes": verified.bytes,
+        "sha256": verified.sha256,
+    })));
+    serde_json::to_writer(&mut *stdout, &reply)?;
+    writeln!(stdout)?;
+    Ok(())
+}
 
 pub(super) fn inspect_file(args: &[String], stdout: &mut dyn Write) -> Result<()> {
     let mut args = args.iter();

@@ -5,10 +5,24 @@ use windows::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_SHARE_READ};
 
 /// Hash a selected file through one read-only handle that denies writes and deletes.
 pub fn local_sha256(path: &Path, cancel: &TransferCancel) -> Result<String> {
+    local_sha256_with_size(path, None, cancel)
+}
+
+pub(crate) fn local_sha256_with_size(
+    path: &Path,
+    expected_bytes: Option<u64>,
+    cancel: &TransferCancel,
+) -> Result<String> {
     ensure!(!cancel.is_cancelled(), "SHA-256 comparison cancelled");
     let Source::File(file, size) = open_source(path, FILE_READ_DATA, FILE_SHARE_READ)? else {
         bail!("Choose a regular file for SHA-256 comparison");
     };
+    if let Some(expected) = expected_bytes {
+        ensure!(
+            size == expected,
+            "File byte count differs from the expected {expected} bytes (found {size})"
+        );
+    }
     hash_local_handle(file, size, None, cancel)
 }
 

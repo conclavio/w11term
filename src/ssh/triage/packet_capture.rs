@@ -31,6 +31,7 @@ pub use local::{
     CaptureComparison, CaptureExcerpt, CaptureExcerptPlan, ConversationChange,
     ConversationEndpoints, ConversationQuery, LocalCapture, ip_protocol_label,
 };
+pub use report::{CaptureReportVerification, verify_packet_capture_report};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +52,7 @@ impl PacketCaptureOptions {
     pub const DEFAULT_SECONDS: u8 = 15;
     pub const DEFAULT_SNAP_LENGTH: u32 = 192;
     pub const DEFAULT_MAX_MIB: u8 = 16;
+    pub(crate) const MAX_MIB: u8 = 64;
 
     pub fn default_scratch_directory(tmpfs: bool) -> &'static str {
         if tmpfs { "/dev/shm" } else { "/tmp" }
@@ -74,8 +76,9 @@ impl PacketCaptureOptions {
             "Packet capture duration must be 1..=60 seconds"
         );
         ensure!(
-            (1..=64).contains(&self.max_mib),
-            "Packet capture budget must be 1..=64 MiB"
+            (1..=Self::MAX_MIB).contains(&self.max_mib),
+            "Packet capture budget must be 1..={} MiB",
+            Self::MAX_MIB,
         );
         ensure!(
             self.packet_limit != Some(0),

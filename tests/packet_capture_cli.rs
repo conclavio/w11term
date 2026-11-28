@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::Path,
@@ -121,6 +122,82 @@ fn classic_capture() -> Vec<u8> {
     );
     bytes.extend([0_u8; 2]);
     bytes
+}
+
+#[test]
+fn verifies_renamed_captures_and_reports_distinct_size_and_checksum_mismatches() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let capture = root.join("copied capture.pcap");
+    let report = root.join("capture report.json");
+    let original = classic_capture();
+    fs::write(&capture, &original).unwrap();
+    let sha256: String = Sha256::digest(&original)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let mut recorded = json!({
+        "schema_version": 1,
+        "file_name": "original capture.pcap",
+        "bytes": original.len(),
+        "sha256": sha256.to_ascii_uppercase(),
+        "reviewed": { "host": "test.example" }
+    });
+    let write_report =
+        |value: &Value| fs::write(&report, serde_json::to_vec(value).unwrap()).unwrap();
+    let verify = || {
+        Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+            .current_dir(root)
+            .env_remove("LOCALAPPDATA")
+            .args([
+                "verify-packet-capture-report",
+                "copied capture.pcap",
+                "capture report.json",
+            ])
+            .output()
+            .unwrap()
+    };
+    let error = |expected: &str| {
+        let output = verify();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let reply: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(
+            reply["error"].as_str().unwrap().contains(expected),
+            "{reply}"
+        );
+    };
+
+    write_report(&recorded);
+    let verified = verify();
+    assert!(verified.status.success(), "{verified:?}");
+    let reply: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(reply["ok"], true);
+    assert_eq!(reply["result"]["bytes"], original.len());
+    assert_eq!(reply["result"]["sha256"], sha256);
+    assert_eq!(reply["result"]["capture_path"], json!(capture));
+    assert_eq!(reply["result"]["report_path"], json!(report));
+
+    fs::write(&capture, &original[..original.len() - 1]).unwrap();
+    error("File byte count differs");
+    let mut changed = original.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    fs::write(&capture, changed).unwrap();
+    error("Capture SHA-256 differs");
+
+    recorded["schema_version"] = json!(2);
+    write_report(&recorded);
+    error("Unsupported packet capture report version");
+    recorded["schema_version"] = json!(1);
+    recorded["sha256"] = json!("bad digest");
+    write_report(&recorded);
+    error("Invalid packet capture report SHA-256");
+    recorded["bytes"] = json!(65 * 1024 * 1024);
+    write_report(&recorded);
+    error("invalid byte count");
+    fs::write(&report, vec![b' '; 256 * 1024 + 1]).unwrap();
+    error("Packet capture report exceeds 256 KiB");
 }
 
 #[test]

@@ -1,7 +1,73 @@
 use super::{Capture, PacketCaptureOptions, Plan, Rotation, RotationResult};
-use anyhow::{Context, Result};
-use serde::Serialize;
-use std::{borrow::Cow, io::Write, path::Path};
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+use std::{
+    borrow::Cow,
+    fs::File,
+    io::{Read, Write},
+    path::Path,
+};
+
+const SCHEMA_VERSION: u8 = 1;
+const MAX_REPORT_BYTES: u64 = 256 * 1024;
+
+#[derive(Deserialize)]
+struct ReportDigest {
+    schema_version: u8,
+    bytes: u64,
+    sha256: String,
+}
+
+pub struct CaptureReportVerification {
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+pub fn verify_packet_capture_report(
+    capture: &Path,
+    report: &Path,
+) -> Result<CaptureReportVerification> {
+    let file = File::open(report).context("Opening the packet capture report")?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "Choose a packet capture report file"
+    );
+    let mut data = Vec::new();
+    file.take(MAX_REPORT_BYTES + 1)
+        .read_to_end(&mut data)
+        .context("Reading the packet capture report")?;
+    ensure!(
+        data.len() as u64 <= MAX_REPORT_BYTES,
+        "Packet capture report exceeds 256 KiB"
+    );
+    let digest: ReportDigest =
+        serde_json::from_slice(&data).context("Reading the packet capture report JSON")?;
+    ensure!(
+        digest.schema_version == SCHEMA_VERSION,
+        "Unsupported packet capture report version {}",
+        digest.schema_version
+    );
+    let maximum = u64::from(PacketCaptureOptions::MAX_MIB) * 1024 * 1024;
+    ensure!(
+        (24..=maximum).contains(&digest.bytes),
+        "Packet capture report has an invalid byte count"
+    );
+    let expected = crate::sftp::normalize_sha256(&digest.sha256)
+        .context("Invalid packet capture report SHA-256")?;
+    let sha256 = crate::sftp::local_sha256_with_size(
+        capture,
+        Some(digest.bytes),
+        &crate::sftp::TransferCancel::default(),
+    )?;
+    ensure!(
+        sha256 == expected,
+        "Capture SHA-256 differs from the packet capture report"
+    );
+    Ok(CaptureReportVerification {
+        bytes: digest.bytes,
+        sha256,
+    })
+}
 
 #[derive(Clone, Serialize)]
 pub(super) struct Reviewed {
@@ -53,7 +119,7 @@ struct Report<'a> {
 impl Capture {
     pub fn save_report(&self, path: &Path) -> Result<()> {
         let report = Report {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             file_name: self
                 .path
                 .file_name()

@@ -10,6 +10,7 @@ use w11term::{
         PacketCaptureExcerpt, PacketCaptureExcerptPlan, PacketCaptureInterfaces, PacketCapturePlan,
         PacketConversationEndpoints, ip_protocol_label, open_capture_in_wireshark,
         open_capture_interval_in_wireshark, open_capture_pair_in_wireshark,
+        verify_packet_capture_report,
     },
 };
 
@@ -50,6 +51,7 @@ pub enum Action {
     Review,
     Save,
     SaveReport,
+    VerifyReport,
     SettingsExpanded(bool),
     OpenSettings,
     SaveSettings,
@@ -77,6 +79,7 @@ pub enum Outcome {
     Destination(PathBuf),
     Saved(PacketCapture),
     ReportSaved(PathBuf),
+    ReportVerified(u64),
     SettingsLoaded(PathBuf, PacketCaptureOptions),
     SettingsSaved(PathBuf),
     ExcerptSaved(PacketCaptureExcerpt),
@@ -974,6 +977,10 @@ impl Panel {
         if self.loaded.is_some() {
             files.extend([
                 KeyedView::new(
+                    "verify-capture-report",
+                    button("Verify capture report…", idle, || Action::VerifyReport),
+                ),
+                KeyedView::new(
                     "compare-captures",
                     button("Compare captures…", idle, || Action::CompareCapture),
                 ),
@@ -1202,6 +1209,7 @@ impl TerminalApp {
             Action::Review => self.review_packet_capture(ctx),
             Action::Save => self.choose_capture_file(FileChoice::Save, ctx),
             Action::SaveReport => self.save_packet_report(ctx),
+            Action::VerifyReport => self.verify_packet_report(ctx),
             Action::SettingsExpanded(expanded) => panel.settings_expanded = expanded,
             Action::OpenSettings => self.choose_capture_file(FileChoice::OpenSettings, ctx),
             Action::SaveSettings => self.choose_capture_file(FileChoice::SaveSettings, ctx),
@@ -1562,6 +1570,24 @@ impl TerminalApp {
         });
     }
 
+    fn verify_packet_report(&mut self, ctx: &ComponentContext<Self>) {
+        let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
+            return;
+        };
+        let panel = &mut self.packet_capture;
+        let Some(capture) = &panel.loaded else { return };
+        let capture = capture.path().to_owned();
+        let ticket = panel.begin("Choosing a packet capture report to verify…");
+        work(ctx, ticket, move || {
+            let purpose = file_picker::Purpose::OpenPacketCaptureReport(capture.clone());
+            let Some(file) = file_picker::pick(owner, purpose)? else {
+                return Ok(None);
+            };
+            let verified = verify_packet_capture_report(&capture, &file.path)?;
+            Ok(Some(Outcome::ReportVerified(verified.bytes)))
+        });
+    }
+
     fn packet_capture_finished(
         &mut self,
         ticket: Arc<()>,
@@ -1625,6 +1651,9 @@ impl TerminalApp {
             }
             Ok(Some(Outcome::ReportSaved(path))) => {
                 panel.status = Some(format!("Saved packet capture report · {}", path.display()));
+            }
+            Ok(Some(Outcome::ReportVerified(bytes))) => {
+                panel.status = Some(format!("Capture matches report · {bytes} bytes verified"));
             }
             Ok(Some(Outcome::SettingsLoaded(path, settings))) => {
                 panel.inputs = settings.into();
