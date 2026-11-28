@@ -48,15 +48,20 @@ pub enum Outcome {
     ComparisonFiltered(FilteredComparison),
     Reviewed(Box<capture::Review>),
     Destination(Box<capture::Recording>),
-    Captured(Arc<Profile>, PathBuf, CpuProfileSummary),
+    Captured(Arc<Profile>, PathBuf, Box<CapturedProfile>),
     Exported,
+}
+
+pub struct CapturedProfile {
+    summary: CpuProfileSummary,
+    repeat: capture::Repeat,
 }
 
 struct Loaded {
     profile: Arc<Profile>,
     path: PathBuf,
     plot: Plot,
-    capture: Option<CpuProfileSummary>,
+    capture: Option<Box<CapturedProfile>>,
     differential: Option<Differential>,
     ticket: Arc<()>,
     zoom: usize,
@@ -98,7 +103,12 @@ impl Panel {
         ticket
     }
 
-    fn load(&mut self, profile: Arc<Profile>, path: PathBuf, capture: Option<CpuProfileSummary>) {
+    fn load(
+        &mut self,
+        profile: Arc<Profile>,
+        path: PathBuf,
+        capture: Option<Box<CapturedProfile>>,
+    ) {
         self.comparison = None;
         self.inspection = None;
         self.loaded = Some(Loaded::new(profile, path, capture, 0));
@@ -229,6 +239,15 @@ impl Panel {
                     .content("Capture from SSH"),
             ));
             if let Some(loaded) = &self.loaded {
+                if loaded.capture.is_some() {
+                    fields.push(KeyedView::new(
+                        "repeat-profile",
+                        Button::new()
+                            .is_enabled(idle)
+                            .on_click(send(|| Action::Capture(capture::Action::Repeat)))
+                            .content("Repeat CPU profile…"),
+                    ));
+                }
                 fields.push(KeyedView::new(
                     "compare",
                     Button::new()
@@ -256,7 +275,7 @@ impl Loaded {
     fn new(
         profile: Arc<Profile>,
         path: PathBuf,
-        capture: Option<CpuProfileSummary>,
+        capture: Option<Box<CapturedProfile>>,
         zoom: usize,
     ) -> Self {
         Self::with_mode(profile, path, capture, zoom, None)
@@ -276,7 +295,7 @@ impl Loaded {
     fn with_mode(
         profile: Arc<Profile>,
         path: PathBuf,
-        capture: Option<CpuProfileSummary>,
+        capture: Option<Box<CapturedProfile>>,
         zoom: usize,
         differential: Option<Differential>,
     ) -> Self {
@@ -502,6 +521,7 @@ impl Loaded {
             ));
         }
         if let Some(capture) = &self.capture {
+            let capture = &capture.summary;
             if let Some(raw) = &capture.perf_data {
                 fields.push(text(
                     "raw-recording",
@@ -885,8 +905,8 @@ impl TerminalApp {
                 self.diagnostic_control.finish(&ticket, &result);
                 if let Some(activity) = &mut panel.activity {
                     activity.finish(&ticket, &result, |outcome| match outcome {
-                        Outcome::Captured(_, path, summary) => {
-                            let outcome = profile_outcome(summary)
+                        Outcome::Captured(_, path, capture) => {
+                            let outcome = profile_outcome(&capture.summary)
                                 .map_or_else(String::new, |outcome| format!("\n{outcome}"));
                             Some(format!("Saved CPU profile{outcome}\n{}", path.display()))
                         }
@@ -934,8 +954,8 @@ impl TerminalApp {
                             form.review = Some(*review);
                         }
                     }
-                    Ok(Some(Outcome::Captured(profile, path, summary))) => {
-                        panel.load(profile, path.clone(), Some(summary));
+                    Ok(Some(Outcome::Captured(profile, path, capture))) => {
+                        panel.load(profile, path.clone(), Some(capture));
                         panel.capture = None;
                         panel.status = Some("Captured CPU profile".into());
                         self.remember_diagnostic(ArtifactKind::CpuProfile, [path], ctx);

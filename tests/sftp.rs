@@ -523,7 +523,14 @@ impl server::Handler for Peer {
             s.channel_success(c)?;
             match args.as_slice() {
                 ["4", "inspect", "42", "0", "2", "99", "fp", "32768", "4096"] => {
-                    s.data(c, b"w11term-cpu-profile-v1\t800\td29ya2Vy\n".to_vec())?;
+                    let ticks = fs::read_to_string(self.root.join("profile-start-ticks"))
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(800);
+                    s.data(
+                        c,
+                        format!("w11term-cpu-profile-v1\t{ticks}\td29ya2Vy\n").into_bytes(),
+                    )?;
                     s.exit_status_request(c, 0)?;
                 }
                 [

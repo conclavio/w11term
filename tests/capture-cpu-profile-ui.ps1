@@ -6,6 +6,8 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $output = Join-Path $State 'profile from triage.folded'
 $marker = [IO.File]::ReadAllText((Join-Path $State 'capture-marker'))
+$ticks = [IO.File]::ReadAllText((Join-Path $State 'profile-ticks-path'))
+$repeat = 'Repeat CPU profile' + [char]0x2026
 $dot = ' ' + [char]0xb7 + ' '
 $measurement = [IO.File]::ReadAllText((Join-Path $State 'profile-measurement'))
 $profileWorker = 'Profile worker' + $dot + 'PID 42' + $dot + '80.0% ' + $measurement
@@ -92,6 +94,23 @@ try {
     if ([IO.File]::ReadAllText($output) -cne ('worker;main;hot_loop 1' + [char]10)) {
         throw 'The saved profile does not contain the reviewed stack'
     }
+    $null = Control @('focus-pane','--pane',"$remotePane")
+    Wait-Focus $remotePane
+    Click-CaptureButton $repeat
+    $null = Wait-Until 'the repeated PID draft restores its target and sampling' {
+        $pidField = Find-Element 'Linux process ID' $editType
+        $seconds = Find-Element 'Duration in seconds' $editType
+        $pidField -and $pidField.GetCurrentPattern($valuePattern).Current.Value -eq '42' -and
+            $seconds -and $seconds.GetCurrentPattern($valuePattern).Current.Value -eq '2' -and
+            !(Find-Element 'Record CPU profile' $button)
+    }
+    [IO.File]::WriteAllText($ticks, '801')
+    Click-CaptureButton 'Review CPU profile'
+    $null = Wait-Until 'review rejects a recycled PID on the original SSH connection' {
+        (Find-Element 'The original PID now belongs to a different process. Enter the PID you want to profile.') -and
+            !(Find-Element 'Record CPU profile' $button)
+    }
+    Click-CaptureButton 'Back to flame graph'
     $null = Control @('close-pane','--pane',"$remotePane")
     Wait-Focus $localPane
     Click-CaptureButton 'Return to diagnostics overview'
@@ -99,6 +118,15 @@ try {
     Click-CaptureButton 'Open CPU flame graph activity'
     $null = Wait-Until 'the completed graph survives closing SSH' {
         Find-Element ('All samples' + $dot + '1 sample' + $dot + '100.0% of capture')
+    }
+    Click-CaptureButton $repeat
+    $null = Wait-Until 'an offline repeat restores sampling but leaves the PID empty' {
+        $pidField = Find-Element 'Linux process ID' $editType
+        $seconds = Find-Element 'Duration in seconds' $editType
+        $review = Find-Element 'Review CPU profile' $button
+        $pidField -and !$pidField.GetCurrentPattern($valuePattern).Current.Value -and
+            $seconds -and $seconds.GetCurrentPattern($valuePattern).Current.Value -eq '2' -and
+            $review -and !$review.Current.IsEnabled
     }
 } finally {
     Close-FixtureApp $app

@@ -235,7 +235,7 @@ async fn native_cpu_launch_reviews_literal_arguments_and_saves_the_stopped_profi
     drive_mixed_gui("cpu-launch-ui.ps1", &ssh, state.path());
     assert!(marker.exists());
     assert_eq!(transports.load(Ordering::Relaxed), 1);
-    assert_eq!(channels.load(Ordering::Relaxed), 3);
+    assert_eq!(channels.load(Ordering::Relaxed), 5);
     server.abort();
 }
 
@@ -311,10 +311,15 @@ async fn record_cpu_profile_from_triage(top_fallback: bool) {
         captured.to_str().unwrap(),
     )
     .unwrap();
+    fs::write(
+        state.path().join("profile-ticks-path"),
+        remote.path().join("profile-start-ticks").to_str().unwrap(),
+    )
+    .unwrap();
     drive_mixed_gui("capture-cpu-profile-ui.ps1", &ssh, state.path());
     assert!(captured.exists());
     assert_eq!(transports.load(Ordering::Relaxed), 1);
-    assert_eq!(channels.load(Ordering::Relaxed), 5);
+    assert_eq!(channels.load(Ordering::Relaxed), 6);
     server.abort();
 }
 

@@ -6,6 +6,7 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $folded = Join-Path $State 'launched workload.folded'
 $raw = [IO.Path]::ChangeExtension($folded, 'perf.data')
+$repeated = Join-Path $State 'repeated workload.folded'
 $marker = [IO.File]::ReadAllText((Join-Path $State 'launch-marker'))
 $wire = [IO.File]::ReadAllText((Join-Path $State 'launch-wire'))
 $comboType = [System.Windows.Automation.ControlType]::ComboBox
@@ -123,6 +124,43 @@ try {
     $expected = [Text.Encoding]::ASCII.GetBytes('PERFILE2') +
         [byte[]]@(0,255,13,10) + [Text.Encoding]::ASCII.GetBytes('raw perf fixture') + [byte]0
     if (($actual -join ',') -cne ($expected -join ',')) { throw 'The raw perf recording was not preserved byte for byte' }
+    [IO.File]::Delete($marker)
+    Click-LaunchButton ('Repeat CPU profile' + [char]0x2026)
+    $null = Wait-Until 'the repeat draft restores the literal command and requires fresh review' {
+        $program = Find-Element 'Linux executable' $editType
+        $argv = Find-Element 'Arguments (JSON array)' $editType
+        $directory = Find-Element 'Working directory (defaults to home)' $editType
+        $seconds = Find-Element 'Time limit in seconds' $editType
+        $program -and $program.GetCurrentPattern($valuePattern).Current.Value -ceq './cpu worker' -and
+            $argv -and $argv.GetCurrentPattern($valuePattern).Current.Value -ceq '["one arg","it''s $literal","","--child"]' -and
+            $directory -and $directory.GetCurrentPattern($valuePattern).Current.Value -ceq '/tmp/work space' -and
+            $seconds -and $seconds.GetCurrentPattern($valuePattern).Current.Value -ceq '2' -and
+            !(Find-Element 'Record CPU profile' $button)
+    }
+    Click-LaunchButton 'Review CPU profile'
+    $null = Wait-Until 'the fresh review retains the raw recording option' {
+        (Find-Element 'Executable "/tmp/work space/cpu worker"') -and
+            (Find-Element 'Saves a .perf.data file next to the folded profile. The transfer can take up to 60 additional seconds.')
+    }
+    Click-LaunchButton 'Record CPU profile'
+    $dialog = Wait-OwnedDialog 'Save CPU profile'
+    if ([IO.File]::Exists($marker)) {
+        throw 'The repeated workload started before destination approval'
+    }
+    $null = Wait-Until 'enter a new destination for the repeated profile' {
+        [FixtureDialog]::SetFilename($dialog, $repeated, 'cpu-profile.folded')
+    }
+    $null = Wait-Until 'confirm the repeated profile destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the repeated workload starts' { [IO.File]::Exists($marker) }
+    Click-LaunchButton 'Stop and save profile'
+    $null = Wait-Until 'the repeated profile and raw recording are saved' {
+        [IO.File]::Exists($repeated) -and (Find-Element 'Captured CPU profile') -and
+            [IO.File]::Exists([IO.Path]::ChangeExtension($repeated, 'perf.data'))
+    }
+    if ([IO.File]::ReadAllText($repeated) -cne [IO.File]::ReadAllText($folded) -or
+        ([IO.File]::ReadAllBytes([IO.Path]::ChangeExtension($repeated, 'perf.data')) -join ',') -cne ($actual -join ',')) {
+        throw 'The repeated profile did not preserve the folded stacks and raw recording'
+    }
 } finally {
     Close-FixtureApp $app
 }
