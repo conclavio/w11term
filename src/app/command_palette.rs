@@ -1179,7 +1179,7 @@ pub(super) fn view(
         .as_ref()
         .filter(|_| mode == Search::RunningCommands);
     let search_height = if mode == Search::CommandHistory {
-        if narrow_history { 264.0 } else { 232.0 }
+        if narrow_history { 304.0 } else { 232.0 }
     } else if mode == Search::RunningCommands {
         running.map_or(296.0, pane_picker::Picker::running_controls_height)
     } else if mode == Search::ClosedTabs && !rows.is_empty() {
@@ -1354,8 +1354,9 @@ pub(super) fn view(
     let history_controls = history.map_or_else(View::empty, |picker| {
         picker.window_history_controls(narrow_history, ctx)
     });
-    let history_export =
-        history.map_or_else(View::empty, |picker| picker.history_export_button(app, ctx));
+    let history_actions = history.map_or_else(View::empty, |picker| {
+        picker.window_history_actions(narrow_history, app, ctx)
+    });
     let running_controls = running.map_or_else(View::empty, |picker| {
         picker.running_command_controls(app, ctx)
     });
@@ -1380,7 +1381,7 @@ pub(super) fn view(
             history_controls,
             StackPanel::new().spacing(4.0).keyed_children(results),
             reopen_window,
-            history_export,
+            history_actions,
             running_controls,
         )),
         (app.width - 32.0).clamp(1.0, 660.0),

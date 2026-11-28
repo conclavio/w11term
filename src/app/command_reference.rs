@@ -679,6 +679,16 @@ impl Panel {
 }
 
 impl TerminalApp {
+    pub(super) fn captured_reference_query(
+        &self,
+        pane: u64,
+        link: w11term::events::CommandLink,
+    ) -> Option<command_line::Lookup> {
+        let frame = self.history_frame(pane)?;
+        let text = frame.command_for_link(link)?.command.as_deref()?;
+        self.recorded_reference_query(pane, text)
+    }
+
     pub(super) fn recorded_reference_query(
         &self,
         pane: u64,

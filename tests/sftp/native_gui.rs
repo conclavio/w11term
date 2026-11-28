@@ -95,6 +95,25 @@ async fn native_selected_terminal_command_resolves_a_subcommand_offline() {
     run_palette_fixture("selected-command-reference-ui.ps1", b"", Some(&history)).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens an SSH manual from a PowerShell window-history search and restores its filtered result"]
+async fn native_window_history_opens_the_selected_capture_and_manual() {
+    run_palette_fixture(
+        "window-history-reference-ui.ps1",
+        b"",
+        Some(concat!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07git log -5\r\n",
+            "\x1b]133;C\x07earlier output audit-token\r\n\x1b]133;D;5\x07",
+            "\x1b]133;A\x07$ \x1b]133;B\x07git status --short\r\n",
+            "\x1b]133;C\x07latest output audit-token\r\n\x1b]133;D;2\x07",
+            "\x1b]133;A\x07$ \x1b]133;B\x07git diff\r\n",
+            "\x1b]133;C\x07successful output audit-token\r\n\x1b]133;D;0\x07",
+            "window-history-reference-ready\r\n",
+        )),
+    )
+    .await;
+}
+
 #[test]
 #[ignore = "saves an offline manual example and recalls it in a real PowerShell pane"]
 fn native_reference_examples_save_offline_and_require_explicit_shell_submit() {
