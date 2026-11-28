@@ -126,6 +126,26 @@ try {
     $expected = [Text.Encoding]::ASCII.GetBytes('PERFILE2') +
         [byte[]]@(0,255,13,10) + [Text.Encoding]::ASCII.GetBytes('raw perf fixture') + [byte]0
     if (($actual -join ',') -cne ($expected -join ',')) { throw 'The raw perf recording was not preserved byte for byte' }
+    $reportPath = "$folded.json"
+    Click-LaunchButton ('Save capture report' + [char]0x2026)
+    $dialog = Wait-OwnedDialog 'Save CPU profile report'
+    $null = Wait-Until 'choose the command capture report destination' {
+        [FixtureDialog]::SetFilename($dialog, $reportPath, [IO.Path]::GetFileName($reportPath))
+    }
+    $null = Wait-Until 'confirm the command capture report destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'command capture report is saved' { Find-Element 'Saved CPU profile report' }
+    $proof = & $Cli verify-cpu-profile-report $folded $reportPath --perf-data $raw | ConvertFrom-Json
+    $report = $proof.result.report
+    $target = $report.reviewed.target
+    $expectedArguments = @('one arg', 'it''s $literal', '', '--child')
+    if ($LASTEXITCODE -ne 0 -or !$proof.ok -or $target.mode -ne 'command' -or
+        $target.program -cne '/tmp/work space/cpu worker' -or $target.directory -cne '/tmp/work space' -or
+        ($target.options.arguments -join [char]0) -cne ($expectedArguments -join [char]0) -or
+        $report.workload.status -ne 'stopped' -or $report.samples -ne 2 -or
+        !$report.reviewed.raw_perf_data_requested -or $report.raw_perf_data.bytes -ne $actual.Length -or
+        ![FixtureDialog]::SameFile($raw, $proof.result.verified_perf_data_path)) {
+        throw "Command capture report did not preserve the reviewed options and both files: $($proof | ConvertTo-Json -Depth 10 -Compress)"
+    }
     if (Find-Element $compareOriginal $button) { throw 'A standalone profile has no original to compare' }
     [IO.File]::Delete($marker)
     Click-LaunchButton ('Repeat CPU profile' + [char]0x2026)
@@ -186,8 +206,10 @@ try {
     $dialog = Wait-OwnedDialog 'Open folded stacks'
     $null = Wait-Until 'enter the standalone profile path' { [FixtureDialog]::SetFilename($dialog, $folded, '') }
     $null = Wait-Until 'open the standalone profile' { [FixtureDialog]::ClickButton($dialog, 1) }
-    $null = Wait-Until 'opening a standalone profile clears the repeat comparison' {
-        (Find-Element 'launched workload.folded') -and !(Find-Element $compareOriginal $button)
+    $null = Wait-Until 'opening a standalone profile clears the capture actions' {
+        (Find-Element 'launched workload.folded') -and
+            !(Find-Element $compareOriginal $button) -and
+            !(Find-Element ('Save capture report' + [char]0x2026) $button)
     }
 } finally {
     Close-FixtureApp $app

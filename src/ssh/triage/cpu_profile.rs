@@ -4,9 +4,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{BufWriter, Write},
+    io::{BufWriter, Seek, Write},
     num::NonZeroU32,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -17,6 +18,7 @@ const WORKER: &str = concat!(
 );
 const RUNNER: &str = include_str!("cpu-launch-command.sh");
 const MAX_SECONDS: u8 = 30;
+const EVENT: &str = "cpu-clock:u";
 const RECORD_KIB: usize = 32 * 1024;
 const STACKS_KIB: usize = 4 * 1024;
 const PROCESS_WIRE_BYTES: usize = 4096;
@@ -27,8 +29,10 @@ const END_MARKER: &[u8] = b"\nw11term-cpu-profile-end\n";
 const STOP_MARKER: &[u8] = b"w11term-cpu-profile-stopped-v1\n";
 pub(crate) mod launch;
 mod raw;
+mod report;
 pub use launch::CpuWorkloadOutcome;
 pub use raw::PerfDataArtifact;
+pub use report::{CpuProfileCaptureReport, verify_cpu_profile_report};
 pub const PERF_DATA_TRANSFER_SECONDS: u64 = 60;
 pub(crate) const CONTROL_TIMEOUT_SECONDS: u64 =
     MAX_SECONDS as u64 + EXTRA_WORK_SECONDS + SSH_MARGIN_SECONDS + 20;
@@ -149,7 +153,7 @@ impl Target {
                     ),
             "The reviewed SSH connection changed. Review the process again."
         );
-        Recording::check_destinations(path, perf_data)?;
+        Recording::check_destinations(path, perf_data, None)?;
         crate::ssh::NETWORK
             .block_on(self.capture_cpu_profile(
                 plan.options,
@@ -188,7 +192,7 @@ impl Target {
             process_name: crate::events::display_field(&name),
             process_start_ticks: ticks,
             options,
-            event: "cpu-clock:u",
+            event: EVENT,
             deadline_seconds: options.worker_seconds() + SSH_MARGIN_SECONDS,
             max_recording_bytes: RECORD_KIB * 1024,
             max_stack_output_bytes: STACKS_KIB * 1024,
@@ -245,7 +249,18 @@ impl Target {
                 folded.summary.stopped_by_user = stopped.is_some();
                 folded
             });
-        Ok(Recording { folded, perf_data })
+        let reviewed = report::Review::process(
+            self.link.verified_endpoint(),
+            options,
+            crate::events::display_field(&name),
+            ticks,
+            raw,
+        );
+        Ok(Recording {
+            folded,
+            perf_data,
+            reviewed,
+        })
     }
 }
 
@@ -320,47 +335,75 @@ pub struct CpuProfileSummary {
     pub perf_data: Option<PerfDataArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub perf_data_warning: Option<String>,
+    #[serde(skip)]
+    pub capture_report: Option<Arc<CpuProfileCaptureReport>>,
 }
 
 pub(crate) struct Recording {
     folded: Result<Folded>,
     perf_data: Option<raw::Staged>,
+    reviewed: report::Review,
 }
 
 impl Recording {
-    pub(crate) fn check_destinations(folded: &Path, perf_data: Option<&Path>) -> Result<()> {
-        if let Some(perf_data) = perf_data {
-            raw::distinct_destinations(folded, perf_data)
-        } else {
-            Folded::check_destination(folded).map(|_| ())
+    pub(crate) fn check_destinations(
+        folded: &Path,
+        perf_data: Option<&Path>,
+        report: Option<&Path>,
+    ) -> Result<()> {
+        let destinations = [
+            (Some(folded), "folded CPU profile"),
+            (perf_data, "raw perf recording"),
+            (report, "CPU profile report"),
+        ];
+        let mut checked: Vec<(PathBuf, String)> = Vec::new();
+        for (path, label) in destinations {
+            let Some(path) = path else { continue };
+            let directory = diagnostic_destination(path, label)?;
+            if perf_data.is_some() || report.is_some() {
+                let directory = directory.canonicalize()?;
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                ensure!(
+                    !checked.iter().any(|(existing_dir, existing_name)| {
+                        &directory == existing_dir && name.eq_ignore_ascii_case(existing_name)
+                    }),
+                    "Choose different destinations for the CPU profile, raw recording and report"
+                );
+                checked.push((directory, name.into_owned()));
+            }
         }
+        Ok(())
     }
 
     pub(crate) fn save(self, path: &Path) -> Result<CpuProfileSummary> {
         let folded = self.folded.and_then(|folded| folded.save(path));
-        let Some(raw) = self.perf_data else {
-            return folded;
-        };
-        match (folded, raw.save()) {
-            (Ok(mut summary), Ok(raw)) => {
+        let (mut summary, artifact) = match (folded, self.perf_data.map(raw::Staged::save)) {
+            (folded, None) => folded,
+            (Ok((mut summary, artifact)), Some(Ok(raw))) => {
                 summary.perf_data = Some(raw);
-                Ok(summary)
+                Ok((summary, artifact))
             }
-            (Ok(mut summary), Err(error)) => {
+            (Ok((mut summary, artifact)), Some(Err(error))) => {
                 summary.perf_data_warning =
                     Some(format!("Raw perf recording could not be saved. {error:#}"));
-                Ok(summary)
+                Ok((summary, artifact))
             }
-            (Err(error), Ok(raw)) => Err(error).with_context(|| {
+            (Err(error), Some(Ok(raw))) => Err(error).with_context(|| {
                 format!(
                     "Raw perf recording saved to {}. The folded profile could not be saved",
                     raw.path.display()
                 )
             }),
-            (Err(error), Err(raw_error)) => Err(error).context(format!(
+            (Err(error), Some(Err(raw_error))) => Err(error).context(format!(
                 "Raw perf recording could not be saved. {raw_error:#}"
             )),
-        }
+        }?;
+        summary.capture_report = Some(Arc::new(CpuProfileCaptureReport::new(
+            artifact,
+            self.reviewed,
+            &summary,
+        )));
+        Ok(summary)
     }
 }
 
@@ -369,7 +412,7 @@ impl Folded {
         diagnostic_destination(path, "folded CPU profile")
     }
 
-    pub(crate) fn save(self, path: &Path) -> Result<CpuProfileSummary> {
+    fn save(self, path: &Path) -> Result<(CpuProfileSummary, report::Artifact)> {
         let directory = Self::check_destination(path)?;
         let mut staged = tempfile::NamedTempFile::new_in(directory)?;
         {
@@ -380,11 +423,21 @@ impl Folded {
             writer.flush()?;
         }
         staged.as_file().sync_all()?;
+        let file = staged.as_file_mut();
+        let bytes = file.metadata()?.len();
+        file.rewind()?;
+        let sha256 = crate::sftp::hash_local_handle(
+            file,
+            bytes,
+            None,
+            &crate::sftp::TransferCancel::default(),
+        )
+        .context("Hashing the folded CPU profile")?;
         staged
             .persist_noclobber(path)
             .map_err(|error| error.error)
             .context("Saving the folded CPU profile")?;
-        Ok(self.summary)
+        Ok((self.summary, report::Artifact::new(path, bytes, sha256)))
     }
 }
 

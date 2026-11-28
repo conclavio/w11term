@@ -5,6 +5,7 @@ pub mod flame_graph;
 mod profile;
 
 pub use compare::{Change, Comparison, FilteredComparison};
+pub(crate) use profile::MAX_FILE_BYTES;
 pub use profile::{Frame, Profile, Search};
 
 pub fn sample_share(samples: u64, total: u64) -> f64 {

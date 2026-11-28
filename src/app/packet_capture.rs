@@ -1775,7 +1775,7 @@ impl TerminalApp {
         work(ctx, ticket, move || {
             let purpose = file_picker::Purpose::CaptureReport {
                 capture: capture.path.clone(),
-                kind: file_picker::CaptureFileKind::Packet,
+                kind: file_picker::CaptureReportKind::Packet,
                 save: true,
             };
             let Some(file) = file_picker::pick(owner, purpose)? else {
@@ -1815,7 +1815,7 @@ impl TerminalApp {
         work(ctx, ticket, move || {
             let purpose = file_picker::Purpose::CaptureReport {
                 capture: capture.clone(),
-                kind: file_picker::CaptureFileKind::Packet,
+                kind: file_picker::CaptureReportKind::Packet,
                 save: false,
             };
             let Some(file) = file_picker::pick(owner, purpose)? else {

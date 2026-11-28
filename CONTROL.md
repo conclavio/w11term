@@ -1982,6 +1982,15 @@ In the Windows app, select a connected Linux SSH pane and open **More → Diagno
 
 Choose **Review CPU profile** to check the live process and verified SSH endpoint. Then choose **Record CPU profile** and a new local folded stacks file. Changes to the settings require a fresh review. Recording stays tied to the pane, connection, and process start time from review. The resulting file opens in the flame graph with the unresolved frame count and **Perf output**, when available.
 
+On a completed capture, choose **Save capture report…** to write a new JSON file beside the folded profile or at another destination. The report records the reviewed SSH endpoint, PID and start ticks or resolved command and literal arguments, sampling settings, stop or command outcome, and sample totals. It includes the original filenames, byte counts, and SHA-256 digests of the folded profile and any saved raw recording. Review the endpoint and command metadata before sharing the report.
+
+`verify-cpu-profile-report` checks a selected folded file against that report offline. Pass `--perf-data` to check both files in one command. Filenames may change. The JSON reply contains the report and the paths checked, and a mismatch returns a nonzero exit code. The digests verify file contents against the supplied report.
+
+```powershell
+& $ctl verify-cpu-profile-report '.\cpu.folded' '.\cpu.folded.json'
+& $ctl verify-cpu-profile-report '.\cpu.folded' '.\cpu.folded.json' --perf-data '.\cpu.perf.data'
+```
+
 Choose **Repeat CPU profile…** on a completed capture to reuse its sampling settings, raw recording choice, and any command inputs. A recorded PID is filled in on its original SSH connection and checked against the original process start time at review. With another pane selected, enter a PID for that pane. Each repeat requires a fresh review and a new destination.
 
 After recording a repeat, choose **Compare with original profile** to open the original stacks as **Before** and the repeated run as **After**. The comparison uses the loaded stacks. **Back to flame graph** returns to the repeated result.
@@ -2004,6 +2013,8 @@ $plan = (& $ctl --pid 12345 preview-cpu-profile @sampling | ConvertFrom-Json).re
 $plan
 & $ctl --pid 12345 capture-cpu-profile @sampling --connection-generation $plan.connection_generation --process-start-ticks $plan.process_start_ticks --output-file '.\cpu.folded'
 ```
+
+Add `--report-file PATH` to save the same capture report from the CLI. The reply returns `result.report_path` on success or `result.report_error` if the profile was saved and the report could not be written.
 
 The defaults are 10 seconds, 99 Hz, and frame pointers. Choose 1–30 seconds, 1–199 Hz, or `dwarf` for DWARF unwinding with an 8 KiB stack snapshot. The remote Linux host needs `perf`, Bash, GNU coreutils, and permission to sample the process. w11term samples user-space CPU activity on the selected process and checks that its start time matches before and after recording. It runs under the signed-in SSH account. [perf record](https://github.com/torvalds/linux/blob/master/tools/perf/Documentation/perf-record.txt) · [Linux perf permissions](https://docs.kernel.org/admin-guide/perf-security.html)
 

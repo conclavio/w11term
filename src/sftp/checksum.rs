@@ -45,7 +45,7 @@ fn open_local_for_hash(path: &Path, expected_bytes: Option<u64>) -> Result<(File
     Ok((file, size))
 }
 
-pub(super) fn hash_local_handle(
+pub(crate) fn hash_local_handle(
     mut file: impl Read,
     size: u64,
     max_bytes: Option<u64>,

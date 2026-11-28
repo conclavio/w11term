@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DEPTH: usize = 513;
 const MAX_FRAMES: usize = 250_000;
 

@@ -1,11 +1,11 @@
 use super::{
     CaptureStop, CpuCallGraph, CpuProfileSummary, END_MARKER, EXTRA_WORK_SECONDS, PROBE_SECONDS,
     RECORD_KIB, RUNNER, Recording, SSH_MARGIN_SECONDS, STACKS_KIB, SUPERVISOR, Target, fold, quote,
-    transfer_seconds, validate_sampling,
+    report, transfer_seconds, validate_sampling,
 };
 use anyhow::{Context, Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -18,7 +18,8 @@ const WORKER: &str = concat!(
 const REVIEW_BYTES: usize = 16 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CpuLaunchOptions {
     pub program: String,
     pub arguments: Vec<String>,
@@ -76,7 +77,7 @@ pub struct CpuLaunchPlan {
     pub max_stack_output_bytes: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(tag = "status", content = "code", rename_all = "kebab-case")]
 pub enum CpuWorkloadOutcome {
     Exited(u8),
@@ -135,7 +136,7 @@ impl Target {
                     ),
             "The reviewed SSH connection changed. Review the command again."
         );
-        Recording::check_destinations(path, perf_data)?;
+        Recording::check_destinations(path, perf_data, None)?;
         crate::ssh::NETWORK
             .block_on(self.capture_cpu_launch(plan, perf_data.map(Path::to_owned), stop))?
             .save(path)
@@ -219,7 +220,12 @@ impl Target {
                     .collect();
                 folded
             });
-        Ok(Recording { folded, perf_data })
+        let reviewed = report::Review::command(plan, raw);
+        Ok(Recording {
+            folded,
+            perf_data,
+            reviewed,
+        })
     }
 }
 
