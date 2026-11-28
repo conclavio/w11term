@@ -63,14 +63,7 @@ function Wait-Platform([string]$Name) {
 }
 function Select-InstalledTool([string]$Name) {
     Click 'Installed SSH tools'
-    $tools = Wait-Until 'active remote tools offered lookup' { Find-Element 'Installed SSH commands' $combo }
-    $tools.SetFocus()
-    $expand = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
-    $tools.GetCurrentPattern($expand).Expand()
-    $choice = Wait-Until "installed $Name from the portable bundle" {
-        Find-Element "${Name}${dot}portable" ([System.Windows.Automation.ControlType]::ListItem) -Visible
-    }
-    $choice.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Select-NativeComboItem 'Installed SSH commands' "${Name}${dot}portable"
 }
 function Select-ToolVersion([string]$Id, [string]$Suffix = '') {
     $label = "portable${dot}$($Id.Substring(0,12))$Suffix"

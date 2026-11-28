@@ -257,23 +257,12 @@ function Wait-CaptureCombo([string]$Name) {
     }
 }
 
-function Select-CaptureComboItem([string]$Combo, [string]$Name) {
-    $dropdown = (Wait-CaptureCombo $Combo).GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-    $item = Wait-Until "'$Name' is selectable in '$Combo'" {
-        if ($dropdown.Current.ExpandCollapseState -eq 'Collapsed') {
-            $dropdown.Expand()
-        }
-        Find-Element $Name ([System.Windows.Automation.ControlType]::ListItem) -Visible
-    }
-    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-}
-
 function Select-ComparisonConversationType([string]$Name) {
-    Select-CaptureComboItem 'Conversation type' $Name
+    Select-NativeComboItem 'Conversation type' $Name
 }
 
 function Select-ComparisonCaptureSide([string]$Name) {
-    Select-CaptureComboItem 'Capture to open in Wireshark' $Name
+    Select-NativeComboItem 'Capture to open in Wireshark' $Name
 }
 
 function Udp-PortFilter([int]$Port) {
@@ -321,12 +310,7 @@ try {
             (Find-Element "Peak 1 packet${dot}4 bytes${dot}+0.000 s from timeline start" -Visible)
     }
     $expander.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
-    $picker = Wait-CaptureCombo 'Saved capture interfaces'
-    $picker.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $wireless = Wait-Until 'the second saved interface can be selected' {
-        Find-Element "Section 1${dot}Interface 1${dot}wireless" ([System.Windows.Automation.ControlType]::ListItem) -Visible
-    }
-    $wireless.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Select-NativeComboItem 'Saved capture interfaces' "Section 1${dot}Interface 1${dot}wireless"
     $null = Wait-Until 'the selected interface shows its own capture totals and snap length' {
         (Find-Element "wireless${dot}Linux cooked v2${dot}Unlimited snap length") -and
             (Find-Element "Interface packets 1${dot}4 captured bytes${dot}0 truncated") -and
@@ -371,7 +355,7 @@ try {
     Select-Viewer
     if ([IO.File]::Exists($olderCapture + '.opened')) { throw 'Selecting the local file launched Wireshark' }
     $expander = Open-PacketSection 'packet-timeline'
-    Select-CaptureComboItem 'Packet timeline intervals' "+0.499712 s${dot}1 packet"
+    Select-NativeComboItem 'Packet timeline intervals' "+0.499712 s${dot}1 packet"
     $null = Wait-Until 'the timeline has applied the selected interval' {
         Find-Element "Packet timeline chart${dot}selected +0.499712 s"
     }
@@ -979,13 +963,7 @@ try {
     }
     $null = Control @('focus-pane','--pane',"$remote")
     Wait-Focus $remote
-    $dropdown = Wait-CaptureCombo 'Capture interfaces'
-    $dropdown.SetFocus()
-    $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
-    $loopback = Wait-Until 'tcpdump loopback device can be chosen' {
-        Find-Element "lo${dot}[Up, Running, Loopback]" ([System.Windows.Automation.ControlType]::ListItem) -Visible
-    }
-    $loopback.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Select-NativeComboItem 'Capture interfaces' "lo${dot}[Up, Running, Loopback]"
     $null = Wait-Until 'selecting a device fills the editable interface field' {
         $field = Find-Element 'Linux network interface' $edit
         $field -and $field.GetCurrentPattern($value).Current.Value -ceq 'lo'

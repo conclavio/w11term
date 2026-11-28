@@ -249,15 +249,9 @@ impl Panel {
                         if let Some(library) = &mut self.library {
                             library.catalog.set_private_page(key.clone(), page);
                         }
-                        self.set_query(key.name);
-                        self.exact = true;
-                        if self.platform.unwrap_or(auto) != key.platform {
-                            self.platform = Some(key.platform);
-                        }
-                        self.selected = 0;
+                        self.show_page(key, auto);
                         self.cached.replace(None);
                         self.private_page = None;
-                        self.focus = self.focus.wrapping_add(1);
                     }
                     Err(error) => {
                         editor.saving = false;

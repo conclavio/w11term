@@ -8,9 +8,13 @@ use w11term::sftp::{InstalledTools, Job, Operation, TransferCancel};
 mod catalog;
 mod dotfiles;
 mod download;
+mod example;
 mod private_page;
+mod saved_pages;
 mod tool_install;
 mod tool_removal;
+
+pub use saved_pages::Lookup as SavedManualLookup;
 
 pub(super) const LABEL: &str = "Command reference";
 pub(super) const SELECTION: &str = "Look up selected command";
@@ -22,11 +26,8 @@ pub enum Action {
     Query(String),
     Platform(Option<usize>),
     Select(usize),
-    Edit(clipboard_paste::Origin, String),
-    Draft(String),
-    CancelEdit,
+    Example(example::Action),
     Copy(String),
-    Insert(clipboard_paste::Origin),
     Link(String),
     Refresh,
     Loaded(Result<Loaded, String>),
@@ -34,6 +35,7 @@ pub enum Action {
     ListedTools(Arc<()>, Result<InstalledTools, String>),
     ToolPage(Arc<()>, usize),
     Private(private_page::Action),
+    SavedPage(saved_pages::Action),
     ToolInstall(tool_install::Action),
     ToolRemoval(tool_removal::Action),
     Dotfiles(dotfiles::Action),
@@ -87,16 +89,19 @@ struct ToolLookup {
     result: Option<Result<InstalledTools, String>>,
 }
 
-struct Draft {
-    origin: clipboard_paste::Origin,
-    text: String,
-}
-
 struct Search {
     query: String,
-    exact: bool,
+    mode: SearchMode,
     platform: Platform,
     results: Vec<Key>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+enum SearchMode {
+    #[default]
+    Search,
+    PreferredExact,
+    Page(Key),
 }
 
 #[derive(Default)]
@@ -106,16 +111,18 @@ pub(super) struct Panel {
     library: Option<Loaded>,
     error: Option<String>,
     query: String,
-    exact: bool,
+    mode: SearchMode,
     platform: Option<Platform>,
     cached: RefCell<Option<Search>>,
     selected: usize,
-    draft: Option<Draft>,
+    draft: Option<example::Draft>,
     query_field: ElementRef<TextBox>,
     draft_field: ElementRef<TextBox>,
+    draft_option: ElementRef<ComboBox>,
     focus: u64,
     tools: Option<ToolLookup>,
     private_page: Option<private_page::Editor>,
+    saved_pages: saved_pages::State,
     tool_install: Option<tool_install::Installer>,
     tool_removal: Option<tool_removal::Panel>,
     dotfiles: Option<dotfiles::Installer>,
@@ -147,12 +154,13 @@ impl Panel {
         self.tool_install = None;
         self.tool_removal = None;
         self.dotfiles = None;
+        self.saved_pages.close();
         if let Some(lookup) = self.tools.take() {
             lookup.cancel.cancel();
         }
     }
 
-    fn subpanel_open(&self) -> bool {
+    pub(super) fn subpanel_open(&self) -> bool {
         self.private_page.is_some()
             || self.tool_install.is_some()
             || self.tool_removal.is_some()
@@ -163,41 +171,55 @@ impl Panel {
         let text = text.chars().take(128).filter(|c| !c.is_control()).collect();
         if self.query != text {
             self.query = text;
-            self.exact = false;
+            self.mode = SearchMode::Search;
             self.selected = 0;
             self.draft = None;
         }
     }
 
+    fn show_page(&mut self, key: Key, auto: Platform) {
+        self.set_query(key.name.clone());
+        if self.platform.unwrap_or(auto) != key.platform {
+            self.platform = Some(key.platform);
+        }
+        self.mode = SearchMode::Page(key);
+        self.selected = 0;
+        self.draft = None;
+        self.focus = self.focus.wrapping_add(1);
+    }
+
     fn results(&self, platform: Platform) -> std::cell::Ref<'_, [Key]> {
         let previous = self.cached.borrow();
         if previous.as_ref().is_none_or(|search| {
-            search.query != self.query || search.platform != platform || search.exact != self.exact
+            search.query != self.query || search.platform != platform || search.mode != self.mode
         }) {
             drop(previous);
             let results = self
                 .library
                 .as_ref()
-                .map(|loaded| {
-                    if self.exact {
-                        loaded
-                            .catalog
-                            .exact(&self.query, platform)
-                            .into_iter()
-                            .collect()
-                    } else {
-                        loaded
-                            .catalog
-                            .search(&self.query, platform)
-                            .into_iter()
-                            .map(|(key, _)| key.clone())
-                            .collect()
-                    }
+                .map(|loaded| match &self.mode {
+                    SearchMode::Page(key) => loaded
+                        .catalog
+                        .page(key)
+                        .map(|_| key.clone())
+                        .into_iter()
+                        .collect(),
+                    SearchMode::PreferredExact => loaded
+                        .catalog
+                        .exact(&self.query, platform)
+                        .into_iter()
+                        .collect(),
+                    SearchMode::Search => loaded
+                        .catalog
+                        .search(&self.query, platform)
+                        .into_iter()
+                        .map(|(key, _)| key.clone())
+                        .collect(),
                 })
                 .unwrap_or_default();
             self.cached.replace(Some(Search {
                 query: self.query.clone(),
-                exact: self.exact,
+                mode: self.mode.clone(),
                 platform,
                 results,
             }));
@@ -254,22 +276,29 @@ impl Panel {
         if let Some(installer) = &self.dotfiles {
             return installer.view(tool_pane, dotfile_sync, ctx);
         }
-        let target = if self
+        let preferred = self.platform.unwrap_or(auto);
+        let results = self.results(preferred);
+        let selected = results.get(self.selected).or_else(|| results.first());
+        let draft = self
             .draft
             .as_ref()
-            .is_some_and(|draft| Some(draft.origin) == origin)
-        {
+            .filter(|draft| selected == Some(&draft.page));
+        let target = if draft.is_some() {
             self.draft_field.clone()
         } else {
             self.query_field.clone()
         };
+        let option = draft
+            .filter(|draft| draft.focus_option())
+            .map(|_| self.draft_option.clone());
         ctx.use_effect("focus command reference", self.focus, move || {
-            let _ = target.request_focus();
+            if let Some(option) = option {
+                let _ = option.request_focus();
+            } else {
+                let _ = target.request_focus();
+            }
             None
         });
-        let preferred = self.platform.unwrap_or(auto);
-        let results = self.results(preferred);
-        let selected = results.get(self.selected).or_else(|| results.first());
         let page = selected.and_then(|key| {
             let page = self.library.as_ref()?.catalog.page(key)?;
             Some((page, key.platform))
@@ -291,6 +320,7 @@ impl Panel {
                 })
                 .text_wrapping(TextWrapping::Wrap),
         )];
+        pieces.push(self.saved_pages.section(self.library.as_ref(), ctx));
         if let Some(target) = tool_pane {
             pieces.push(KeyedView::new(
                 "installed-tools",
@@ -393,6 +423,9 @@ impl Panel {
                         .text_wrapping(TextWrapping::Wrap),
                 ),
             ]);
+            if let Some(key) = selected {
+                pieces.push(self.saved_pages.button(key, ctx));
+            }
         }
         if let (Some(target), Some(key), Some(_)) = (tool_pane, selected, page)
             && matches!(key.platform, LINUX | COMMON)
@@ -415,7 +448,9 @@ impl Panel {
         if let Some(Ok(installed)) = lookup.and_then(|lookup| lookup.result.as_ref()) {
             let command = match selected {
                 Some(key) if matches!(key.platform, LINUX | COMMON) => Some(key.name.as_str()),
-                None if self.exact && preferred == LINUX => Some(self.query.as_str()),
+                None if self.mode == SearchMode::PreferredExact && preferred == LINUX => {
+                    Some(self.query.as_str())
+                }
                 _ => None,
             };
             for tool in installed
@@ -445,7 +480,7 @@ impl Panel {
                 ));
             }
         }
-        if let Some((page, _)) = page {
+        if let (Some((page, _)), Some(key)) = (page, selected) {
             if let Some(link) = &page.link {
                 let url = link.clone();
                 pieces.push(KeyedView::new(
@@ -458,41 +493,15 @@ impl Panel {
                         .content(link.as_str()),
                 ));
             }
-            if let Some(draft) = &self.draft {
-                let insert = draft.origin;
-                let available = Some(insert) == origin && catalog::insertable(&draft.text);
+            if let Some(draft) = draft {
                 pieces.push(KeyedView::new(
                     "draft",
-                    StackPanel::new().spacing(6.0).children((
-                        TextBox::new()
-                            .element_ref(&self.draft_field)
-                            .automation_name("Edit command example")
-                            .text(&draft.text)
-                            .on_text_changed(
-                                ctx.callback(|text| Message::CommandReference(Action::Draft(text))),
-                            ),
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .spacing(8.0)
-                            .children((
-                                Button::new()
-                                    .is_enabled(available)
-                                    .on_click(ctx.callback(move |_| {
-                                        Message::CommandReference(Action::Insert(insert))
-                                    }))
-                                    .content("Insert into terminal"),
-                                Button::new()
-                                    .on_click(ctx.callback(|_| {
-                                        Message::CommandReference(Action::CancelEdit)
-                                    }))
-                                    .content("Cancel edit"),
-                            )),
-                    )),
+                    draft.view(origin, &self.draft_field, &self.draft_option, ctx),
                 ));
             }
             for (index, example) in page.examples.iter().enumerate() {
                 let copy = example.command.clone();
-                let edit = example.command.clone();
+                let edit = key.clone();
                 pieces.push(KeyedView::new(
                     format!("example-{index}"),
                     StackPanel::new().spacing(4.0).children((
@@ -514,14 +523,10 @@ impl Panel {
                                     .content("Copy"),
                                 Button::new()
                                     .automation_name(format!("Edit example {}", index + 1))
-                                    .is_enabled(origin.is_some())
                                     .on_click(ctx.callback(move |_| {
-                                        origin.map_or(Message::ControlIdle, |origin| {
-                                            Message::CommandReference(Action::Edit(
-                                                origin,
-                                                edit.clone(),
-                                            ))
-                                        })
+                                        Message::CommandReference(Action::Example(
+                                            example::Action::Edit(edit.clone(), index, origin),
+                                        ))
                                     }))
                                     .content("Edit example"),
                             )),
@@ -856,6 +861,7 @@ impl TerminalApp {
                     panel.set_query(text);
                 }
                 if !was_open || panel.library.is_none() {
+                    panel.saved_pages.refresh(ctx);
                     self.start_reference_load(false, ctx);
                 }
             }
@@ -867,6 +873,9 @@ impl TerminalApp {
                     panel.platform = platform;
                     panel.selected = 0;
                     panel.draft = None;
+                    if matches!(panel.mode, SearchMode::Page(_)) {
+                        panel.mode = SearchMode::Search;
+                    }
                 }
             }
             Action::Platform(None) => {}
@@ -876,40 +885,16 @@ impl TerminalApp {
                     panel.draft = None;
                 }
             }
-            Action::Edit(target, text) => {
-                if Some(target) == origin {
-                    panel.draft = Some(Draft {
-                        origin: target,
-                        text,
-                    });
-                    panel.focus = panel.focus.wrapping_add(1);
-                }
-            }
+            Action::Example(action) => self.reference_example_action(action, auto, origin, ctx),
             Action::Copy(text) => {
                 panel.error = w11term::clipboard::write(&text)
                     .err()
                     .map(|err| format!("Copying the command example: {err:#}"));
             }
-            Action::Draft(text) => {
-                if let Some(draft) = &mut panel.draft {
-                    draft.text = text.chars().take(4096).collect();
-                }
-            }
-            Action::CancelEdit => panel.draft = None,
-            Action::Insert(target) => {
-                if Some(target) == origin
-                    && let Some(draft) = &panel.draft
-                    && draft.origin == target
-                    && catalog::insertable(&draft.text)
-                {
-                    let text = draft.text.clone();
-                    panel.draft = None;
-                    self.paste_saved_text(target, text, ctx);
-                }
-            }
             Action::Link(link) => Self::open_link(&link),
             Action::Refresh => self.start_reference_load(true, ctx),
             Action::Private(action) => panel.author_private_page(action, auto, ctx),
+            Action::SavedPage(action) => panel.saved_page_action(action, auto, ctx),
             Action::ToolInstall(action) => self.tool_install_action(action, ctx),
             Action::ToolRemoval(action) => self.tool_removal_action(action, ctx),
             Action::Dotfiles(action) => self.reference_dotfiles_action(action, ctx),
@@ -930,7 +915,7 @@ impl TerminalApp {
                     && let Some(tool) = tools.tools.get(index)
                 {
                     panel.set_query(tool.name.clone());
-                    panel.exact = true;
+                    panel.mode = SearchMode::PreferredExact;
                     panel.platform = None;
                     panel.focus = panel.focus.wrapping_add(1);
                 }

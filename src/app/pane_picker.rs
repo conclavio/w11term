@@ -339,6 +339,7 @@ pub(super) struct Picker {
     matches: Vec<Choice>,
     commands: Vec<command_palette::Row>,
     bookmarks: Option<Result<Vec<BookmarkEntry>, &'static str>>,
+    saved_manuals: Option<Result<command_reference::SavedManualLookup, String>>,
     text: text_search::Results,
     window_history: window_history::Search,
     selected: usize,
@@ -385,6 +386,17 @@ impl Picker {
         match &self.bookmarks {
             None => Some("Loading scrollback bookmarks…"),
             Some(Err(message)) => Some(message),
+            Some(Ok(_)) => None,
+        }
+    }
+
+    pub(super) fn saved_manual_status(&self) -> Option<&str> {
+        if self.mode != Mode::Commands(command_palette::Search::SavedManuals) {
+            return None;
+        }
+        match &self.saved_manuals {
+            None => Some("Loading saved manuals…"),
+            Some(Err(error)) => Some(error),
             Some(Ok(_)) => None,
         }
     }
@@ -905,6 +917,53 @@ impl TerminalApp {
         );
     }
 
+    pub(super) fn open_saved_manual_search(&mut self, ctx: &ComponentContext<Self>) {
+        if self.picker.is_some() || self.command_reference.subpanel_open() {
+            return;
+        }
+        self.start_picker(Mode::Commands(command_palette::Search::SavedManuals), ctx);
+        let launch = self.picker.as_ref().unwrap().launch.clone();
+        let rejected = Message::SavedManualsRead(
+            launch.clone(),
+            Err("Saved manual search worker unavailable".into()),
+        );
+        ctx.spawn_background_with_rejection(
+            move |_| {
+                Message::SavedManualsRead(
+                    launch,
+                    command_reference::SavedManualLookup::load()
+                        .map_err(|error| format!("{error:#}")),
+                )
+            },
+            rejected,
+        );
+    }
+
+    pub(super) fn saved_manuals_read(
+        &mut self,
+        launch: &Arc<()>,
+        result: Result<command_reference::SavedManualLookup, String>,
+    ) {
+        if let Some(picker) = self.picker.as_mut().filter(|picker| {
+            picker.mode == Mode::Commands(command_palette::Search::SavedManuals)
+                && Arc::ptr_eq(&picker.launch, launch)
+        }) {
+            picker.saved_manuals = Some(result);
+            self.refresh_open_commands();
+        }
+    }
+
+    pub(super) fn take_saved_manual_lookup(
+        &mut self,
+    ) -> Option<command_reference::SavedManualLookup> {
+        self.picker
+            .as_mut()
+            .filter(|picker| picker.mode == Mode::Commands(command_palette::Search::SavedManuals))?
+            .saved_manuals
+            .take()?
+            .ok()
+    }
+
     pub(super) fn bookmarks_received(
         &mut self,
         launch: &Arc<()>,
@@ -1073,6 +1132,13 @@ impl TerminalApp {
             Mode::Commands(command_palette::Search::Bookmarks(origin, screen)) => {
                 self.bookmark_rows(origin, screen, query)
             }
+            Mode::Commands(command_palette::Search::SavedManuals) => self
+                .picker
+                .as_ref()
+                .filter(|picker| picker.mode == mode)
+                .and_then(|picker| picker.saved_manuals.as_ref()?.as_ref().ok())
+                .map(|lookup| lookup.rows(query))
+                .unwrap_or_default(),
             Mode::Commands(command_palette::Search::GroupLibrary(group)) => {
                 self.group_saved_command_rows(group, query)
             }
@@ -1306,6 +1372,7 @@ impl TerminalApp {
             matches,
             commands,
             bookmarks: None,
+            saved_manuals: None,
             text: text_search::Results::default(),
             window_history: window_history::Search::default(),
             selected,

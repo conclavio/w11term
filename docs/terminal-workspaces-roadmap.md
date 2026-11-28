@@ -362,6 +362,14 @@ Open **More → Command reference** for a Tealdeer-style side panel. Search by c
 
 English tldr-pages are bundled for offline lookup. The platform defaults to Windows for local shells and Linux for WSL and SSH. Use the platform dropdown for a different remote OS. **Update pages** keeps a usable cache if refreshing fails, and **New private page** adds a local manual for the selected platform. w11term bundles pages for `diskwatch`, `mdd`, and `netwatch` alongside the upstream collection. [tldr-pages client specification](https://github.com/tldr-pages/tldr/blob/main/CLIENT-SPECIFICATION.md)
 
+**Saved pages** brings frequently used manuals back by command and platform. Keep a private and a bundled variant in the list together, reopen them offline after a restart, and remove shortcuts from the panel.
+
+**Find saved manual…** searches saved page titles, commands, and platforms from the command palette. Opening a result restores that exact page beside the current pane.
+
+Save an edited example to the shared **Saved commands** library from Command reference. Open the example editor offline, choose a name for the exact line, and recall it from the palette or a group later.
+
+Fill named values and choose flag spellings in a manual example. A repeated placeholder uses one value across the command. Review the preview and apply it to the editable draft before saving or inserting the example.
+
 **Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
 
 ## Managed SSH utilities

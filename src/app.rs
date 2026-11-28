@@ -1458,6 +1458,10 @@ pub enum Message {
     PickerHover(u64),
     PickerFrame(u64, u64),
     BookmarksRead(Arc<()>, Option<Vec<w11term::terminal::BookmarkEntry>>),
+    SavedManualsRead(
+        Arc<()>,
+        Result<command_reference::SavedManualLookup, String>,
+    ),
     PickerChoose(u64),
     PlacePane(TabId, pane_picker::PlacementTarget, Direction),
     PickerFocus(u8),
@@ -6138,6 +6142,7 @@ impl Component for TerminalApp {
                 | Message::PickerFrame(..)
                 | Message::WindowSearchChanged
                 | Message::BookmarksRead(..)
+                | Message::SavedManualsRead(..)
                 | Message::PickerFocus(..)
                 | Message::PickerFocusAfterMenu(..)
                 | Message::PaneRatio(..)
@@ -6422,6 +6427,7 @@ impl Component for TerminalApp {
             Message::PickerHover(pane) => self.hover_picker(pane, context),
             Message::PickerFrame(pane, generation) => self.picker_frame(pane, generation, context),
             Message::BookmarksRead(launch, entries) => self.bookmarks_received(&launch, entries),
+            Message::SavedManualsRead(launch, result) => self.saved_manuals_read(&launch, result),
             Message::PickerChoose(pane) => self.choose_picker_pane(pane, context),
             Message::PlacePane(source, target, side) => {
                 self.place_pane(source, target, side, context)
