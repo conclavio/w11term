@@ -1,7 +1,7 @@
 use super::offline::{profile_rollout, profile_store, rollback_args};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
-use std::{io::Write, path::Path};
+use std::{io::Write, path::Path, process::ExitCode};
 use w11term::control::Reply;
 use w11term::profiles::{ToolProfileBuildChecks, rollback_tool_rollout};
 use w11term::sftp::{
@@ -13,6 +13,8 @@ pub const HELP: &str = "w11term-cli fetch-tool-bundle BUNDLE.json [--architectur
 w11term-cli fetch-tool-bundle --example NEW_BUNDLE.json [--preset essentials|admin | --tools rg,jq,mdd]";
 pub(super) const AUDIT_VERB: &str = "audit-tool-profiles";
 pub(super) const AUDIT_HELP: &str = "w11term-cli audit-tool-profiles [--profiles CATALOG] [--profile NAME] [--verify-builds [--architecture x86_64|aarch64]]";
+pub(super) const PREPARE_VERB: &str = "prepare-tool-profiles";
+pub(super) const PREPARE_HELP: &str = "w11term-cli prepare-tool-profiles --profile NAME [--profile NAME ...] [--profiles CATALOG] [--architecture x86_64|aarch64]";
 pub(super) const ROLLOUT_VERB: &str = "rollout-tool-profiles";
 pub(super) const ROLLOUT_HELP: &str = "w11term-cli rollout-tool-profiles --candidate MANIFEST --profile NAME [--profile NAME ...] [--profiles CATALOG] [--review TOKEN]";
 pub(super) const ROLLBACK_VERB: &str = "rollback-tool-profiles";
@@ -70,6 +72,42 @@ pub(super) fn rollout(args: &[String], output: &mut dyn Write) -> Result<()> {
     serde_json::to_writer(&mut *output, &reply)?;
     writeln!(output)?;
     Ok(())
+}
+
+pub(super) fn prepare(args: &[String], output: &mut dyn Write) -> Result<ExitCode> {
+    let mut catalog = None;
+    let mut architecture = None;
+    let mut profiles = Vec::new();
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let value = args
+            .next()
+            .with_context(|| format!("{flag} requires a value"))?;
+        match flag.as_str() {
+            "--profiles" => {
+                ensure!(
+                    catalog.replace(value.as_str()).is_none(),
+                    "specify --profiles only once"
+                );
+            }
+            "--profile" => profiles.push(value.clone()),
+            "--architecture" => {
+                ensure!(architecture.is_none(), "specify --architecture only once");
+                architecture = Some(parse_architecture(value)?);
+            }
+            _ => bail!("unsupported SSH tool preparation option {flag}"),
+        }
+    }
+    let report = profile_store(catalog)?.prepare_tool_profiles(&profiles, architecture)?;
+    let exit = if report.failed_profiles == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    };
+    let reply = Reply::from_result(Ok(serde_json::to_value(report)?));
+    serde_json::to_writer(&mut *output, &reply)?;
+    writeln!(output)?;
+    Ok(exit)
 }
 
 pub(super) fn rollback(args: &[String], output: &mut dyn Write) -> Result<()> {

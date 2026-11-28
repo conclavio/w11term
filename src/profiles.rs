@@ -24,8 +24,9 @@ pub use sftp_searches::SavedSftpSearch;
 mod tools;
 pub use tools::{
     ToolManifestBaseline, ToolManifestChanges, ToolProfileAudit, ToolProfileAuditRow,
-    ToolProfileAuditStatus, ToolProfileBuildChecks, ToolRestoreStatus, ToolRollbackProfile,
-    ToolRollbackReport, ToolRolloutProfile, ToolRolloutReport, rollback_tool_rollout,
+    ToolProfileAuditStatus, ToolProfileBuildChecks, ToolProfilePreparation, ToolRestoreStatus,
+    ToolRollbackProfile, ToolRollbackReport, ToolRolloutProfile, ToolRolloutReport,
+    rollback_tool_rollout,
 };
 
 #[derive(Clone, Debug, PartialEq)]

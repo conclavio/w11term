@@ -1621,6 +1621,14 @@ $audit.result.profiles | Where-Object {
 
 In the Windows audit, select a build verification scope and choose **Prepare pinned downloads** on a profile. This caches its HTTPS builds for that scope before you connect, including downloads in custom manifests. w11term rechecks the saved approval and the manifest shown in the audit before fetching, then refreshes the local readiness results. Local executable entries can be checked separately in the same audit.
 
+Use `prepare-tool-profiles` to cache the approved downloads for several saved profiles without launching w11term or connecting to SSH. Name each profile explicitly. Omit `--architecture` to prepare every declared download architecture.
+
+```powershell
+& $ctl prepare-tool-profiles --profile East --profile West --architecture aarch64
+```
+
+The command reports each profile in request order, with a status of `prepared`, `no-downloads`, or `failed`. A failed profile makes the command exit with code 1 and the JSON report is still available on stdout. Verified downloads remain in the shared cache for retry. The profile catalog stays read-only during preparation.
+
 Use `rollout-tool-profiles` to adopt one revised manifest in multiple saved SSH profiles. Select each profile explicitly. Each must already approve the candidate's bundle name and launcher directory. The preview lists the candidate's SHA-256 and any detectable additions, removals, and build changes. A missing or changed baseline is marked separately. Pinned profiles receive the new manifest hash, and profiles that follow the file keep that setting.
 
 In Windows, open **Settings → Profiles → Audit SSH tool profiles → Roll out tool manifest**. Pick the revision, check the profiles you want to update, and choose **Review selected tool rollout**. **Apply reviewed tool rollout** updates the reviewed selection.

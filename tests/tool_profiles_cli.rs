@@ -301,6 +301,131 @@ fn profile(bundle: &str, pin: Option<&str>) -> Value {
     })
 }
 
+#[test]
+fn prepares_selected_profile_downloads_and_reports_partial_failures() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let cache = root.join("tools/cache/v1");
+    fs::create_dir_all(&cache).unwrap();
+    let arm = tool_elf::executable(UtilityArchitecture::Aarch64, None);
+    let arm_pin = sha256(&arm);
+    fs::write(cache.join(&arm_pin), &arm).unwrap();
+    let download = json!({"format": "raw", "url": "https://tools.example.test/rg"});
+    let tools = json!({"version": 1, "name": "fleet", "tools": [{"name": "rg", "builds": [
+        {"architecture": "aarch64", "sha256": arm_pin, "download": download},
+        {"architecture": "x86_64", "sha256": "f".repeat(64), "download": download},
+    ]}]})
+    .to_string();
+    let local = fleet_manifest(&[("rg", 'a')]);
+    fs::write(root.join("release.json"), &tools).unwrap();
+    fs::write(root.join("local.json"), &local).unwrap();
+    let invalid = tools.replace("\"fleet\"", "\"wrong-bundle\"");
+    fs::write(root.join("wrong.json"), &invalid).unwrap();
+    let pin = sha256(&tools);
+    let catalog_path = root.join("fleet profiles.json");
+    let catalog = json!({"profiles": {
+        "Pinned": profile("release.json", Some(&pin)),
+        "Follow file": profile("release.json", None),
+        "Stale": profile("release.json", Some(&"0".repeat(64))),
+        "Wrong scope": profile("wrong.json", Some(&sha256(&invalid))),
+        "Local only": profile("local.json", Some(&sha256(&local))),
+        "Unselected": profile("missing-manifest.json", None),
+    }})
+    .to_string();
+    fs::write(&catalog_path, &catalog).unwrap();
+    let prepare = |args: &[&str]| {
+        let mut scoped = vec![
+            "--profiles",
+            "fleet profiles.json",
+            "--architecture",
+            "aarch64",
+        ];
+        scoped.extend_from_slice(args);
+        cli(root, "prepare-tool-profiles", &scoped)
+    };
+    let prepared = reply(prepare(&["--profile", "Pinned", "--profile", "Local only"]));
+    assert_eq!(prepared["failed_profiles"], 0);
+    assert_eq!(prepared["architecture"], "aarch64");
+    assert_eq!(prepared["profiles_path"], json!(catalog_path));
+    assert_eq!(
+        prepared["profiles"],
+        json!([
+            {"profile": "Pinned", "status": "prepared", "manifest_sha256": pin, "prepared_builds": 1},
+            {"profile": "Local only", "status": "no-downloads", "manifest_sha256": sha256(&local)},
+        ])
+    );
+
+    let partial = prepare(&[
+        "--profile",
+        "Stale",
+        "--profile",
+        "Follow file",
+        "--profile",
+        "Wrong scope",
+        "--profile",
+        "Absent",
+    ]);
+    assert_eq!(partial.status.code(), Some(1), "{partial:?}");
+    assert!(partial.stderr.is_empty(), "{partial:?}");
+    let response: Value = serde_json::from_slice(&partial.stdout).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["failed_profiles"], 3);
+    let rows = response["result"]["profiles"].as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    for (index, name, detail) in [
+        (0, "Stale", "differs from its saved pin"),
+        (2, "Wrong scope", "manifest name or bin directory changed"),
+        (3, "Absent", "SSH profile Absent was not found"),
+    ] {
+        assert_eq!(rows[index]["profile"], name);
+        assert_eq!(rows[index]["status"], "failed");
+        assert!(
+            rows[index]["error"].as_str().unwrap().contains(detail),
+            "{}",
+            rows[index]
+        );
+    }
+    assert_eq!(rows[1]["profile"], "Follow file");
+    assert_eq!(rows[1]["status"], "prepared");
+    assert_eq!(rows[1]["prepared_builds"], 1);
+
+    let local_only = reply(cli(
+        root,
+        "prepare-tool-profiles",
+        &[
+            "--profiles",
+            "fleet profiles.json",
+            "--profile",
+            "Local only",
+        ],
+    ));
+    assert!(local_only["architecture"].is_null());
+    assert_eq!(local_only["profiles"][0]["status"], "no-downloads");
+    for (args, detail) in [
+        (&[][..], "at least one SSH profile"),
+        (
+            &["--profile", "Pinned", "--profile", "Pinned"][..],
+            "each SSH profile only once",
+        ),
+    ] {
+        let invalid = prepare(args);
+        assert_eq!(invalid.status.code(), Some(1));
+        assert!(invalid.stdout.is_empty());
+        let response: Value = serde_json::from_slice(&invalid.stderr).unwrap();
+        assert!(
+            response["error"].as_str().unwrap().contains(detail),
+            "{response}"
+        );
+    }
+    assert_eq!(fs::read_to_string(catalog_path).unwrap(), catalog);
+    assert_eq!(
+        fs::read_to_string(root.join("release.json")).unwrap(),
+        tools
+    );
+    assert_eq!(fs::read(cache.join(arm_pin)).unwrap(), arm);
+    assert_eq!(fs::read_dir(cache).unwrap().count(), 1);
+}
+
 fn fleet_manifest(commands: &[(&str, char)]) -> String {
     let tools: Vec<_> = commands
         .iter()

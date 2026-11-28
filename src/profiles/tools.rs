@@ -1,19 +1,19 @@
 use super::ProfileStore;
 use crate::{
     options::SshOptions,
-    sftp::{
-        ToolArchitectureAudit, UtilityArchitecture, UtilityBundle, fetch_tool_bundle_cancellable,
-    },
+    sftp::{ToolArchitectureAudit, UtilityArchitecture, UtilityBundle},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::Serialize;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
 
+mod prepare;
 mod rollback;
 mod rollout;
+pub use prepare::ToolProfilePreparation;
 pub use rollback::{
     ToolRestoreStatus, ToolRollbackProfile, ToolRollbackReport, rollback_tool_rollout,
 };
@@ -86,45 +86,6 @@ impl Manifest {
 type ManifestCache = HashMap<PathBuf, Result<Manifest, String>>;
 
 impl ProfileStore {
-    /// Cache the downloads from the exact manifest shown in a saved profile audit.
-    pub fn prepare_tool_profile(
-        &self,
-        profile: &str,
-        manifest_sha256: &str,
-        architecture: Option<UtilityArchitecture>,
-        cancelled: impl Fn() -> bool,
-    ) -> Result<usize> {
-        ensure!(!cancelled(), "SSH tool preparation cancelled");
-        let profiles = self.load()?;
-        let options = profiles
-            .get(profile)
-            .with_context(|| format!("SSH profile {profile} was not found"))?;
-        let approval = rollout::approval(options)?;
-        let Manifest {
-            mut bundle, digest, ..
-        } = Manifest::load(&approval.bundle)?;
-        ensure!(
-            digest == manifest_sha256 && approval.manifest_pin()?.is_none_or(|pin| pin == digest),
-            "The tool manifest or its pin changed. Refresh the audit before preparing downloads."
-        );
-        approval.validate_manifest_destination(&bundle)?;
-
-        for tool in &mut bundle.tools {
-            tool.builds.retain(|build| {
-                build.download.is_some()
-                    && architecture.is_none_or(|architecture| build.architecture == architecture)
-            });
-        }
-        bundle.tools.retain(|tool| !tool.builds.is_empty());
-        let download_count = bundle.tools.iter().map(|tool| tool.builds.len()).sum();
-        ensure!(
-            download_count > 0,
-            "No pinned downloads match the selected architecture"
-        );
-        fetch_tool_bundle_cancellable(&bundle, None, cancelled)?;
-        Ok(download_count)
-    }
-
     pub fn audit_tool_profiles(
         &self,
         selected: Option<&str>,

@@ -14,6 +14,13 @@ type OfflineCommand = fn(&[String], &mut dyn Write) -> Result<()>;
 
 pub(super) fn run(args: &[String]) -> Option<ExitCode> {
     let (verb, args) = args.split_first()?;
+    if verb == tool_bundles::PREPARE_VERB {
+        return Some(run_command(
+            args,
+            tool_bundles::PREPARE_HELP,
+            tool_bundles::prepare,
+        ));
+    }
     let (help, command): (&str, OfflineCommand) = match verb.as_str() {
         command_reference::VERB => (command_reference::HELP, command_reference::lookup),
         dotfiles::VERB => (dotfiles::HELP, dotfiles::save),
@@ -56,16 +63,26 @@ pub(super) fn run(args: &[String]) -> Option<ExitCode> {
         ),
         _ => return None,
     };
+    Some(run_command(args, help, |args, output| {
+        command(args, output).map(|()| ExitCode::SUCCESS)
+    }))
+}
+
+fn run_command(
+    args: &[String],
+    help: &str,
+    command: impl FnOnce(&[String], &mut dyn Write) -> Result<ExitCode>,
+) -> ExitCode {
     if args == ["--help"] || args == ["-h"] {
         println!("{help}");
-        return Some(ExitCode::SUCCESS);
+        return ExitCode::SUCCESS;
     }
     match command(args, &mut io::stdout().lock()) {
-        Ok(()) => Some(ExitCode::SUCCESS),
+        Ok(exit) => exit,
         Err(error) => {
             let reply = Reply::from_result(Err(error));
             eprintln!("{}", serde_json::to_string(&reply).unwrap());
-            Some(ExitCode::FAILURE)
+            ExitCode::FAILURE
         }
     }
 }
