@@ -12,6 +12,7 @@ const COMPARISON_LIMIT: &str =
 
 pub enum Action {
     Open(TabId),
+    OpenRepeat(TabId),
     Back(TabId),
     Ready(TabId, Arc<()>, Result<Option<Arc<Comparison>>, String>),
     Select(TabId, Arc<Comparison>, usize),
@@ -59,6 +60,10 @@ enum Input {
         before: Vec<PathBuf>,
         after: Vec<PathBuf>,
     },
+    Loaded {
+        working: Arc<Trace>,
+        failing: Arc<Trace>,
+    },
 }
 
 impl TerminalApp {
@@ -75,6 +80,7 @@ impl TerminalApp {
     pub(super) fn syscall_compare_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         match action {
             Action::Open(tab) => self.open_trace_comparison(tab, ctx),
+            Action::OpenRepeat(tab) => self.open_repeat_trace_comparison(tab, ctx),
             Action::Ready(tab, ticket, result) => {
                 if let Some(AppTab {
                     page: Page::SyscallTrace(page),
@@ -279,6 +285,21 @@ impl TerminalApp {
         self.read_trace_comparison(tab, Input::Picker { working, owner }, ctx);
     }
 
+    fn open_repeat_trace_comparison(&mut self, tab: TabId, ctx: &ComponentContext<Self>) {
+        if self.tabs.active_id() != Some(tab) {
+            return;
+        }
+        let Some((working, failing)) = self
+            .syscall_page(tab)
+            .filter(|page| page.pending.is_none() && !page.capture.open)
+            .and_then(|page| page.report.repeat_source.clone().zip(page.loaded.clone()))
+        else {
+            return;
+        };
+        let comparison = self.new_syscall_viewer(Box::default(), ctx);
+        self.read_trace_comparison(comparison, Input::Loaded { working, failing }, ctx);
+    }
+
     fn read_trace_comparison(&mut self, tab: TabId, input: Input, ctx: &ComponentContext<Self>) {
         let Some(page) = self.syscall_page(tab).filter(|page| page.pending.is_none()) else {
             return;
@@ -286,6 +307,7 @@ impl TerminalApp {
         let status = match &input {
             Input::Picker { .. } => "Opening the failing trace and comparing syscall sequences…",
             Input::Saved { .. } => "Comparing saved syscall traces…",
+            Input::Loaded { .. } => "Comparing the original and repeated syscall traces…",
         };
         let ticket = page.begin(status);
         let rejected = message(Action::Ready(
@@ -312,6 +334,9 @@ impl TerminalApp {
                             Arc::new(Trace::open(before).context("Opening the baseline trace")?),
                             after,
                         ),
+                        Input::Loaded { working, failing } => {
+                            return Ok(Some(Arc::new(Comparison::build(working, failing))));
+                        }
                     };
                     if files.is_empty() || scope.is_cancelled() {
                         return Ok(None);
@@ -398,14 +423,31 @@ impl ViewState {
         &self,
         tab: TabId,
         idle: bool,
+        has_repeat_source: bool,
         ctx: &ViewContext<TerminalApp>,
     ) -> KeyedView {
-        KeyedView::new(
-            "compare-traces",
+        let mut actions = vec![KeyedView::new(
+            "select-trace",
             Button::new()
                 .is_enabled(idle)
                 .on_click(ctx.callback(move |_| message(Action::Open(tab))))
                 .content("Compare with failing trace…"),
+        )];
+        if has_repeat_source {
+            actions.push(KeyedView::new(
+                "original-trace",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(ctx.callback(move |_| message(Action::OpenRepeat(tab))))
+                    .content("Compare with original trace"),
+            ));
+        }
+        KeyedView::new(
+            "compare-traces",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .keyed_children(actions),
         )
     }
 

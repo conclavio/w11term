@@ -152,6 +152,7 @@ pub(super) struct ViewState {
     review: Option<Review>,
     stop: Option<SyscallCaptureStop>,
     settings_path: Option<PathBuf>,
+    repeat_source: Option<Arc<Trace>>,
 }
 
 impl Drop for ViewState {
@@ -297,8 +298,10 @@ impl TerminalApp {
                         let summary = capture_summary(&capture, &trace);
                         let path = capture.path.clone();
                         if let Ok(trace) = trace {
+                            let repeat_source = page.capture.repeat_source.take();
                             page.load(trace);
                             page.report.capture = Some(Arc::new(capture));
+                            page.report.repeat_source = repeat_source;
                         }
                         page.status = Some(summary);
                         self.remember_diagnostic(
@@ -337,11 +340,13 @@ impl TerminalApp {
 
     pub(super) fn repeat_syscall_capture(
         &mut self,
+        original: Arc<Trace>,
         options: SyscallOptions,
         ctx: &ComponentContext<Self>,
     ) -> anyhow::Result<()> {
         let mut page = Box::<PageState>::default();
         page.capture.inputs = Inputs::from_options(options)?;
+        page.capture.repeat_source = Some(original);
         page.capture.open(&self.syscall_capture_targets());
         self.new_syscall_viewer(page, ctx);
         Ok(())
@@ -578,10 +583,15 @@ impl ViewState {
         }
     }
 
-    pub(super) fn back(&mut self) {
+    fn back(&mut self) {
         self.open = false;
         self.review = None;
         self.stop = None;
+    }
+
+    pub(super) fn reset_for_loaded_trace(&mut self) {
+        self.back();
+        self.repeat_source = None;
     }
 
     pub(super) fn switch(

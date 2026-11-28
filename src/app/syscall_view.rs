@@ -304,7 +304,7 @@ impl PageState {
         self.timing = Default::default();
         self.comparison = Default::default();
         self.report = Default::default();
-        self.capture.back();
+        self.capture.reset_for_loaded_trace();
         self.reset_position();
     }
 
@@ -414,7 +414,10 @@ impl PageState {
         if trace.file_count() == 1 {
             header.push(self.report.view(id, idle, ctx));
         }
-        header.push(self.comparison.launch(id, idle, ctx));
+        header.push(
+            self.comparison
+                .launch(id, idle, self.report.repeat_source.is_some(), ctx),
+        );
         header.push(self.descriptors.switch(id, idle, ctx));
         if self.descriptors.open {
             return self.descriptors.view(id, trace, header, idle, ctx);

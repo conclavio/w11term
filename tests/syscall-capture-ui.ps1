@@ -7,6 +7,7 @@ $destination = Join-Path $State 'stopped capture.strace'
 $started = [IO.File]::ReadAllText((Join-Path $State 'syscall-start-marker'))
 $saveLabel = 'Trace and save' + [char]0x2026
 $repeatLabel = 'Repeat capture' + [char]0x2026
+$compareOriginal = 'Compare with original trace'
 $saveSettings = 'Save settings' + [char]0x2026
 $loadSettings = 'Load settings' + [char]0x2026
 $settingsFile = Join-Path $State 'Syscall capture settings.json'
@@ -99,6 +100,13 @@ function Choose-Report([string]$Path, [string]$Trace, [switch]$Save) {
             [FixtureDialog]::SetCommonDialogFilename($dialog, $Path)
     }
     $null = Wait-Until 'accept the report filename' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+
+function Open-SavedTrace([string]$Path) {
+    Click ('Open syscall trace' + [char]0x2026)
+    $dialog = Wait-OwnedDialog 'Open syscall trace'
+    $null = Wait-Until 'enter the saved trace path' { [FixtureDialog]::SetFilename($dialog, $Path, '') }
+    $null = Wait-Until 'open the saved trace' { [FixtureDialog]::ClickButton($dialog, 1) }
 }
 
 $app = Start-Process -FilePath $Gui -ArgumentList @('--profiles',('"' + $profiles + '"'),'--profile','"Palette PowerShell"') -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $State 'gui.log')
@@ -232,6 +240,9 @@ try {
     Run-Palette 'Diagnostics overview'
     Wait-DiagnosticArtifact 'Saved syscall trace' $destination 'Stopped by request'
     Click 'Open Syscall capture activity'
+    if (Find-Element $compareOriginal $button) {
+        throw 'A standalone capture offered comparison with a nonexistent source'
+    }
     $startStamp = [IO.File]::GetLastWriteTimeUtc($started)
     Set-NativeExpansion 'Syscall capture report' $true
     Click $repeatLabel
@@ -253,10 +264,7 @@ try {
     }
 
     [IO.File]::Copy($destination, $renamed)
-    Click ('Open syscall trace' + [char]0x2026)
-    $dialog = Wait-OwnedDialog 'Open syscall trace'
-    $null = Wait-Until 'enter the renamed trace path' { [FixtureDialog]::SetFilename($dialog, $renamed, '') }
-    $null = Wait-Until 'open the renamed trace' { [FixtureDialog]::ClickButton($dialog, 1) }
+    Open-SavedTrace $renamed
     $null = Wait-Until 'the renamed trace is open' { Find-TraceText 'Renamed saved trace.strace' }
     Set-NativeExpansion 'Syscall capture report' $true
     if ((Find-Element ('Save capture report' + [char]0x2026) $button) -or (Find-Element $repeatLabel $button)) {
@@ -294,6 +302,26 @@ try {
     Click 'Stop syscall capture'
     $null = Wait-Until 'the repeat capture is saved and displayed' {
         [IO.File]::Exists($repeated) -and (Find-TraceText 'Repeated capture.strace')
+    }
+    $moved = Join-Path $State 'Original moved after opening.strace'
+    [IO.File]::Move($renamed, $moved)
+    try {
+        Click $compareOriginal
+        $null = Wait-Until 'comparison uses both loaded traces without reopening the original file' {
+            (Find-Element "Working${dot}Renamed saved trace.strace") -and
+                (Find-Element "Failing${dot}Repeated capture.strace") -and
+                (Find-Element 'No differences found in the available records.')
+        }
+    } finally {
+        [IO.File]::Move($moved, $renamed)
+    }
+    Press-Key 0x79 # Close the comparison tab and return to the repeated result.
+    $null = Wait-Until 'the repeated capture remains open' {
+        (Find-TraceText 'Repeated capture.strace') -and (Find-Element $compareOriginal $button)
+    }
+    Open-SavedTrace $destination
+    $null = Wait-Until 'opening a different file clears the repeat comparison' {
+        (Find-TraceText 'stopped capture.strace') -and !(Find-Element $compareOriginal $button)
     }
     Press-Key 0x79
     $null = Wait-Until 'the imported trace and report remain open' {

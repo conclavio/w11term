@@ -19,6 +19,7 @@ pub enum Outcome {
 #[derive(Default)]
 pub(super) struct ViewState {
     pub(super) capture: Option<Arc<SyscallCapture>>,
+    pub(super) repeat_source: Option<Arc<Trace>>,
     verified: Option<(PathBuf, Box<SyscallCaptureReport>)>,
     expanded: bool,
 }
@@ -37,12 +38,12 @@ impl TerminalApp {
                 if self.tabs.active_id() != Some(id) {
                     return;
                 }
-                let options = self
+                let source = self
                     .syscall_page(id)
                     .filter(|page| page.pending.is_none() && !page.capture.open)
-                    .and_then(|page| page.report.options().cloned());
-                if let Some(options) = options
-                    && let Err(error) = self.repeat_syscall_capture(options, ctx)
+                    .and_then(|page| page.loaded.clone().zip(page.report.options().cloned()));
+                if let Some((original, options)) = source
+                    && let Err(error) = self.repeat_syscall_capture(original, options, ctx)
                     && let Some(page) = self.syscall_page(id)
                 {
                     page.status = Some(format!("{error:#}"));
