@@ -2,6 +2,26 @@ use super::*;
 
 pub type ChecksResult = Result<Arc<Vec<ToolArchitectureAudit>>, String>;
 
+pub(super) const REQUIREMENTS: [(&str, Option<ToolRolloutBuildPolicy>); 4] = [
+    ("Review readiness", None),
+    ("Require all declared architectures", Some(require(None))),
+    (
+        "Require x86-64 builds",
+        Some(require(Some(UtilityArchitecture::X86_64))),
+    ),
+    (
+        "Require ARM64 builds",
+        Some(require(Some(UtilityArchitecture::Aarch64))),
+    ),
+];
+
+const fn require(architecture: Option<UtilityArchitecture>) -> ToolRolloutBuildPolicy {
+    ToolRolloutBuildPolicy {
+        architecture,
+        require_ready: true,
+    }
+}
+
 struct Job {
     ticket: Arc<()>,
     download: Option<UtilityArchitecture>,
@@ -23,6 +43,15 @@ impl Drop for Checks {
 }
 
 impl Checks {
+    pub(super) fn use_review(&mut self, report: &ToolRolloutBuildReport) {
+        self.result = Some(Ok(Arc::new(report.checks.clone())));
+    }
+
+    pub(super) fn ready(&self) -> bool {
+        matches!(&self.result, Some(Ok(checks)) if !checks.is_empty()
+            && checks.iter().all(|check| check.locally_available))
+    }
+
     pub(super) fn busy(&self) -> bool {
         self.job.is_some()
     }

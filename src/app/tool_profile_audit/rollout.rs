@@ -2,7 +2,10 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use w11term::{
     options::ToolSync,
-    profiles::{ToolManifestBaseline, ToolRollbackReport, ToolRolloutReport},
+    profiles::{
+        ToolManifestBaseline, ToolRollbackReport, ToolRolloutBuildPolicy, ToolRolloutBuildReport,
+        ToolRolloutReport,
+    },
 };
 
 mod candidate;
@@ -15,6 +18,7 @@ pub enum Action {
     Picked(Arc<()>, Result<Option<Picked>, String>),
     Filter(Arc<()>, String),
     Select(Arc<()>, String, bool),
+    SelectBuildRequirement(Arc<()>, Option<usize>),
     Review(Arc<()>),
     CheckCandidate(Arc<()>),
     PrepareCandidate(Arc<()>, UtilityArchitecture),
@@ -70,6 +74,7 @@ pub(super) struct Panel {
     error: Option<String>,
     saved_receipt: Option<PathBuf>,
     candidate_checks: candidate::Checks,
+    build_requirement: usize,
 }
 
 fn message(id: TabId, action: Action) -> Message {
@@ -96,6 +101,13 @@ impl Panel {
 
     fn can_close(&self) -> bool {
         !self.applying() && !matches!(self.work, Work::Picking(_) | Work::SavingReceipt(_))
+    }
+
+    fn can_apply(&self, report: &ToolRolloutReport) -> bool {
+        report.changed_profiles > 0
+            && !self.candidate_checks.busy()
+            && (candidate::REQUIREMENTS[self.build_requirement].1.is_none()
+                || self.candidate_checks.ready())
     }
 
     fn pick(
@@ -154,6 +166,7 @@ impl Panel {
             error: None,
             saved_receipt: None,
             candidate_checks: candidate::Checks::default(),
+            build_requirement: 0,
         }
     }
 
@@ -177,6 +190,7 @@ impl Panel {
         let ticket = self.ticket.clone();
         let candidate = targets.candidate.clone();
         let selected: Vec<_> = self.selected.iter().cloned().collect();
+        let policy = candidate::REQUIREMENTS[self.build_requirement].1;
         let rejected = message(
             id,
             Action::Completed(
@@ -187,7 +201,14 @@ impl Panel {
         self.task = Some(ctx.spawn_background_with_rejection(
             move |_| {
                 let result = ProfileStore::new(catalog)
-                    .and_then(|store| store.rollout_tools(&selected, &candidate, review.as_deref()))
+                    .and_then(|store| {
+                        store.rollout_tools_with_builds(
+                            &selected,
+                            &candidate,
+                            review.as_deref(),
+                            policy,
+                        )
+                    })
                     .map(Arc::new)
                     .map_err(|error| format!("{error:#}"));
                 message(id, Action::Completed(ticket, result))
@@ -322,6 +343,28 @@ impl Panel {
                             format!("{} selected", self.selected.len()),
                         ));
                         fields.push(KeyedView::new(
+                            "build-requirement",
+                            StackPanel::new().spacing(4.0).children((
+                                TextBlock::new().text("Candidate build requirement"),
+                                ComboBox::new()
+                                    .automation_name("Candidate build requirement")
+                                    .items_source(candidate::REQUIREMENTS.map(|(label, _)| label))
+                                    .selected_index(Some(self.build_requirement))
+                                    .on_selection_changed(ctx.callback({
+                                        let ticket = self.ticket.clone();
+                                        move |index| {
+                                            message(
+                                                id,
+                                                Action::SelectBuildRequirement(
+                                                    ticket.clone(),
+                                                    index,
+                                                ),
+                                            )
+                                        }
+                                    })),
+                            )),
+                        ));
+                        fields.push(KeyedView::new(
                             "review",
                             Button::new()
                                 .is_enabled(!self.selected.is_empty())
@@ -348,6 +391,16 @@ impl Panel {
                 ));
                 self.candidate_checks
                     .describe(&mut fields, &self.ticket, send);
+                let (requirement, policy) = candidate::REQUIREMENTS[self.build_requirement];
+                if policy.is_some() {
+                    fields.push(note("selected-build-requirement", requirement));
+                    if !self.candidate_checks.busy() && !self.candidate_checks.ready() {
+                        fields.push(note(
+                            "build-requirement-unmet",
+                            "Prepare or repair the required builds before applying the rollout.",
+                        ));
+                    }
+                }
                 fields.extend(report.profiles.iter().map(review_row));
                 fields.push(KeyedView::new(
                     "review-actions",
@@ -356,9 +409,7 @@ impl Panel {
                         .spacing(8.0)
                         .children((
                             Button::new()
-                                .is_enabled(
-                                    report.changed_profiles > 0 && !self.candidate_checks.busy(),
-                                )
+                                .is_enabled(self.can_apply(report))
                                 .on_click(send(Action::Apply(self.ticket.clone())))
                                 .content("Apply reviewed tool rollout"),
                             Button::new()
@@ -504,6 +555,7 @@ impl TerminalApp {
             Action::Picked(ticket, _)
             | Action::Filter(ticket, _)
             | Action::Select(ticket, ..)
+            | Action::SelectBuildRequirement(ticket, _)
             | Action::Review(ticket)
             | Action::CheckCandidate(ticket)
             | Action::PrepareCandidate(ticket, _)
@@ -559,6 +611,12 @@ impl TerminalApp {
                     panel.selected.remove(&name);
                 }
             }
+            Action::SelectBuildRequirement(_, Some(index))
+                if matches!(panel.work, Work::Choosing)
+                    && index < candidate::REQUIREMENTS.len() =>
+            {
+                panel.build_requirement = index;
+            }
             Action::Review(_)
                 if matches!(panel.work, Work::Choosing) && !panel.selected.is_empty() =>
             {
@@ -566,8 +624,7 @@ impl TerminalApp {
             }
             Action::Apply(_) => {
                 if let Work::Reviewed(report) = &panel.work
-                    && report.changed_profiles > 0
-                    && !panel.candidate_checks.busy()
+                    && panel.can_apply(report)
                 {
                     panel.request(id, catalog, Some(report.review.clone()), ctx);
                 }
@@ -609,13 +666,17 @@ impl TerminalApp {
                 panel.work = match result {
                     Ok(report) if report.applied => Work::Applied(report),
                     Ok(report) => {
-                        panel.candidate_checks.start(
-                            id,
-                            panel.ticket.clone(),
-                            report.clone(),
-                            None,
-                            ctx,
-                        );
+                        if let Some(builds) = &report.candidate_builds {
+                            panel.candidate_checks.use_review(builds);
+                        } else {
+                            panel.candidate_checks.start(
+                                id,
+                                panel.ticket.clone(),
+                                report.clone(),
+                                None,
+                                ctx,
+                            );
+                        }
                         Work::Reviewed(report)
                     }
                     Err(error) => {

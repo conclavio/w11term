@@ -13,6 +13,7 @@ $off = [System.Windows.Automation.ToggleState]::Off
 $dot = ' ' + [char]0xb7 + ' '
 $candidate = Join-Path $State 'Fleet revision.json'
 $candidateBefore = [IO.File]::ReadAllText($candidate)
+$candidateExecutable = Join-Path $State 'candidate-executable'
 $previous = Join-Path $State 'previous.json'
 $previousBefore = [IO.File]::ReadAllText($previous)
 $receipt = Join-Path $State 'Tool rollout receipt.json'
@@ -128,7 +129,7 @@ try {
     $cache = Join-Path $env:W11TERM_DATA_DIR 'tools/cache/v1'
     $null = [IO.Directory]::CreateDirectory($cache)
     $executablePin = ($candidateBefore | ConvertFrom-Json).tools[0].builds[0].sha256
-    [IO.File]::Copy((Join-Path $State 'candidate-executable'), (Join-Path $cache $executablePin))
+    [IO.File]::Copy($candidateExecutable, (Join-Path $cache $executablePin))
     Click $prepare
     $null = Wait-Until 'preparation refreshes readiness before any rollout' {
         (Find-Element "Candidate x86-64${dot}1 of 2 commands ready locally") -and
@@ -146,8 +147,48 @@ try {
     }
     if ([IO.File]::ReadAllText($profiles) -cne $catalogBefore) { throw 'A stale rollout edited saved profiles' }
     [IO.File]::WriteAllText($candidate, $candidateBefore)
+
+    $jq = Join-Path $State 'jq'
+    [IO.File]::Copy($candidateExecutable, $jq)
+    $requirement = 'Candidate build requirement'
+    $apply = 'Apply reviewed tool rollout'
+    $unmet = 'Prepare or repair the required builds before applying the rollout.'
+    Select-NativeComboItem $requirement 'Require all declared architectures'
     Click 'Review selected tool rollout'
-    Click 'Apply reviewed tool rollout'
+    $null = Wait-Until 'missing ARM64 builds prevent an all-architecture rollout' {
+        $applyButton = Find-Element $apply $button
+        $applyButton -and !$applyButton.Current.IsEnabled -and
+            (Find-Element $unmet) -and
+            (Find-Element "Candidate x86-64${dot}2 of 2 commands ready locally") -and
+            (Find-Element "Candidate ARM64${dot}0 of 2 commands ready locally")
+    }
+    Click 'Back to selected profiles'
+    Select-NativeComboItem $requirement 'Require x86-64 builds'
+    [IO.File]::Delete($jq)
+    Click 'Review selected tool rollout'
+    $null = Wait-Until 'the x86-64 policy shows its missing local build' {
+        $applyButton = Find-Element $apply $button
+        $applyButton -and !$applyButton.Current.IsEnabled -and
+            (Find-Element 'Require x86-64 builds') -and (Find-Element $unmet) -and
+            (Find-Element "Candidate x86-64${dot}1 of 2 commands ready locally") -and
+            !(Find-Element "Candidate ARM64${dot}0 of 2 commands ready locally")
+    }
+    [IO.File]::Copy($candidateExecutable, $jq)
+    Click 'Check candidate builds'
+    $null = Wait-Until 'rechecking the prepared x86-64 builds enables apply' {
+        $applyButton = Find-Element $apply $button
+        $applyButton -and $applyButton.Current.IsEnabled -and
+            (Find-Element "Candidate x86-64${dot}2 of 2 commands ready locally")
+    }
+    [IO.File]::WriteAllText($jq, 'corrupted after the readiness check')
+    Click $apply
+    $null = Wait-Until 'the apply step rejects an executable corrupted after review' {
+        Find-Element 'Candidate builds are missing or invalid for jq (X86_64). Prepare the builds and try again.'
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $catalogBefore) { throw 'A failed build requirement changed saved profiles' }
+    [IO.File]::Copy($candidateExecutable, $jq, $true)
+    Click 'Review selected tool rollout'
+    Click $apply
     $null = Wait-Until 'the two selected bindings were updated' {
         Find-Element 'Updated tool manifests in 2 saved SSH profiles.'
     }

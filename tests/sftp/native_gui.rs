@@ -4699,10 +4699,11 @@ fn native_tool_profile_rollout_preserves_the_open_profile_draft() {
     let mut next: serde_json::Value =
         serde_json::from_str(&manifest(&[("rg", 'b'), ("jq", 'd')])).unwrap();
     next["tools"][0]["builds"] = json!([
-        {"architecture": "x86_64", "sha256": tool_pin,
+        {"architecture": "x86_64", "sha256": &tool_pin,
          "download": {"format": "raw", "url": "https://tools.example.test/rg"}},
         {"architecture": "aarch64", "path": "rg-arm64", "sha256": "e".repeat(64)},
     ]);
+    next["tools"][1]["builds"][0]["sha256"] = json!(tool_pin);
     let next = next.to_string();
     let previous_pin = super::utilities::tool_sha256(before.as_bytes());
     let next_pin = super::utilities::tool_sha256(next.as_bytes());

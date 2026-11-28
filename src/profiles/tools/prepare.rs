@@ -104,8 +104,12 @@ impl ToolRolloutReport {
         cancelled: impl Fn() -> bool,
     ) -> Result<Vec<ToolArchitectureAudit>> {
         ensure!(!cancelled(), "Candidate tool verification cancelled");
+        let architecture = self
+            .candidate_builds
+            .as_ref()
+            .and_then(|builds| builds.policy.architecture);
         self.reviewed_candidate()?
-            .audit_executables(None, &cancelled)
+            .audit_executables(architecture, &cancelled)
     }
 
     /// Prepare one architecture from the reviewed candidate and refresh local readiness.

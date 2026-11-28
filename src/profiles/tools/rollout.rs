@@ -38,7 +38,7 @@ pub struct ToolRolloutBuildPolicy {
 #[derive(Serialize)]
 pub struct ToolRolloutBuildReport {
     #[serde(flatten)]
-    policy: ToolRolloutBuildPolicy,
+    pub(super) policy: ToolRolloutBuildPolicy,
     pub ready: bool,
     pub checks: Vec<ToolArchitectureAudit>,
 }
