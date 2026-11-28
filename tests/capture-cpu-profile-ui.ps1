@@ -7,7 +7,8 @@ Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 $output = Join-Path $State 'profile from triage.folded'
 $marker = [IO.File]::ReadAllText((Join-Path $State 'capture-marker'))
 $dot = ' ' + [char]0xb7 + ' '
-$profileWorker = 'Profile worker' + $dot + 'PID 42' + $dot + '80.0% peak CPU'
+$measurement = [IO.File]::ReadAllText((Join-Path $State 'profile-measurement'))
+$profileWorker = 'Profile worker' + $dot + 'PID 42' + $dot + '80.0% ' + $measurement
 $valuePattern = [System.Windows.Automation.ValuePattern]::Pattern
 $editType = [System.Windows.Automation.ControlType]::Edit
 
@@ -34,8 +35,11 @@ try {
     $null = Control @('wait-ssh-connected','--pane',"$remotePane",'--timeout','15')
     Run-Palette 'Linux performance triage'
     Click-CaptureButton 'Run triage'
-    $null = Wait-Until 'process ranked by the recorded interval peak' {
+    $null = Wait-Until 'process ranked by the recorded CPU measurement' {
         Find-Element $profileWorker $button
+    }
+    if (Find-Element ('Profile top-only' + $dot + 'PID 99' + $dot + '95.0% CPU in top snapshot') $button) {
+        throw 'The top snapshot displaced available pidstat interval evidence'
     }
     $null = Control @('focus-pane','--pane',"$localPane")
     Wait-Focus $localPane

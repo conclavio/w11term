@@ -388,8 +388,9 @@ impl Panel {
         for process in &self.busy_processes {
             let pid = process.pid;
             let label = display_output(&format!(
-                "{} · PID {pid} · {:.1}% peak CPU",
-                process.command, process.peak_cpu
+                "{} · PID {pid} · {}",
+                process.command,
+                process.cpu_label()
             ));
             fields.push(KeyedView::new(
                 format!("profile-pid-{pid}"),

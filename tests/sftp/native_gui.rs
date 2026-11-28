@@ -242,6 +242,16 @@ async fn native_cpu_launch_reviews_literal_arguments_and_saves_the_stopped_profi
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "records a reviewed CPU profile from the native Linux triage report"]
 async fn native_cpu_profile_reviews_the_triage_connection_before_recording() {
+    record_cpu_profile_from_triage(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "records a reviewed CPU profile from top when pidstat is missing"]
+async fn native_cpu_profile_uses_top_when_pidstat_is_missing() {
+    record_cpu_profile_from_triage(true).await;
+}
+
+async fn record_cpu_profile_from_triage(top_fallback: bool) {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     let transports = Arc::new(AtomicUsize::new(0));
@@ -255,10 +265,25 @@ async fn native_cpu_profile_reviews_the_triage_connection_before_recording() {
         "09:40:01 1000 42 78.00 2.00 0.00 0.00 80.00 1 worker\n",
         "09:40:01 1000 80 1.00 0.00 0.00 0.00 1.00 1 helper\n",
     ));
-    let triage = TRIAGE_RESPONSE.replace(
-        "pidstat\t1000\t2000\t0\t\t",
-        &format!("pidstat\t1000\t2000\t0\t{pidstat}\t"),
-    );
+    let top = if top_fallback {
+        "42 worker 20 0 100m 48m 5m R 80.0 0.5 1:20.00 worker\n"
+    } else {
+        "99 worker 20 0 100m 48m 5m R 95.0 0.5 1:20.00 top-only\n"
+    };
+    let top = STANDARD.encode(format!(
+        "top - 09:40:00 up 4 days, 1 user\n\nPID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND\n{top}"
+    ));
+    let pidstat_row = if top_fallback {
+        "pidstat\t1000\t2000\t127\t\t".into()
+    } else {
+        format!("pidstat\t1000\t2000\t0\t{pidstat}\t")
+    };
+    let triage = TRIAGE_RESPONSE
+        .replace("pidstat\t1000\t2000\t0\t\t", &pidstat_row)
+        .replace(
+            "top\t1000\t1010\t0\t\t",
+            &format!("top\t1000\t1010\t0\t{top}\t"),
+        );
     fs::write(remote.path().join("triage-response"), triage).unwrap();
     fs::write(remote.path().join("profile-wait-for-stop"), []).unwrap();
     fs::write(
@@ -274,6 +299,12 @@ async fn native_cpu_profile_reviews_the_triage_connection_before_recording() {
     )
     .unwrap();
     let state = tempfile::tempdir().unwrap();
+    let measurement = if top_fallback {
+        "CPU in top snapshot"
+    } else {
+        "peak CPU"
+    };
+    fs::write(state.path().join("profile-measurement"), measurement).unwrap();
     let captured = remote.path().join("profile-captured");
     fs::write(
         state.path().join("capture-marker"),

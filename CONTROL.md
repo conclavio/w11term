@@ -1978,7 +1978,7 @@ The response appears as selectable text. **Copy response** puts it on the Window
 
 ### Capture a Linux CPU profile
 
-In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → CPU flame graph → Capture from SSH**. Enter a PID, duration, frequency, and unwind mode. You can also choose a process under **Busy processes during triage** in the CPU findings. That list ranks processes by their peak reported interval CPU usage and fills in the PID from the live report. [pidstat manual](https://github.com/sysstat/sysstat/blob/master/man/pidstat.in)
+In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → CPU flame graph → Capture from SSH**. Enter a PID, duration, frequency, and unwind mode. You can also choose a process under **Busy processes during triage** in the CPU findings. The list ranks processes by their peak reported `pidstat` interval CPU usage. When no positive interval rows are available, it ranks the observed `top` snapshot rows and labels their source. Choosing a process fills in its PID for review on the same SSH connection. [pidstat manual](https://github.com/sysstat/sysstat/blob/master/man/pidstat.in) · [Procps top manual](https://man7.org/linux/man-pages/man1/top.1.html)
 
 Choose **Review CPU profile** to check the live process and verified SSH endpoint. Then choose **Record CPU profile** and a new local folded stacks file. Changes to the settings require a fresh review. Recording stays tied to the pane, connection, and process start time from review. The resulting file opens in the flame graph with the unresolved frame count and **Perf output**, when available.
 
