@@ -1,7 +1,7 @@
 use super::{CatalogEdit, ProfileStore};
 use crate::{
     options::{DotfileSync, SshOptions},
-    sftp::{DotfileBundle, digest_hex, normalize_sha256},
+    sftp::{DotfileBundle, DotfileShell, digest_hex, normalize_sha256},
 };
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Serialize)]
@@ -24,8 +25,21 @@ pub struct DotfileRolloutProfile {
     pub profile: String,
     pub previous: DotfileSync,
     pub candidate_bundle_sha256: String,
+    pub baseline: DotfileRolloutBaseline,
     pub next_pin: Option<String>,
     pub changed: bool,
+    #[serde(skip)]
+    pub before_fragments: Option<Arc<[String; 2]>>,
+    #[serde(skip)]
+    pub candidate_fragments: Arc<[String; 2]>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", content = "bundle_sha256", rename_all = "kebab-case")]
+pub enum DotfileRolloutBaseline {
+    Pinned(String),
+    File(String),
+    Unavailable,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,10 +65,31 @@ fn approval(options: &SshOptions) -> Result<&DotfileSync> {
     Ok(settings)
 }
 
-fn candidate_versions(candidate: &Path) -> Result<Vec<(crate::sftp::DotfileShell, String)>> {
+fn load_candidate(candidate: &Path) -> Result<DotfileBundle> {
     DotfileBundle::load(candidate)
-        .and_then(|bundle| bundle.content_versions())
         .with_context(|| format!("Reading candidate dotfiles bundle {}", candidate.display()))
+}
+
+struct ShellContents {
+    shell: DotfileShell,
+    digest: String,
+    fragments: Arc<[String; 2]>,
+}
+
+impl ShellContents {
+    fn capture(bundle: &DotfileBundle) -> Result<Vec<Self>> {
+        bundle
+            .content_versions()?
+            .into_iter()
+            .map(|(shell, digest)| {
+                Ok(Self {
+                    shell,
+                    digest,
+                    fragments: Arc::new(bundle.normalized_fragments(shell)?),
+                })
+            })
+            .collect()
+    }
 }
 
 impl<'a> Rollout<'a> {
@@ -64,30 +99,54 @@ impl<'a> Rollout<'a> {
         selected: &BTreeSet<&str>,
         profiles: &BTreeMap<String, SshOptions>,
     ) -> Result<Self> {
-        let versions = candidate_versions(candidate)?;
+        let versions = ShellContents::capture(&load_candidate(candidate)?)?;
+        let mut previous_bundles = BTreeMap::<PathBuf, Vec<ShellContents>>::new();
         let mut revisions = Vec::with_capacity(selected.len());
         for &name in selected {
             let options = profiles
                 .get(name)
                 .with_context(|| format!("SSH profile {name} was not found"))?;
             let previous = approval(options).with_context(|| format!("SSH profile {name}"))?;
-            let digest = versions
+            let proposed = versions
                 .iter()
-                .find_map(|(shell, digest)| (*shell == previous.shell).then_some(digest))
+                .find(|entry| entry.shell == previous.shell)
                 .with_context(|| {
                     format!(
                         "The candidate has no fragments for {} in SSH profile {name}",
                         previous.shell.label()
                     )
                 })?;
-            let next_pin = previous.bundle_sha256.as_ref().map(|_| digest.clone());
+            let before = if previous.bundle == candidate {
+                &versions
+            } else {
+                previous_bundles
+                    .entry(previous.bundle.clone())
+                    .or_insert_with(|| {
+                        DotfileBundle::load(&previous.bundle)
+                            .and_then(|bundle| ShellContents::capture(&bundle))
+                            .unwrap_or_default()
+                    })
+            };
+            let pin = previous.bundle_sha256.as_deref();
+            let baseline = before.iter().find(|entry| {
+                entry.shell == previous.shell && pin.is_none_or(|pin| entry.digest == pin)
+            });
+            let baseline_report = match (baseline, pin) {
+                (Some(entry), Some(_)) => DotfileRolloutBaseline::Pinned(entry.digest.clone()),
+                (Some(entry), None) => DotfileRolloutBaseline::File(entry.digest.clone()),
+                (None, _) => DotfileRolloutBaseline::Unavailable,
+            };
+            let next_pin = pin.map(|_| proposed.digest.clone());
             revisions.push(DotfileRolloutProfile {
                 profile: name.to_owned(),
                 previous: previous.clone(),
-                candidate_bundle_sha256: digest.clone(),
+                candidate_bundle_sha256: proposed.digest.clone(),
+                baseline: baseline_report,
                 changed: previous.bundle.as_path() != candidate
                     || previous.bundle_sha256 != next_pin,
                 next_pin,
+                before_fragments: baseline.map(|entry| entry.fragments.clone()),
+                candidate_fragments: proposed.fragments.clone(),
             });
         }
         Ok(Self {
@@ -98,7 +157,7 @@ impl<'a> Rollout<'a> {
     }
 
     fn review(&self) -> Result<String> {
-        let mut digest = Sha256::new_with_prefix(b"w11term-dotfiles-rollout-v1\0");
+        let mut digest = Sha256::new_with_prefix(b"w11term-dotfiles-rollout-v2\0");
         digest.update(serde_json::to_vec(self)?);
         Ok(digest_hex(digest))
     }
@@ -121,7 +180,7 @@ impl<'a> Rollout<'a> {
 
 impl ProfileStore {
     pub fn dotfile_rollout_targets(&self, candidate: &Path) -> Result<Vec<(String, DotfileSync)>> {
-        let versions = candidate_versions(candidate)?;
+        let versions = load_candidate(candidate)?.content_versions()?;
         Ok(self
             .load()?
             .into_iter()
@@ -159,7 +218,7 @@ impl ProfileStore {
         let changed = plan.profiles.iter().filter(|entry| entry.changed).count();
         if let Some(review) = review {
             const STALE: &str =
-                "The candidate or profile approvals changed. Preview the rollout again.";
+                "The candidate, baseline, or profile approvals changed. Preview the rollout again.";
             let review = normalize_sha256(review)?;
             ensure!(token == review, STALE);
             if changed > 0 {

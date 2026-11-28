@@ -696,7 +696,14 @@ fn reviewed_rollout_updates_only_named_approvals_and_retains_pin_policy() {
     let root = directory.path();
     let catalog = root.join("profiles.json");
     let candidate = root.join("revision.json");
-    let pin = "a".repeat(64);
+    let old_path = root.join("original.json");
+    fs::write(
+        &old_path,
+        br#"{"version":1,"bash":"PS1=old","fish":"set -g fish_greeting old"}"#,
+    )
+    .unwrap();
+    let old = DotfileBundle::load(&old_path).unwrap();
+    let pin = old.content_version(DotfileShell::Bash).unwrap();
     let mut east = ssh_profile("bash", "original.json", Some(&pin));
     east["local_custom_field"] = json!({"keep": true});
     let mut west = ssh_profile("fish", "original.json", None);
@@ -726,6 +733,16 @@ fn reviewed_rollout_updates_only_named_approvals_and_retains_pin_policy() {
     assert_eq!(result["applied"], false);
     assert_eq!(result["changed_profiles"], 2);
     assert_eq!(result["profiles"][0]["profile"], "East");
+    assert_eq!(
+        result["profiles"][0]["baseline"],
+        json!({"kind": "pinned", "bundle_sha256": pin})
+    );
+    assert_eq!(
+        result["profiles"][1]["baseline"],
+        json!({"kind": "file", "bundle_sha256": old.content_version(DotfileShell::Fish).unwrap()})
+    );
+    assert!(!preview.to_string().contains("PS1="));
+    assert!(!preview.to_string().contains("fish_greeting"));
     let expected_pin = DotfileBundle::load(&candidate)
         .unwrap()
         .content_version(DotfileShell::Bash)
@@ -772,6 +789,8 @@ fn rollout_rejects_stale_inputs_ineligible_profiles_and_concurrent_writers() {
     let root = directory.path();
     let catalog = root.join("profiles.json");
     let candidate = root.join("revision.json");
+    let baseline_path = root.join("original.json");
+    let baseline = br#"{"version":1,"bash":"PS1=original"}"#;
     let mut disabled = ssh_profile("bash", "original.json", None);
     disabled.as_object_mut().unwrap().remove("dotfiles");
     let original = json!({"profiles": {
@@ -782,6 +801,7 @@ fn rollout_rejects_stale_inputs_ineligible_profiles_and_concurrent_writers() {
     let original_bundle = json!({"version": 1, "bash": "PS1=revision"}).to_string();
     fs::write(&catalog, original.to_string()).unwrap();
     fs::write(&candidate, &original_bundle).unwrap();
+    fs::write(&baseline_path, baseline).unwrap();
     for (args, expected) in [
         (&[][..], "Choose at least one SSH profile"),
         (&["--profile", "East", "--profile", "East"], "only once"),
@@ -809,6 +829,16 @@ fn rollout_rejects_stale_inputs_ineligible_profiles_and_concurrent_writers() {
     assert_eq!(fs::read_to_string(&catalog).unwrap(), original.to_string());
 
     fs::write(&candidate, original_bundle).unwrap();
+    fs::write(
+        &baseline_path,
+        br#"{"version":1,"bash":"PS1=changed-after-review"}"#,
+    )
+    .unwrap();
+    let stale_baseline = apply();
+    assert_eq!(stale_baseline.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&stale_baseline.stderr).contains("Preview the rollout again"));
+    assert_eq!(fs::read_to_string(&catalog).unwrap(), original.to_string());
+    fs::write(&baseline_path, baseline).unwrap();
     let mut moved = original.clone();
     moved["profiles"]["East"]["dotfiles"]["home"] = json!("/home/moved");
     fs::write(&catalog, moved.to_string()).unwrap();

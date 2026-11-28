@@ -45,12 +45,25 @@ try {
     $null = Wait-CheckBox 'Rollout profile West' $on
     Click 'Review selected rollout profiles'
     $null = Wait-Until 'the Bash digest appears in the review' { Find-Element "Proposed digest $digest" }
+    $null = Wait-Until 'the review identifies the pin and the unavailable Fish baseline' {
+        (Find-Element 'Compared with the approved pinned version.') -and
+            (Find-Element 'The approved bundle could not be verified. Showing proposed fragments.')
+    }
+    Set-NativeExpansion 'East prompt changes' $true
+    $null = Wait-Until 'the reviewed Bash lines show the old and new prompts' {
+        Get-NativeTextLabels | Where-Object { $_.Contains('Removed line 1') -and $_.Contains('PS1=before') -and
+            $_.Contains('Added line 1') -and $_.Contains('PS1=reviewed') }
+    }
+    Set-NativeExpansion 'West prompt changes' $true
+    $null = Wait-Until 'a missing baseline shows only the proposed Fish prompt' {
+        Get-NativeTextLabels | Where-Object { $_.Contains('Proposed line 1') -and $_.Contains('set -g fish_greeting reviewed') }
+    }
     if ([IO.File]::ReadAllText($profiles) -cne $oldCatalog) { throw 'Preview changed the catalog' }
 
     [IO.File]::WriteAllText($candidate, $oldCandidate.Replace('PS1=reviewed', 'PS1=edited'))
     Click 'Apply reviewed rollout'
     $null = Wait-Until 'the rollout rejected the changed revision' {
-        Find-Element 'The candidate or profile approvals changed. Preview the rollout again.'
+        Find-Element 'The candidate, baseline, or profile approvals changed. Preview the rollout again.'
     }
     if ([IO.File]::ReadAllText($profiles) -cne $oldCatalog) { throw 'Stale rollout changed the catalog' }
     [IO.File]::WriteAllText($candidate, $oldCandidate)

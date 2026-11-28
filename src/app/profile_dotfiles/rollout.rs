@@ -1,6 +1,7 @@
 use super::*;
+use crate::app::command_reference::dotfiles::comparison::{code_details, diff_text};
 use std::collections::BTreeSet;
-use w11term::profiles::{DotfileRolloutReport, ProfileStore};
+use w11term::profiles::{DotfileRolloutBaseline, DotfileRolloutReport, ProfileStore};
 
 type Targets = Vec<(String, DotfileSync)>;
 
@@ -13,7 +14,7 @@ pub enum Action {
     Review(Arc<()>),
     Back(Arc<()>),
     Apply(Arc<()>),
-    Completed(Arc<()>, Result<Arc<DotfileRolloutReport>, String>),
+    Completed(Arc<()>, Result<Arc<ReviewedRollout>, String>),
     Close(Arc<()>),
 }
 
@@ -22,7 +23,7 @@ enum Work {
     Loading,
     Editing,
     Reviewing,
-    Reviewed(Arc<DotfileRolloutReport>),
+    Reviewed(Arc<ReviewedRollout>),
     Applying,
     Applied(usize),
 }
@@ -36,6 +37,37 @@ pub(super) struct Panel {
     query: String,
     work: Work,
     error: Option<String>,
+}
+
+pub struct ReviewedRollout {
+    report: DotfileRolloutReport,
+    changes: Vec<[Option<String>; 2]>,
+}
+
+impl ReviewedRollout {
+    fn new(report: DotfileRolloutReport) -> Self {
+        let changes = if report.applied {
+            Vec::new()
+        } else {
+            report
+                .profiles
+                .iter()
+                .map(|entry| {
+                    [0, 1].map(|index| {
+                        diff_text(
+                            entry
+                                .before_fragments
+                                .as_deref()
+                                .map_or("", |before| before[index].as_str()),
+                            &entry.candidate_fragments[index],
+                            entry.before_fragments.is_none(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        Self { report, changes }
+    }
 }
 
 fn message(id: TabId, action: Action) -> Message {
@@ -81,6 +113,7 @@ impl Panel {
                     .and_then(|store| {
                         store.rollout_dotfiles(&profiles, &candidate, review.as_deref())
                     })
+                    .map(ReviewedRollout::new)
                     .map(Arc::new)
                     .map_err(|error| format!("{error:#}"));
                 message(id, Action::Completed(ticket, result))
@@ -103,12 +136,24 @@ impl Panel {
                 "status",
                 format!("Updated dotfiles in {count} saved SSH profiles."),
             )),
-            Work::Reviewed(report) => {
-                for entry in &report.profiles {
+            Work::Reviewed(review) => {
+                let report = &review.report;
+                for (entry, changes) in report.profiles.iter().zip(&review.changes) {
                     let old = &entry.previous;
                     let policy = match (&old.bundle_sha256, &entry.next_pin) {
                         (Some(previous), Some(_)) => format!("Previous pin {previous}"),
                         _ => "Follows the bundle file".into(),
+                    };
+                    let baseline = match &entry.baseline {
+                        DotfileRolloutBaseline::Pinned(_) => {
+                            "Compared with the approved pinned version."
+                        }
+                        DotfileRolloutBaseline::File(_) => {
+                            "Compared with the approved bundle file on disk."
+                        }
+                        DotfileRolloutBaseline::Unavailable => {
+                            "The approved bundle could not be verified. Showing proposed fragments."
+                        }
                     };
                     fields.push(KeyedView::new(
                         format!("review-{}", entry.profile),
@@ -125,8 +170,26 @@ impl Panel {
                             TextBlock::new()
                                 .text(format!("Proposed digest {}", entry.candidate_bundle_sha256))
                                 .text_wrapping(TextWrapping::Wrap),
+                            TextBlock::new()
+                                .text(baseline)
+                                .text_wrapping(TextWrapping::Wrap),
                         )),
                     ));
+                    if changes.iter().all(Option::is_none) {
+                        fields.push(KeyedView::new(
+                            format!("unchanged-{}", entry.profile),
+                            TextBlock::new().text("No dotfile fragment lines changed."),
+                        ));
+                    }
+                    for (role, lines) in ["environment", "prompt"].into_iter().zip(changes) {
+                        if let Some(lines) = lines {
+                            fields.push(code_details(
+                                format!("changes-{role}-{}", entry.profile),
+                                &format!("{} {role} changes", entry.profile),
+                                lines,
+                            ));
+                        }
+                    }
                 }
                 if report.changed_profiles == 0 {
                     fields.push(label(
@@ -323,22 +386,22 @@ impl TerminalApp {
                 panel.request(id, catalog, None, ctx)
             }
             Action::Apply(_) => {
-                if let Work::Reviewed(report) = &panel.work
-                    && report.changed_profiles > 0
+                if let Work::Reviewed(review) = &panel.work
+                    && review.report.changed_profiles > 0
                 {
-                    panel.request(id, catalog, Some(report.review.clone()), ctx);
+                    panel.request(id, catalog, Some(review.report.review.clone()), ctx);
                 }
             }
             Action::Completed(_, result)
                 if matches!(panel.work, Work::Reviewing | Work::Applying) =>
             {
                 match result {
-                    Ok(report) if report.applied => {
-                        panel.work = Work::Applied(report.changed_profiles);
-                        self.refresh_rollout_origin(id, &report);
+                    Ok(review) if review.report.applied => {
+                        panel.work = Work::Applied(review.report.changed_profiles);
+                        self.refresh_rollout_origin(id, &review.report);
                         self.refresh_profiles();
                     }
-                    Ok(report) => panel.work = Work::Reviewed(report),
+                    Ok(review) => panel.work = Work::Reviewed(review),
                     Err(error) => {
                         panel.work = Work::Editing;
                         panel.error = Some(error);

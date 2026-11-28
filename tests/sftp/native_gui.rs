@@ -4592,8 +4592,16 @@ async fn native_saving_an_ssh_profile_keeps_the_original_live_pane() {
 #[test]
 #[ignore = "reviews and applies a selected SSH profile bundle rollout in the Windows editor"]
 fn native_dotfile_rollout_updates_reviewed_saved_profiles() {
+    use w11term::sftp::{DotfileBundle, DotfileShell};
+
     let state = tempfile::tempdir().unwrap();
     let key = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let baseline = state.path().join("previous.json");
+    fs::write(&baseline, br#"{"version":1,"bash":"PS1=before"}"#).unwrap();
+    let pinned = DotfileBundle::load(&baseline)
+        .unwrap()
+        .content_version(DotfileShell::Bash)
+        .unwrap();
     let profile = |host: &str, shell: &str, pin: Option<&str>| {
         json!({
             "host": host, "user": "operator", "auth": "agent", "host_key": key,
@@ -4604,7 +4612,7 @@ fn native_dotfile_rollout_updates_reviewed_saved_profiles() {
         })
     };
     fs::write(state.path().join("profiles.json"), json!({"profiles": {
-        "East": profile("east.example.test", "bash", Some(&"a".repeat(64))),
+        "East": profile("east.example.test", "bash", Some(&pinned)),
         "West": profile("west.example.test", "fish", None),
         "Other": profile("other.example.test", "bash", None),
         "Fixture local": {"backend": "local", "executable": "powershell.exe", "args": ["-NoProfile", "-NoLogo"]},
