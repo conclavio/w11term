@@ -46,7 +46,7 @@ pub enum ToolProfileAuditStatus {
     FollowsFile,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ToolProfileBuildChecks {
     Skip,
     Verify(Option<UtilityArchitecture>),
@@ -66,6 +66,16 @@ impl ProfileStore {
         selected: Option<&str>,
         checks: ToolProfileBuildChecks,
     ) -> Result<ToolProfileAudit> {
+        self.audit_tool_profiles_cancellable(selected, checks, || false)
+    }
+
+    pub fn audit_tool_profiles_cancellable(
+        &self,
+        selected: Option<&str>,
+        checks: ToolProfileBuildChecks,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<ToolProfileAudit> {
+        ensure!(!cancelled(), "SSH tool audit cancelled");
         let profiles = self.load()?;
         if let Some(profile) = selected {
             ensure!(
@@ -77,8 +87,12 @@ impl ProfileStore {
         let profiles = profiles
             .iter()
             .filter(|(name, _)| selected.is_none_or(|selected| selected == name.as_str()))
-            .map(|(name, profile)| audit_profile(name, profile, checks, &mut manifests))
-            .collect();
+            .map(|(name, profile)| {
+                ensure!(!cancelled(), "SSH tool audit cancelled");
+                audit_profile(name, profile, checks, &mut manifests, &cancelled)
+            })
+            .collect::<Result<_>>()?;
+        ensure!(!cancelled(), "SSH tool audit cancelled");
         Ok(ToolProfileAudit {
             profiles_path: self.path().to_owned(),
             profiles,
@@ -91,7 +105,8 @@ fn audit_profile(
     profile: &SshOptions,
     checks: ToolProfileBuildChecks,
     manifests: &mut ManifestCache,
-) -> ToolProfileAuditRow {
+    cancelled: &impl Fn() -> bool,
+) -> Result<ToolProfileAuditRow> {
     use ToolProfileAuditStatus::*;
 
     let settings = profile.tool_bundle.as_deref();
@@ -111,12 +126,12 @@ fn audit_profile(
         build_checks: None,
     };
     let Some(settings) = settings else {
-        return row;
+        return Ok(row);
     };
     if profile.durable || profile.player.rustmush {
         row.status = NotRun;
         row.detail = Some("This profile uses its own shell startup.".into());
-        return row;
+        return Ok(row);
     }
     let pin = match settings
         .validate_profile(profile)
@@ -126,7 +141,7 @@ fn audit_profile(
         Err(error) => {
             row.status = InvalidSettings;
             row.detail = Some(format!("{error:#}"));
-            return row;
+            return Ok(row);
         }
     };
     row.path_error = settings.add_to_path.as_ref().and_then(|path| {
@@ -147,7 +162,7 @@ fn audit_profile(
         Err(error) => {
             row.status = ManifestError;
             row.detail = Some(error.clone());
-            return row;
+            return Ok(row);
         }
     };
     row.manifest_sha256 = Some(manifest.digest.clone());
@@ -164,10 +179,11 @@ fn audit_profile(
     if matches!(row.status, MatchesPin | FollowsFile)
         && let ToolProfileBuildChecks::Verify(architecture) = checks
     {
-        let verification = manifest
-            .build_checks
-            .get_or_insert_with(|| manifest.bundle.audit_executables(architecture));
-        row.build_checks = Some(verification.clone());
+        if manifest.build_checks.is_none() {
+            manifest.build_checks =
+                Some(manifest.bundle.audit_executables(architecture, cancelled)?);
+        }
+        row.build_checks.clone_from(&manifest.build_checks);
     }
-    row
+    Ok(row)
 }

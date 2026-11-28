@@ -52,7 +52,8 @@ impl UtilityBundle {
     pub(crate) fn audit_executables(
         &self,
         selected: Option<UtilityArchitecture>,
-    ) -> Vec<ToolArchitectureAudit> {
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Vec<ToolArchitectureAudit>> {
         [UtilityArchitecture::X86_64, UtilityArchitecture::Aarch64]
             .into_iter()
             .filter(|architecture| match selected {
@@ -73,22 +74,25 @@ impl UtilityBundle {
                             .builds
                             .iter()
                             .filter(|build| build.architecture == architecture)
-                            .map(|build| audit_build(build, &mut remaining))
-                            .collect();
-                        ToolCommandAudit {
+                            .map(|build| {
+                                ensure!(!cancelled(), "SSH tool audit cancelled");
+                                Ok(audit_build(build, &mut remaining))
+                            })
+                            .collect::<Result<_>>()?;
+                        Ok(ToolCommandAudit {
                             name: tool.name.clone(),
                             locally_available: builds
                                 .iter()
                                 .any(|build| build.status == ToolExecutableStatus::Verified),
                             builds,
-                        }
+                        })
                     })
-                    .collect();
-                ToolArchitectureAudit {
+                    .collect::<Result<_>>()?;
+                Ok(ToolArchitectureAudit {
                     architecture,
                     locally_available: commands.iter().all(|command| command.locally_available),
                     commands,
-                }
+                })
             })
             .collect()
     }

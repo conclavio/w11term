@@ -4637,13 +4637,15 @@ fn native_tool_profile_audit_filters_refreshes_and_preserves_a_draft() {
         }]}]})
         .to_string()
     };
-    let previous = manifest("a".repeat(64));
+    let executable = super::utilities::executable(w11term::sftp::UtilityArchitecture::X86_64, None);
+    let previous = manifest(super::utilities::tool_sha256(&executable));
     let current = manifest("b".repeat(64));
     let previous_pin = super::utilities::tool_sha256(previous.as_bytes());
     let current_pin = super::utilities::tool_sha256(current.as_bytes());
     fs::write(root.join("previous-tools.json"), previous).unwrap();
     fs::write(root.join("west-tools.json"), &current).unwrap();
     fs::write(root.join("east-tools.json"), current).unwrap();
+    fs::write(root.join("rg"), executable).unwrap();
     let profile = |host: &str, bundle: &str, pin: Option<&str>| {
         json!({
             "host": host, "user": "ops", "auth": "agent", "host_key": key,

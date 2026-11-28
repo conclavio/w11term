@@ -4,11 +4,31 @@ use std::path::PathBuf;
 use w11term::profiles::{
     ToolProfileAudit, ToolProfileAuditRow, ToolProfileAuditStatus, ToolProfileBuildChecks,
 };
+use w11term::sftp::{
+    ToolArchitectureAudit, ToolExecutableSource, ToolExecutableStatus, UtilityArchitecture,
+};
+
+const CHECKS: [(&str, ToolProfileBuildChecks); 4] = [
+    ("Manifest approvals only", ToolProfileBuildChecks::Skip),
+    (
+        "Verify all manifest architectures",
+        ToolProfileBuildChecks::Verify(None),
+    ),
+    (
+        "Verify x86-64 builds",
+        ToolProfileBuildChecks::Verify(Some(UtilityArchitecture::X86_64)),
+    ),
+    (
+        "Verify ARM64 builds",
+        ToolProfileBuildChecks::Verify(Some(UtilityArchitecture::Aarch64)),
+    ),
+];
 
 pub enum Action {
     Open,
     Refresh,
     Loaded(Arc<()>, Result<ToolProfileAudit, String>),
+    SelectChecks(Option<usize>),
     Filter(String),
     IssuesOnly(bool),
     Edit(String),
@@ -18,32 +38,48 @@ pub enum Action {
 pub(super) struct AuditPage {
     filter: String,
     issues_only: bool,
+    checks: ToolProfileBuildChecks,
     state: State,
 }
 
 enum State {
-    Loading(Arc<()>),
+    Loading(Arc<()>, ComponentTask),
     Ready(ToolProfileAudit),
     Failed(String),
 }
 
-fn load(catalog: PathBuf, id: TabId, ctx: &ComponentContext<TerminalApp>) -> State {
+impl Drop for AuditPage {
+    fn drop(&mut self) {
+        if let State::Loading(_, task) = &self.state {
+            task.cancel();
+        }
+    }
+}
+
+fn load(
+    catalog: PathBuf,
+    id: TabId,
+    checks: ToolProfileBuildChecks,
+    ctx: &ComponentContext<TerminalApp>,
+) -> State {
     let request = Arc::new(());
-    let state = State::Loading(request.clone());
+    let work_request = request.clone();
     let rejected = Message::ToolProfileAudit(
         id,
         Action::Loaded(request.clone(), Err("SSH tool audit unavailable".into())),
     );
-    ctx.spawn_background_with_rejection(
-        move |_| {
+    let task = ctx.spawn_background_with_rejection(
+        move |cancel| {
             let result = ProfileStore::new(catalog)
-                .and_then(|store| store.audit_tool_profiles(None, ToolProfileBuildChecks::Skip))
+                .and_then(|store| {
+                    store.audit_tool_profiles_cancellable(None, checks, || cancel.is_cancelled())
+                })
                 .map_err(|error| format!("{error:#}"));
-            Message::ToolProfileAudit(id, Action::Loaded(request, result))
+            Message::ToolProfileAudit(id, Action::Loaded(work_request, result))
         },
         rejected,
     );
-    state
+    State::Loading(request, task)
 }
 
 impl TerminalApp {
@@ -57,10 +93,12 @@ impl TerminalApp {
             return;
         };
         if matches!(action, Action::Open) && current.is_none() {
+            let checks = ToolProfileBuildChecks::Skip;
             *current = Some(SettingsEditor::ToolProfileAudit(AuditPage {
                 filter: String::new(),
                 issues_only: false,
-                state: load(self.store.path().to_owned(), id, ctx),
+                checks,
+                state: load(self.store.path().to_owned(), id, checks, ctx),
             }));
             return;
         }
@@ -68,10 +106,18 @@ impl TerminalApp {
             return;
         };
         match action {
-            Action::Refresh if !matches!(page.state, State::Loading(_)) => {
-                page.state = load(self.store.path().to_owned(), id, ctx);
+            Action::Refresh if !matches!(page.state, State::Loading(..)) => {
+                page.state = load(self.store.path().to_owned(), id, page.checks, ctx);
             }
-            Action::Loaded(request, result) if matches!(&page.state, State::Loading(active) if Arc::ptr_eq(active, &request)) => {
+            Action::SelectChecks(Some(index)) if !matches!(page.state, State::Loading(..)) => {
+                if let Some(&(_, checks)) = CHECKS.get(index)
+                    && checks != page.checks
+                {
+                    page.checks = checks;
+                    page.state = load(self.store.path().to_owned(), id, checks, ctx);
+                }
+            }
+            Action::Loaded(request, result) if matches!(&page.state, State::Loading(active, _) if Arc::ptr_eq(active, &request)) => {
                 page.state = match result {
                     Ok(report) => State::Ready(report),
                     Err(error) => State::Failed(error),
@@ -86,12 +132,13 @@ impl TerminalApp {
                 }
             }
             Action::Back => *current = None,
-            Action::Open | Action::Refresh | Action::Loaded(..) => {}
+            Action::Open | Action::Refresh | Action::SelectChecks(_) | Action::Loaded(..) => {}
         }
     }
 }
 
 pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) -> View {
+    let loading = matches!(page.state, State::Loading(..));
     let mut fields = vec![
         KeyedView::new(
             "title",
@@ -111,12 +158,26 @@ pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) 
                         )
                         .content("Back to settings"),
                     Button::new()
-                        .is_enabled(!matches!(page.state, State::Loading(_)))
+                        .is_enabled(!loading)
                         .on_click(
                             ctx.callback(move |_| Message::ToolProfileAudit(id, Action::Refresh)),
                         )
                         .content("Refresh audit"),
                 )),
+        ),
+        KeyedView::new(
+            "checks",
+            StackPanel::new().spacing(4.0).children((
+                TextBlock::new().text("Audit scope"),
+                ComboBox::new()
+                    .automation_name("SSH tool audit scope")
+                    .is_enabled(!loading)
+                    .items_source(CHECKS.iter().map(|(label, _)| *label))
+                    .selected_index(CHECKS.iter().position(|(_, checks)| *checks == page.checks))
+                    .on_selection_changed(ctx.callback(move |index| {
+                        Message::ToolProfileAudit(id, Action::SelectChecks(index))
+                    })),
+            )),
         ),
         KeyedView::new(
             "filter",
@@ -140,14 +201,28 @@ pub(super) fn view(id: TabId, page: &AuditPage, ctx: &ViewContext<TerminalApp>) 
         ),
     ];
     match &page.state {
-        State::Loading(_) => fields.push(note("status", "Checking saved SSH tool approvals…")),
+        State::Loading(..) => fields.push(note(
+            "status",
+            match page.checks {
+                ToolProfileBuildChecks::Skip => "Checking saved SSH tool approvals…",
+                ToolProfileBuildChecks::Verify(_) => "Verifying local and cached SSH tools…",
+            },
+        )),
         State::Failed(error) => fields.push(note("error", error)),
         State::Ready(report) => {
             let query = profile_query::Query::new(&page.filter);
             let mut rows = Vec::new();
             for entry in &report.profiles {
                 let (label, issue) = status_label(&entry.status);
-                if page.issues_only && !issue && entry.path_error.is_none() {
+                if page.issues_only
+                    && !issue
+                    && entry.path_error.is_none()
+                    && !entry
+                        .build_checks
+                        .iter()
+                        .flatten()
+                        .any(|check| !check.locally_available)
+                {
                     continue;
                 }
                 let address = host_groups::ssh_address(&entry.user, &entry.host, entry.port);
@@ -249,13 +324,71 @@ fn row(
             &details.join("\n"),
         ));
     }
+    for check in entry.build_checks.iter().flatten() {
+        let architecture = profile_tools::architecture_label(check.architecture);
+        let available = check
+            .commands
+            .iter()
+            .filter(|command| command.locally_available)
+            .count();
+        fields.push(note(
+            format!("build-summary-{architecture}"),
+            format!(
+                "{architecture} · {available} of {} commands ready locally",
+                check.commands.len()
+            ),
+        ));
+        fields.push(code_details(
+            format!("builds-{architecture}"),
+            &format!("{architecture} builds for {}", entry.profile),
+            &build_details(check),
+        ));
+    }
     KeyedView::new(
         format!("profile-{}", entry.profile),
         StackPanel::new().spacing(4.0).keyed_children(fields),
     )
 }
 
-fn note(key: &'static str, text: impl Into<String>) -> KeyedView {
+fn build_details(check: &ToolArchitectureAudit) -> String {
+    let mut lines = Vec::new();
+    for command in &check.commands {
+        if command.builds.is_empty() {
+            lines.push(format!("{} · No build in manifest", command.name));
+            continue;
+        }
+        lines.push(command.name.clone());
+        for build in &command.builds {
+            let status = match build.status {
+                ToolExecutableStatus::Verified => "Verified",
+                ToolExecutableStatus::Missing => "Missing",
+                ToolExecutableStatus::Error => "Could not verify",
+            };
+            let source = match build.source {
+                ToolExecutableSource::LocalFile => "local file",
+                ToolExecutableSource::DownloadCache => "cached download",
+            };
+            lines.push(format!("{status} {source}"));
+            if let Some(path) = &build.path {
+                lines.push(path.display().to_string());
+            }
+            lines.push(format!("Executable SHA-256 {}", build.pinned_sha256));
+            if let Some(interpreter) = &build.interpreter {
+                lines.push(format!("Interpreter {interpreter}"));
+            }
+            if let Some(glibc) = &build.minimum_glibc {
+                lines.push(format!("Minimum glibc {glibc}"));
+            }
+            if let Some(detail) = &build.detail {
+                lines.push(detail.clone());
+            }
+        }
+        lines.push(String::new());
+    }
+    lines.join("\n").trim_end().to_owned()
+}
+
+fn note(key: impl Into<Key>, text: impl Into<String>) -> KeyedView {
     KeyedView::new(
         key,
         TextBlock::new()

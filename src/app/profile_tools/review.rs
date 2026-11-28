@@ -1,18 +1,11 @@
 use super::*;
 use crate::app::command_reference::dotfiles::comparison::code_details;
 use std::collections::BTreeSet;
-use w11term::sftp::{UtilityArchitecture, UtilityBuild, UtilityDownload};
-
-fn platform(architecture: UtilityArchitecture) -> &'static str {
-    match architecture {
-        UtilityArchitecture::X86_64 => "x86-64",
-        UtilityArchitecture::Aarch64 => "ARM64",
-    }
-}
+use w11term::sftp::{UtilityBuild, UtilityDownload};
 
 pub(super) fn build_label(builds: &[UtilityBuild], index: usize) -> String {
     let architecture = builds[index].architecture;
-    let platform = platform(architecture);
+    let platform = architecture_label(architecture);
     if builds
         .iter()
         .filter(|build| build.architecture == architecture)
@@ -36,7 +29,7 @@ pub(super) fn tool_view(tool: &UtilityTool) -> KeyedView {
     let platforms = tool
         .builds
         .iter()
-        .map(|build| platform(build.architecture))
+        .map(|build| architecture_label(build.architecture))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>()

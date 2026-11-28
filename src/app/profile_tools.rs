@@ -3,13 +3,20 @@ use std::path::PathBuf;
 use w11term::{
     options::{ToolPath, ToolSync},
     sftp::{
-        DotfileShell, ToolBundlePreset, UtilityBundle, UtilityTool, builtin_tool_names,
-        prepare_builtin_tool_bundle, validate_dotfiles_home,
+        DotfileShell, ToolBundlePreset, UtilityArchitecture, UtilityBundle, UtilityTool,
+        builtin_tool_names, prepare_builtin_tool_bundle, validate_dotfiles_home,
     },
 };
 
 mod local_bundle;
 mod review;
+
+pub(super) fn architecture_label(architecture: UtilityArchitecture) -> &'static str {
+    match architecture {
+        UtilityArchitecture::X86_64 => "x86-64",
+        UtilityArchitecture::Aarch64 => "ARM64",
+    }
+}
 
 const TITLE: &str = "SSH tools";
 const PATH_MODES: [&str; 4] = [

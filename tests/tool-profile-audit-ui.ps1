@@ -9,6 +9,8 @@ $value = [System.Windows.Automation.ValuePattern]::Pattern
 $on = [System.Windows.Automation.ToggleState]::On
 $off = [System.Windows.Automation.ToggleState]::Off
 $westManifest = Join-Path $State 'west-tools.json'
+$westExecutable = Join-Path $State 'rg'
+$dot = ' ' + [char]0xb7 + ' '
 $fixtureProfiles = ($catalogBefore | ConvertFrom-Json).profiles
 $expectedPin = $fixtureProfiles.West.tool_bundle.manifest_sha256
 $currentPin = $fixtureProfiles.East.tool_bundle.manifest_sha256
@@ -91,6 +93,47 @@ try {
     $null = Wait-Until 'the repaired profile is now reported as matching' {
         (Find-Element 'Showing 1 of 4 SSH profiles.') -and
             (Find-Element 'Manifest matches its pin')
+    }
+
+    Select-NativeComboItem 'SSH tool audit scope' 'Verify ARM64 builds'
+    $null = Wait-Until 'ARM64 verification shows the unavailable command' {
+        Find-Element "ARM64${dot}0 of 1 commands ready locally"
+    }
+    Set-NativeExpansion 'ARM64 builds for West' $true
+    $null = Wait-Until 'the ARM64 details explain that no build was listed' {
+        Find-Element "rg${dot}No build in manifest"
+    }
+    (Wait-CheckBox 'Show only tool sync issues' $off).Toggle()
+    $null = Wait-Until 'the architecture gap keeps West in the issue filter' {
+        (Find-Element 'Showing 1 of 4 SSH profiles.') -and
+            (Find-Element "ARM64${dot}0 of 1 commands ready locally")
+    }
+    Select-NativeComboItem 'SSH tool audit scope' 'Verify x86-64 builds'
+    $null = Wait-Until 'a verified x86-64 command clears West from the issue filter' {
+        Find-Element 'No SSH profiles match these filters.'
+    }
+    (Wait-CheckBox 'Show only tool sync issues' $on).Toggle()
+    $null = Wait-Until 'the local x86-64 build is ready' {
+        Find-Element "x86-64${dot}1 of 1 commands ready locally"
+    }
+    Set-NativeExpansion 'x86-64 builds for West' $true
+    $approvedBuild = ([IO.File]::ReadAllText($westManifest) | ConvertFrom-Json).tools[0].builds[0]
+    $null = Wait-Until 'build details show the verified file and SHA-256' {
+        Get-NativeTextLabels | Where-Object {
+            $_.Contains('Verified local file') -and $_.Contains($westExecutable) -and
+                $_.Contains("Executable SHA-256 $($approvedBuild.sha256)")
+        }
+    }
+    [IO.File]::Move($westExecutable, (Join-Path $State 'moved-rg'))
+    Click 'Refresh audit'
+    $null = Wait-Until 'refresh reruns the same x86-64 executable audit' {
+        Find-Element "x86-64${dot}0 of 1 commands ready locally"
+    }
+    Set-NativeExpansion 'x86-64 builds for West' $true
+    $null = Wait-Until 'build details identify the missing file' {
+        Get-NativeTextLabels | Where-Object {
+            $_.Contains('Missing local file') -and $_.Contains($westExecutable)
+        }
     }
     Click 'Back to settings'
     $null = Wait-Until 'the regular Settings page is restored' {

@@ -1601,6 +1601,8 @@ Set the optional `manifest_sha256` to the SHA-256 of the entire manifest file to
 
 In Windows, open **Settings → Profiles → Audit SSH tool profiles**. Filter by profile name or SSH address, or choose **Show only tool sync issues**. Expand a profile's manifest details to see the path and any current and pinned digests. **Edit SSH tools** opens that profile's SSH tools editor. Use **Refresh audit** after saving changes.
 
+Under **Audit scope**, choose one architecture or **Verify all manifest architectures** to check local executable files and the download cache. Expand the build details for each architecture to see verified and missing files, hash or ELF errors, and commands that have no build for that architecture. The issues filter includes profiles where an architecture has a command with no verified local build. **Refresh audit** repeats the selected check.
+
 Run `audit-tool-profiles` to check saved SSH tool approvals offline. It uses the normal profile catalog unless you pass `--profiles CATALOG`. Add `--profile NAME` to check one saved SSH profile. The report includes the pinned and current manifest digests. Its statuses are `matches-pin`, `pin-mismatch`, `follows-file`, `manifest-error`, `manifest-scope-mismatch`, `invalid-settings`, `disabled`, and `not-run`. A separate `path_error` flags locally detectable errors in the optional Shell PATH approval. The command exits successfully when it can produce a report, even when rows contain problems. The audit reads the catalog and manifests. Login checks the authenticated account, remote home, executable builds, and startup files.
 
 ```powershell
