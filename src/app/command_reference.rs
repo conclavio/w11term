@@ -1,5 +1,6 @@
 use super::*;
 use catalog::{COMMON, Key, LINUX, Loaded, PLATFORMS, PageSource, Platform, WINDOWS};
+use std::collections::VecDeque;
 use w11term::events::{
     DotfileSyncReport, ToolBundleSyncReport, ToolBundleSyncStatus, ToolPathSyncStatus,
 };
@@ -11,6 +12,7 @@ mod dotfiles;
 mod download;
 mod example;
 mod private_page;
+mod related;
 mod saved_pages;
 mod tool_install;
 mod tool_removal;
@@ -37,6 +39,7 @@ pub enum Action {
     ToolPage(Arc<()>, usize),
     Private(private_page::Action),
     SavedPage(saved_pages::Action),
+    Related(related::Action),
     ToolInstall(tool_install::Action),
     ToolRemoval(tool_removal::Action),
     Dotfiles(dotfiles::Action),
@@ -118,6 +121,7 @@ pub(super) struct Panel {
     selected: usize,
     draft: Option<example::Draft>,
     command_lookup: Option<command_line::Lookup>,
+    related_history: VecDeque<related::Location>,
     query_field: ElementRef<TextBox>,
     draft_field: ElementRef<TextBox>,
     draft_option: ElementRef<ComboBox>,
@@ -153,6 +157,7 @@ impl Panel {
         self.open = false;
         self.draft = None;
         self.command_lookup = None;
+        self.related_history.clear();
         self.private_page = None;
         self.tool_install = None;
         self.tool_removal = None;
@@ -170,19 +175,22 @@ impl Panel {
             || self.dotfiles.is_some()
     }
 
-    fn set_query(&mut self, text: String) {
+    fn set_query(&mut self, text: String) -> bool {
         let text = text.chars().take(128).filter(|c| !c.is_control()).collect();
-        if self.query != text {
-            self.query = text;
-            self.command_lookup = None;
-            self.mode = SearchMode::Search;
-            self.selected = 0;
-            self.draft = None;
+        if self.query == text {
+            return false;
         }
+        self.query = text;
+        self.command_lookup = None;
+        self.mode = SearchMode::Search;
+        self.selected = 0;
+        self.draft = None;
+        true
     }
 
     fn show_page(&mut self, key: Key, auto: Platform) {
         self.command_lookup = None;
+        self.related_history.clear();
         self.set_query(key.name.clone());
         if self.platform.unwrap_or(auto) != key.platform {
             self.platform = Some(key.platform);
@@ -430,6 +438,17 @@ impl Panel {
                     }),
             ));
         }
+        if !self.related_history.is_empty() {
+            pieces.push(KeyedView::new(
+                "related-back",
+                Button::new()
+                    .style(ButtonStyle::Subtle)
+                    .on_click(ctx.callback(|_| {
+                        Message::CommandReference(Action::Related(related::Action::Back))
+                    }))
+                    .content("Back to previous manual"),
+            ));
+        }
         if let Some((page, platform)) = page {
             pieces.extend([
                 KeyedView::new("title", TextBlock::new().font_size(22.0).text(&page.title)),
@@ -446,6 +465,12 @@ impl Panel {
             ]);
             if let Some(key) = selected {
                 pieces.push(self.saved_pages.button(key, ctx));
+                if !page.related.is_empty() {
+                    pieces.push(KeyedView::new(
+                        "related-commands",
+                        self.related_view(key, page, preferred, ctx),
+                    ));
+                }
             }
         }
         if let (Some(target), Some(key), Some(_)) = (tool_pane, selected, page)
@@ -716,6 +741,7 @@ impl TerminalApp {
         panel.open = true;
         panel.draft = None;
         panel.saved_pages.close();
+        panel.related_history.clear();
         panel.platform = Some(lookup.platform());
         panel.focus = panel.focus.wrapping_add(1);
         panel.set_query(lookup.executable().to_owned());
@@ -930,6 +956,7 @@ impl TerminalApp {
                 panel.command_lookup = None;
                 panel.focus = panel.focus.wrapping_add(1);
                 if let Some(text) = selected {
+                    panel.related_history.clear();
                     let lookup =
                         command_line::Lookup::new(&text, auto, panel.platform.unwrap_or(auto));
                     panel.set_query(text);
@@ -945,12 +972,17 @@ impl TerminalApp {
                 }
             }
             Action::Close => panel.close(),
-            Action::Query(text) => panel.set_query(text),
+            Action::Query(text) => {
+                if panel.set_query(text) {
+                    panel.related_history.clear();
+                }
+            }
             Action::Platform(Some(index)) => {
                 let platform = PLATFORMS.get(index.wrapping_sub(1)).copied();
                 if panel.platform != platform {
                     panel.platform = platform;
                     panel.command_lookup = None;
+                    panel.related_history.clear();
                     panel.selected = 0;
                     panel.draft = None;
                     if matches!(panel.mode, SearchMode::Page(_)) {
@@ -975,6 +1007,7 @@ impl TerminalApp {
             Action::Refresh => self.start_reference_load(true, ctx),
             Action::Private(action) => panel.author_private_page(action, auto, ctx),
             Action::SavedPage(action) => panel.saved_page_action(action, auto, ctx),
+            Action::Related(action) => panel.related_action(action, auto),
             Action::ToolInstall(action) => self.tool_install_action(action, ctx),
             Action::ToolRemoval(action) => self.tool_removal_action(action, ctx),
             Action::Dotfiles(action) => self.reference_dotfiles_action(action, ctx),
@@ -994,6 +1027,7 @@ impl TerminalApp {
                     && let Some(Ok(tools)) = &lookup.result
                     && let Some(tool) = tools.tools.get(index)
                 {
+                    panel.related_history.clear();
                     panel.set_query(tool.name.clone());
                     panel.mode = SearchMode::PreferredExact;
                     panel.platform = None;

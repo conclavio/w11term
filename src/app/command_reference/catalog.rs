@@ -12,6 +12,7 @@ pub(super) const MAX_ARCHIVE: usize = 16 * 1024 * 1024;
 pub(super) const MAX_PAGE: usize = 64 * 1024;
 const MAX_CONTENT: usize = 32 * 1024 * 1024;
 const MAX_PAGES: usize = 20_000;
+const MAX_RELATED: usize = 12;
 const TOOL_PAGES: &[(&str, &str)] = &[
     (
         "diskwatch",
@@ -81,6 +82,7 @@ pub(super) struct Page {
     pub title: String,
     pub description: String,
     pub link: Option<String>,
+    pub related: Vec<String>,
     pub examples: Vec<Example>,
     pub source: PageSource,
     search_words: Vec<Box<str>>,
@@ -92,6 +94,7 @@ impl Page {
         let title = lines.find(|line| !line.is_empty())?.strip_prefix("# ")?;
         let mut description = Vec::new();
         let mut link = None;
+        let mut related = Vec::new();
         let mut examples = Vec::new();
         let mut label = None;
         for line in lines {
@@ -104,6 +107,10 @@ impl Page {
                     })
                 {
                     link = Some(url.to_owned());
+                } else if let Some(names) = related_names(quote)
+                    && related.len() + names.len() <= MAX_RELATED
+                {
+                    related.extend(names);
                 } else {
                     description.push(quote);
                 }
@@ -123,6 +130,7 @@ impl Page {
         }
         let search_text = std::iter::once(title)
             .chain(description.iter().copied())
+            .chain(related.iter().map(String::as_str))
             .chain(examples.iter().map(|example| example.description.as_str()))
             .collect::<Vec<_>>()
             .join(" ")
@@ -134,10 +142,32 @@ impl Page {
             title: title.to_owned(),
             description: description.join("\n"),
             link,
+            related,
             examples,
             source,
             search_words,
         })
+    }
+}
+
+fn related_names(quote: &str) -> Option<Vec<String>> {
+    let list = quote.strip_prefix("See also: ")?.trim_end_matches('.');
+    let mut pieces = list.split('`');
+    if pieces.next()? != "" {
+        return None;
+    }
+    let mut names = Vec::new();
+    loop {
+        let label = pieces.next()?;
+        if names.len() == MAX_RELATED || !valid_name(&query(label)) {
+            return None;
+        }
+        names.push(label.to_owned());
+        match pieces.next()?.trim() {
+            "" if pieces.next().is_none() => return Some(names),
+            "," | "and" | ", and" => {}
+            _ => return None,
+        }
     }
 }
 
@@ -448,6 +478,29 @@ fn with_local_pages(mut catalog: Catalog, mut status: String, directory: &Path) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_only_standalone_related_command_lists() {
+        let page = Page::parse(
+            concat!(
+                "# Cargo guide\n> Describe a shipping task.\n",
+                "> See also: `port inventory`, `ospp.vbs`, and `carrier-route`.\n",
+                "> See also: `cargo` when preparing a new crate.\n",
+                "> See also: `https://example.invalid/path`.",
+            ),
+            PageSource::Custom,
+        )
+        .unwrap();
+        assert_eq!(
+            page.related,
+            ["port inventory", "ospp.vbs", "carrier-route"]
+        );
+        assert_eq!(
+            page.description,
+            "Describe a shipping task.\nSee also: `cargo` when preparing a new crate.\nSee also: `https://example.invalid/path`."
+        );
+        assert!(page.search_words.iter().any(|word| &**word == "inventory"));
+    }
 
     #[test]
     fn shipped_pages_cover_platform_common_and_cross_platform_lookup() {

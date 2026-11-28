@@ -114,6 +114,17 @@ async fn native_window_history_opens_the_selected_capture_and_manual() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "follows offline See also links by platform and restores the previous manual search"]
+async fn native_related_command_reference_preserves_platform_and_search() {
+    run_palette_fixture(
+        "related-command-reference-ui.ps1",
+        b"",
+        Some("related-reference-ready\r\n"),
+    )
+    .await;
+}
+
 #[test]
 #[ignore = "saves an offline manual example and recalls it in a real PowerShell pane"]
 fn native_reference_examples_save_offline_and_require_explicit_shell_submit() {

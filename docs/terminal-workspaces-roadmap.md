@@ -376,6 +376,8 @@ Look up a manual directly from a result in **Find command history…**. The manu
 
 **Look up selected command** applies the same command matching to highlighted shell text and honors the platform dropdown. Selections without an exact manual stay available for task search.
 
+Follow a **See also** link to another offline manual. Links prefer the chosen platform and fall back to Common. **Back to previous manual** restores the previous page and search result.
+
 **Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
 
 ## Managed SSH utilities
