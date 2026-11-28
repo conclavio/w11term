@@ -39,7 +39,9 @@ mod sftp_transfers;
 mod ssh_groups;
 mod triage;
 mod workspace_preview;
-pub use crate::ssh::triage::cpu_profile::{CpuCallGraph, CpuProfileOptions};
+pub use crate::ssh::triage::cpu_profile::{
+    CpuCallGraph, CpuProfileOptions, launch::CpuLaunchOptions,
+};
 pub use crate::ssh::triage::packet_capture::PacketCaptureOptions;
 pub use crate::ssh::triage::syscall_capture::{SyscallFilter, SyscallOptions};
 pub use command_history::{CommandOutputFile, CommandStatus};
@@ -80,6 +82,27 @@ pub enum Request {
         perf_data_file: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         report_file: Option<PathBuf>,
+    },
+    PreviewCpuCommand {
+        pane: u64,
+        options: CpuLaunchOptions,
+    },
+    CaptureCpuCommand {
+        pane: u64,
+        options: CpuLaunchOptions,
+        connection_generation: std::num::NonZeroU64,
+        review_id: String,
+        job_id: String,
+        output_file: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        perf_data_file: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_file: Option<PathBuf>,
+    },
+    StopCpuCommand {
+        pane: u64,
+        connection_generation: std::num::NonZeroU64,
+        job_id: String,
     },
     PreviewPacketCapture {
         pane: u64,
@@ -1504,6 +1527,9 @@ impl Registry {
             Request::PreviewCpuProfile { pane, options } => {
                 self.preview_cpu_profile(pane, options).await
             }
+            Request::PreviewCpuCommand { pane, options } => {
+                self.preview_cpu_command(pane, options).await
+            }
             Request::PreviewPacketCapture { pane, options } => {
                 self.preview_packet_capture(pane, options).await
             }
@@ -1592,6 +1618,40 @@ impl Registry {
                     perf_data_file,
                 )
                 .await
+            }
+            Request::CaptureCpuCommand {
+                pane,
+                options,
+                connection_generation,
+                review_id,
+                job_id,
+                output_file,
+                perf_data_file,
+                report_file,
+            } => {
+                self.capture_cpu_command(
+                    pane,
+                    options,
+                    triage::CpuCommandReview {
+                        generation: connection_generation,
+                        review_id: &review_id,
+                        job_id: &job_id,
+                    },
+                    triage::CapturePaths {
+                        capture: output_file,
+                        report: report_file,
+                    },
+                    perf_data_file,
+                )
+                .await
+            }
+            Request::StopCpuCommand {
+                pane,
+                connection_generation,
+                job_id,
+            } => {
+                self.stop_cpu_command(pane, connection_generation, &job_id)
+                    .await
             }
             Request::Sftp {
                 pane,
@@ -2904,11 +2964,18 @@ async fn call_on(mut pipe: NamedPipeClient, request: &Request) -> Result<Reply> 
             Request::CaptureCpuProfile {
                 perf_data_file: Some(_),
                 ..
+            }
+            | Request::CaptureCpuCommand {
+                perf_data_file: Some(_),
+                ..
             } => {
                 crate::ssh::triage::cpu_profile::CONTROL_TIMEOUT_SECONDS
                     + crate::ssh::PERF_DATA_TRANSFER_SECONDS
             }
-            Request::PreviewCpuProfile { .. } | Request::CaptureCpuProfile { .. } => {
+            Request::PreviewCpuProfile { .. }
+            | Request::CaptureCpuProfile { .. }
+            | Request::PreviewCpuCommand { .. }
+            | Request::CaptureCpuCommand { .. } => {
                 crate::ssh::triage::cpu_profile::CONTROL_TIMEOUT_SECONDS
             }
             Request::Sftp {

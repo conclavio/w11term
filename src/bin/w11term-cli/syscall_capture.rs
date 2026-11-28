@@ -1,4 +1,7 @@
-use super::offline;
+use super::{
+    diagnostics::{CaptureFlags, read_capture_flags},
+    offline,
+};
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::BTreeMap, io::Write, path, sync::Arc};
 use w11term::{
@@ -64,7 +67,7 @@ pub(super) const SAVE_SETTINGS_HELP: &str = concat!(
 );
 
 pub(super) fn save_settings(args: &[String], output: &mut dyn Write) -> Result<()> {
-    let mut inputs = read_flags(SAVE_SETTINGS_VERB, args.iter().cloned(), |flag| {
+    let mut inputs = read_capture_flags(SAVE_SETTINGS_VERB, args.iter().cloned(), |flag| {
         TRACE_FLAGS.contains(&flag) || flag == "--output-file"
     })?;
     let json = capture_options(&mut inputs.flags, inputs.arguments)?.settings_json()?;
@@ -216,10 +219,10 @@ pub(super) fn parse(
 ) -> Result<Request> {
     let stop = verb == "stop-syscall-capture";
     let preview = verb == "preview-syscall-capture";
-    let TraceInputs {
+    let CaptureFlags {
         mut flags,
         arguments,
-    } = read_flags(verb, args, |flag| {
+    } = read_capture_flags(verb, args, |flag| {
         flag == "--pane"
             || !preview && matches!(flag, "--connection-generation" | "--job-id")
             || !preview
@@ -285,35 +288,6 @@ pub(super) fn parse(
             .map(path::absolute)
             .transpose()?,
     })
-}
-
-struct TraceInputs {
-    flags: BTreeMap<String, String>,
-    arguments: Vec<String>,
-}
-
-fn read_flags(
-    verb: &str,
-    mut args: impl Iterator<Item = String>,
-    accepts: impl Fn(&str) -> bool,
-) -> Result<TraceInputs> {
-    let mut flags = BTreeMap::new();
-    let mut arguments = Vec::new();
-    while let Some(flag) = args.next() {
-        ensure!(accepts(&flag), "Unsupported option {flag} for {verb}");
-        let value = args
-            .next()
-            .with_context(|| format!("{flag} requires a value"))?;
-        if flag == "--arg" {
-            arguments.push(value);
-        } else {
-            ensure!(
-                flags.insert(flag.clone(), value).is_none(),
-                "Specify {flag} only once"
-            );
-        }
-    }
-    Ok(TraceInputs { flags, arguments })
 }
 
 fn capture_options(

@@ -34,7 +34,8 @@ kill -TERM "$monitor" 2>/dev/null || :
 wait "$monitor" 2>/dev/null || :
 if [[ -s $work/exited ]]; then
     mv -- "$work/exited" "$work/outcome"
-elif [[ -f $work/stop-requested && ( $status == 143 || $status == 137 ) ]]; then
+elif [[ -f $work/stop-requested && ( $status == 124 || $status == 143 || $status == 137 ) ]]; then
+    # GNU timeout can also return 124 after receiving our explicit TERM.
     printf 'stopped\n' > "$work/outcome"
 elif [[ $status == 124 || $status == 137 ]]; then
     printf 'timeout\n' > "$work/outcome"

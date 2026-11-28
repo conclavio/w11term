@@ -10,6 +10,12 @@ pub(super) struct CapturePaths {
     pub report: Option<PathBuf>,
 }
 
+pub(super) struct CpuCommandReview<'a> {
+    pub generation: NonZeroU64,
+    pub review_id: &'a str,
+    pub job_id: &'a str,
+}
+
 impl CapturePaths {
     fn check_report_destination(&self, artifact: &str) -> Result<()> {
         if let Some(report) = &self.report {
@@ -39,6 +45,34 @@ async fn append_capture_report(
         Ok(()) => result["report_path"] = json!(path),
         Err(error) => result["report_error"] = json!(format!("{error:#}")),
     }
+}
+
+async fn publish_cpu_profile(
+    profile: Recording,
+    paths: CapturePaths,
+    mut result: Value,
+) -> Result<Value> {
+    let path = paths.capture;
+    let (path, summary) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let summary = profile.save(&path)?;
+        Ok((path, summary))
+    })
+    .await??;
+    result["profile_path"] = json!(path);
+    result["summary"] = json!(summary);
+    append_capture_report(
+        &mut result,
+        paths.report,
+        "CPU profile report",
+        move |path| {
+            summary
+                .capture_report
+                .context("CPU profile capture metadata unavailable")?
+                .save(path)
+        },
+    )
+    .await;
+    Ok(result)
 }
 
 impl Registry {
@@ -87,35 +121,83 @@ impl Registry {
         paths: CapturePaths,
         perf_data_file: Option<PathBuf>,
     ) -> Result<Value> {
-        let CapturePaths {
-            capture: path,
-            report,
-        } = paths;
-        Recording::check_destinations(&path, perf_data_file.as_deref(), report.as_deref())?;
+        Recording::check_destinations(
+            &paths.capture,
+            perf_data_file.as_deref(),
+            paths.report.as_deref(),
+        )?;
         let target = self.diagnostic_target(pane, Some(generation)).await?;
         let profile = target
             .capture_cpu_profile(options, process_start_ticks, perf_data_file, None)
             .await?;
-        let (path, summary) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let summary = profile.save(&path)?;
-            Ok((path, summary))
-        })
-        .await??;
-        let mut result = json!({
-            "pane": pane,
-            "connection_generation": generation,
-            "target_pid": options.target_pid,
-            "profile_path": path,
-            "summary": summary,
-        });
-        append_capture_report(&mut result, report, "CPU profile report", move |path| {
-            summary
-                .capture_report
-                .context("CPU profile capture metadata unavailable")?
-                .save(path)
-        })
-        .await;
-        Ok(result)
+        publish_cpu_profile(
+            profile,
+            paths,
+            json!({
+                "pane": pane,
+                "connection_generation": generation,
+                "target_pid": options.target_pid,
+            }),
+        )
+        .await
+    }
+
+    pub(super) async fn preview_cpu_command(
+        &self,
+        pane: u64,
+        options: CpuLaunchOptions,
+    ) -> Result<Value> {
+        let mut target = self.diagnostic_target(pane, None).await?;
+        let plan = target.preview_cpu_launch(options).await?;
+        Ok(json!({ "pane": pane, "plan": plan }))
+    }
+
+    pub(super) async fn capture_cpu_command(
+        &self,
+        pane: u64,
+        options: CpuLaunchOptions,
+        review: CpuCommandReview<'_>,
+        paths: CapturePaths,
+        perf_data_file: Option<PathBuf>,
+    ) -> Result<Value> {
+        Recording::check_destinations(
+            &paths.capture,
+            perf_data_file.as_deref(),
+            paths.report.as_deref(),
+        )?;
+        let target = self
+            .diagnostic_target(pane, Some(review.generation))
+            .await?;
+        let profile = target
+            .capture_reviewed_cpu_launch(
+                pane,
+                options,
+                review.review_id,
+                review.job_id,
+                perf_data_file,
+            )
+            .await?;
+        publish_cpu_profile(
+            profile,
+            paths,
+            json!({
+                "pane": pane,
+                "connection_generation": review.generation,
+                "job_id": review.job_id,
+            }),
+        )
+        .await
+    }
+
+    pub(super) async fn stop_cpu_command(
+        &self,
+        pane: u64,
+        generation: NonZeroU64,
+        job_id: &str,
+    ) -> Result<Value> {
+        let target = self.diagnostic_target(pane, Some(generation)).await?;
+        target.stop_cpu_command_capture(pane, job_id)?;
+        Ok(json!({ "pane": pane, "job_id": job_id, "stop_requested": true }))
     }
 
     pub(super) async fn preview_packet_capture(

@@ -171,6 +171,19 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                 let request = cpu_profile::parse(&arg, args, pane)?;
                 return Ok(Invocation::new(pid, request));
             }
+            "preview-cpu-command" | "capture-cpu-command" | "stop-cpu-command"
+                if verb.is_none() =>
+            {
+                ensure!(
+                    payload.is_none()
+                        && path.is_none()
+                        && !no_paste
+                        && connection_generation.is_none(),
+                    "CPU command profiling accepts --pid and --pane before the command"
+                );
+                let request = cpu_profile::parse_command(&arg, args, pane)?;
+                return Ok(Invocation::new(pid, request));
+            }
             "list-packet-interfaces"
             | "preview-packet-capture"
             | "capture-packets"

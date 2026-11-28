@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
-use std::path;
+use std::{collections::BTreeMap, path};
 use w11term::{
     control::Request,
     diagnostic_history::{Artifact, Kind},
@@ -10,6 +10,35 @@ pub(super) const HELP: &str = concat!(
     "--kind cpu-profile|triage-report|syscall-trace|packet-capture ",
     "--file PATH [--file PATH ...] [--compare-with PATH ...]",
 );
+
+pub(super) struct CaptureFlags {
+    pub flags: BTreeMap<String, String>,
+    pub arguments: Vec<String>,
+}
+
+pub(super) fn read_capture_flags(
+    verb: &str,
+    mut args: impl Iterator<Item = String>,
+    accepts: impl Fn(&str) -> bool,
+) -> Result<CaptureFlags> {
+    let mut flags = BTreeMap::new();
+    let mut arguments = Vec::new();
+    while let Some(flag) = args.next() {
+        ensure!(accepts(&flag), "Unsupported option {flag} for {verb}");
+        let value = args
+            .next()
+            .with_context(|| format!("{flag} requires a value"))?;
+        if flag == "--arg" {
+            arguments.push(value);
+        } else {
+            ensure!(
+                flags.insert(flag.clone(), value).is_none(),
+                "Specify {flag} only once"
+            );
+        }
+    }
+    Ok(CaptureFlags { flags, arguments })
+}
 
 pub(super) fn parse(mut args: impl Iterator<Item = String>) -> Result<Request> {
     let mut window = None;
