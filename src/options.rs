@@ -490,6 +490,8 @@ pub struct DotfileSync {
     pub bundle_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zdotdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fish_config_dir: Option<String>,
     pub host: String,
     pub user: String,
     pub port: u16,
@@ -498,13 +500,40 @@ pub struct DotfileSync {
 }
 
 impl DotfileSync {
-    pub(crate) fn approves(&self, endpoint: (&str, &str, u16, &str)) -> bool {
-        (
-            self.host.as_str(),
-            self.user.as_str(),
-            self.port,
-            self.fingerprint.as_str(),
-        ) == endpoint
+    fn approves_account(&self, host: &str, user: &str, port: u16) -> bool {
+        (self.host.as_str(), self.user.as_str(), self.port) == (host, user, port)
+    }
+
+    pub(crate) fn approves(
+        &self,
+        (host, user, port, fingerprint): (&str, &str, u16, &str),
+    ) -> bool {
+        self.approves_account(host, user, port) && self.fingerprint == fingerprint
+    }
+
+    pub fn validate_profile(&self, profile: &SshOptions) -> Result<()> {
+        ensure!(
+            self.approves_account(&profile.host, &profile.user, profile.port),
+            "The dotfiles approval names a different SSH account"
+        );
+        ensure!(
+            matches!(self.fingerprint.parse::<Fingerprint>(), Ok(fingerprint @ Fingerprint::Sha256(_)) if fingerprint.to_string() == self.fingerprint),
+            "The dotfiles approval needs a SHA256 host-key fingerprint"
+        );
+        ensure!(
+            profile
+                .host_key
+                .as_deref()
+                .is_none_or(|pin| pin == self.fingerprint),
+            "The dotfiles approval differs from the profile's host-key pin"
+        );
+        crate::sftp::validate_dotfiles_home(&self.home)?;
+        crate::sftp::select_startup_directory(
+            self.shell,
+            self.zdotdir.as_deref(),
+            self.fish_config_dir.as_deref(),
+        )?;
+        Ok(())
     }
 }
 
@@ -512,6 +541,8 @@ impl DotfileSync {
 #[serde(deny_unknown_fields)]
 pub struct ToolSync {
     pub bundle: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_sha256: Option<String>,
     pub name: String,
     pub bin_directory: String,
     pub host: String,
@@ -524,13 +555,43 @@ pub struct ToolSync {
 }
 
 impl ToolSync {
-    pub(crate) fn approves(&self, endpoint: (&str, &str, u16, &str)) -> bool {
-        (
-            self.host.as_str(),
-            self.user.as_str(),
-            self.port,
-            self.fingerprint.as_str(),
-        ) == endpoint
+    fn approves_account(&self, host: &str, user: &str, port: u16) -> bool {
+        (self.host.as_str(), self.user.as_str(), self.port) == (host, user, port)
+    }
+
+    pub(crate) fn approves(
+        &self,
+        (host, user, port, fingerprint): (&str, &str, u16, &str),
+    ) -> bool {
+        self.approves_account(host, user, port) && self.fingerprint == fingerprint
+    }
+
+    pub(crate) fn validate_profile(&self, profile: &SshOptions) -> Result<()> {
+        ensure!(
+            self.approves_account(&profile.host, &profile.user, profile.port),
+            "The tool approval names a different SSH account"
+        );
+        ensure!(
+            matches!(self.fingerprint.parse::<Fingerprint>(), Ok(fingerprint @ Fingerprint::Sha256(_)) if fingerprint.to_string() == self.fingerprint),
+            "The tool approval needs a SHA256 host-key fingerprint"
+        );
+        ensure!(
+            profile
+                .host_key
+                .as_deref()
+                .is_none_or(|pin| pin == self.fingerprint),
+            "The tool approval differs from the profile's host-key pin"
+        );
+        crate::sftp::validate_dotfiles_home(&self.home)?;
+        self.validate_bundle_destination()
+    }
+
+    pub(crate) fn manifest_pin(&self) -> Result<Option<String>> {
+        self.manifest_sha256
+            .as_deref()
+            .map(crate::sftp::normalize_sha256)
+            .transpose()
+            .context("Invalid tool manifest SHA-256 pin")
     }
 }
 
@@ -540,6 +601,23 @@ pub struct ToolPath {
     pub shell: crate::sftp::DotfileShell,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zdotdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fish_config_dir: Option<String>,
+}
+
+impl ToolPath {
+    pub(crate) fn startup_directory(&self, home: &str) -> Result<Option<&str>> {
+        let directory = crate::sftp::select_startup_directory(
+            self.shell,
+            self.zdotdir.as_deref(),
+            self.fish_config_dir.as_deref(),
+        )?;
+        ensure!(
+            !home.contains(':'),
+            "The account home contains a PATH separator"
+        );
+        Ok(directory)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -738,7 +816,7 @@ fn default_port() -> u16 {
     22
 }
 
-fn default_profiles_path() -> Result<PathBuf> {
+pub fn default_profiles_path() -> Result<PathBuf> {
     Ok(crate::keys::data_dir()?.join("profiles.json"))
 }
 

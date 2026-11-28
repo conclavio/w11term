@@ -9,12 +9,25 @@ use std::{
 
 mod bookmarks;
 pub use bookmarks::{BookmarkPeer, bookmark_directory};
+mod dotfiles;
+pub use dotfiles::{
+    DotfileRestoreStatus, DotfileRollbackReport, DotfileRolloutBaseline, DotfileRolloutProfile,
+    DotfileRolloutReport, rollback_dotfile_rollout,
+};
 mod folder_permissions;
 pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate, FolderMutationPermit};
 mod group_file;
 pub use group_file::{decode_group_file, encode_group_file, read_group_file, remap_group_profiles};
+mod receipt;
 mod sftp_searches;
 pub use sftp_searches::SavedSftpSearch;
+mod tools;
+pub use tools::{
+    ToolManifestBaseline, ToolManifestChanges, ToolProfileAudit, ToolProfileAuditRow,
+    ToolProfileAuditStatus, ToolProfileBuildChecks, ToolProfilePreparation, ToolRestoreStatus,
+    ToolRollbackProfile, ToolRollbackReport, ToolRolloutBuildPolicy, ToolRolloutBuildReport,
+    ToolRolloutProfile, ToolRolloutReport, rollback_tool_rollout,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProfileSnapshot {

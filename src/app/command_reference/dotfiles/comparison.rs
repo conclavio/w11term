@@ -58,7 +58,7 @@ impl From<FragmentReport> for Comparison {
     }
 }
 
-pub(super) fn diff_text(before: &str, after: &str, proposed_only: bool) -> Option<String> {
+pub(in crate::app) fn diff_text(before: &str, after: &str, proposed_only: bool) -> Option<String> {
     let diff = Difference::compare_files(before, after);
     if diff.changes.is_empty() {
         return None;
@@ -112,7 +112,7 @@ impl Comparison {
     }
 }
 
-pub(super) fn code_details(key: String, label: &str, code: &str) -> KeyedView {
+pub(in crate::app) fn code_details(key: String, label: &str, code: &str) -> KeyedView {
     KeyedView::new(
         key,
         View::component::<CodeDetails>(Code {

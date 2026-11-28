@@ -15,6 +15,10 @@ mod command_reference;
 mod cpu_profile;
 #[path = "w11term-cli/diagnostics.rs"]
 mod diagnostics;
+#[path = "w11term-cli/dotfile_profiles.rs"]
+mod dotfile_profiles;
+#[path = "w11term-cli/dotfiles.rs"]
+mod dotfiles;
 #[path = "w11term-cli/offline.rs"]
 mod offline;
 #[path = "w11term-cli/packet_capture.rs"]
@@ -147,6 +151,17 @@ fn parse_invocation(args: impl IntoIterator<Item = String>) -> Result<Invocation
                     "open-diagnostic accepts --pid before the command"
                 );
                 return Ok(Invocation::new(pid, diagnostics::parse(args)?));
+            }
+            command_reference::OPEN_VERB if verb.is_none() => {
+                ensure!(
+                    pane.is_none()
+                        && payload.is_none()
+                        && path.is_none()
+                        && !no_paste
+                        && connection_generation.is_none(),
+                    "open-command-reference accepts --pid before the command"
+                );
+                return Ok(Invocation::new(pid, command_reference::parse_open(args)?));
             }
             "preview-cpu-profile" | "capture-cpu-profile" if verb.is_none() => {
                 ensure!(
@@ -325,20 +340,38 @@ async fn main() -> ExitCode {
         println!("{}", triage::COMPARE_HELP);
         println!("\n{}\n{}", cpu_profile::HELP, cpu_profile::COMPARE_HELP);
         println!(
-            "\n{}\n{}\n{}\n{}",
+            "\n{}\n{}\n{}\n{}\n{}\n{}",
             packet_capture::HELP,
             packet_capture::INSPECT_HELP,
             packet_capture::COMPARE_HELP,
-            packet_capture::CLIP_HELP
+            packet_capture::CLIP_HELP,
+            packet_capture::SAVE_SETTINGS_HELP,
+            packet_capture::VERIFY_REPORT_HELP
         );
         println!(
-            "\n{}\n{}\n{}",
+            "\n{}\n{}\n{}\n{}\n{}",
             syscall_capture::HELP,
             syscall_capture::INSPECT_HELP,
-            syscall_capture::COMPARE_HELP
+            syscall_capture::COMPARE_HELP,
+            syscall_capture::SAVE_SETTINGS_HELP,
+            syscall_capture::VERIFY_REPORT_HELP,
         );
         println!("\n{}", diagnostics::HELP);
         println!("\n{}", command_reference::HELP);
+        println!(
+            "\n{}\n{}\n{}",
+            dotfiles::HELP,
+            dotfiles::INSPECT_HELP,
+            dotfiles::COMPARE_HELP
+        );
+        println!("{}", dotfile_profiles::HELP);
+        println!("{}", dotfile_profiles::ROLLOUT_HELP);
+        println!("{}", dotfile_profiles::ROLLBACK_HELP);
+        println!("{}", tool_bundles::AUDIT_HELP);
+        println!("{}", tool_bundles::PREPARE_HELP);
+        println!("{}", tool_bundles::ROLLOUT_HELP);
+        println!("{}", tool_bundles::ROLLBACK_HELP);
+        println!("{}", command_reference::OPEN_HELP);
         return ExitCode::SUCCESS;
     }
     if args == ["fetch-tool-bundle", "--help"] || args == ["fetch-tool-bundle", "-h"] {
@@ -347,6 +380,12 @@ async fn main() -> ExitCode {
     }
     if args == ["open-diagnostic", "--help"] || args == ["open-diagnostic", "-h"] {
         println!("{}", diagnostics::HELP);
+        return ExitCode::SUCCESS;
+    }
+    if args == [command_reference::OPEN_VERB, "--help"]
+        || args == [command_reference::OPEN_VERB, "-h"]
+    {
+        println!("{}", command_reference::OPEN_HELP);
         return ExitCode::SUCCESS;
     }
     if let Some(exit) = offline::run(&args) {

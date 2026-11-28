@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::Path,
@@ -124,6 +125,193 @@ fn classic_capture() -> Vec<u8> {
 }
 
 #[test]
+fn verifies_renamed_captures_and_reports_distinct_size_and_checksum_mismatches() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let capture = root.join("copied capture.pcap");
+    let report = root.join("capture report.json");
+    let original = classic_capture();
+    fs::write(&capture, &original).unwrap();
+    let sha256: String = Sha256::digest(&original)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let mut recorded = json!({
+        "schema_version": 1,
+        "file_name": "original capture.pcap",
+        "bytes": original.len(),
+        "sha256": sha256.to_ascii_uppercase(),
+        "reviewed": { "host": "test.example" }
+    });
+    let write_report =
+        |value: &Value| fs::write(&report, serde_json::to_vec(value).unwrap()).unwrap();
+    let verify = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+            .current_dir(root)
+            .env_remove("LOCALAPPDATA")
+            .args([
+                "verify-packet-capture-report",
+                "copied capture.pcap",
+                "capture report.json",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let error = |extra: &[&str], expected: &str| {
+        let output = verify(extra);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let reply: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(
+            reply["error"].as_str().unwrap().contains(expected),
+            "{reply}"
+        );
+    };
+
+    write_report(&recorded);
+    let verified = verify(&[]);
+    assert!(verified.status.success(), "{verified:?}");
+    let reply: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(reply["ok"], true);
+    assert_eq!(reply["result"]["bytes"], original.len());
+    assert_eq!(reply["result"]["sha256"], sha256);
+    assert_eq!(reply["result"]["capture_path"], json!(capture));
+    assert_eq!(reply["result"]["report_path"], json!(report));
+    assert_eq!(reply["result"]["details"], Value::Null);
+    assert!(reply["result"].get("settings_path").is_none());
+
+    let output = root.join("settings to rerun.json");
+    let export = ["--save-settings", "settings to rerun.json"];
+    error(&export, "Packet capture report has no recorded settings");
+    assert!(!output.exists());
+
+    let options = json!({
+        "interface": "lo", "filter": "udp and dst port 4321", "snap_length": 192,
+        "seconds": 15, "max_mib": 1, "packet_limit": 3, "rotate_files": 2,
+        "scratch_directory": "/dev/shm", "require_tmpfs": true
+    });
+    recorded["packets"] = json!(1);
+    recorded["stop_reason"] = json!("stopped");
+    recorded["diagnostics"] = json!([]);
+    recorded["reviewed"] = json!({
+        "host": "test.example", "user": "test", "port": 22,
+        "host_key_fingerprint": "SHA256:fixture", "scratch_directory": "/dev/shm",
+        "scratch_filesystem": "tmpfs", "tcpdump_arguments": ["-i", "lo"],
+        "options": options
+    });
+    write_report(&recorded);
+
+    let saved = verify(&export);
+    assert!(saved.status.success(), "{saved:?}");
+    let reply: Value = serde_json::from_slice(&saved.stdout).unwrap();
+    assert_eq!(reply["result"]["settings_path"], json!(output));
+    let settings = fs::read(&output).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&settings).unwrap(),
+        json!({"schema_version": 1, "options": options})
+    );
+    error(&export, "Saving verified packet capture settings");
+    assert_eq!(fs::read(&output).unwrap(), settings);
+
+    let rejected = root.join("invalid settings.json");
+    let reject_export = ["--save-settings", "invalid settings.json"];
+    recorded["reviewed"]["options"]["seconds"] = json!(0);
+    write_report(&recorded);
+    assert!(verify(&[]).status.success());
+    error(
+        &reject_export,
+        "Packet capture duration must be 1..=60 seconds",
+    );
+    assert!(!rejected.exists());
+    recorded["reviewed"]["options"]["seconds"] = json!(15);
+    write_report(&recorded);
+
+    fs::write(&capture, &original[..original.len() - 1]).unwrap();
+    error(&reject_export, "File byte count differs");
+    let mut changed = original.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    fs::write(&capture, changed).unwrap();
+    error(&reject_export, "Capture SHA-256 differs");
+    assert!(!rejected.exists());
+
+    recorded["schema_version"] = json!(2);
+    write_report(&recorded);
+    error(&[], "Unsupported packet capture report version");
+    recorded["schema_version"] = json!(1);
+    recorded["sha256"] = json!("bad digest");
+    write_report(&recorded);
+    error(&[], "Invalid packet capture report SHA-256");
+    recorded["bytes"] = json!(65 * 1024 * 1024);
+    write_report(&recorded);
+    error(&[], "invalid byte count");
+    fs::write(&report, vec![b' '; 256 * 1024 + 1]).unwrap();
+    error(&[], "Packet capture report exceeds 256 KiB");
+}
+
+#[test]
+fn creates_reusable_capture_settings_offline_and_preserves_existing_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let save_settings = |extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_w11term-cli"))
+            .current_dir(root)
+            .env_remove("LOCALAPPDATA")
+            .args([
+                "save-packet-capture-settings",
+                "--interface",
+                "lo",
+                "--filter",
+                "udp and dst port 4321",
+                "--tmpfs",
+            ])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+
+    let output = save_settings(&[]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({
+            "schema_version": 1,
+            "options": {
+                "interface": "lo", "filter": "udp and dst port 4321", "snap_length": 192,
+                "seconds": 15, "max_mib": 16, "packet_limit": null,
+                "scratch_directory": "/dev/shm", "require_tmpfs": true
+            }
+        })
+    );
+    let file_name = "capture settings.json";
+    let result = save_settings(&["--output-file", file_name]);
+    assert!(result.status.success(), "{result:?}");
+    let reply: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let path = Path::new(reply["result"]["path"].as_str().unwrap());
+    assert_eq!(reply["ok"], true);
+    assert_eq!(path, root.join(file_name));
+    assert_eq!(fs::read(path).unwrap(), output.stdout);
+    let loaded = w11term::control::PacketCaptureOptions::load_settings(path).unwrap();
+    assert!(loaded.require_tmpfs);
+    assert_eq!(loaded.filter, "udp and dst port 4321");
+
+    let collision = save_settings(&["--seconds", "20", "--output-file", file_name]);
+    assert!(!collision.status.success());
+    assert!(collision.stdout.is_empty());
+    assert_eq!(fs::read(path).unwrap(), output.stdout);
+    for bad in [&["--seconds", "61"][..], &["--pane", "7"], &["--tmpfs"]] {
+        let output = save_settings(&[bad, &["--output-file", "invalid.json"]].concat());
+        assert!(!output.status.success(), "{bad:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["ok"], false);
+        assert!(!root.join("invalid.json").exists());
+    }
+}
+
+#[test]
 fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -150,6 +338,7 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
             "file_bytes": 62,
             "packets": 2,
             "captured_bytes": 6,
+            "original_bytes": 12,
             "truncated_packets": 1,
             "timestamped_packets": 2,
             "timestamp_span_ns": "1250000000",
@@ -182,6 +371,7 @@ fn inspects_offline_and_writes_the_same_report_to_a_new_file() {
                 "capture_statistics": null,
                 "packets": 2,
                 "captured_bytes": 6,
+                "original_bytes": 12,
                 "truncated_packets": 1,
                 "timestamped_packets": 2,
                 "timestamp_span_ns": "1250000000"
@@ -498,7 +688,7 @@ fn compares_beyond_the_ranked_summary_and_keeps_direction_only_changes() {
     assert_eq!(report["before"]["timestamp_span_ns"], "11000000000");
     assert_eq!(
         report["totals_delta"],
-        json!({"packets": 1, "captured_bytes": 20, "truncated_packets": 0})
+        json!({"packets": 1, "captured_bytes": 20, "original_bytes": 20, "truncated_packets": 0})
     );
     let changes = report["conversation_changes"].as_array().unwrap();
     assert_eq!(changes.len(), 2);
@@ -746,15 +936,18 @@ fn compares_average_rates_over_the_full_window_and_reports_rate_only_conversatio
     assert_eq!(
         report["average_rates"],
         json!({
-            "before": {"packets_per_second": 1.5, "captured_bytes_per_second": 42.0},
-            "after": {"packets_per_second": 0.75, "captured_bytes_per_second": 21.0},
-            "delta": {"packets_per_second": -0.75, "captured_bytes_per_second": -21.0}
+            "before": {"packets_per_second": 1.5, "captured_bytes_per_second": 42.0, "original_bytes_per_second": 42.0},
+            "after": {"packets_per_second": 0.75, "captured_bytes_per_second": 21.0, "original_bytes_per_second": 21.0},
+            "delta": {"packets_per_second": -0.75, "captured_bytes_per_second": -21.0, "original_bytes_per_second": -21.0}
         })
     );
     assert_eq!(report["conversation_changes"], json!([]));
     assert_eq!(report["transport_changes"], json!([]));
     let ip = &report["rate_only_changes"]["ip_conversations"][0];
-    assert_eq!(ip["average_rates"], report["average_rates"]);
+    assert_eq!(
+        ip["average_rates"]["delta"],
+        json!({"packets_per_second": -0.75, "captured_bytes_per_second": -21.0})
+    );
     let pairs = report["rate_only_changes"]["transport_conversations"]
         .as_array()
         .unwrap();
@@ -787,6 +980,91 @@ fn compares_average_rates_over_the_full_window_and_reports_rate_only_conversatio
     assert_eq!(
         zero_span["rate_only_changes"]["transport_conversations"],
         json!([])
+    );
+}
+
+#[test]
+fn compares_recorded_packet_lengths_across_different_snap_lengths() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let before = "short.pcap";
+    let after = "full.pcapng";
+    let mut pcap = classic_capture()[..24].to_vec();
+    pcap[16..20].copy_from_slice(&4_u32.to_le_bytes());
+    for (seconds, fraction, original) in [(10_u32, 250_000, 4), (11, 500_000, 8)] {
+        pcap.extend(
+            [seconds, fraction, 4, original]
+                .into_iter()
+                .flat_map(u32::to_le_bytes),
+        );
+        pcap.extend([0; 4]);
+    }
+    fs::write(root.join(before), pcap).unwrap();
+
+    let mut pcapng: Vec<_> = [
+        0x0A0D0D0A_u32,
+        28,
+        0x1A2B3C4D,
+        1,
+        u32::MAX,
+        u32::MAX,
+        28,
+        1,
+        20,
+        1,
+        64,
+        20,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    // Preserve all the data. The first record has a legacy length below its captured length.
+    for (timestamp, captured, original) in [(10_250_000_u32, 4_u32, 3_u32), (11_500_000, 8, 8)] {
+        let block_bytes = 32 + captured;
+        pcapng.extend(
+            [6, block_bytes, 0, 0, timestamp, captured, original]
+                .into_iter()
+                .flat_map(u32::to_le_bytes),
+        );
+        pcapng.extend(std::iter::repeat_n(0, captured as usize));
+        pcapng.extend(block_bytes.to_le_bytes());
+    }
+    fs::write(root.join(after), pcapng).unwrap();
+
+    let whole = compare(root, before, after, &[]);
+    assert!(whole.status.success(), "{whole:?}");
+    let report: Value = serde_json::from_slice(&whole.stdout).unwrap();
+    assert_eq!(report["before"]["original_bytes"], 12);
+    assert_eq!(report["after"]["original_bytes"], 12);
+    assert_eq!(
+        report["totals_delta"],
+        json!({"packets": 0, "captured_bytes": 4, "original_bytes": 0, "truncated_packets": -1})
+    );
+    let delta = &report["average_rates"]["delta"];
+    assert_eq!(delta["captured_bytes_per_second"], 3.2);
+    assert_eq!(delta["original_bytes_per_second"], 0.0);
+    assert_eq!(
+        report["average_rates"]["after"]["original_bytes_per_second"],
+        9.6
+    );
+
+    let interval = compare(
+        root,
+        before,
+        after,
+        &["--elapsed-ns", "1250000000:1250000001"],
+    );
+    assert!(interval.status.success(), "{interval:?}");
+    let report: Value = serde_json::from_slice(&interval.stdout).unwrap();
+    assert_eq!(report["before"]["original_bytes"], 8);
+    assert_eq!(report["after"]["original_bytes"], 8);
+    assert_eq!(
+        report["average_rates"]["before"]["original_bytes_per_second"],
+        8e9
+    );
+    assert_eq!(
+        report["average_rates"]["delta"]["original_bytes_per_second"],
+        0.0
     );
 }
 

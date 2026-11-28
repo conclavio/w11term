@@ -10,6 +10,7 @@ fn bundle(shell: DotfileShell, zdotdir: Option<&str>) -> Operation {
         bundle: manifest("managed"),
         shell,
         zdotdir: zdotdir.map(String::from),
+        fish_config_dir: None,
     }
 }
 
@@ -19,6 +20,8 @@ fn manifest(prompt: &str) -> DotfileBundle {
         environment: Some("export PROJECT=local\r\n".into()),
         bash: Some(format!("PS1='{prompt}> '")),
         zsh: Some(format!("PROMPT='{prompt}> '")),
+        fish_environment: None,
+        fish: None,
     }
 }
 
@@ -27,6 +30,7 @@ fn apply(prompt: &str, plan: &Value) -> Operation {
         bundle: manifest(prompt),
         shell: DotfileShell::Bash,
         zdotdir: None,
+        fish_config_dir: None,
         review: plan["review"].as_str().unwrap().to_owned(),
     }
 }
@@ -45,6 +49,7 @@ fn dotfile_switch(target: DotfileTarget, preview: Option<&Value>) -> Operation {
         target,
         shell: DotfileShell::Bash,
         zdotdir: None,
+        fish_config_dir: None,
         review: preview.map(|plan| plan["review"].as_str().unwrap().into()),
     }
 }
@@ -53,6 +58,7 @@ fn repair_hooks(shell: DotfileShell, zdotdir: Option<&str>, preview: Option<&Val
     Operation::RepairDotfileHooks {
         shell,
         zdotdir: zdotdir.map(String::from),
+        fish_config_dir: None,
         review: preview.map(|plan| plan["review"].as_str().unwrap().into()),
     }
 }
@@ -202,6 +208,7 @@ async fn preview_dotfiles_uses_the_selected_zsh_startup_directory() {
             bundle: manifest("managed"),
             shell: DotfileShell::Zsh,
             zdotdir: Some("config/zsh".into()),
+            fish_config_dir: None,
             review: plan["review"].as_str().unwrap().into(),
         },
     )
@@ -382,6 +389,7 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
         bundle: manifest(prompt),
         shell: DotfileShell::Bash,
         zdotdir: None,
+        fish_config_dir: None,
     };
     let stale = guarded_job(&pane, None, preview("first")).await.unwrap();
     fs::write(&startup, "# corrected Bash configuration\n").unwrap();
@@ -531,6 +539,7 @@ async fn dotfiles_installation_rechecks_the_review_and_publishes_one_active_vers
             bundle: snapshot_bundle,
             shell: DotfileShell::Bash,
             zdotdir: None,
+            fish_config_dir: None,
         },
     )
     .await
@@ -690,11 +699,14 @@ async fn exported_dotfile_bundle_round_trips_a_fragment_at_its_size_limit() {
         environment: Some(environment.clone()),
         bash: None,
         zsh: Some("PROMPT='portable> '\r\n".into()),
+        fish_environment: None,
+        fish: None,
     };
     let preview = |bundle| Operation::PreviewDotfiles {
         bundle,
         shell: DotfileShell::Zsh,
         zdotdir: None,
+        fish_config_dir: None,
     };
     let plan = guarded_job(&pane, None, preview(bundle.clone()))
         .await
@@ -707,6 +719,7 @@ async fn exported_dotfile_bundle_round_trips_a_fragment_at_its_size_limit() {
             bundle,
             shell: DotfileShell::Zsh,
             zdotdir: None,
+            fish_config_dir: None,
             review: plan["review"].as_str().unwrap().into(),
         },
     )
@@ -782,6 +795,7 @@ pub(super) fn connect_options(source: Source, local: &std::path::Path) -> SshOpt
         shell: DotfileShell::Bash,
         bundle_sha256: None,
         zdotdir: None,
+        fish_config_dir: None,
         host: options.host.clone(),
         user: options.user.clone(),
         port: options.port,
@@ -840,9 +854,88 @@ async fn login(options: &SshOptions, selector: &str, expected: &str) -> Session 
     assert_eq!(sync.data["status"], expected, "{sync:?}");
     let generation = pane.ssh_connection_generation().unwrap();
     let report = pane.events.dotfile_sync(generation).unwrap();
-    assert_eq!(report.shell, DotfileShell::Bash);
+    assert_eq!(report.shell, options.dotfiles.as_ref().unwrap().shell);
     assert_eq!(serde_json::to_value(&*report).unwrap(), sync.data);
     pane
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fish_dotfiles_sync_before_the_shell_and_support_reviewed_recovery() {
+    let (source, remote, _, server) = fixture_connections(false, 4).await;
+    let root = remote.path();
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("dotfiles-shell-probe"), "fish").unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let mut options = connect_options(source, local.path());
+    let shell = DotfileShell::Fish;
+    let settings = options.dotfiles.as_mut().unwrap();
+    settings.shell = shell;
+    let bundle_path = settings.bundle.clone();
+    let mut bundle = manifest("independent Bash");
+    assert!(bundle.validate(shell).is_err());
+    let bash_id = bundle.content_version(DotfileShell::Bash).unwrap();
+    bundle.fish_environment = Some("set -gx PROJECT fish-managed\r\n".into());
+    bundle.fish = Some("function fish_prompt; printf 'ops> '; end".into());
+    assert_eq!(bundle.content_version(DotfileShell::Bash).unwrap(), bash_id);
+    let id = bundle.content_version(shell).unwrap();
+    settings.bundle_sha256 = Some(id.clone());
+    bundle.save_new(&bundle_path).unwrap();
+
+    let pane = login(&options, &id, "updated").await;
+    let startup_dir = root.join(".config/fish");
+    let startup = startup_dir.join("config.fish");
+    let hook = fs::read_to_string(&startup).unwrap();
+    assert!(hook.contains("/fish-current"));
+    let managed = root.join(".config/w11term/dotfiles");
+    let contents = managed.join(format!("fish-{id}"));
+    assert_eq!(
+        fs::read_to_string(contents.join("environment.fish")).unwrap(),
+        "set -gx PROJECT fish-managed\n"
+    );
+    assert!(!root.join(".profile").exists());
+    assert!(!managed.join("bash-current").exists());
+    assert!(!contents.join("environment.sh").exists());
+
+    let original = format!("# Existing Fish setup\n{hook}");
+    fs::write(
+        &startup,
+        original.replace("/prompt.fish", "/edited-prompt.fish"),
+    )
+    .unwrap();
+    let repair = |review| repair_hooks(shell, None, review);
+    let plan = guarded_job(&pane, None, repair(None)).await.unwrap();
+    assert_eq!(plan["files"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        file(&plan, "/.config/fish/config.fish")["action"],
+        "replace-hook"
+    );
+    guarded_job(&pane, None, repair(Some(&plan))).await.unwrap();
+    assert_eq!(fs::read_to_string(&startup).unwrap(), original);
+    fs::remove_file(&startup).unwrap();
+    fs::remove_dir(&startup_dir).unwrap();
+    let plan = guarded_job(&pane, None, repair(None)).await.unwrap();
+    assert_eq!(plan["directories_to_create"], json!(["/.config/fish"]));
+    guarded_job(&pane, None, repair(Some(&plan))).await.unwrap();
+    assert_eq!(fs::read_to_string(&startup).unwrap(), hook);
+
+    let snapshot = local.path().join("Fish snapshot.json");
+    guarded_job(
+        &pane,
+        None,
+        Operation::ExportDotfileBundle {
+            shell,
+            bundle_sha256: id.clone(),
+            local: snapshot.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let saved = DotfileBundle::load(&snapshot).unwrap();
+    saved.verify_version(shell, &id).unwrap();
+    assert!(saved.environment.is_none());
+    drop(pane);
+    drop(login(&options, &id, "current").await);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

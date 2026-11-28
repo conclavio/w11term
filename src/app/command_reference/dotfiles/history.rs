@@ -106,10 +106,7 @@ impl Panel {
                 .on_click(ctx.callback(move |_| send(action())))
                 .content(label)
         };
-        let shell = match installer.shell {
-            DotfileShell::Bash => "Bash",
-            DotfileShell::Zsh => "Zsh",
-        };
+        let shell = installer.shell.label();
         let mut fields = vec![
             KeyedView::new(
                 "title",
@@ -350,10 +347,15 @@ impl TerminalApp {
         let Some(connection) = session.ssh_connection_at(pane.generation) else {
             return;
         };
-        match installer.startup_directory() {
-            Ok(zdotdir) => {
-                self.open_dotfile_snapshot_profile(&profile, saved, zdotdir, &connection, ctx)
-            }
+        match installer.startup_directories() {
+            Ok((zdotdir, fish_config_dir)) => self.open_dotfile_snapshot_profile(
+                &profile,
+                saved,
+                zdotdir,
+                fish_config_dir,
+                &connection,
+                ctx,
+            ),
             Err(error) => {
                 if let Some(installer) = &mut self.command_reference.dotfiles {
                     installer.status = Some(error);
@@ -482,7 +484,7 @@ impl TerminalApp {
                         _ => return,
                     };
                     history.review = None;
-                    let zdotdir = match installer.startup_directory() {
+                    let (zdotdir, fish_config_dir) = match installer.startup_directories() {
                         Ok(path) => path,
                         Err(error) => {
                             installer.status = Some(error);
@@ -500,6 +502,7 @@ impl TerminalApp {
                             target,
                             shell: installer.shell,
                             zdotdir,
+                            fish_config_dir,
                             review,
                         },
                     ))
@@ -584,10 +587,7 @@ impl Installer {
     ) {
         let target = self.target;
         let shell = self.shell;
-        let name = match shell {
-            DotfileShell::Bash => "bash",
-            DotfileShell::Zsh => "zsh",
-        };
+        let name = shell.name();
         let purpose = file_picker::Purpose::SaveDotfilesBundle {
             current,
             suggestion: format!("dotfiles-{name}-{}.json", short_id(&bundle_sha256)),

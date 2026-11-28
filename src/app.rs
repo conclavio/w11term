@@ -76,6 +76,7 @@ mod profile_jumps;
 mod profile_tools;
 mod saved_commands;
 mod shell_setup;
+mod tool_profile_audit;
 mod word_delimiters;
 mod wsl_path;
 use file_drawer::{FileAction, FileDrawer};
@@ -413,6 +414,7 @@ enum SettingsEditor {
     Keyboard(keyboard_settings::KeyboardPage),
     Patterns(pattern_settings::PatternPage),
     SavedCommands(saved_commands::Editor),
+    ToolProfileAudit(tool_profile_audit::AuditPage),
     WordDelimiters(word_delimiters::Editor),
 }
 enum Page {
@@ -1555,6 +1557,7 @@ pub enum Message {
     SshIdentity(identity_picker::Action),
     ProfileDotfiles(TabId, profile_dotfiles::Action),
     ProfileTools(TabId, profile_tools::Action),
+    ToolProfileAudit(TabId, tool_profile_audit::Action),
     MoveProfile(String, isize, Arc<[String]>),
     SetProfilePin(String, bool),
     FilterProfiles(String),
@@ -2668,7 +2671,7 @@ impl TerminalApp {
         }
     }
 
-    fn settings_view(&self, context: &ViewContext<Self>) -> View {
+    fn settings_view(&self, id: TabId, context: &ViewContext<Self>) -> View {
         let appearance = self.appearance.read().unwrap().clone();
         let mut children:Vec<View>=vec![
             TextBlock::new().text("Settings").font_size(26.0).into(),
@@ -2702,6 +2705,14 @@ impl TerminalApp {
         ];
         let mut profiles: Vec<View> =
             vec![TextBlock::new().text("Profiles").font_size(20.0).into()];
+        profiles.push(
+            Button::new()
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .on_click(context.callback(move |_| {
+                    Message::ToolProfileAudit(id, tool_profile_audit::Action::Open)
+                }))
+                .content("Audit SSH tool profiles"),
+        );
         let order: Arc<[String]> = self.catalog.profile_order.as_slice().into();
         let startup = self.catalog.startup_profile.as_deref();
         let startup_choices: Vec<_> = std::iter::once((None, LAB.to_owned()))
@@ -5091,7 +5102,7 @@ impl TerminalApp {
             if live.session.is_direct_ssh_shell()
                 || matches!(&live.source, Source::Local(shell) if shell.wsl_distribution().is_some())
             {
-                items.extend(shell_setup::Setup::menu_items());
+                items.extend(shell_setup::menu_items());
             }
             items.push(self.rename_pane_item());
             if pane_colors::available(live) {
@@ -6401,7 +6412,7 @@ impl Component for TerminalApp {
                 }
             }
             Message::CopyShellSetup(setup) => {
-                if let Err(error) = setup.copy() {
+                if let Err(error) = shell_setup::copy(setup) {
                     self.window_error = Some(format!("Couldn’t copy the shell setup. {error:#}"));
                 }
             }
@@ -6974,6 +6985,13 @@ impl Component for TerminalApp {
             }
             Message::Control(w11term::control::UiRequest::OpenDiagnostic { launch, reply }) => {
                 self.control_open_diagnostic(launch, reply, context);
+            }
+            Message::Control(w11term::control::UiRequest::OpenCommandReference {
+                query,
+                platform,
+                reply,
+            }) => {
+                self.control_open_reference(query, platform, reply, context);
             }
             Message::Control(w11term::control::UiRequest::TabAppearance {
                 tab_id,
@@ -7803,6 +7821,7 @@ impl Component for TerminalApp {
             Message::SshIdentity(action) => self.ssh_identity_action(action, context),
             Message::ProfileDotfiles(id, action) => self.edit_profile_dotfiles(id, action, context),
             Message::ProfileTools(id, action) => self.edit_profile_tools(id, action, context),
+            Message::ToolProfileAudit(id, action) => self.tool_profile_audit(id, action, context),
             Message::EditProfile(name) => self.edit_profile(name, context),
             Message::DuplicateProfile(id) => self.duplicate_profile(id, context),
             Message::DeleteProfile(id) => {
@@ -8172,6 +8191,9 @@ impl Component for TerminalApp {
             }
             Message::WindowsTextSizeChanged => {}
             Message::WindowSize(size) => {
+                if !crate::window_state::valid_client_extent((size.width, size.height)) {
+                    return;
+                }
                 self.width = size.width;
                 self.window_height = size.height;
                 if !self.window_restored {
@@ -8218,12 +8240,14 @@ impl Component for TerminalApp {
                     // requested through ResizeClient with a custom title bar.
                     // After the first resize, apply the remaining error to the
                     // last request, or the same caption offset would recur.
-                    let estimate = (client.0 + delta.0, client.1 + delta.1);
-                    self.client_size = if first && estimate != self.client_size {
-                        estimate
-                    } else {
-                        (self.client_size.0 + delta.0, self.client_size.1 + delta.1)
-                    };
+                    if let Some(corrected) = crate::window_state::corrected_client_extent(
+                        self.client_size,
+                        client,
+                        delta,
+                        first,
+                    ) {
+                        self.client_size = corrected;
+                    }
                     if first {
                         context.spawn_background_with_rejection(
                             move |_| {
@@ -8566,7 +8590,7 @@ impl Component for TerminalApp {
                     }
                     _ => self.pane_view(id, tab, false, context),
                 },
-                Page::Settings(None) => self.settings_view(context),
+                Page::Settings(None) => self.settings_view(id, context),
                 Page::Settings(Some(SettingsEditor::WordDelimiters(editor))) => {
                     word_delimiters::view(editor, context)
                 }
@@ -8591,6 +8615,9 @@ impl Component for TerminalApp {
                 ),
                 Page::Settings(Some(SettingsEditor::SavedCommands(page))) => {
                     saved_commands::view(page, &self.saved_commands, context)
+                }
+                Page::Settings(Some(SettingsEditor::ToolProfileAudit(page))) => {
+                    tool_profile_audit::view(id, page, context)
                 }
                 Page::LocalProfile(draft) => self.local_profile_view(id, draft, context),
                 Page::Workspaces(page) => self.workspace_view(id, page, context),

@@ -533,7 +533,7 @@ impl Panel {
                         }
                         self.mode = SearchMode::PreferredExact;
                         self.selected = 0;
-                        self.focus = self.focus.wrapping_add(1);
+                        self.request_focus();
                         self.error = Some(status);
                     }
                     Err(error) => {
@@ -554,7 +554,7 @@ impl Panel {
                     .is_some_and(|editor| editor.work.is_none() && editor.recovery.is_none())
                 {
                     self.private_page = None;
-                    self.focus = self.focus.wrapping_add(1);
+                    self.request_focus();
                 }
             }
         }

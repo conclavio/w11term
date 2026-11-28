@@ -20,6 +20,7 @@ $combo = [System.Windows.Automation.ControlType]::ComboBox
 $edit = [System.Windows.Automation.ControlType]::Edit
 $item = [System.Windows.Automation.ControlType]::ListItem
 $value = [System.Windows.Automation.ValuePattern]::Pattern
+$dot = ' ' + [char]0xb7 + ' '
 $pickTitle = 'Choose SSH private key'
 $browseLabel = 'Browse for private key'
 
@@ -59,6 +60,61 @@ function File-Sha256([string]$Path) {
         $hash.Dispose()
     }
 }
+function Test-ReviewedToolBuilds([string]$Body, [hashtable[]]$Builds) {
+    $lines = @($Body -split '\r\n|\r|\n' | Where-Object { $_ -ne '' })
+    $index = 0
+    foreach ($build in $Builds) {
+        if ($lines[$index] -cne $build.Architecture -or $lines[$index + 2] -cne "Executable SHA-256 $($build.Digest)") {
+            return $false
+        }
+        if ($build.File) {
+            if (![FixtureDialog]::SameFile($build.File, $lines[$index + 1])) { return $false }
+        } elseif ($lines[$index + 1] -cne $build.Url) {
+            return $false
+        }
+        $index += 3
+        if ($build.Member) {
+            if ($lines[$index] -cne "Archive member $($build.Member)" -or
+                $lines[$index + 1] -cne "Archive SHA-256 $($build.ArchiveDigest)") { return $false }
+            $index += 2
+        }
+    }
+    return $index -eq $lines.Count
+}
+function Wait-ToolBuildReview([string]$Name, [hashtable[]]$Builds) {
+    Set-NativeExpansion $Name $true
+    $text = [System.Windows.Automation.TextPattern]::Pattern
+    $typedText = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+    $hasText = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::IsTextPatternAvailableProperty, $true)
+    $query = [System.Windows.Automation.OrCondition]::new($typedText, $hasText)
+    $observed = @{ Offscreen = $null; Text = '(missing)' }
+    $search = @{ scroll = $null }
+    try {
+        $null = Wait-Until "the reviewed builds for '$Name'" {
+            try {
+                $expander = Get-NativeExpanderElement $Name
+                if (!$expander) { return }
+                $observed.Offscreen = $expander.Current.IsOffscreen
+                $contents = foreach ($item in $expander.FindAll([System.Windows.Automation.TreeScope]::Descendants, $query)) {
+                    $provider = $null
+                    if ($item.TryGetCurrentPattern($text, [ref]$provider)) { $provider.DocumentRange.GetText(-1) }
+                    $item.Current.Name
+                }
+                $observed.Text = $contents -join ' | '
+                foreach ($body in $contents) {
+                    if (Test-ReviewedToolBuilds $body $Builds) { return $true }
+                }
+                Move-NativeControlIntoView $expander $search
+            } catch [System.Windows.Automation.ElementNotAvailableException] {
+                $search.scroll = $null
+            }
+        }
+    } catch {
+        throw "$_ Expander offscreen=$($observed.Offscreen). Last review text [$($observed.Text)]."
+    }
+}
 function Pick-LinuxExecutable([string]$Action, [string]$Name) {
     Click $Action
     $dialog = Wait-OwnedDialog 'Choose a Linux executable'
@@ -87,12 +143,33 @@ function Set-DotfileFragment([string]$Name, [string]$Text) {
     $field.GetCurrentPattern($value).SetValue($Text.Replace("`n", "`r"))
     $null = Wait-Until "the multiline dotfile fragment '$Name' is retained" { (Dotfile-Fragment $Name) -ceq $Text }
 }
+function Get-DotfileMenuAction([string]$TriggerName, [string]$ItemName) {
+    $search = @{ scroll = $null; attemptedReveal = $false }
+    Get-NativeMenuAction $TriggerName $ItemName -VisibleItem -Reveal {
+        try {
+            $trigger = Find-Element $TriggerName $button
+            if ($trigger -and $trigger.Current.IsEnabled -and !$search.attemptedReveal) {
+                $search.attemptedReveal = $true
+                $scrollItem = $null
+                if ($trigger.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scrollItem)) {
+                    $scrollItem.ScrollIntoView()
+                    return
+                }
+                if ($trigger.Current.IsKeyboardFocusable) {
+                    $trigger.SetFocus()
+                    return
+                }
+            }
+            Move-NativeControlIntoView $trigger $search
+        } catch [System.Windows.Automation.ElementNotAvailableException] {
+            $search.attemptedReveal = $false
+            $search.scroll = $null
+        }
+    }
+}
 function Import-ShellFragment([string]$Destination, [string]$Source) {
     $import = 'Import shell fragment'
-    $search = @{ scroll = $null }
-    Invoke-Button (Get-NativeMenuAction $import $Destination -VisibleItem -Reveal {
-        Move-NativeControlIntoView (Find-Element $import $button) $search
-    })
+    Invoke-Button (Get-DotfileMenuAction $import $Destination)
     $title = 'Choose a shell fragment file'
     $dialog = Wait-OwnedDialog $title
     if ($Source) {
@@ -106,6 +183,9 @@ function Import-ShellFragment([string]$Destination, [string]$Source) {
         $control = Find-Element $import $button
         $control -and $control.Current.IsEnabled -and !(Find-OwnedDialog $title)
     }
+}
+function Add-ShellSetup([string]$Mode) {
+    Invoke-Button (Get-DotfileMenuAction 'Add shell setup' $Mode)
 }
 function Save-DotfilesBundle([string]$Action, [string]$Path) {
     Invoke-Button (Wait-DotfileControl $Action $button)
@@ -233,13 +313,21 @@ try {
     Set-DotfileFragment 'Shared environment fragment' $shared
     Set-DotfileFragment 'Bash startup fragment' $bash
     Set-DotfileFragment 'Zsh startup fragment' $zsh
+    $fish = 'function fish_prompt; printf "fleet> "; end'
+    Set-DotfileFragment 'Fish startup fragment' $fish
+    Add-ShellSetup 'Fish directory reporting only'
+    $fishDirectory = Wait-Until 'the Fish draft includes directory reporting after the existing prompt' {
+        $text = Dotfile-Fragment 'Fish startup fragment'
+        if ($text.StartsWith("$fish`n# >>> w11term shell setup >>>") -and
+            $text.Contains('__w11term_report_fish_directory') -and !$text.Contains('__w11term_fish_preexec')) { $text }
+    }
     $created = Join-Path $State 'Authored dotfiles.json'
     Save-DotfilesBundle 'Save dotfiles bundle' $created
     $originalHash = File-Sha256 $created
     $initial = [IO.File]::ReadAllText($created) | ConvertFrom-Json
     if ($initial.version -ne 1 -or $initial.environment -cne $shared -or
-        $initial.bash -cne $bash -or $initial.zsh -cne $zsh) {
-        throw 'The authored dotfiles did not preserve all three multiline fragments'
+        $initial.bash -cne $bash -or $initial.zsh -cne $zsh -or $initial.fish -cne $fishDirectory) {
+        throw 'The authored dotfiles did not preserve the original fragments and added Fish setup'
     }
     Invoke-Button (Wait-DotfileControl 'Revise selected dotfiles bundle' $button)
     if ((Dotfile-Fragment 'Bash startup fragment') -cne $bash -or
@@ -270,12 +358,24 @@ try {
     $null = Wait-Until 'the Bash editor shows the appended UTF-8 text' {
         (Dotfile-Fragment 'Bash startup fragment') -ceq $revisedBash
     }
+    Add-ShellSetup 'Fish directory and prompt integration'
+    $fishIntegration = Wait-Until 'the full Fish integration replaces the directory-only block' {
+        $text = Dotfile-Fragment 'Fish startup fragment'
+        if ($text.StartsWith("$fish`n# >>> w11term shell setup >>>") -and
+            $text.Contains('__w11term_report_fish_directory') -and $text.Contains('__w11term_fish_preexec') -and
+            [regex]::Matches($text, '# >>> w11term shell setup >>>').Count -eq 1) { $text }
+    }
+    Add-ShellSetup 'Fish directory and prompt integration'
+    $null = Wait-Until 'reselecting the same integration leaves the draft unchanged' {
+        (Find-Element 'Fish startup fragment already includes this setup.') -and
+            (Dotfile-Fragment 'Fish startup fragment') -ceq $fishIntegration
+    }
     $revision = Join-Path $State 'Revised dotfiles.json'
     Save-DotfilesBundle 'Save dotfiles revision' $revision
     $updated = [IO.File]::ReadAllText($revision) | ConvertFrom-Json
     $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.dotfiles.bundle
     if ($updated.environment -cne $shared -or $updated.bash -cne $revisedBash -or
-        $updated.zsh -cne $zsh -or (File-Sha256 $created) -cne $originalHash -or
+        $updated.zsh -cne $zsh -or $updated.fish -cne $fishIntegration -or (File-Sha256 $created) -cne $originalHash -or
         (File-Sha256 $bashSource) -cne $importHash -or
         ![FixtureDialog]::SameFile($bundle, $approved)) {
         throw 'Revising a bundle changed its source, another fragment, or the saved approval'
@@ -298,7 +398,24 @@ try {
     Set-NativeExpansion 'SSH tools' $true
     $toolName = 'Fleet tools.json'
     $toolBundle = Join-Path $State $toolName
-    [IO.File]::WriteAllText($toolBundle, ('{"version":1,"name":"portable","tools":[{"name":"rg","builds":[{"architecture":"x86_64","path":"rg","sha256":"' + ('a' * 64) + '"}]}]}'))
+    $archiveUrl = 'https://example.test/rg-arm64.tar.gz'
+    $archiveMember = 'rg/bin/rg'
+    $archivePin = 'c' * 64
+    $localTool = Join-Path $State 'rg'
+    [IO.File]::WriteAllText($localTool, 'test placeholder')
+    $localToolPin = 'a' * 64
+    $downloadedToolPin = 'b' * 64
+    $manifest = @{
+        version = 1
+        name = 'portable'
+        tools = @(@{ name = 'rg'; builds = @(
+            @{ architecture = 'x86_64'; path = 'rg'; sha256 = $localToolPin },
+            @{ architecture = 'aarch64'; sha256 = $downloadedToolPin; download = @{
+                format = 'tar-gz'; url = $archiveUrl; member = $archiveMember; archive_sha256 = $archivePin
+            } }
+        ) })
+    }
+    [IO.File]::WriteAllText($toolBundle, ($manifest | ConvertTo-Json -Depth 10))
     Click 'Browse for tool bundle'
     $toolDialog = Wait-Until 'owned tool bundle picker' { Find-OwnedDialog 'Choose SSH tool bundle' }
     $null = Wait-Until 'enter the full tool manifest path' { [FixtureDialog]::SetFilename($toolDialog, $toolBundle, '') }
@@ -334,16 +451,43 @@ try {
     if ($modePopup.Current.ExpandCollapseState -eq 'Expanded') { $modePopup.Collapse() }
     Click 'Review tool bundle'
     $review = 'portable ' + [char]0x2192 + ' test@example.test:22 ' + [char]0x00b7 + ' /home/test/.local/bin'
-    $null = Wait-Until 'tool bundle and launcher directory reviewed' { Find-Element $review }
+    $manifestHash = File-Sha256 $toolBundle
+    $null = Wait-Until 'tool bundle, launcher directory and manifest digest reviewed' {
+        (Find-Element $review) -and (Find-Element "Reviewed manifest SHA-256 $manifestHash")
+    }
+    Wait-ToolBuildReview "rg${dot}ARM64, x86-64" @(
+        @{ Architecture = 'x86-64'; File = $localTool; Digest = $localToolPin }
+        @{ Architecture = 'ARM64'; Url = $archiveUrl; Digest = $downloadedToolPin
+            Member = $archiveMember; ArchiveDigest = $archivePin }
+    )
     Click 'Approve tool sync'
-    $null = Wait-Until 'tool sync approved' { Find-Element 'Approved tool bundle: portable' }
+    $null = Wait-Until 'tool sync approved with a pinned manifest' {
+        (Find-Element 'Approved tool bundle: portable') -and (Find-Element "Pinned manifest SHA-256 $manifestHash")
+    }
     Click 'Save profile changes'
     $null = Wait-Until 'tool approvals persisted' {
         $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
         $tools.name -ceq 'portable' -and $tools.bin_directory -ceq '.local/bin' -and
+            $tools.manifest_sha256 -ceq $manifestHash -and
             $tools.host -ceq 'example.test' -and $tools.home -ceq '/home/test' -and
             $tools.fingerprint -ceq $fingerprint -and $tools.add_to_path.shell -ceq 'bash' -and
             [FixtureDialog]::SameFile($toolBundle, $tools.bundle)
+    }
+    Select-NativeComboItem 'Tool bundle shell PATH' 'Manage Fish PATH'
+    Set-Field 'Tool PATH Fish configuration directory' 'xdg settings/fish'
+    $null = Wait-Until 'changing the startup settings requires a fresh build review' {
+        $approve = Find-Element 'Approve tool sync' $button
+        $approve -and !$approve.Current.IsEnabled -and !(Get-NativeExpander $rgBuilds)
+    }
+    Click 'Review tool bundle'
+    $null = Wait-Until 'the Fish PATH approval has the same tool destination' { Find-Element $review }
+    Click 'Approve tool sync'
+    $null = Wait-Until 'Fish PATH approved for the tool bundle' { Find-Element 'Approved tool bundle: portable' }
+    Click 'Save profile changes'
+    $null = Wait-Until 'Fish PATH approval persisted' {
+        $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+        $tools.add_to_path.shell -ceq 'fish' -and $tools.add_to_path.fish_config_dir -ceq 'xdg settings/fish' -and
+            $tools.bin_directory -ceq '.local/bin'
     }
     Click 'Disable tool sync'
     $null = Wait-Until 'tool sync disabled' { Find-Element 'Tool sync off' }
@@ -432,7 +576,6 @@ try {
     Click 'Create bundle from local tools'
     Set-Field 'New bundle name' 'team-tools'
     Set-Field 'Linux command name' 'operator'
-    $dot = ' ' + [char]0xb7 + ' '
     foreach ($build in @(@('operator-x64', 'x86-64'), @('operator-arm','ARM64'))) {
         Pick-LinuxExecutable 'Add Linux executable' $build[0]
         $null = Wait-Until "detected $($build[1]) executable" { Find-Element "operator${dot}$($build[1])" }
@@ -492,11 +635,31 @@ try {
     }
     Click 'Review tool bundle'
     $null = Wait-Until 'new revision reviewed' { Find-Element $review }
+    $replacementPin = $revisionBundle.tools.builds[0].sha256
+    $retainedPin = $createdBundle.tools.builds[1].sha256
+    Wait-ToolBuildReview "operator${dot}ARM64, x86-64" @(
+        @{ Architecture = 'x86-64'; File = (Join-Path $State 'operator-x64-next'); Digest = $replacementPin }
+        @{ Architecture = 'ARM64'; File = (Join-Path $State 'operator-arm'); Digest = $retainedPin }
+    )
     Click 'Approve tool sync'
     Click 'Save profile changes'
     $null = Wait-Until 'revision approval saved' {
         $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
-        [FixtureDialog]::SameFile($revision, $tools.bundle)
+        [FixtureDialog]::SameFile($revision, $tools.bundle) -and $tools.manifest_sha256 -ceq (File-Sha256 $revision)
+    }
+    $checked = [System.Windows.Automation.ToggleState]::On
+    $unchecked = [System.Windows.Automation.ToggleState]::Off
+    (Wait-CheckBox 'Follow changes to the tool manifest' $unchecked).Toggle()
+    $null = Wait-CheckBox 'Follow changes to the tool manifest' $checked
+    Click 'Review tool bundle'
+    Click 'Approve tool sync'
+    $null = Wait-Until 'the tool approval follows the manifest' {
+        Find-Element 'Tool sync follows changes to the manifest file.'
+    }
+    Click 'Save profile changes'
+    $null = Wait-Until 'follow-manifest approval is saved without a pin' {
+        $tools = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.fixture.tool_bundle
+        [FixtureDialog]::SameFile($revision, $tools.bundle) -and !$tools.manifest_sha256
     }
 } finally {
     if (!$app.HasExited) {

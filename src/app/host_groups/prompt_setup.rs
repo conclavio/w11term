@@ -155,7 +155,7 @@ impl TerminalApp {
                         draft.feedback.clear();
                     }
                     Form::Copy(shell) => {
-                        draft.feedback = match shell.copy() {
+                        draft.feedback = match shell_setup::copy(shell) {
                             Ok(()) => "Copied shell integration.".into(),
                             Err(error) => format!("Could not copy shell integration · {error}"),
                         };

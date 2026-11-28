@@ -1,12 +1,18 @@
 use super::dotfiles::under_home;
 use super::*;
+use crate::options::ToolSync;
 use std::{collections::BTreeSet, io::Read};
 
+mod audit;
 mod build;
 mod downloads;
 mod install;
 mod local;
 mod login;
+pub use audit::{
+    ToolArchitectureAudit, ToolCommandAudit, ToolExecutableAudit, ToolExecutableSource,
+    ToolExecutableStatus,
+};
 use build::{LibcVersion, Verified};
 pub use downloads::{
     ToolBundlePreset, UtilityDownload, builtin_tool_bundle, builtin_tool_names,
@@ -51,14 +57,14 @@ pub struct UtilityBundle {
     pub tools: Vec<UtilityTool>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UtilityTool {
     pub name: String,
     pub builds: Vec<UtilityBuild>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UtilityBuild {
     pub architecture: UtilityArchitecture,
@@ -108,8 +114,40 @@ fn valid_command_name(name: &str) -> bool {
     safe_component(name) && !name.starts_with(['.', '-'])
 }
 
+impl ToolSync {
+    pub(crate) fn validate_bundle_destination(&self) -> Result<()> {
+        ensure!(
+            safe_component(&self.name) && !self.name.starts_with('.'),
+            "Invalid approved tool bundle name"
+        );
+        ensure!(
+            valid_bin_directory(&self.bin_directory),
+            "Invalid approved tool bin directory"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_manifest_destination(&self, bundle: &UtilityBundle) -> Result<()> {
+        ensure!(
+            bundle.name == self.name && bundle.bin_directory == self.bin_directory,
+            "The manifest name or bin directory changed. Approve the tool bundle again."
+        );
+        Ok(())
+    }
+}
+
 impl UtilityBundle {
     pub fn load(manifest: &Path) -> Result<Self> {
+        Self::load_manifest(manifest).map(|(bundle, _)| bundle)
+    }
+
+    /// Load the manifest and hash the exact bytes used to build it.
+    pub fn load_with_manifest_sha256(manifest: &Path) -> Result<(Self, String)> {
+        let (bundle, bytes) = Self::load_manifest(manifest)?;
+        Ok((bundle, digest_hex(Sha256::new_with_prefix(bytes))))
+    }
+
+    fn load_manifest(manifest: &Path) -> Result<(Self, Vec<u8>)> {
         let manifest = std::path::absolute(manifest)?;
         let mut bytes = Vec::new();
         let file = std::fs::File::open(&manifest)?;
@@ -134,7 +172,7 @@ impl UtilityBundle {
             }
         }
         bundle.validate()?;
-        Ok(bundle)
+        Ok((bundle, bytes))
     }
 
     pub fn validate(&self) -> Result<()> {

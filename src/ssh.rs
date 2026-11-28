@@ -35,15 +35,19 @@ pub use triage::cpu_profile::{
 pub use triage::packet_capture::{
     Capture as PacketCapture, CaptureComparison as PacketCaptureComparison,
     CaptureExcerpt as PacketCaptureExcerpt, CaptureExcerptPlan as PacketCaptureExcerptPlan,
-    CaptureInterfaces as PacketCaptureInterfaces, ConversationChange as PacketConversationChange,
+    CaptureInterfaces as PacketCaptureInterfaces, CaptureReportDetails, CaptureReportReview,
+    CaptureReportVerification, ConversationChange as PacketConversationChange,
     ConversationEndpoints as PacketConversationEndpoints,
     ConversationQuery as PacketConversationQuery, LocalCapture as LocalPacketCapture,
     Plan as PacketCapturePlan, ip_protocol_label, open_capture_conversation_in_wireshark,
     open_capture_conversation_interval_in_wireshark, open_capture_in_wireshark,
     open_capture_interval_in_wireshark, open_capture_pair_in_wireshark,
-    open_capture_transport_in_wireshark,
+    open_capture_transport_in_wireshark, verify_packet_capture_report,
 };
-pub use triage::syscall_capture::{Capture as SyscallCapture, Plan as SyscallCapturePlan};
+pub use triage::syscall_capture::{
+    Capture as SyscallCapture, Plan as SyscallCapturePlan, SyscallCaptureReport,
+    SyscallCaptureReportReview, verify_syscall_capture_report,
+};
 pub use triage::{
     Delta as TriageDelta, Finding as TriageFinding, Plan as TriagePlan, Report as TriageReport,
     Resource as TriageResource, SampleStatus as TriageSampleStatus, Target as TriageTarget,

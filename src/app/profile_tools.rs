@@ -3,14 +3,28 @@ use std::path::PathBuf;
 use w11term::{
     options::{ToolPath, ToolSync},
     sftp::{
-        DotfileShell, ToolBundlePreset, UtilityBundle, builtin_tool_names,
-        prepare_builtin_tool_bundle, validate_dotfiles_home, validate_zdotdir,
+        DotfileShell, ToolBundlePreset, UtilityArchitecture, UtilityBundle, UtilityTool,
+        builtin_tool_names, prepare_builtin_tool_bundle, validate_dotfiles_home,
     },
 };
 
 mod local_bundle;
+mod review;
+
+pub(super) fn architecture_label(architecture: UtilityArchitecture) -> &'static str {
+    match architecture {
+        UtilityArchitecture::X86_64 => "x86-64",
+        UtilityArchitecture::Aarch64 => "ARM64",
+    }
+}
 
 const TITLE: &str = "SSH tools";
+const PATH_MODES: [&str; 4] = [
+    "Manual PATH setup",
+    "Manage Bash PATH",
+    "Manage Zsh PATH",
+    "Manage Fish PATH",
+];
 
 #[derive(Clone, Copy)]
 pub enum Field {
@@ -18,6 +32,7 @@ pub enum Field {
     Home,
     Fingerprint,
     Zdotdir,
+    FishConfigDir,
 }
 
 #[derive(Clone)]
@@ -25,6 +40,7 @@ pub enum Action {
     Expanded(bool),
     Text(Field, String),
     PathMode(Option<usize>),
+    FollowManifest(bool),
     Browse,
     Picked(Arc<()>, Result<Option<String>, String>),
     Preset(Option<usize>),
@@ -33,9 +49,14 @@ pub enum Action {
     StarterFinished(Arc<()>, Result<String, String>),
     Local(local_bundle::Action),
     Review,
-    Reviewed(Arc<()>, Result<Box<ToolSync>, String>),
+    Reviewed(Arc<()>, Result<Arc<ReviewedBundle>, String>),
     Approve,
     Disable,
+}
+
+pub struct ReviewedBundle {
+    approval: Box<ToolSync>,
+    tools: Vec<UtilityTool>,
 }
 
 #[derive(Clone, Default)]
@@ -45,9 +66,11 @@ pub(super) struct Editor {
     home: String,
     fingerprint: String,
     zdotdir: String,
-    path_mode: usize,
+    fish_config_dir: String,
+    path_shell: Option<DotfileShell>,
+    follow_manifest: bool,
     approved: Option<Box<ToolSync>>,
-    reviewed: Option<Box<ToolSync>>,
+    reviewed: Option<Arc<ReviewedBundle>>,
     work: Option<Arc<()>>,
     preset: ToolBundlePreset,
     starter: Option<(Arc<()>, ComponentTask)>,
@@ -60,27 +83,20 @@ impl Editor {
         let Some(settings) = approved.as_ref() else {
             return Self::default();
         };
-        let (path_mode, zdotdir) =
-            settings
-                .add_to_path
-                .as_ref()
-                .map_or((0, String::new()), |path| {
-                    (
-                        if path.shell == DotfileShell::Zsh {
-                            2
-                        } else {
-                            1
-                        },
-                        path.zdotdir.clone().unwrap_or_default(),
-                    )
-                });
+        let path = settings.add_to_path.as_ref();
         Self {
             bundle: settings.bundle.to_string_lossy().into_owned(),
             preset: ToolBundlePreset::from_managed_path(&settings.bundle).unwrap_or_default(),
             home: settings.home.clone(),
             fingerprint: settings.fingerprint.clone(),
-            zdotdir,
-            path_mode,
+            zdotdir: path
+                .and_then(|path| path.zdotdir.clone())
+                .unwrap_or_default(),
+            fish_config_dir: path
+                .and_then(|path| path.fish_config_dir.clone())
+                .unwrap_or_default(),
+            path_shell: path.map(|path| path.shell),
+            follow_manifest: settings.manifest_sha256.is_none(),
             approved,
             ..Self::default()
         }
@@ -90,6 +106,26 @@ impl Editor {
         self.approved.clone()
     }
 
+    pub(super) fn adopt_rollout(&mut self, before: &ToolSync, after: &ToolSync, base: &Path) {
+        if self.approved.as_deref() != Some(before) {
+            return;
+        }
+        self.approved = Some(Box::new(after.clone()));
+        if base.join(self.bundle.trim()) == before.bundle
+            && self.starter.is_none()
+            && self.local.is_none()
+        {
+            if self.preset
+                == ToolBundlePreset::from_managed_path(&before.bundle).unwrap_or_default()
+            {
+                self.preset =
+                    ToolBundlePreset::from_managed_path(&after.bundle).unwrap_or_default();
+            }
+            self.bundle = after.bundle.to_string_lossy().into_owned();
+            self.edited();
+        }
+    }
+
     fn candidate(&self, draft: &ProfileDraft, base: &Path) -> anyhow::Result<ToolSync> {
         let (host, user, port) = parse_ssh_address(&draft.host, &draft.user, &draft.port)?;
         let fingerprint =
@@ -97,24 +133,21 @@ impl Editor {
         anyhow::ensure!(!self.bundle.trim().is_empty(), "Choose an SSH tool bundle");
         let home = self.home.trim();
         validate_dotfiles_home(home)?;
-        let add_to_path = match self.path_mode {
-            1 => Some(ToolPath {
-                shell: DotfileShell::Bash,
-                zdotdir: None,
-            }),
-            2 => {
-                let zdotdir = self.zdotdir.trim();
-                let zdotdir = (!zdotdir.is_empty()).then_some(zdotdir);
-                validate_zdotdir(DotfileShell::Zsh, zdotdir)?;
-                Some(ToolPath {
-                    shell: DotfileShell::Zsh,
-                    zdotdir: zdotdir.map(str::to_owned),
+        let add_to_path = self
+            .path_shell
+            .map(|shell| -> anyhow::Result<_> {
+                let (zdotdir, fish_config_dir) =
+                    profile_dotfiles::startup_fields(shell, &self.zdotdir, &self.fish_config_dir)?;
+                Ok(ToolPath {
+                    shell,
+                    zdotdir,
+                    fish_config_dir,
                 })
-            }
-            _ => None,
-        };
+            })
+            .transpose()?;
         Ok(ToolSync {
             bundle: base.join(self.bundle.trim()),
+            manifest_sha256: None,
             name: String::new(),
             bin_directory: String::new(),
             host,
@@ -127,7 +160,11 @@ impl Editor {
     }
 
     fn agrees(&self, scope: &ToolSync, draft: &ProfileDraft, base: &Path) -> bool {
+        if self.follow_manifest != scope.manifest_sha256.is_none() {
+            return false;
+        }
         self.candidate(draft, base).is_ok_and(|mut current| {
+            current.manifest_sha256.clone_from(&scope.manifest_sha256);
             current.name.clone_from(&scope.name);
             current.bin_directory.clone_from(&scope.bin_directory);
             current == *scope
@@ -186,8 +223,8 @@ impl Editor {
         };
         let reviewed = self
             .reviewed
-            .as_ref()
-            .filter(|settings| self.agrees(settings, draft, base));
+            .as_deref()
+            .filter(|review| self.agrees(&review.approval, draft, base));
         let approved = self
             .approved
             .as_ref()
@@ -196,7 +233,8 @@ impl Editor {
             "Preparing verified Linux builds for x86-64 and ARM64…".into()
         } else if let Some(feedback) = &self.feedback {
             feedback.clone()
-        } else if let Some(settings) = reviewed {
+        } else if let Some(review) = reviewed {
+            let settings = &review.approval;
             format!(
                 "{} → {}@{}:{} · {}/{}",
                 settings.name,
@@ -214,6 +252,17 @@ impl Editor {
             "Tool sync off".into()
         };
         let idle = self.work.is_none() && self.starter.is_none();
+        let pin_status = match (reviewed.map(|review| &review.approval), approved) {
+            (Some(settings), _) => settings
+                .manifest_sha256
+                .as_ref()
+                .map(|digest| format!("Reviewed manifest SHA-256 {digest}")),
+            (None, Some(settings)) => Some(settings.manifest_sha256.as_ref().map_or_else(
+                || "Tool sync follows changes to the manifest file.".into(),
+                |digest| format!("Pinned manifest SHA-256 {digest}"),
+            )),
+            (None, None) => None,
+        };
         let custom = match &self.preset {
             ToolBundlePreset::Custom(names) => Some(names),
             _ => None,
@@ -330,15 +379,15 @@ impl Editor {
                     TextBlock::new().text("Shell PATH"),
                     ComboBox::new()
                         .automation_name("Tool bundle shell PATH")
-                        .items_source(["Manual PATH setup", "Manage Bash PATH", "Manage Zsh PATH"])
-                        .selected_index(self.path_mode)
+                        .items_source(PATH_MODES)
+                        .selected_index(self.path_shell.map_or(0, |shell| shell.menu_index() + 1))
                         .on_selection_changed(ctx.callback(move |index| {
                             Message::ProfileTools(id, Action::PathMode(index))
                         })),
                 )),
             ),
         ]);
-        if self.path_mode == 2 {
+        if self.path_shell == Some(DotfileShell::Zsh) {
             fields.push(KeyedView::new(
                 "zdotdir",
                 field(
@@ -348,8 +397,29 @@ impl Editor {
                     "Relative to the remote home",
                 ),
             ));
+        } else if self.path_shell == Some(DotfileShell::Fish) {
+            fields.push(KeyedView::new(
+                "fish-config-dir",
+                field(
+                    Field::FishConfigDir,
+                    "Tool PATH Fish configuration directory",
+                    &self.fish_config_dir,
+                    "Relative to the remote home",
+                ),
+            ));
         }
         fields.extend([
+            KeyedView::new(
+                "follow-manifest",
+                CheckBox::new()
+                    .automation_name("Follow changes to the tool manifest")
+                    .is_checked(self.follow_manifest)
+                    .is_enabled(idle)
+                    .on_is_checked_changed(ctx.callback(move |follow| {
+                        Message::ProfileTools(id, Action::FollowManifest(follow))
+                    }))
+                    .content("Follow changes to the tool manifest"),
+            ),
             KeyedView::new(
                 "actions",
                 StackPanel::new()
@@ -377,6 +447,17 @@ impl Editor {
                     .text_wrapping(TextWrapping::Wrap),
             ),
         ]);
+        if let Some(pin_status) = pin_status {
+            fields.push(KeyedView::new(
+                "manifest-pin-status",
+                TextBlock::new()
+                    .text(pin_status)
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        if let Some(review) = reviewed {
+            fields.extend(review.tools.iter().map(review::tool_view));
+        }
         self.expander(
             id,
             StackPanel::new().spacing(8.0).keyed_children(fields),
@@ -445,9 +526,19 @@ impl TerminalApp {
         match action {
             Action::Local(_) => unreachable!("local bundle actions handled above"),
             Action::Expanded(expanded) => draft.tool_bundle.expanded = expanded,
-            Action::PathMode(Some(index)) if index != draft.tool_bundle.path_mode && index < 3 => {
-                draft.tool_bundle.path_mode = index;
-                draft.tool_bundle.edited();
+            Action::FollowManifest(follow) => {
+                let editor = &mut draft.tool_bundle;
+                if editor.follow_manifest != follow {
+                    editor.follow_manifest = follow;
+                    editor.edited();
+                }
+            }
+            Action::PathMode(Some(index)) if index < PATH_MODES.len() => {
+                let shell = index.checked_sub(1).map(|index| DotfileShell::ALL[index]);
+                if draft.tool_bundle.path_shell != shell {
+                    draft.tool_bundle.path_shell = shell;
+                    draft.tool_bundle.edited();
+                }
             }
             Action::PathMode(_) => (),
             Action::Preset(Some(index))
@@ -492,6 +583,7 @@ impl TerminalApp {
                     Field::Home => &mut editor.home,
                     Field::Fingerprint => &mut editor.fingerprint,
                     Field::Zdotdir => &mut editor.zdotdir,
+                    Field::FishConfigDir => &mut editor.fish_config_dir,
                 };
                 if *slot != value {
                     *slot = value;
@@ -620,17 +712,22 @@ impl TerminalApp {
                 draft.tool_bundle.edited();
                 let request = Arc::new(());
                 draft.tool_bundle.work = Some(request.clone());
+                let follow_manifest = draft.tool_bundle.follow_manifest;
                 let rejected = Message::ProfileTools(
                     id,
                     Action::Reviewed(request.clone(), Err("Bundle review unavailable".into())),
                 );
                 ctx.spawn_background_with_rejection(
                     move |_| {
-                        let result = UtilityBundle::load(&settings.bundle)
-                            .map(move |bundle| {
+                        let result = UtilityBundle::load_with_manifest_sha256(&settings.bundle)
+                            .map(move |(bundle, digest)| {
+                                settings.manifest_sha256 = (!follow_manifest).then_some(digest);
                                 settings.name = bundle.name;
                                 settings.bin_directory = bundle.bin_directory;
-                                settings
+                                Arc::new(ReviewedBundle {
+                                    approval: settings,
+                                    tools: bundle.tools,
+                                })
                             })
                             .map_err(|error| format!("{error:#}"));
                         Message::ProfileTools(id, Action::Reviewed(request, result))
@@ -666,18 +763,18 @@ impl TerminalApp {
                     return;
                 }
                 match result {
-                    Ok(scope) if draft.tool_bundle.agrees(&scope, draft, base) => {
-                        draft.tool_bundle.reviewed = Some(scope)
+                    Ok(review) if draft.tool_bundle.agrees(&review.approval, draft, base) => {
+                        draft.tool_bundle.reviewed = Some(review)
                     }
                     Ok(_) => (),
                     Err(error) => draft.tool_bundle.feedback = Some(error),
                 }
             }
             Action::Approve if draft.tool_bundle.starter.is_none() => {
-                if let Some(scope) = draft.tool_bundle.reviewed.take()
-                    && draft.tool_bundle.agrees(&scope, draft, base)
+                if let Some(review) = draft.tool_bundle.reviewed.take()
+                    && draft.tool_bundle.agrees(&review.approval, draft, base)
                 {
-                    draft.tool_bundle.approved = Some(scope);
+                    draft.tool_bundle.approved = Some(review.approval.clone());
                     draft.tool_bundle.feedback = None;
                     draft.saved = false;
                 }

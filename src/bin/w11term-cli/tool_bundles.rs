@@ -1,6 +1,9 @@
-use anyhow::{Context, Result, bail};
+use super::offline::{profile_rollout_with, profile_store, rollback_args};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{io::Write, path::Path, process::ExitCode};
+use w11term::control::Reply;
+use w11term::profiles::{ToolProfileBuildChecks, ToolRolloutBuildPolicy, rollback_tool_rollout};
 use w11term::sftp::{
     ToolBundlePreset, UtilityArchitecture, UtilityBundle, export_builtin_tool_bundle,
     fetch_tool_bundle,
@@ -8,6 +11,147 @@ use w11term::sftp::{
 
 pub const HELP: &str = "w11term-cli fetch-tool-bundle BUNDLE.json [--architecture x86_64|aarch64]\n\
 w11term-cli fetch-tool-bundle --example NEW_BUNDLE.json [--preset essentials|admin | --tools rg,jq,mdd]";
+pub(super) const AUDIT_VERB: &str = "audit-tool-profiles";
+pub(super) const AUDIT_HELP: &str = "w11term-cli audit-tool-profiles [--profiles CATALOG] [--profile NAME] [--verify-builds [--architecture x86_64|aarch64]]";
+pub(super) const PREPARE_VERB: &str = "prepare-tool-profiles";
+pub(super) const PREPARE_HELP: &str = "w11term-cli prepare-tool-profiles --profile NAME [--profile NAME ...] [--profiles CATALOG] [--architecture x86_64|aarch64]";
+pub(super) const ROLLOUT_VERB: &str = "rollout-tool-profiles";
+pub(super) const ROLLOUT_HELP: &str = "w11term-cli rollout-tool-profiles --candidate MANIFEST --profile NAME [--profile NAME ...] [--profiles CATALOG] [--verify-builds|--require-ready] [--architecture x86_64|aarch64] [--review TOKEN]";
+pub(super) const ROLLBACK_VERB: &str = "rollback-tool-profiles";
+pub(super) const ROLLBACK_HELP: &str =
+    "w11term-cli rollback-tool-profiles ROLLOUT-REPLY.json [--review TOKEN]";
+
+pub(super) fn audit(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let mut catalog = None;
+    let mut profile = None;
+    let mut verify = false;
+    let mut architecture = None;
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        if flag == "--verify-builds" {
+            ensure!(!verify, "specify --verify-builds only once");
+            verify = true;
+            continue;
+        }
+        let target = match flag.as_str() {
+            "--profiles" => &mut catalog,
+            "--profile" => &mut profile,
+            "--architecture" => &mut architecture,
+            _ => bail!("unsupported tool profile audit option {flag}"),
+        };
+        let value = args
+            .next()
+            .with_context(|| format!("{flag} requires a value"))?;
+        ensure!(
+            target.replace(value.as_str()).is_none(),
+            "specify {flag} only once"
+        );
+    }
+    ensure!(
+        verify || architecture.is_none(),
+        "--architecture requires --verify-builds"
+    );
+    let checks = if verify {
+        ToolProfileBuildChecks::Verify(architecture.map(parse_architecture).transpose()?)
+    } else {
+        ToolProfileBuildChecks::Skip
+    };
+    let audit = profile_store(catalog)?.audit_tool_profiles(profile, checks)?;
+    let reply = Reply::from_result(Ok(serde_json::to_value(audit)?));
+    serde_json::to_writer(&mut *output, &reply)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+pub(super) fn rollout(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let mut require_ready = None;
+    let mut architecture = None;
+    let args = profile_rollout_with(
+        args,
+        "Choose a tool manifest with --candidate",
+        |flag, args| {
+            match flag {
+                "--verify-builds" | "--require-ready" => {
+                    ensure!(
+                        require_ready.replace(flag == "--require-ready").is_none(),
+                        "Choose either --verify-builds or --require-ready once"
+                    );
+                }
+                "--architecture" => {
+                    ensure!(architecture.is_none(), "specify --architecture only once");
+                    architecture = Some(parse_architecture(
+                        args.next().context("--architecture requires a value")?,
+                    )?);
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        },
+    )?;
+    ensure!(
+        require_ready.is_some() || architecture.is_none(),
+        "--architecture requires --verify-builds or --require-ready"
+    );
+    let policy = require_ready.map(|require_ready| ToolRolloutBuildPolicy {
+        architecture,
+        require_ready,
+    });
+    let result = args.store.rollout_tools_with_builds(
+        &args.profiles,
+        &args.candidate,
+        args.review,
+        policy,
+    )?;
+    let reply = Reply::from_result(Ok(serde_json::to_value(result)?));
+    serde_json::to_writer(&mut *output, &reply)?;
+    writeln!(output)?;
+    Ok(())
+}
+
+pub(super) fn prepare(args: &[String], output: &mut dyn Write) -> Result<ExitCode> {
+    let mut catalog = None;
+    let mut architecture = None;
+    let mut profiles = Vec::new();
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        let value = args
+            .next()
+            .with_context(|| format!("{flag} requires a value"))?;
+        match flag.as_str() {
+            "--profiles" => {
+                ensure!(
+                    catalog.replace(value.as_str()).is_none(),
+                    "specify --profiles only once"
+                );
+            }
+            "--profile" => profiles.push(value.clone()),
+            "--architecture" => {
+                ensure!(architecture.is_none(), "specify --architecture only once");
+                architecture = Some(parse_architecture(value)?);
+            }
+            _ => bail!("unsupported SSH tool preparation option {flag}"),
+        }
+    }
+    let report = profile_store(catalog)?.prepare_tool_profiles(&profiles, architecture)?;
+    let exit = if report.failed_profiles == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    };
+    let reply = Reply::from_result(Ok(serde_json::to_value(report)?));
+    serde_json::to_writer(&mut *output, &reply)?;
+    writeln!(output)?;
+    Ok(exit)
+}
+
+pub(super) fn rollback(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let (path, review) = rollback_args(args)?;
+    let result = rollback_tool_rollout(path, review)?;
+    let reply = Reply::from_result(Ok(serde_json::to_value(result)?));
+    serde_json::to_writer(&mut *output, &reply)?;
+    writeln!(output)?;
+    Ok(())
+}
 
 pub fn run(args: &[String]) -> Result<Value> {
     match args {
@@ -33,14 +177,17 @@ pub fn run(args: &[String]) -> Result<Value> {
         }
         [file] if !file.starts_with("--") => fetch(file, None),
         [file, flag, raw] if !file.starts_with("--") && flag == "--architecture" => {
-            let architecture = match raw.as_str() {
-                "x86_64" => UtilityArchitecture::X86_64,
-                "aarch64" => UtilityArchitecture::Aarch64,
-                _ => bail!("--architecture requires x86_64 or aarch64"),
-            };
-            fetch(file, Some(architecture))
+            fetch(file, Some(parse_architecture(raw)?))
         }
         _ => bail!("{HELP}"),
+    }
+}
+
+fn parse_architecture(value: &str) -> Result<UtilityArchitecture> {
+    match value {
+        "x86_64" => Ok(UtilityArchitecture::X86_64),
+        "aarch64" => Ok(UtilityArchitecture::Aarch64),
+        _ => bail!("--architecture requires x86_64 or aarch64"),
     }
 }
 

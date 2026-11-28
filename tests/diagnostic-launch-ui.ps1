@@ -117,7 +117,7 @@ function Wait-PacketComparison {
     $null = Wait-Until 'packet comparison shows the two roles and the recorded change' {
         (Find-Element "Before${dot}baseline packets.pcap${dot}PCAP") -and
             (Find-Element "After${dot}candidate packets.pcapng${dot}PCAPNG") -and
-            (Find-Element "Capture change${dot}+1 packets${dot}+20 captured bytes${dot}+0 truncated") -and
+            (Find-Element "Capture change${dot}+1 packets${dot}+20 captured bytes${dot}+0 truncated${dot}+20 original bytes") -and
             (Find-Element 'IP conversation changes 1')
     }
 }

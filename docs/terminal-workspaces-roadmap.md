@@ -285,6 +285,8 @@ The overview's **Activity** list follows jobs started from the app in the curren
 
 ### Packet capture and Wireshark
 
+Save the capture inputs to a settings file for repeated measurements. Load it in the Windows panel or pass it to the CLI for a new review on the selected SSH connection. [Capture settings](../CONTROL.md#capture-linux-packets-and-open-wireshark)
+
 - Choose an interface, an optional capture filter, and a snap length. Review the effective `tcpdump -i IFACE -nn -p -s SNAPLEN -w -` arguments and packet limit before starting. For rolling capture, use the stdout stream and place complete pcap records into a bounded set of private files so the capture keeps tcpdump’s existing privilege handling. Rotate before a record exceeds a file’s budget. Show the number of overwritten files and save the retained packets in capture order. Stop cleanly so tcpdump can flush its output and report packet drops. [tcpdump manual](https://github.com/the-tcpdump-group/tcpdump/blob/master/tcpdump.1.in) · [Rolling capture controls](../CONTROL.md#capture-linux-packets-and-open-wireshark)
 - Use a private job directory on disk or an operator-selected, verified `tmpfs` mount. Check available capacity and reserve headroom before starting. Enforce bytes and file-count budgets per capture and across concurrent captures on the host. For RAM-backed capture, use a filesystem quota or a bounded writer with headroom for the final record. Show the reason when the selected location cannot meet the budget and let the operator choose a disk location.
 - Download completed captures to a local staging path. Check the captured size and, when available, a remote checksum before publishing the local file. Open the published capture with the configured Windows Wireshark executable using `-r` and the local path. Keep **Save capture** available when Wireshark is absent. Clean up remote artifacts after a verified transfer or when the retention period expires. [Wireshark command-line options](https://www.wireshark.org/docs/wsug_html_chunked/ChCustCommandLine.html)
@@ -332,7 +334,7 @@ Ship selection explanation and Bash drafting with a shared request preview, then
 
 Use a single SSH profile to bring your shell setup and tools to a Linux account. Under **Settings → Edit profile**, configure **SSH dotfiles** for prompt and shell startup fragments and **SSH tools** for your pinned executables. Review and approve each bundle for the remote account. On an ordinary SSH connect or reconnect, w11term syncs the approved dotfiles first and then syncs the tools over SFTP before starting the shell. Each step reports its own outcome. A skipped sync still lets the shell open. [SSH dotfile sync](../CONTROL.md#sync-dotfiles-on-ssh-connect) · [SSH tool sync](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
 
-The SSH dotfiles editor can create a bundle locally or revise an existing bundle in a new file. It edits the shared environment and the Bash and Zsh fragments directly. Choosing the new file leaves the profile's saved approval in place until the new selection is approved and saved.
+The SSH dotfiles editor can create a bundle locally or revise an existing bundle in a new file. It edits Bash and Zsh startup fragments and their shared environment, plus two separate Fish fragments. Choosing the new file leaves the profile's saved approval in place until the new selection is approved and saved.
 
 **Import shell fragment** appends an existing local shell file to the selected editor section for review before saving a bundle. [Import local dotfiles](../CONTROL.md#sync-dotfiles-on-ssh-connect)
 
@@ -342,9 +344,9 @@ For an already connected SSH pane, **More → Command reference → Apply SSH do
 
 Install and version reviews show which lines change in the managed environment and prompt fragments. The install review also shows the generated startup hooks it will add. [Dotfile content review](../CONTROL.md#preview-and-apply-ssh-dotfiles)
 
-**Review startup hook repair** restores an edited or missing Bash or Zsh hook while keeping the active dotfile version and the surrounding startup text. [Startup hook repair](../CONTROL.md#preview-and-apply-ssh-dotfiles)
+**Review startup hook repair** restores an edited or missing Bash, Zsh, or Fish hook while keeping the active dotfile version and the surrounding startup text. [Startup hook repair](../CONTROL.md#preview-and-apply-ssh-dotfiles)
 
-**Dotfile versions** lists the active and retained versions for Bash or Zsh. Review and restore a previous version, or disable managed fragments for the account. Both pause automatic sync. Resume it from the same panel to let approved profiles sync on reconnect. [Dotfile version history](../CONTROL.md#restore-or-disable-ssh-dotfiles)
+**Dotfile versions** lists the active and retained versions for Bash, Zsh, or Fish. Review and restore a previous version, or disable managed fragments for the account. Both pause automatic sync. Resume it from the same panel to let approved profiles sync on reconnect. [Dotfile version history](../CONTROL.md#restore-or-disable-ssh-dotfiles)
 
 Select a version and save its verified fragments as a Windows bundle for reuse in another SSH profile. [Save a retained version](../CONTROL.md#restore-or-disable-ssh-dotfiles)
 
@@ -352,7 +354,7 @@ From the same pane, **Review saved dotfiles in this SSH profile** carries the sa
 
 Pin an approved dotfile version to keep reconnects on that shell's reviewed content. If the local bundle changes, the shell still opens and the login status explains why sync was skipped. [Pin a profile version](../CONTROL.md#sync-dotfiles-on-ssh-connect)
 
-From that pane, **More → Command reference** shows both login sync results for the current connection. **Apply SSH dotfiles** shows the reason when dotfiles sync was skipped or unconfirmed. The command manual can show the managed launcher path. With Bash or Zsh PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)
+From that pane, **More → Command reference** shows both login sync results for the current connection. **Apply SSH dotfiles** shows the reason when dotfiles sync was skipped or unconfirmed. The command manual can show the managed launcher path. With Bash, Zsh, or Fish PATH management enabled, the new prompt can find the selected tools by name. [Managed SSH utilities](#managed-ssh-utilities) · [Command reference](#command-reference)
 
 **Acceptance.** Use a profile with both bundles enabled on a clean Linux account. At the first prompt, verify that the managed prompt is active and that `command -v` resolves a bundled utility to the expected launcher under `~/.local/bin`. Reconnect and verify both sync results and the same prompt and launcher.
 
@@ -388,6 +390,8 @@ Follow a **See also** link to another offline manual. Links prefer the chosen pl
 
 Use `w11term-cli command-reference` for exact offline lookup or ranked task search from a shell. It reads the same bundled or cached pages and private overrides as the side panel. [CLI examples](../CONTROL.md#offline-command-reference)
 
+Use `open-command-reference` over the control pipe to open an offline manual in a chosen w11term window while you keep working in the foreground. The target pane supplies the preferred platform unless the request specifies one. [Control options](../CONTROL.md#offline-command-reference)
+
 **Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
 
 ## Managed SSH utilities
@@ -406,9 +410,9 @@ Select a command from **Installed SSH tools** to review removing it. The new rel
 
 In **Bundle versions**, review and permanently delete an inactive release to reclaim space on the SSH host. The review shows the file names and their total size before confirmation. [Delete an inactive release](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
-**Manage PATH for new shells** reviews Bash or Zsh startup-file changes for the installed bundle. It can append the verified launcher directory after existing entries or remove its managed blocks while preserving the surrounding settings. [Manual PATH management](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
+**Manage PATH for new shells** reviews Bash, Zsh, or Fish startup-file changes for the installed bundle. It can append the verified launcher directory after existing entries or remove its managed blocks while preserving the surrounding settings. [Manual PATH management](../CONTROL.md#install-or-roll-back-a-reviewed-ssh-tool-bundle)
 
-With profile approval, a connection can sync a bundle before opening the shell. **Manage Bash PATH** or **Manage Zsh PATH** appends the launcher directory after existing entries so tools already on the account's `PATH` keep precedence. The command-reference panel shows the sync result and offers PATH repair or resuming updates after a reviewed rollback. Scripts can also review an addition to an active tool bundle and keep its existing binaries and launcher directory. A new version from an addition pauses login sync until automatic updates are resumed. [Sync approval and PATH behavior](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
+With profile approval, a connection can sync a bundle before opening the shell. **Manage Bash PATH**, **Manage Zsh PATH**, or **Manage Fish PATH** appends the launcher directory after existing entries so tools already on the account's `PATH` keep precedence. The command-reference panel shows the sync result and offers PATH repair or resuming updates after a reviewed rollback. Scripts can also review an addition to an active tool bundle and keep its existing binaries and launcher directory. A new version from an addition pauses login sync until automatic updates are resumed. [Sync approval and PATH behavior](../CONTROL.md#sync-a-tool-bundle-on-ssh-connect)
 
 **Acceptance.** Install a small bundle on clean Linux x64 and arm64 fixtures and run the intended commands from the next shell prompt. Exercise an incompatible binary and an existing user-owned command. Verify the selected executable through `PATH`, that repeat sync skips unchanged bytes, and that rollback restores the previous managed version.
 

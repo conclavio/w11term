@@ -1,5 +1,5 @@
 use super::*;
-use w11term::sftp::{LocalUtilityBundle, LocalUtilityExecutable, UtilityArchitecture};
+use w11term::sftp::{LocalUtilityBundle, LocalUtilityExecutable};
 
 #[derive(Clone, Copy)]
 pub enum Field {
@@ -131,25 +131,8 @@ impl Editor {
         for tool in self.bundle.tools() {
             let name = &tool.name;
             for (index, build) in tool.builds.iter().enumerate() {
-                let platform = match build.architecture {
-                    UtilityArchitecture::X86_64 => "x86-64",
-                    UtilityArchitecture::Aarch64 => "ARM64",
-                };
-                let architecture = if tool
-                    .builds
-                    .iter()
-                    .filter(|other| other.architecture == build.architecture)
-                    .nth(1)
-                    .is_some()
-                {
-                    format!("{platform} build {}", index + 1)
-                } else {
-                    platform.into()
-                };
-                let source = build.download.as_ref().map_or_else(
-                    || build.path.display().to_string(),
-                    |download| download.url().to_owned(),
-                );
+                let architecture = review::build_label(&tool.builds, index);
+                let source = review::build_source(build);
                 fields.push(KeyedView::new(
                     format!("{name}/{index}"),
                     StackPanel::new().spacing(4.0).children((

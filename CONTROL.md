@@ -209,6 +209,14 @@ an error. A retry after the update captures the newly committed text.
 .\target\release\w11term-cli.exe command-reference 'comparative benchmark' --platform linux --search
 ```
 
+`open-command-reference QUERY [--window ID] [--platform PLATFORM]` opens an exact manual in the side panel of a running instance. Use `list-windows` to find the target ID. With no `--window`, the request uses the instance's most recently active window. With no `--platform`, it prefers the target window's selected pane's platform, with a Common fallback. It keeps the active tab and desktop focus in place and sends no shell input. A missing manual or an open Command reference editor produces a failed reply.
+
+```powershell
+& $ctl --pid 12345 open-command-reference 'git checkout' --window 2 --platform linux
+```
+
+The pipe verb is `open-command-reference`. Its fields are `query` and optionally `window_id` and `platform`. The JSON result includes the resolved `window_id`, canonical `command`, and actual `platform`.
+
 ## Pipe protocol, version 1
 
 Each GUI owns `\\.\pipe\w11term-<pid>` and publishes `%LOCALAPPDATA%\w11term\instances\<pid>.json`:
@@ -1273,20 +1281,22 @@ Direct pipe clients send
 
 ### Preview and apply SSH dotfiles
 
-From a connected SSH pane, open **More → Command reference → Apply SSH dotfiles**. The panel starts with the profile's bundle and shell if set. You can also choose a local bundle, Bash or Zsh, and an optional startup directory for Zsh. Select **Review dotfiles changes** to see the account, resolved SFTP home, planned file changes, and any conflicts. Check that the resolved directory is the shell account's home, then select **Apply reviewed dotfiles** on the same connection. A changed bundle or remote startup file requires another review. Applying updates the managed startup files for future shells and leaves the profile's login-sync settings in place.
+From a connected SSH pane, open **More → Command reference → Apply SSH dotfiles**. The panel starts with the profile's bundle and shell if set. You can also choose a local bundle and Bash, Zsh, or Fish as the target. Zsh accepts an optional startup directory. Select **Review dotfiles changes** to see the account, resolved SFTP home, planned file changes, and any conflicts. Check that the resolved directory is the shell account's home, then select **Apply reviewed dotfiles** on the same connection. A changed bundle or remote startup file requires another review. Applying updates the managed startup files for future shells and leaves the profile's login-sync settings in place.
 
 Expand **Environment fragment changes** or **Prompt fragment changes** to review the lines that will be added and removed. Expand a proposed **Startup hook** to see the generated block in context of its target path. The review omits unrelated startup-file contents. If the active managed fragments cannot be verified, the review identifies that condition and shows the proposed lines. A verified active fragment that changes after review makes the confirmation stale.
 
-`sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. For a Zsh setup that uses a different startup directory under that home, pass `--zdotdir RELATIVE_DIR`.
+`sftp --pane ID preview-dotfiles BUNDLE.json --shell bash|zsh|fish` shows how a Windows bundle would fit into the startup files for an open SSH pane. The preview reads the remote filesystem over the pane's SFTP connection. Use it when the SFTP starting directory is the login shell's home, and check the returned `home`. Pass `--zdotdir RELATIVE_DIR` for a custom Zsh directory or `--fish-config-dir RELATIVE_DIR` for a custom Fish directory. Use the same option for the reviewed apply, hook repair, and version switch.
 
-Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` fragment is shared by the chosen shells. Set `bash` or `zsh` for the prompt, aliases, and interactive setup specific to that shell. Each fragment supports up to 16 KiB. The preview computes planned file hashes with LF line endings and a final newline on nonempty fragments.
+Save a UTF-8 JSON bundle with `version` set to `1`. The optional `environment` fragment is shared by Bash and Zsh. Set `bash`, `zsh`, or `fish` for the prompt, aliases, and interactive setup specific to that shell. Fish reads its own `fish_environment` fragment and uses Fish syntax in both sections. Each fragment supports up to 16 KiB. The preview computes planned file hashes with LF line endings and a final newline on nonempty fragments.
 
 ```json
 {
   "version": 1,
   "environment": "export EDITOR=vim\n",
   "bash": "PS1='ops \\u@\\h> '\n",
-  "zsh": "PROMPT='ops %n@%m> '\n"
+  "zsh": "PROMPT='ops %n@%m> '\n",
+  "fish_environment": "set -gx EDITOR vim\n",
+  "fish": "function fish_prompt\n    printf 'ops> '\nend\n"
 }
 ```
 
@@ -1301,6 +1311,8 @@ $review = $preview.result.sftp.review
 
 In `result.sftp`, `directories_to_create` names missing managed directories and `files` gives the absolute paths, proposed actions, and before/after SHA-256 hashes. For Bash, the preview selects the first existing login file in the order `.bash_profile`, `.bash_login`, `.profile`, and plans a new `.profile` if none exists. It also previews `.bashrc`. Zsh previews `.zprofile` and `.zshrc`. Startup entries include the exact `hook` block. A changed or duplicated marker block is a `hook-conflict`, and modified version files or selectors get their own conflict status. The `supports_atomic_replace` field reports whether the server offers the OpenSSH atomic replacement extension.
 
+Fish defaults to `~/.config/fish/config.fish`. In the Fish configuration directory field, enter the existing directory holding `config.fish`, relative to the SSH home. For example, if `XDG_CONFIG_HOME` is `$HOME/settings`, enter `settings/fish`. A review can create the default startup directories or add `config.fish` to an existing custom directory. The hook loads the Fish environment on startup and loads the prompt fragment in interactive shells. [Fish configuration files](https://fishshell.com/docs/current/language.html#configuration-files)
+
 Pass the returned `review` token to apply on the same pane with the same bundle, shell and optional `--zdotdir`. If either the plan or the SFTP connection changed, preview again. Apply checks for conflicts and atomic replacement support before writing. It stages fragments in a directory named for `bundle_sha256` under `~/.config/w11term/dotfiles/`, installs the startup hooks, then switches the shell’s active bundle with a single file rename. New shells use that version. A failed activation can leave staged files, which a fresh preview can reuse. Older bundle directories are retained.
 
 Apply replies with `shell`, `home`, `bundle_sha256` and the ordered `changed_files`. An unchanged bundle returns an empty list. A missing fragment becomes an empty managed file. Direct pipe clients can send `{"op":"preview-dotfiles","shell":"bash","bundle":{"version":1,"bash":"PS1='ops> '"}}` with the normal SFTP request fields. Use `"op":"apply-dotfiles"` plus the returned `"review"` for the reviewed installation.
@@ -1309,7 +1321,7 @@ Install and switch previews include `fragment_changes`. Its `baseline` is `verif
 
 To recover an edited or missing startup hook, choose **Review startup hook repair** in the dotfiles installer and confirm **Repair reviewed startup hooks**. The review shows changed lines inside a replaced block and the full block for a missing hook. Repair uses the selected shell and Zsh startup directory, preserves the surrounding file text, and keeps the active version and update policy. Duplicate, incomplete, or nested w11term markers block repair. Changes to existing files require the server's atomic rename support.
 
-Scripts use `preview-dotfile-hooks --shell bash|zsh [--zdotdir RELATIVE_DIR]` and `repair-dotfile-hooks --shell bash|zsh --review TOKEN` with the same optional `--zdotdir`. The preview includes `ready` and `files`, with the old managed block in `replaced_hook` and replacement in `hook`. Repair returns `changed_files`. A failed or interrupted repair requires a fresh review.
+Scripts use `preview-dotfile-hooks --shell bash|zsh|fish [--zdotdir RELATIVE_DIR]` and `repair-dotfile-hooks --shell bash|zsh|fish --review TOKEN` with the same optional `--zdotdir` for Zsh. The preview includes `ready` and `files`, with the old managed block in `replaced_hook` and replacement in `hook`. Repair returns `changed_files`. A failed or interrupted repair requires a fresh review.
 
 ### Restore or disable SSH dotfiles
 
@@ -1317,9 +1329,9 @@ In **Command reference → Apply SSH dotfiles**, choose the shell and its startu
 
 Choose **Review resuming automatic dotfile sync** and then **Resume automatic dotfile sync** to allow an approved profile to sync on its next SSH connection. After a restore, the currently selected version stays active. After disabling, managed fragments stay inactive until a bundle is installed. To apply a particular local bundle immediately, return to the installer and review it there.
 
-Use `list-dotfile-versions --shell bash|zsh` to get a shell's SFTP home, active hash, selector state and up to 64 retained versions. The active version appears first, followed by the most recently modified directories. After resuming from disabled, the selector state is `awaiting-sync` until a bundle is installed. The listing identifies candidate directories. **Review dotfile restore** verifies the selected bundle's contents and startup hooks.
+Use `list-dotfile-versions --shell bash|zsh|fish` to get a shell's SFTP home, active hash, selector state and up to 64 retained versions. The active version appears first, followed by the most recently modified directories. After resuming from disabled, the selector state is `awaiting-sync` until a bundle is installed. The listing identifies candidate directories. **Review dotfile restore** verifies the selected bundle's contents and startup hooks.
 
-Use `preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh` to review a switch on the pane's SFTP connection. The preview includes the current `active_bundle_sha256` and the proposed `bundle_sha256`. A null value represents disabled or inactive dotfiles. Pass the same `--zdotdir` used to install Zsh hooks in a custom directory.
+Use `preview-dotfiles-switch SHA256|disabled|automatic --shell bash|zsh|fish` to review a switch on the pane's SFTP connection. The preview includes the current `active_bundle_sha256` and the proposed `bundle_sha256`. A null value represents disabled or inactive dotfiles. Pass the same `--zdotdir` used to install Zsh hooks in a custom directory.
 
 ```powershell
 $versions = & $ctl --pid 12345 sftp --pane $pane list-dotfile-versions --shell bash | ConvertFrom-Json
@@ -1337,21 +1349,99 @@ Select an active or older version in **Dotfile versions** and choose **Save sele
 
 For the profile that opened the connected pane, choose **Review saved dotfiles in this SSH profile** after saving. The profile editor shows the saved digest, verified host-key fingerprint, SFTP home, shell, and optional Zsh startup directory. **Approve dotfiles sync** checks that the manifest still reproduces the saved version. This handoff selects **Pin approved dotfile version** by default. Choose **Save profile changes** to use it on the next connection.
 
-Scripts use `sftp --pane ID export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh`. The result includes `shell`, `home`, `bundle_sha256`, and the saved `local` path. Direct pipe clients send `"op":"export-dotfile-bundle"` with `shell`, `bundle_sha256`, and an absolute Windows `local` path.
+Scripts use `sftp --pane ID export-dotfile-bundle SHA256 LOCAL.json --shell bash|zsh|fish`. The result includes `shell`, `home`, `bundle_sha256`, and the saved `local` path. Direct pipe clients send `"op":"export-dotfile-bundle"` with `shell`, `bundle_sha256`, and an absolute Windows `local` path.
 
 ### Sync dotfiles on SSH connect
 
-In **Settings → Edit profile → SSH dotfiles**, choose **Create dotfiles bundle** and enter a shared environment fragment, a Bash startup fragment, or a Zsh startup fragment. You can fill in more than one. **Save dotfiles bundle** writes a new local file and selects it in the profile. To change an existing bundle, select it and choose **Revise selected dotfiles bundle**. Save the revision to a new file. Profiles that use the original file continue to use it until you approve and save the revision for those profiles.
+In **Settings → Edit profile → SSH dotfiles**, choose **Create dotfiles bundle** and fill in the fragments you want to manage. Use the shared environment for Bash and Zsh and the separate Fish environment and startup fields for Fish. **Save dotfiles bundle** writes a new local file and selects it in the profile. To change an existing bundle, select it and choose **Revise selected dotfiles bundle**. Save the revision to a new file. Profiles that use the original file continue to use it until you approve and save the revision for those profiles.
 
 In either editor, **Import shell fragment** appends a local UTF-8 file to the section you choose, including extensionless files such as `.profile`, `.bashrc`, and `.zshrc`. It accepts a UTF-8 BOM and converts CRLF to LF. Review or edit the combined text before saving. Each combined fragment can be up to 16 KiB.
+
+Use **Add shell setup** to append the bundled Bash, Zsh, or Fish setup after the existing startup fragment. Choose **Directory reporting only** when your prompt already emits semantic markers, or choose **Directory and prompt integration** to enable directory reporting, prompt navigation, command history, and completion alerts. The inserted code stays editable. Selecting another mode for the same shell replaces an intact generated block. Saving writes a new bundle that you can review and approve for SSH sync.
+
+Use `save-dotfiles-bundle` to build the same bundles offline. `--environment-file` imports into the shared Bash and Zsh environment. `--bash-file`, `--zsh-file`, `--fish-environment-file`, and `--fish-file` import into the corresponding fragments. Repeat a file option to append multiple files to that fragment in order. The importer accepts UTF-8 with an optional BOM, normalizes CRLF to LF, and applies the same combined 16 KiB limit as the editor.
+
+Pass `--from-bundle PATH` to start from an existing bundle. Imports append to its selected fragments, and the command preserves untouched fragments. You can also request `--shell bash|zsh|fish --setup directory|full` with or without imports. The CLI inserts or updates that setup block after reading the requested files. With `--output-file PATH` it saves a new file and returns its absolute path. Omit that option to print the bundle JSON. Review the result before approving it for an account.
+
+```powershell
+& $ctl save-dotfiles-bundle --environment-file '.\.profile' --bash-file '.\.bashrc' --zsh-file '.\.zshrc' --output-file '.\fleet.json'
+& $ctl save-dotfiles-bundle --fish-file '.\config.fish' --shell fish --setup full --from-bundle '.\fleet.json' --output-file '.\fleet-with-fish-setup.json'
+```
+
+Use `inspect-dotfiles-bundle BUNDLE` to validate a local bundle and list its available shells and their `bundle_sha256` values in `result.shells`. These are the per-shell digests used for profile pins and retained remote versions. The reply contains no shell fragment text. Add `--shell bash|zsh|fish` to check one shell. With `--sha256 HEX` it exits with code 1 if that shell’s digest differs from the expected value.
+
+```powershell
+$before = & $ctl inspect-dotfiles-bundle '.\fleet.json' --shell bash | ConvertFrom-Json
+$digest = $before.result.shells[0].bundle_sha256
+& $ctl inspect-dotfiles-bundle '.\candidate.json' --shell bash --sha256 $digest
+```
+
+Use `compare-dotfiles-bundles BEFORE AFTER` to compare two local bundles. It reports `result.changed` and lists the shells present in either file in `result.shells`. Each entry has a `change` of `added`, `removed`, `changed`, or `unchanged` and the `before_bundle_sha256` and `after_bundle_sha256` values. A null digest means the bundle has no fragments for that shell. `changed_fragments` names the affected roles, `environment` and `prompt`.
+
+The comparison uses the normalized text w11term would install. JSON formatting, CRLF versus LF, and a missing final newline on nonempty text produce the same result. Select one shell with `--shell`. Add `--include-text` to see the exact normalized `before` and `after` text of each changed fragment. A successful comparison exits with code 0 even when it finds changes.
+
+```powershell
+$comparison = & $ctl compare-dotfiles-bundles '.\fleet.json' '.\candidate.json' --shell bash | ConvertFrom-Json
+$comparison.result.shells
+```
 
 From the full text preview of an SSH file, **Use in dotfiles editor** brings a snapshot into the connected profile's draft. It opens a new bundle draft if there is no editor open for that profile. Choose the first and last lines and use **Append SSH lines** to select the destination fragment. Select lines outside existing w11term startup blocks. Saving creates a local bundle. Using the bundle on login still requires profile approval and saving.
 
 Open **Settings → Edit profile → SSH dotfiles**. Choose the bundle and shell, then enter the account's SFTP home and verified SHA256 host-key fingerprint. The dotfiles fingerprint field can stay blank when the profile already has that fingerprint pinned. Review the displayed account and host, select **Approve dotfiles sync**, then save the profile. To stop syncing on future connects, select **Disable dotfiles sync** and save. Use the manual `switch-dotfiles` command to select `disabled` on the server as well.
 
-Select **Pin approved dotfile version** before approving to record the digest of the shared environment and the selected shell fragment. If the local bundle later produces a different digest, login sync skips the update and the SSH shell still opens. Approve and save the revised bundle to update the pin. Clear the checkbox, approve, and save to follow future edits to the local bundle. Existing approvals keep following the file until you pin them.
+Use **Preview dotfile changes** to see the selected shell’s proposed digest and line changes. The preview compares with that shell’s currently approved local bundle when available. For a pinned approval, the old file must still match its pin. If the original cannot be verified, the preview shows the proposed fragments. Once you preview a bundle, approval checks that the selected shell still matches the previewed digest, even if you leave the pin checkbox clear.
 
-The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. An optional `bundle_sha256` field stores the pin shown in the editor. For Zsh with an alternate startup directory under the approved home, set `"zdotdir":"relative/directory"` or fill in the corresponding field in the editor.
+Use `audit-dotfiles-profiles` to check all saved SSH profiles offline. It uses the normal profile catalog and resolves bundle paths beside that catalog. Use `--profiles PATH` for a different catalog or `--profile NAME` for one saved SSH profile. Entries in `result.profiles` report `matches-pin`, `pin-mismatch`, `follows-file`, `bundle-error`, `invalid-settings`, `disabled`, or `not-run`. The last status covers durable and RustMUSH profiles, which use their own shell startup. The report checks local files and configuration. The authenticated account, remote home, and startup hooks are checked on the SSH connection.
+
+Add `--candidate BUNDLE` to compare a proposed revision with the local file for each configured direct SSH profile. The candidate comparison identifies equivalent content, changed content, unavailable shells, or a missing current baseline. `candidate.matches_pin` is true or false when the profile has a pin and the candidate supplies its shell. The audit returns digests and metadata and leaves profiles untouched.
+
+```powershell
+$audit = & $ctl audit-dotfiles-profiles --candidate '.\fleet-revision.json' | ConvertFrom-Json
+$audit.result.profiles | Where-Object status -eq 'pin-mismatch'
+```
+
+Use `rollout-dotfiles-profiles` to adopt a reviewed local revision in one or more saved SSH profiles with existing dotfile approval. Select each profile explicitly with `--profile`. The preview lists the previous approval, the candidate digest for that shell, and the pin that would be saved. It preserves the configured shell, account, host key, home, and startup directory. Pinned profiles receive the new digest and profiles that follow the file keep that policy.
+
+```powershell
+$rollout = @('rollout-dotfiles-profiles', '--candidate', '.\fleet-revision.json', '--profile', 'East', '--profile', 'West')
+$preview = & $ctl @rollout | ConvertFrom-Json
+$preview.result.profiles
+```
+
+After reviewing the result, repeat the same selection with `--review` and the returned token.
+
+```powershell
+& $ctl @rollout --review $preview.result.review
+```
+
+Both steps use the normal profile catalog unless you supply `--profiles PATH`. The report identifies each baseline as a matching pinned version, an unpinned file on disk, or unavailable. It includes the digest for a readable baseline. The apply step rechecks the selected approvals, baseline digests, and candidate shell digests and writes all updates in a single catalog replacement. Changes to those inputs require a new preview. Profiles without an existing valid approval and revisions missing any selected shell cannot be applied. The rollout edits the local catalog. Sync runs when a new ordinary SSH session opens with the updated profile.
+
+In the Windows editor, select the revision under **SSH dotfiles** and choose **Roll out to saved profiles**. Check the saved profiles you intend to update. **Review selected rollout profiles** shows their accounts, previous bundle paths and pins, proposed shell digests, and expandable environment and prompt line changes. If the baseline is missing or no longer matches its pin, the review shows the proposed lines. **Apply reviewed rollout** saves that selection with the same stale-input checks as the CLI.
+
+While the Windows rollout result is open, **Review rollback** lists the bundle paths and pins the rollback would restore. **Apply reviewed rollback** restores the batch together. Each selected approval must still match the completed rollout. If a bundle changes after the rollback preview, review it again before confirming.
+
+Choose **Save rollout receipt** in the Windows result to keep a JSON file you can use after closing the editor. The receipt includes the local catalog and bundle paths and the profile names and approval metadata. For a CLI rollout, save the JSON reply from the successful apply for the same purpose.
+
+To reopen either receipt in Windows, go to **Settings → Edit profile → SSH dotfiles → Review rollout receipt**. Choose a receipt for the profile catalog the window uses. Review the previous paths, pins, and bundle status, then choose **Apply reviewed rollback** to restore the listed approvals.
+
+`rollback-dotfiles-profiles` accepts either receipt and previews the previous bundle paths and pins for the profiles that rollout changed. It uses the catalog recorded in the reply and rejects the whole batch if any of those approvals have since changed. The preview reports whether each previous bundle is available and whether it matches its saved pin. Rollback restores the prior approvals even if a previous bundle is missing. Login sync checks the restored approval and bundle when a new SSH session opens.
+
+```powershell
+# For a Windows rollout, use the saved receipt and skip the first line.
+& $ctl @rollout --review $preview.result.review | Set-Content -Encoding utf8 '.\rollout-reply.json'
+$rollback = & $ctl rollback-dotfiles-profiles '.\rollout-reply.json' | ConvertFrom-Json
+$rollback.result.profiles
+```
+
+After reviewing the restored approvals, apply the rollback with its own token.
+
+```powershell
+& $ctl rollback-dotfiles-profiles '.\rollout-reply.json' --review $rollback.result.review
+```
+
+Select **Pin approved dotfile version** before approving to record the digest of the selected shell's environment and startup fragments. If the local bundle later produces a different digest, login sync skips the update and the SSH shell still opens. Approve and save the revised bundle to update the pin. Clear the checkbox, approve, and save to follow future edits to the local bundle. Existing approvals keep following the file until you pin them.
+
+The same approval can be set in the profile's `dotfiles` object in `profiles.json`. A relative bundle path resolves beside the profile catalog. An optional `bundle_sha256` field stores the pin shown in the editor. Set `zdotdir` for a custom Zsh directory or `fish_config_dir` for a custom Fish directory under the approved home. If you move an existing configuration, review startup hook repair at the new location before resuming automatic updates.
 
 ```json
 {
@@ -1438,7 +1528,7 @@ To repair an installed release, select the Windows manifest with the same bundle
 
 From the manual for a built-in Linux tool such as `jq` or `rg`, choose **Review installing jq** or the corresponding action for that tool. The review shows the SSH account, launcher, retained tools, and the pinned build for the host's architecture. Choose **Download pinned Linux build** if the Windows cache needs the executable, then confirm **Install reviewed jq**. The install adds the command to the shared built-in bundle and preserves its active binaries. A new release pauses that bundle's automatic updates until you resume them from **Bundle versions**.
 
-After a manual install or a review of an already installed built-in tool, choose **Manage PATH for new shells**. Pick Bash or Zsh and enter the relative Zsh startup directory if your account uses a custom `ZDOTDIR`. **Review PATH setup** shows the exact startup files and managed blocks. **Apply reviewed PATH setup** appends the verified bundle's launcher directory after your existing PATH entries for new shells. This is a one-time change to the connected account and requires no profile approval.
+After a manual install or a review of an already installed built-in tool, choose **Manage PATH for new shells**. Pick Bash, Zsh, or Fish. For a custom `ZDOTDIR` or Fish configuration location, enter the directory relative to the remote home. **Review PATH setup** shows the startup files, managed blocks, and any default Fish startup directories it would create. **Apply reviewed PATH setup** appends the verified bundle's launcher directory after your existing PATH entries for new shells. This is a one-time change to the connected account and requires no profile approval.
 
 To undo it, choose **Review PATH removal** and then **Remove reviewed PATH blocks**. The review shows exactly which managed blocks will be removed. Other startup content, the files themselves, and the installed tools are preserved. An edited, duplicate, or incomplete block stops the reviewed removal. Profiles configured to manage this directory can add it again during their next connection.
 
@@ -1485,9 +1575,15 @@ For scripts, use `preview-tool-bundle-prune NAME SHA256` followed by `prune-tool
 
 ### Sync a tool bundle on SSH connect
 
-Open **Settings → Edit profile → SSH tools**. Browse for the bundle manifest and enter the remote SFTP home and verified SHA256 host-key fingerprint. A pinned profile fingerprint also works. Select **Manage Bash PATH** or **Manage Zsh PATH** to append the launcher directory after the shell's existing PATH entries. Then select **Review tool bundle**, confirm the account and launcher directory, choose **Approve tool sync**, and save.
+Open **Settings → Edit profile → SSH tools**. Browse for the bundle manifest and enter the remote SFTP home and verified SHA256 host-key fingerprint. A pinned profile fingerprint also works. Select **Manage Bash PATH**, **Manage Zsh PATH**, or **Manage Fish PATH** to append the launcher directory after the shell's existing PATH entries. Then select **Review tool bundle**, confirm the account and launcher directory, choose **Approve tool sync**, and save.
 
-Profiles can store the same approval under `tool_bundle`. Paths to local manifests resolve beside the profile catalog. The approved `name` and `bin_directory` come from the manifest and bind later updates to that destination. Use `add_to_path.shell` with `bash` or `zsh`, and optionally `add_to_path.zdotdir` for a Zsh startup directory relative to home.
+The review lists the commands and their available architectures. Expand a command to see each build's local path or download URL, executable SHA-256, and archive member and SHA-256 when applicable.
+
+New approvals pin the exact manifest file by default. If the file changes, w11term skips tool and PATH sync and still opens the SSH shell. Review, approve, and save again to sync a revision. Choose **Follow changes to the tool manifest** before review to let this profile follow edits to the file. Existing approvals with no pin already follow the file.
+
+Profiles can store the same approval under `tool_bundle`. Paths to local manifests resolve beside the profile catalog. The approved `name` and `bin_directory` come from the manifest and bind later updates to that destination. Use `add_to_path.shell` with `bash`, `zsh`, or `fish`. For a custom startup directory, use `add_to_path.zdotdir` for Zsh or `add_to_path.fish_config_dir` for Fish.
+
+Set the optional `manifest_sha256` to the SHA-256 of the entire manifest file to pin it. In PowerShell, use `(Get-FileHash '.\Fleet tools.json' -Algorithm SHA256).Hash`.
 
 ```json
 {
@@ -1503,7 +1599,75 @@ Profiles can store the same approval under `tool_bundle`. Paths to local manifes
 }
 ```
 
-On an ordinary SSH connect or reconnect, w11term checks the verified endpoint and SFTP home, syncs the approved bundle, and then opens the shell. An unavailable or unconfirmed sync still allows login. The 20-second deadline covers the bundle and PATH work together. The `tool-bundle-sync` event reports the bundle outcome and, when configured, the PATH outcome. PATH management appends a marked block to the shell's login and interactive startup files and reports edits to that block for review. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths.
+In Windows, open **Settings → Profiles → Audit SSH tool profiles**. Filter by profile name or SSH address, or choose **Show only tool sync issues**. Expand a profile's manifest details to see the path and any current and pinned digests. **Edit SSH tools** opens that profile's SSH tools editor. Use **Refresh audit** after saving changes.
+
+Under **Audit scope**, choose one architecture or **Verify all manifest architectures** to check local executable files and the download cache. Expand the build details for each architecture to see verified and missing files, hash or ELF errors, and commands that have no build for that architecture. The issues filter includes profiles where an architecture has a command with no verified local build. **Refresh audit** repeats the selected check.
+
+Run `audit-tool-profiles` to check saved SSH tool approvals offline. It uses the normal profile catalog unless you pass `--profiles CATALOG`. Add `--profile NAME` to check one saved SSH profile. The report includes the pinned and current manifest digests. Its statuses are `matches-pin`, `pin-mismatch`, `follows-file`, `manifest-error`, `manifest-scope-mismatch`, `invalid-settings`, `disabled`, and `not-run`. A separate `path_error` flags locally detectable errors in the optional Shell PATH approval. The command exits successfully when it can produce a report, even when rows contain problems. The audit reads the catalog and manifests. Login checks the authenticated account, remote home, executable builds, and startup files.
+
+```powershell
+$audit = & $ctl audit-tool-profiles | ConvertFrom-Json
+$audit.result.profiles | Where-Object status -eq 'pin-mismatch'
+```
+
+Add `--verify-builds` to verify the pinned SHA-256 and Linux ELF format and architecture of local executables and cached downloads. It checks the architectures declared in each approved manifest. Add `--architecture x86_64` or `--architecture aarch64` to target one architecture, including one absent from the manifest. Each `build_checks` entry reports whether every command has at least one verified build for that architecture. An empty build list means that command has no matching build. Individual builds report `verified`, `missing`, or `error` in manifest order. The check uses the installation budget of 256 MiB per architecture per manifest. It opens no SSH connections and fetches no assets. Login checks remote interpreter and library availability.
+
+```powershell
+$audit = & $ctl audit-tool-profiles --verify-builds --architecture aarch64 | ConvertFrom-Json
+$audit.result.profiles | Where-Object {
+    $_.build_checks | Where-Object { !$_.locally_available }
+}
+```
+
+In the Windows audit, select a build verification scope and choose **Prepare pinned downloads** on a profile. This caches its HTTPS builds for that scope before you connect, including downloads in custom manifests. w11term rechecks the saved approval and the manifest shown in the audit before fetching, then refreshes the local readiness results. Local executable entries can be checked separately in the same audit.
+
+Use `prepare-tool-profiles` to cache the approved downloads for several saved profiles without launching w11term or connecting to SSH. Name each profile explicitly. Omit `--architecture` to prepare every declared download architecture.
+
+```powershell
+& $ctl prepare-tool-profiles --profile East --profile West --architecture aarch64
+```
+
+The command reports each profile in request order, with a status of `prepared`, `no-downloads`, or `failed`. A failed profile makes the command exit with code 1 and the JSON report is still available on stdout. Verified downloads remain in the shared cache for retry. The profile catalog stays read-only during preparation.
+
+Use `rollout-tool-profiles` to adopt one revised manifest in multiple saved SSH profiles. Select each profile explicitly. Each must already approve the candidate's bundle name and launcher directory. The preview lists the candidate's SHA-256 and any detectable additions, removals, and build changes. A missing or changed baseline is marked separately. Pinned profiles receive the new manifest hash, and profiles that follow the file keep that setting.
+
+In Windows, open **Settings → Profiles → Audit SSH tool profiles → Roll out tool manifest**. Pick the revision, check the profiles you want to update, and choose **Review selected tool rollout**. **Apply reviewed tool rollout** updates the reviewed selection.
+
+By default, the Windows review checks local files and cached executables for every declared architecture. Expand an architecture to see which commands have verified builds. When a pinned download needs preparation, choose **Prepare candidate x86-64 downloads** or **Prepare candidate ARM64 downloads** to fill the Windows cache and refresh the results. **Check candidate builds** refreshes the review after you repair a local file. The separate apply step saves the profile bindings.
+
+Set **Candidate build requirement** before opening the review to require verified builds for x86-64, ARM64, or every declared architecture. The review shows why Apply is unavailable until each required command has a verified build. Apply rechecks the required files before saving the batch.
+
+From the rollout result, choose **Review tool rollback** to see the manifest paths, pin policies, and file status for each profile. **Apply reviewed tool rollback** restores the previous approvals together. Choose **Save tool rollout receipt** to keep a receipt for later, then reopen it from **Open tool rollout receipt** in the audit. The Windows audit and CLI use the same receipt format. The audit opens receipts for its current profile catalog.
+
+```powershell
+$rollout = @('rollout-tool-profiles', '--candidate', '.\Fleet revision.json', '--profile', 'East', '--profile', 'West')
+$preview = & $ctl @rollout | ConvertFrom-Json
+$preview.result.profiles
+& $ctl @rollout --review $preview.result.review | Set-Content -Encoding utf8 '.\tool-rollout-reply.json'
+```
+
+Use `--profiles CATALOG` to select another catalog. The apply step rechecks the candidate, readable baselines, and selected approvals before writing the entire batch. It changes the manifest bindings in the catalog. The revised tools sync when those profiles open a new ordinary SSH connection.
+
+Add `--verify-builds` to include local executable and cache readiness under `candidate_builds`. Use `--require-ready` to make apply require at least one verified build per command in the chosen scope. Omit `--architecture` to check every architecture declared by the candidate. Pass the same policy and architecture flags for preview and apply. If a build needs repair, prepare its bytes and retry with the same review token while the manifests and saved approvals still match.
+
+```powershell
+$rollout += @('--require-ready', '--architecture', 'x86_64')
+$preview = & $ctl @rollout | ConvertFrom-Json
+$preview.result.candidate_builds
+if ($preview.result.candidate_builds.ready) {
+    & $ctl @rollout --review $preview.result.review
+}
+```
+
+To undo the batch, pass the saved apply reply to `rollback-tool-profiles`. It previews only the profiles the rollout changed and uses the catalog recorded in the receipt. The review lists the previous manifest and pin and shows whether the file is available, still matches its pin, and names the approved launcher destination. A reviewed rollback can restore a binding whose old file is missing. The command rejects the batch if a selected approval no longer matches the applied rollout or a reviewed manifest changes before confirmation.
+
+```powershell
+$undo = & $ctl rollback-tool-profiles '.\tool-rollout-reply.json' | ConvertFrom-Json
+$undo.result.profiles
+& $ctl rollback-tool-profiles '.\tool-rollout-reply.json' --review $undo.result.review
+```
+
+On an ordinary SSH connect or reconnect, w11term checks the verified endpoint and SFTP home, syncs the approved bundle, and then opens the shell. An unavailable or unconfirmed sync still allows login. The 20-second deadline covers the bundle and PATH work together. The `tool-bundle-sync` event reports the bundle outcome and, when configured, the PATH outcome. Bash and Zsh use the login and interactive startup files. Fish uses one block in the selected `config.fish` and retains the command order of the existing PATH list. An edited block requires a fresh review. Game sessions, durable attachments, and explicit workspace startup commands use their own startup paths. [Fish PATH variables](https://fishshell.com/docs/current/tutorial.html#path)
 
 **More → Command reference** shows the last login sync for the selected SSH connection. Open **Install SSH tools** for the PATH result and any error detail. Manual installs and rollbacks show their own results in the installer and version history.
 
@@ -1564,11 +1728,42 @@ Use `open-diagnostic` to open files in a running instance. Get the target ID wit
 
 In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → Packet capture** or search for it in the command palette. Choose the interface, optional BPF filter, snap length, duration, and byte budget. Turn on **Use RAM-backed scratch storage** to require tmpfs. **Review packet capture** shows the verified host, effective packet limit, scratch location, and tcpdump arguments. **Capture and save…** starts the capture after you choose a new Windows file. **Stop and save** asks the running tcpdump to finish writing its capture, then transfers the verified file. The result reports why the capture ended and how many packets the kernel dropped when tcpdump reports that count.
 
+Expand **Capture settings files** to save the current inputs as a new JSON file or load settings from an earlier run. Loading fills the editable fields and clears the previous review. Select the SSH pane and review the settings for that connection before capturing. The file contains `schema_version: 1` and `options`, using the packet capture request's option fields. It carries the interface, filter, duration, snap length, packet and file limits, byte budget, and scratch settings.
+
+Use `--settings PATH` in place of the capture option flags in both CLI commands. Pass the pane, review ID, connection generation, and output path as usual. Both commands read the settings file when called. If its capture options change after preview, run the review again.
+
+Use `save-packet-capture-settings` to create the same JSON from the capture flags without launching w11term or connecting to SSH. With `--output-file`, it saves a new file and returns its path in the JSON reply. Omit the option to print the settings to stdout.
+
+```powershell
+$settings = '.\packet-capture-settings.json'
+& $ctl save-packet-capture-settings --interface lo --filter 'udp and port 4321' --seconds 15 --output-file $settings
+$plan = (& $ctl --pid 12345 preview-packet-capture --pane 1 --settings $settings | ConvertFrom-Json).result.plan
+& $ctl --pid 12345 capture-packets --pane 1 --settings $settings --connection-generation $plan.connection_generation --review-id $plan.review_id --output-file '.\after.pcap'
+```
+
+Choose **Save capture report…** on a completed capture to keep a JSON report alongside the PCAP. It is available from the completed result after the SSH pane closes. The report includes the filename, byte count, SHA-256, stop reason, available packet counters, and rolling-buffer outcome. Its `reviewed` section records the verified SSH endpoint and host key fingerprint, the settings, the resolved scratch location, and the effective tcpdump arguments.
+
+Choose **Reuse capture settings** on a completed capture or after verifying a report with recorded settings. The command fills the editable capture form and leaves the displayed capture available. Select the SSH pane for the new run, review the interface and limits, and choose a new output file to start it.
+
+After the new run is saved, **Compare with original capture** opens the source as **Before** and the new capture as **After**. w11term checks the saved sizes and SHA-256 values before comparing. **Back to capture** returns to the new capture.
+
+Pass `--report-file '.\after.pcap.json'` to `capture-packets` to save the report automatically. The reply includes `result.report_path` after export. If the report destination becomes unavailable during capture, the verified PCAP remains saved and the reply includes `result.report_error` alongside `result.capture`. Choose a new path for each file.
+
+Open the capture and choose **Verify capture report…**, or use `verify-packet-capture-report CAPTURE REPORT` from a shell. Either check compares the file's byte count and SHA-256 with the selected report and works offline. You can verify a moved or renamed capture. Windows shows the recorded host and host key, interface, filter, snap length, stop reason, and available drop and rotation counts after a match. The CLI returns the two absolute paths, byte count, digest, and the report's descriptive metadata in `result.details`. A digest-only report returns `details: null`. Invalid digests and mismatches return a nonzero exit code and a JSON error. The digest checks the capture file itself. The host, settings, and counters are the values recorded in the selected report.
+
+```powershell
+& $ctl verify-packet-capture-report '.\after.pcap' '.\after.pcap.json' --save-settings '.\packet settings.json'
+```
+
+Use `--save-settings PATH` to write the recorded capture options to a new settings file after verification. The reply includes `result.settings_path`. Load the file in the Windows panel or pass it to `preview-packet-capture --settings PATH` for a fresh review.
+
 Choose **Open in Wireshark** after saving. w11term looks in the standard Windows Program Files folders. Use **Choose Wireshark executable…** for another installation. The saved capture stays available after you disconnect the SSH pane or close the packet capture panel.
 
 Choose **Open capture file…** in the same panel to reopen a local PCAP or PCAPNG file from an earlier session. This works without SSH. The panel shows the format, file size, packet count, captured bytes, truncated packets, and interface link types. The timestamp span uses the earliest and latest timestamps and shows how many packets were timestamped. The scan stops after one million records or blocks and reads only a bounded prefix of each packet. A partial summary shows the reason it stopped. **Open in Wireshark** opens the original file for packet analysis. [PCAP format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcap/) · [PCAPNG format](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/) · [Link types](https://www.iana.org/assignments/pcap)
 
 Use `inspect-packet-capture` to read the same summary as schema-version-1 JSON without a running w11term instance. The report records the local filename, numeric link types, and the timestamp span in nanoseconds as a decimal string. A missing span is `null`. An incomplete scan returns the verified prefix with `complete: false` and the reason in `issue`. A file with an invalid capture header returns a nonzero exit code. Use `--output-file` to save the report to a new file and get its absolute path in the CLI reply.
+
+The capture and interface summaries show captured bytes and original packet bytes. Original bytes sum each observed record's packet length before snap-length truncation. For legacy records with a shorter original length field, the total uses the captured length. Use the interface and OS drop counters to check for capture loss when a file provides them. JSON includes `original_bytes` in the overall and per-interface totals. [PCAP packet records](https://ietf-opsawg-wg.github.io/draft-ietf-opsawg-pcap/draft-ietf-opsawg-pcap.html#section-5) · [PCAPNG packet blocks](https://ietf-opsawg-wg.github.io/draft-ietf-opsawg-pcap/draft-ietf-opsawg-pcapng.html#section-4.3)
 
 Add `--all-conversations` to include every tracked IP and transport pair, or use `--filter-conversations 'udp 443 192.0.2.0/24'` to search both lists with the same terms as the app. The optional `conversation_results` object contains `ip` and `transport` arrays ranked by captured bytes. A search with no matches returns empty arrays. The existing top-ten arrays and scan coverage remain available in the same report.
 
@@ -1598,7 +1793,7 @@ In **TCP and UDP conversations**, **Limit port pair to timeline interval** contr
 
 Choose **Compare captures…** to use the displayed capture as **Before** and choose a second PCAP or PCAPNG as **After**. The comparison shows each capture's packet totals, timestamp span, and coverage. It lists changes across all tracked IP pairs, with packet and byte counts in each direction. Deltas subtract **Before** from **After** and describe the two capture windows as recorded. Partial scans withhold deltas, and pairs whose counts could be hidden by a scan or tracking limit show unavailable coverage. Pair counts describe decoded outer IP headers. Non-IP or undecodable packets contribute to capture totals and the unclassified count. **Back to capture** returns to the original summary.
 
-**Average rates over each recorded timestamp span** shows packets and captured bytes per second for each file. Each rate divides the observed total by the time between that file's earliest and latest packet timestamps. A side needs a complete scan, timestamps on every packet, and a positive span. Conversation averages use the same full-file spans, so a pair with identical packet and byte counts can appear if its average rate changed. Transport averages also require usable TCP and UDP port coverage. JSON reports each scope's `average_rates` with `before`, `after`, and the difference when both rates are available. It lists pairs whose counts stayed the same under `rate_only_changes`.
+**Average rates over each recorded timestamp span** shows packets, captured bytes, and original packet bytes per second for each file. Each rate divides the observed total by the time between that file's earliest and latest packet timestamps. Original bytes and their rates help compare files recorded with different snap lengths, including comparisons limited to an elapsed interval. A side needs a complete scan, timestamps on every packet, and a positive span. Conversation averages for packets and captured bytes use the same full-file spans, so a pair with identical packet and byte counts can appear if its average rate changed. Transport averages also require usable TCP and UDP port coverage. JSON reports each scope's `average_rates` with `before`, `after`, and the difference when both rates are available. Capture-wide and elapsed-interval rates include `original_bytes_per_second`. It lists pairs whose counts stayed the same under `rate_only_changes`.
 
 Expand **Elapsed packet timeline** to compare bursts on two charts with the same interval widths and packet-count scale. Each file's first timestamped record marks zero. Out-of-order records can appear at negative offsets. Choose a **Start interval**, then use **Range ends at** to include more consecutive intervals. The charts highlight the range and show the observed packet and byte totals for both files. The charts count timestamped records from the scanned portion. Intervals between a side's occupied buckets can show zero, and intervals outside its occupied span show unavailable coverage. The Before and After Wireshark buttons open the selected range on each file's original clock when that side has packets in it. Text and JSON exports include the aligned intervals. JSON `timeline` gives the two Unix timestamp origins, shared start offset and bucket width as decimal nanosecond strings. Each bucket contains both observations and uses `null` for a side outside its timestamped coverage.
 
@@ -1652,6 +1847,8 @@ SFTP transfers the completed file over the existing SSH connection. w11term chec
 
 In the Windows app, open **More → Diagnostics → Syscall trace viewer → Capture over SSH…**. Select a connected SSH pane, enter a Linux executable and its arguments as a JSON array of strings, and choose a working directory, preset and limits. **Review syscall capture** verifies the endpoint and shows the resolved executable and exact strace arguments. **Trace and save…** asks for a new Windows file before starting. **Stop syscall capture** ends the launched command and saves the records collected so far. The viewer opens the verified trace automatically and shows the stop reason.
 
+Use **Save settings…** to export the capture inputs to JSON. **Load settings…** restores those inputs from either a Windows export or a CLI settings file. Review the loaded setup on the selected SSH pane before starting a new trace.
+
 Use a connected Linux SSH pane with SFTP and a version of strace that supports `--kill-on-exit`. Review the working directory, executable identity, exact arguments, and capture bounds first. `--arg` can be repeated and each value is passed literally. The command runs as the remote SSH account with stdin, stdout, and stderr disconnected from the terminal.
 
 ```powershell
@@ -1663,7 +1860,32 @@ $job = [guid]::NewGuid().ToString('N')
 
 From a separate prompt, `stop-syscall-capture --pane 1 --connection-generation GENERATION --job-id JOB` requests an early stop on the matching job. Choose a fresh job ID for each run. Stop, the deadline, and the byte limit terminate the launched command and traced descendants. The result gives the stop reason and reports the command's exit status when it completes on its own. A file that reaches the byte limit can end partway through a record.
 
+For comparable runs, save the Linux program, literal arguments, working directory, preset, and limits with `save-syscall-capture-settings`. Pass `--settings-file` to both preview and capture in place of those flags. Each run still selects its own pane, uses its fresh review and job ID, and saves to a new output file.
+
+```powershell
+& $ctl save-syscall-capture-settings --program /usr/bin/ls --arg -l --arg /tmp --directory /tmp --filter files --seconds 15 --max-mib 4 --output-file '.\working settings.json'
+$traceOptions = @('--pane','1','--settings-file','.\working settings.json')
+$plan = (& $ctl --pid 12345 preview-syscall-capture @traceOptions | ConvertFrom-Json).result.plan
+& $ctl --pid 12345 capture-syscalls @traceOptions --connection-generation $plan.connection_generation --review-id $plan.review_id --job-id ([guid]::NewGuid().ToString('N')) --output-file '.\working.strace'
+```
+
 The original PID-tagged trace includes per-call timing and decoded descriptor details. One byte budget covers the full stream across descendants. w11term checks the SFTP download's size and SHA-256 before acknowledging remote cleanup and saving a new local file. [strace manual](https://github.com/strace/strace/blob/master/doc/strace.1.in)
+
+Add `--report-file '.\working report.json'` to `capture-syscalls` to save a JSON report alongside the trace. It records the reviewed SSH endpoint, the resolved executable and working directory, the literal strace arguments, the stop reason, and the trace's byte count and SHA-256. The reply gives `result.report_path` on success. If the report cannot be written after capture, the trace is still available and `result.report_error` explains the report failure.
+
+```powershell
+& $ctl verify-syscall-capture-report '.\working.strace' '.\working report.json' --save-settings '.\syscall settings.json'
+```
+
+Verification works offline and accepts a renamed trace with matching bytes. The verified JSON includes the saved capture details at `result.report`.
+
+Use `--save-settings PATH` to write the original capture options to a new settings file and get its absolute path in `result.settings_path`. Load that file in the viewer or pass it to `preview-syscall-capture --settings-file PATH` for a fresh review.
+
+In the Windows syscall viewer, expand **Capture report** after a capture to save its report. Open a single trace file and choose **Verify capture report…** to check the file on disk and view the recorded command, limits, SSH endpoint, and outcome. The viewer accepts the same reports as the CLI.
+
+Choose **Repeat capture…** on a completed capture or verified report to prefill a new capture tab with the original inputs. The original trace stays open. Select a live SSH pane and review the command and limits again. w11term resolves the executable and working directory on the selected host before you choose a new output file and start the capture.
+
+After the repeated capture finishes, **Compare with original trace** opens both runs in a comparison tab. The original appears under **Working** and the repeat under **Failing**. The comparison uses the records already loaded in the viewer, and both trace tabs stay open.
 
 Open **More → Diagnostics → Syscall trace viewer** to inspect a saved trace offline. Open one combined log or select the files from the same `strace -ff` run together. Names ending in `.PID` identify the process for those split logs. w11term merges files with epoch timestamps. It also merges short runs with ordered time-of-day timestamps that fit in a window under 12 hours. A merge across midnight requires at least one file to show the rollover in its record order. When timestamps are ambiguous or incomplete, the viewer keeps the files in their input order. Capture with `-ttt` to retain dates in longer runs. [strace timestamp formats](https://github.com/strace/strace/blob/master/doc/strace-log-merge.1.in)
 
@@ -1682,6 +1904,10 @@ Use `inspect-syscall-trace` for the same summary offline. Repeat `--trace` for t
 Choose **File descriptors** to follow open files, sockets and pipes. Search by path, `PID 123`, or `FD 4`. Reuse of the same descriptor number produces separate lifetimes. **Show related lifetimes** follows duplicates and inherited copies of the same open file description. Select a lifetime for the original calls that established, used, or closed it, including observed sharing of a descriptor table and close-on-exec. A lifetime first seen after open or still active when the available records end is labelled with the evidence available. Use the all-calls capture preset and retain timestamps when tracing several processes to capture more of these transitions. [Linux clone(2)](https://man7.org/linux/man-pages/man2/clone.2.html) · [Linux close(2)](https://man7.org/linux/man-pages/man2/close.2.html)
 
 Open the working capture and choose **Compare with failing trace…**. The comparison pairs processes by the executable and observed ancestry, then aligns syscall sequences by name and resource. It uses recorded descriptor lifetimes and process relationships to interpret numbers that differ between runs. Select a change to see both original records, the result or count delta, and available timing relative to each run's start. Turn on **Include timing-only changes** to include calls that differ by at least 1 ms and by at least a quarter of the slower duration. Some alignments are marked uncertain when evidence is incomplete or several sequences could match. Use the evidence arrows to see each record inside a repeated group.
+
+Choose **Open working evidence** or **Open failing evidence** to open that run in a separate trace tab at the group and raw-record page containing the selected call. The viewer marks the call in its original records. Close the source tab to return to the comparison with its filter, timing reference, and selected evidence in place.
+
+Choose **Swap runs** to make the other trace the working baseline. The viewer realigns the loaded records, recalculates the deltas, and reapplies the active filter. It selects the first visible divergence and keeps your timing reference when the same calls still align. **Choose another failing trace…** and **Back to working trace** use the new baseline.
 
 Choose **Use selected pair as time zero** to measure from the selected calls. Earlier calls show negative offsets and later calls show positive offsets in their respective runs. A pair needs a reliable match, equal group counts, and usable times on both sides. For example, two epoch-timestamped calls in a run can be compared when its first record has no timestamp. The reference stays fixed while you change the selection, filter, or page. Choose **Use run starts** to reset it.
 
@@ -1744,15 +1970,21 @@ In a syscall comparison, select a change and its evidence pair, then choose **Re
 
 In a CPU profile comparison, select a stack and choose **Review comparison with OpenRouter…**. The comparison stays beside the draft. The preview includes the two sample totals, the selected stack, and up to ten other stacks ranked by change in sample share within the applied filter. It uses symbol names and sample counts while leaving the local source names in the comparison. The review interprets shifts in sample share as relative measurements.
 
+In a packet capture comparison, choose **Review comparison with OpenRouter…** to draft a summary of the whole captures or the elapsed interval currently being compared. The draft includes packet counts, rates, coverage, and the largest recorded protocol changes. Selecting a conversation adds directional counts and, for TCP or UDP, the two port numbers. IP addresses, filenames, and packet contents stay in the local files and viewer. The original comparison remains beside the editable draft.
+
 Edit the preview to remove any details you want to keep local. The preview accepts up to 16 KiB of text. **Review OpenRouter request** shows the destination, model, and privacy policy. **Send reviewed request** submits the displayed text.
 
 The response appears as selectable text. **Copy response** puts it on the Windows clipboard for manual use. Token usage appears when OpenRouter returns it. **Stop waiting** discards the eventual response in w11term. A request already sent can still finish at OpenRouter.
 
 ### Capture a Linux CPU profile
 
-In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → CPU flame graph → Capture from SSH**. Enter a PID, duration, frequency, and unwind mode. You can also choose a process under **Busy processes during triage** in the CPU findings. That list ranks processes by their peak reported interval CPU usage and fills in the PID from the live report. [pidstat manual](https://github.com/sysstat/sysstat/blob/master/man/pidstat.in)
+In the Windows app, select a connected Linux SSH pane and open **More → Diagnostics → CPU flame graph → Capture from SSH**. Enter a PID, duration, frequency, and unwind mode. You can also choose a process under **Busy processes during triage** in the CPU findings. The list ranks processes by their peak reported `pidstat` interval CPU usage. When no positive interval rows are available, it ranks the observed `top` snapshot rows and labels their source. Choosing a process fills in its PID for review on the same SSH connection. [pidstat manual](https://github.com/sysstat/sysstat/blob/master/man/pidstat.in) · [Procps top manual](https://man7.org/linux/man-pages/man1/top.1.html)
 
 Choose **Review CPU profile** to check the live process and verified SSH endpoint. Then choose **Record CPU profile** and a new local folded stacks file. Changes to the settings require a fresh review. Recording stays tied to the pane, connection, and process start time from review. The resulting file opens in the flame graph with the unresolved frame count and **Perf output**, when available.
+
+Choose **Repeat CPU profile…** on a completed capture to reuse its sampling settings, raw recording choice, and any command inputs. A recorded PID is filled in on its original SSH connection and checked against the original process start time at review. With another pane selected, enter a PID for that pane. Each repeat requires a fresh review and a new destination.
+
+After recording a repeat, choose **Compare with original profile** to open the original stacks as **Before** and the repeated run as **After**. The comparison uses the loaded stacks. **Back to flame graph** returns to the repeated result.
 
 Choose **Stop and save profile** during a recording to finish early and save the collected samples. For an attached PID, the target keeps running. For a profiled command, the remote wrapper stops the workload it started. The viewer and Diagnostics Activity show the stop reason. A requested raw `.perf.data` file uses the same verification and save path as a timed capture.
 

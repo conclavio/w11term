@@ -162,7 +162,7 @@ impl TerminalApp {
                     template: template::Form::parse(&example.command),
                     filling: None,
                 });
-                panel.focus = panel.focus.wrapping_add(1);
+                panel.request_focus();
             }
             return;
         }
@@ -226,7 +226,7 @@ impl TerminalApp {
             Action::BeginFill if draft.filling.is_none() && draft.name.is_none() => {
                 if let Some(form) = &draft.template {
                     draft.filling = Some(form.clone());
-                    panel.focus = panel.focus.wrapping_add(1);
+                    panel.request_focus();
                 }
             }
             Action::FillText(index, text) => {
@@ -244,12 +244,12 @@ impl TerminalApp {
                     draft.text = text;
                     draft.template = draft.filling.take();
                     draft.status = None;
-                    panel.focus = panel.focus.wrapping_add(1);
+                    panel.request_focus();
                 }
             }
             Action::CancelFill if draft.filling.is_some() => {
                 draft.filling = None;
-                panel.focus = panel.focus.wrapping_add(1);
+                panel.request_focus();
             }
             _ => {}
         }

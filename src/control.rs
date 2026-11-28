@@ -1,5 +1,6 @@
 //! Local, current-user-only automation. Control requests never focus a desktop window.
 use crate::{
+    command_reference::{self, Platform},
     diagnostic_history::Artifact,
     options::{DiagnosticLaunch, TabColor},
     pane_layout::{Axis, Direction},
@@ -96,6 +97,8 @@ pub enum Request {
         review_id: String,
         job_id: String,
         output_file: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_file: Option<PathBuf>,
     },
     StopSyscallCapture {
         pane: u64,
@@ -110,6 +113,8 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job_id: Option<String>,
         output_file: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report_file: Option<PathBuf>,
     },
     StopPacketCapture {
         pane: u64,
@@ -274,6 +279,13 @@ pub enum Request {
     ListWindows,
     ListTabs {
         window_id: WindowId,
+    },
+    OpenCommandReference {
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_id: Option<WindowId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platform: Option<String>,
     },
     OpenDiagnostic {
         window_id: WindowId,
@@ -594,6 +606,11 @@ pub enum UiRequest {
         order: Option<Vec<crate::tabs::TabId>>,
         reply: oneshot::Sender<Result<Value, String>>,
     },
+    OpenCommandReference {
+        query: String,
+        platform: Option<Platform>,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
     OpenDiagnostic {
         launch: DiagnosticLaunch,
         reply: oneshot::Sender<Result<Value, String>>,
@@ -752,6 +769,7 @@ impl UiRequest {
             | Self::SaveWorkspace { reply, .. }
             | Self::RepairWorkspace { reply, .. }
             | Self::TabOrder { reply, .. }
+            | Self::OpenCommandReference { reply, .. }
             | Self::OpenDiagnostic { reply, .. }
             | Self::TabAppearance { reply, .. }
             | Self::OpenWorkspace { reply, .. }
@@ -1498,6 +1516,7 @@ impl Registry {
                 review_id,
                 job_id,
                 output_file,
+                report_file,
             } => {
                 self.capture_syscalls(
                     pane,
@@ -1505,7 +1524,10 @@ impl Registry {
                     connection_generation,
                     &review_id,
                     &job_id,
-                    output_file,
+                    triage::CapturePaths {
+                        capture: output_file,
+                        report: report_file,
+                    },
                 )
                 .await
             }
@@ -1524,6 +1546,7 @@ impl Registry {
                 review_id,
                 job_id,
                 output_file,
+                report_file,
             } => {
                 self.capture_packets(
                     pane,
@@ -1531,7 +1554,10 @@ impl Registry {
                     connection_generation,
                     &review_id,
                     job_id,
-                    output_file,
+                    triage::CapturePaths {
+                        capture: output_file,
+                        report: report_file,
+                    },
                 )
                 .await
             }
@@ -1800,6 +1826,40 @@ impl Registry {
             }
             Request::ListWindows => Ok(self.list_windows()),
             Request::ListTabs { window_id } => self.tab_order(window_id, None).await,
+            Request::OpenCommandReference {
+                query,
+                window_id,
+                platform,
+            } => {
+                ensure!(
+                    command_reference::insertable(&query),
+                    "provide a command or subcommand name"
+                );
+                let query = command_reference::query(&query);
+                ensure!(
+                    crate::saved_reference_pages::valid_page_name(&query),
+                    "provide a command or subcommand name of at most 128 bytes"
+                );
+                let platform = platform
+                    .as_deref()
+                    .map(command_reference::parse_platform)
+                    .transpose()?;
+                let ui = match window_id {
+                    Some(id) => self.window_ui(id)?,
+                    None => self.active_ui()?,
+                };
+                let (reply, response) = oneshot::channel();
+                ui(UiRequest::OpenCommandReference {
+                    query,
+                    platform,
+                    reply,
+                });
+                tokio::time::timeout(TIMEOUT, response)
+                    .await
+                    .context("open-command-reference timed out")?
+                    .context("GUI is closed")?
+                    .map_err(anyhow::Error::msg)
+            }
             Request::OpenDiagnostic {
                 window_id,
                 artifact,

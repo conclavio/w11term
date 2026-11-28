@@ -523,7 +523,14 @@ impl server::Handler for Peer {
             s.channel_success(c)?;
             match args.as_slice() {
                 ["4", "inspect", "42", "0", "2", "99", "fp", "32768", "4096"] => {
-                    s.data(c, b"w11term-cpu-profile-v1\t800\td29ya2Vy\n".to_vec())?;
+                    let ticks = fs::read_to_string(self.root.join("profile-start-ticks"))
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(800);
+                    s.data(
+                        c,
+                        format!("w11term-cpu-profile-v1\t{ticks}\td29ya2Vy\n").into_bytes(),
+                    )?;
                     s.exit_status_request(c, 0)?;
                 }
                 [
@@ -652,17 +659,22 @@ impl server::Handler for Peer {
         if let Some(wire) = &self.wire {
             let _ = wire.send(in_band_resize::Wire::Shell(c, s.handle()));
         }
-        if self.root.join("dotfiles-shell-probe").is_file() {
+        if let Ok(probe) = fs::read_to_string(self.root.join("dotfiles-shell-probe")) {
+            let (shell, extension, startups): (_, _, &[_]) = if probe == "fish" {
+                ("fish", "fish", &[".config/fish/config.fish"])
+            } else {
+                ("bash", "sh", &[".bashrc", ".profile"])
+            };
             let managed = self.root.join(".config/w11term/dotfiles");
-            let active = fs::read_to_string(managed.join("bash-current")).unwrap_or_default();
+            let active =
+                fs::read_to_string(managed.join(format!("{shell}-current"))).unwrap_or_default();
             let value = active.lines().next().unwrap_or("absent");
             let ready = if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 // Check the files at the instant of the SSH shell request.
-                let bundle = managed.join(format!("bash-{value}"));
-                bundle.join("prompt.sh").is_file()
-                    && bundle.join("environment.sh").is_file()
-                    && self.root.join(".bashrc").is_file()
-                    && self.root.join(".profile").is_file()
+                let bundle = managed.join(format!("{shell}-{value}"));
+                bundle.join(format!("prompt.{extension}")).is_file()
+                    && bundle.join(format!("environment.{extension}")).is_file()
+                    && startups.iter().all(|path| self.root.join(path).is_file())
             } else {
                 value == "disabled"
             };
@@ -675,7 +687,7 @@ impl server::Handler for Peer {
                 .into_bytes(),
             )?;
         }
-        if self.root.join("utility-shell-probe").is_file() {
+        if let Ok(probe) = fs::read_to_string(self.root.join("utility-shell-probe")) {
             let store = self.root.join(".local/share/w11term/tools/portable");
             let selector = fs::read_to_string(store.join("current")).unwrap_or_default();
             let target = selector.lines().nth(1).unwrap_or_default();
@@ -686,7 +698,12 @@ impl server::Handler for Peer {
                         && self.root.join(".local/bin/rg").is_file()
                 })
                 .unwrap_or("absent");
-            let path = fs::read_to_string(self.root.join(".bashrc"))
+            let startup = if probe == "fish" {
+                ".config/fish/config.fish"
+            } else {
+                ".bashrc"
+            };
+            let path = fs::read_to_string(self.root.join(startup))
                 .unwrap_or_default()
                 .contains("w11term tool PATH");
             s.data(c, format!("tools-at-shell:{id}:{path}\r\n").into_bytes())?;
@@ -2337,28 +2354,48 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
         .unwrap()
         .try_into()
         .unwrap();
-    let request = |name: &str, options, job_id| Request::CapturePackets {
+    let request = |name: &str, options, job_id, report: Option<&str>| Request::CapturePackets {
         pane: 1,
         options,
         connection_generation: generation,
         review_id: plan["review_id"].as_str().unwrap().into(),
         job_id,
         output_file: local.path().join(name),
+        report_file: report.map(|name| local.path().join(name)),
     };
     let scratch = remote.path().join("dev/shm");
     let mut changed = options.clone();
     changed.seconds += 1;
     let error = registry
-        .execute(request("stale.pcap", changed, None), callback.clone())
+        .execute(request("stale.pcap", changed, None, None), callback.clone())
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("Review again"));
     assert!(!scratch.exists());
 
+    let existing = local.path().join("existing.json");
+    fs::write(&existing, b"previous report").unwrap();
+    for (destination, expected) in [
+        ("existing.json", "destination already exists"),
+        ("blocked.pcap", "separate capture and report files"),
+    ] {
+        let error = registry
+            .execute(
+                request("blocked.pcap", options.clone(), None, Some(destination)),
+                callback.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(expected));
+        assert!(!local.path().join("blocked.pcap").exists());
+        assert!(!scratch.exists());
+    }
+    assert_eq!(fs::read(existing).unwrap(), b"previous report");
+
     fs::write(remote.path().join("pcap-bad-digest"), []).unwrap();
     let error = registry
         .execute(
-            request("corrupt.pcap", options.clone(), None),
+            request("corrupt.pcap", options.clone(), None, Some("corrupt.json")),
             callback.clone(),
         )
         .await
@@ -2366,11 +2403,17 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
     assert!(format!("{error:#}").contains("SHA-256 digest"));
     assert!(!remote.path().join("pcap-verified").exists());
     assert!(!local.path().join("corrupt.pcap").exists());
+    assert!(!local.path().join("corrupt.json").exists());
     fs::remove_file(remote.path().join("pcap-bad-digest")).unwrap();
 
     let result = registry
         .execute(
-            request("reviewed capture.pcap", options.clone(), None),
+            request(
+                "reviewed capture.pcap",
+                options.clone(),
+                None,
+                Some("capture report.json"),
+            ),
             callback.clone(),
         )
         .await
@@ -2381,6 +2424,36 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
     assert_eq!(capture["received_by_filter"], 2);
     assert_eq!(capture["dropped_by_kernel"], 0);
     assert_eq!(capture["stop_reason"], "packet-limit");
+    let report_path = local.path().join("capture report.json");
+    assert_eq!(result["report_path"], json!(report_path));
+    let report: Value = serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["file_name"], "reviewed capture.pcap");
+    for field in [
+        "bytes",
+        "sha256",
+        "packets",
+        "stop_reason",
+        "dropped_by_kernel",
+        "received_by_filter",
+    ] {
+        assert_eq!(report[field], capture[field], "{field}");
+    }
+    for field in [
+        "host",
+        "user",
+        "port",
+        "host_key_fingerprint",
+        "options",
+        "scratch_directory",
+        "scratch_filesystem",
+        "effective_packet_limit",
+        "tcpdump_arguments",
+    ] {
+        assert_eq!(report["reviewed"][field], plan[field], "{field}");
+    }
+    assert!(report.get("path").is_none());
+    assert!(report["reviewed"].get("review_id").is_none());
     assert!(remote.path().join("pcap-verified").exists());
     assert_eq!(
         fs::read(local.path().join("reviewed capture.pcap")).unwrap(),
@@ -2397,13 +2470,23 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
         job_id: job_id.into(),
     };
     let capture = registry.execute(
-        request("stopped.pcap", options, Some(job.into())),
+        request(
+            "stopped.pcap",
+            options,
+            Some(job.into()),
+            Some("raced report.json"),
+        ),
         callback.clone(),
     );
     let requested = async {
         while !started.is_file() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        fs::write(
+            local.path().join("raced report.json"),
+            b"created during capture",
+        )
+        .unwrap();
         let error = registry
             .execute(stop("00000000000000000000000000000000"), callback.clone())
             .await
@@ -2426,6 +2509,17 @@ async fn packet_capture_verifies_review_and_sftp_bytes_before_acknowledging_clea
     assert_eq!(stopped["job_id"], job);
     assert_eq!(stopped["capture"]["stop_reason"], "stopped");
     assert_eq!(stopped["capture"]["packets"], 1);
+    assert!(stopped.get("report_path").is_none());
+    assert!(
+        stopped["report_error"]
+            .as_str()
+            .unwrap()
+            .contains("Saving new packet capture report")
+    );
+    assert_eq!(
+        fs::read(local.path().join("raced report.json")).unwrap(),
+        b"created during capture"
+    );
     assert_eq!(
         fs::read(local.path().join("stopped.pcap")).unwrap(),
         PCAP_FIXTURE
@@ -2450,6 +2544,9 @@ async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
         string_size: 128,
         filter: control::SyscallFilter::Files,
     };
+    let settings = local.path().join("syscall settings.json");
+    fs::write(&settings, options.settings_json().unwrap()).unwrap();
+    let options = control::SyscallOptions::load_settings(&settings).unwrap();
     let preview = registry
         .execute(
             Request::PreviewSyscallCapture {
@@ -2472,18 +2569,35 @@ async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
         .unwrap();
     let job = "1234567890abcdef1234567890abcdef";
     let output_file = local.path().join("raw.strace");
-    let request = |options| Request::CaptureSyscalls {
+    let report_file = local.path().join("syscall report.json");
+    let request = |options, report: &Path| Request::CaptureSyscalls {
         pane: 1,
         options,
         connection_generation: generation,
         review_id: plan["review_id"].as_str().unwrap().into(),
         job_id: job.into(),
         output_file: output_file.clone(),
+        report_file: Some(report.to_owned()),
     };
-    let mut changed = options.clone();
-    changed.arguments.push("changed".into());
     let error = registry
-        .execute(request(changed), callback.clone())
+        .execute(request(options.clone(), &output_file), callback.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("Choose separate capture and report files"));
+    fs::write(&report_file, b"previous report").unwrap();
+    let error = registry
+        .execute(request(options.clone(), &report_file), callback.clone())
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("already exists"));
+    assert_eq!(fs::read(&report_file).unwrap(), b"previous report");
+    fs::remove_file(&report_file).unwrap();
+    let mut edited = options.clone();
+    edited.arguments.push("changed".into());
+    fs::write(&settings, edited.settings_json().unwrap()).unwrap();
+    let changed = control::SyscallOptions::load_settings(&settings).unwrap();
+    let error = registry
+        .execute(request(changed, &report_file), callback.clone())
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("Review again"));
@@ -2494,7 +2608,7 @@ async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
         connection_generation: generation,
         job_id: job_id.into(),
     };
-    let capture = registry.execute(request(options), callback.clone());
+    let capture = registry.execute(request(options, &report_file), callback.clone());
     let stop = async {
         while !started.exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2514,7 +2628,35 @@ async fn syscall_capture_requires_review_and_stops_only_the_matching_job() {
     assert_eq!(stopped["stop_requested"], true);
     let capture = capture.unwrap();
     assert_eq!(capture["capture"]["stop_reason"], "stopped");
-    assert_eq!(fs::read(output_file).unwrap(), SYSCALL_FIXTURE);
+    assert_eq!(fs::read(&output_file).unwrap(), SYSCALL_FIXTURE);
+    assert_eq!(capture["report_path"], json!(report_file));
+    assert!(capture.get("report_error").is_none());
+    let report = w11term::ssh::verify_syscall_capture_report(&output_file, &report_file).unwrap();
+    assert_eq!(report.bytes, SYSCALL_FIXTURE.len() as u64);
+    assert_eq!(
+        report.sha256,
+        capture["capture"]["sha256"].as_str().unwrap()
+    );
+    assert_eq!(report.stop_reason, "stopped");
+    assert_eq!(report.file_name, "raw.strace");
+    assert_eq!(report.command_exit_status, None);
+    assert_eq!(report.reviewed.program, "/bin/sh");
+    assert_eq!(report.reviewed.directory, "/home/test");
+    assert_eq!(
+        serde_json::to_value(&report.reviewed.strace_arguments).unwrap(),
+        plan["strace_arguments"]
+    );
+    assert_eq!(
+        serde_json::to_value(&report.reviewed.options).unwrap(),
+        plan["options"]
+    );
+    let saved: Value = serde_json::from_slice(&fs::read(report_file).unwrap()).unwrap();
+    for field in ["host", "user", "port", "host_key_fingerprint"] {
+        assert_eq!(saved["reviewed"][field], plan[field], "{field}");
+    }
+    for field in ["review_id", "connection_generation", "identity", "job_id"] {
+        assert!(saved["reviewed"].get(field).is_none(), "{saved}");
+    }
     assert!(remote.path().join("syscall-verified").exists());
     server.abort();
 }

@@ -1,6 +1,7 @@
 use super::*;
 use w11term::ssh::{PacketConversationChange, PacketConversationQuery};
 
+mod review;
 mod timeline;
 
 const ROWS_PER_PAGE: usize = 12;
@@ -49,6 +50,7 @@ pub enum Change {
     Open(ConversationSelection),
     SaveConversationExcerpt(ConversationSelection),
     Export,
+    OpenRouter,
 }
 
 #[derive(Clone)]
@@ -162,6 +164,16 @@ impl Comparison {
         self.elapsed_model
             .as_ref()
             .map_or(&self.model, |(_, model)| model)
+    }
+
+    pub(super) fn openrouter_preview(&self, revision: &Arc<()>) -> Option<String> {
+        if !Arc::ptr_eq(revision, &self.revision) {
+            return None;
+        }
+        let selected = self
+            .selected
+            .and_then(|row| self.row(self.page * ROWS_PER_PAGE + row));
+        Some(review::preview(self.visible_model(), selected))
     }
 
     pub(super) fn elapsed_request(
@@ -406,6 +418,13 @@ impl Comparison {
                     .on_click(action(Change::Export))
                     .content("Export comparison…"),
             ),
+            KeyedView::new(
+                "openrouter",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(action(Change::OpenRouter))
+                    .content("Review comparison with OpenRouter…"),
+            ),
         ];
         if let Some(status) = status {
             fields.push(text("status", status));
@@ -448,8 +467,11 @@ impl Comparison {
                 text(
                     "counts",
                     format!(
-                        "Packets {} · {} captured bytes · {} truncated",
-                        capture.packets, capture.captured_bytes, capture.truncated_packets,
+                        "Packets {} · {} captured bytes · {} truncated · {} original bytes",
+                        capture.packets,
+                        capture.captured_bytes,
+                        capture.truncated_packets,
+                        capture.original_bytes,
                     ),
                 ),
                 text("time", span),
@@ -497,13 +519,7 @@ impl Comparison {
             ));
         }
         if let Some(delta) = &model.totals_delta {
-            fields.push(text(
-                "total-delta",
-                format!(
-                    "Capture change · {:+} packets · {:+} captured bytes · {:+} truncated",
-                    delta.packets, delta.captured_bytes, delta.truncated_packets,
-                ),
-            ));
+            fields.push(text("total-delta", delta.summary()));
         } else {
             fields.push(text(
                 "total-delta",

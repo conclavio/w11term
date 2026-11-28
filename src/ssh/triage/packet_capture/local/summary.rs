@@ -98,6 +98,7 @@ pub struct CaptureCounters {
 pub struct PacketStats {
     pub packets: u32,
     pub captured_bytes: u64,
+    pub original_bytes: u64,
     pub truncated_packets: u32,
     pub timestamped_packets: u32,
     earliest: Option<i128>,
@@ -221,6 +222,8 @@ impl PacketStats {
     fn record(&mut self, captured: u32, original: u32, timestamp: Option<i128>) {
         self.packets += 1;
         self.captured_bytes += u64::from(captured);
+        // Legacy files can advertise less than the bytes they actually contain.
+        self.original_bytes += u64::from(original.max(captured));
         self.truncated_packets += u32::from(captured < original);
         if let Some(timestamp) = timestamp {
             self.timestamped_packets += 1;

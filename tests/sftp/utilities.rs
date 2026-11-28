@@ -70,43 +70,9 @@ pub(super) fn tool_digest_report(
     Ok(Some(report))
 }
 
-// Minimal ELF programs for Linux x86-64 and AArch64 that exit with status 0.
-// The optional interpreter segment lets a fixture exercise missing-loader diagnostics.
-pub(super) fn executable(architecture: UtilityArchitecture, interpreter: Option<&str>) -> Vec<u8> {
-    let mut bytes = vec![0u8; 256];
-    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
-    bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
-    let (machine, code): (u16, &[u8]) = match architecture {
-        UtilityArchitecture::X86_64 => (62, &[0xb8, 60, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05]),
-        UtilityArchitecture::Aarch64 => (
-            183,
-            &[0xa8, 0x0b, 0x80, 0xd2, 0, 0, 0x80, 0xd2, 0x01, 0, 0, 0xd4],
-        ),
-    };
-    bytes[18..20].copy_from_slice(&machine.to_le_bytes());
-    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-    bytes[24..32].copy_from_slice(&0x0040_00e0u64.to_le_bytes());
-    bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
-    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
-    bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
-    bytes[56..58].copy_from_slice(&(1 + u16::from(interpreter.is_some())).to_le_bytes());
-    bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
-    bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
-    bytes[80..88].copy_from_slice(&0x0040_0000u64.to_le_bytes());
-    bytes[96..104].copy_from_slice(&256u64.to_le_bytes());
-    bytes[104..112].copy_from_slice(&256u64.to_le_bytes());
-    bytes[112..120].copy_from_slice(&4096u64.to_le_bytes());
-    if let Some(loader) = interpreter {
-        bytes[120..124].copy_from_slice(&3u32.to_le_bytes());
-        bytes[124..128].copy_from_slice(&4u32.to_le_bytes());
-        bytes[128..136].copy_from_slice(&176u64.to_le_bytes());
-        bytes[152..160].copy_from_slice(&(loader.len() as u64 + 1).to_le_bytes());
-        bytes[160..168].copy_from_slice(&(loader.len() as u64 + 1).to_le_bytes());
-        bytes[176..176 + loader.len()].copy_from_slice(loader.as_bytes());
-    }
-    bytes[224..224 + code.len()].copy_from_slice(code);
-    bytes
-}
+#[path = "../support/tool_elf.rs"]
+mod tool_elf;
+pub(super) use tool_elf::executable;
 
 fn sftp_opened_tool(trace: &std::path::Path) -> bool {
     fs::read_to_string(trace)
@@ -1122,6 +1088,7 @@ async fn installed_tool_path_requires_a_review_of_the_active_release_and_startup
                 path: ToolPath {
                     shell,
                     zdotdir: zdotdir.map(str::to_owned),
+                    fish_config_dir: None,
                 },
                 remove,
             },
@@ -1763,6 +1730,7 @@ fn approved_login(source: Source, local: &std::path::Path) -> SshOptions {
     };
     options.tool_bundle = Some(Box::new(ToolSync {
         bundle: "fleet.json".into(),
+        manifest_sha256: None,
         name: "portable".into(),
         bin_directory: ".local/bin".into(),
         host: options.host.clone(),
@@ -1773,6 +1741,7 @@ fn approved_login(source: Source, local: &std::path::Path) -> SshOptions {
         add_to_path: Some(ToolPath {
             shell: DotfileShell::Bash,
             zdotdir: None,
+            fish_config_dir: None,
         }),
     }));
     let mut restored: SshOptions =
@@ -1887,6 +1856,208 @@ fn connect_tools(options: &SshOptions) -> Session {
             ..Default::default()
         },
     )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_tool_manifest_requires_reapproval_before_updating_on_login() {
+    let (source, remote, _, server) = fixture_connections(false, 3).await;
+    let root = remote.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(root, "x86_64", "/", "/usr/bin");
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("utility-shell-probe"), []).unwrap();
+    let manifest = local.path().join("fleet.json");
+    save_login_manifest(local.path(), 1);
+    let mut options = approved_login(source, local.path());
+    let pin = || tool_sha256(&fs::read(&manifest).unwrap());
+    options.tool_bundle.as_mut().unwrap().manifest_sha256 = Some(pin().to_uppercase());
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("updated")).await;
+    drop(pane);
+
+    let selector = root.join(".local/share/w11term/tools/portable/current");
+    let before = fs::read(&selector).unwrap();
+    let startup = root.join(".bashrc");
+    let hook = fs::read(&startup).unwrap();
+    let launcher = root.join(".local/bin/rg");
+    let command = fs::read(&launcher).unwrap();
+    save_login_manifest(local.path(), 2);
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "skipped", None).await;
+    assert!(
+        pane.events
+            .tool_bundle_sync(1)
+            .unwrap()
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("The tool manifest changed after approval")
+    );
+    assert_eq!(fs::read(&selector).unwrap(), before);
+    assert_eq!(fs::read(&startup).unwrap(), hook);
+    assert_eq!(fs::read(&launcher).unwrap(), command);
+    drop(pane);
+
+    options.tool_bundle.as_mut().unwrap().manifest_sha256 = Some(pin());
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("current")).await;
+    assert_ne!(fs::read(&selector).unwrap(), before);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fish_tool_path_syncs_before_the_shell_and_repairs_only_its_block() {
+    let (source, remote, _, server) = fixture_connections(false, 3).await;
+    let root = remote.path();
+    let local = tempfile::tempdir().unwrap();
+    probe_response(root, "x86_64", "/", "/usr/bin");
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("utility-shell-probe"), "fish").unwrap();
+    save_login_manifest(local.path(), 1);
+    let mut options = approved_login(source, local.path());
+    options.tool_bundle.as_mut().unwrap().add_to_path = Some(ToolPath {
+        shell: DotfileShell::Fish,
+        zdotdir: None,
+        fish_config_dir: None,
+    });
+    let options: SshOptions =
+        serde_json::from_value(serde_json::to_value(options).unwrap()).unwrap();
+
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("updated")).await;
+    assert!(pane.frames.load().rows.iter().any(|row| {
+        let text = row.as_str();
+        text.contains("tools-at-shell:") && text.contains(":true")
+    }));
+    let config = root.join(".config/fish/config.fish");
+    let hook = fs::read_to_string(&config).unwrap();
+    assert!(hook.contains("builtin set -gx PATH"));
+    assert!(!root.join(".bashrc").exists());
+    assert!(!root.join(".profile").exists());
+    drop(pane);
+
+    let dotfiles = include_str!("../../src/sftp/dotfiles/startup.fish");
+    let edited = hook.replace("builtin set -gx PATH", "# edited PATH");
+    let combined =
+        |path_hook| format!("# user settings\n{dotfiles}{path_hook}# trailing settings\n");
+    fs::write(&config, combined(&edited)).unwrap();
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "current", Some("skipped")).await;
+    assert_eq!(fs::read_to_string(&config).unwrap(), combined(&edited));
+    let review = guarded_job(&pane, Some(1), Operation::ReviewToolPath { review: None })
+        .await
+        .unwrap();
+    assert_eq!(review["shell"], "fish");
+    assert_eq!(review["files"].as_array().unwrap().len(), 1);
+    assert_eq!(review["files"][0]["path"], "/.config/fish/config.fish");
+    assert_eq!(review["files"][0]["action"], "replace-hook");
+    guarded_job(
+        &pane,
+        Some(1),
+        Operation::ReviewToolPath {
+            review: Some(review["review"].as_str().unwrap().to_owned()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read_to_string(&config).unwrap(), combined(&hook));
+    drop(pane);
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "current", Some("current")).await;
+    assert_eq!(fs::read_to_string(&config).unwrap(), combined(&hook));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fish_login_and_review_use_the_selected_configuration_directory() {
+    let (source, remote, _, server) = fixture_connections(false, 2).await;
+    let root = remote.path();
+    let local = tempfile::tempdir().unwrap();
+    let directory = "xdg settings/fish";
+    let custom = root.join(directory);
+    fs::create_dir_all(&custom).unwrap();
+    let config = custom.join("config.fish");
+    fs::write(&config, "# user Fish settings\n").unwrap();
+    let second = root.join("second/fish");
+    fs::create_dir_all(&second).unwrap();
+    probe_response(root, "x86_64", "/", "/usr/bin");
+    fs::write(root.join("posix-rename-version"), "1").unwrap();
+    fs::write(root.join("utility-shell-probe"), []).unwrap();
+    save_login_manifest(local.path(), 1);
+    let mut options = approved_login(source, local.path());
+    let tools = options.tool_bundle.as_mut().unwrap();
+    tools.add_to_path = Some(ToolPath {
+        shell: DotfileShell::Fish,
+        zdotdir: None,
+        fish_config_dir: Some(directory.into()),
+    });
+    let bundle = local.path().join("fish.json");
+    fs::write(
+        &bundle,
+        r#"{"version":1,"fish_environment":"set -gx EDITOR vim"}"#,
+    )
+    .unwrap();
+    options.dotfiles = Some(Box::new(w11term::options::DotfileSync {
+        bundle,
+        shell: DotfileShell::Fish,
+        bundle_sha256: None,
+        zdotdir: None,
+        fish_config_dir: Some(directory.into()),
+        host: tools.host.clone(),
+        user: tools.user.clone(),
+        port: tools.port,
+        fingerprint: tools.fingerprint.clone(),
+        home: tools.home.clone(),
+    }));
+    let options: SshOptions =
+        serde_json::from_value(serde_json::to_value(options).unwrap()).unwrap();
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "updated", Some("updated")).await;
+    let installed = fs::read_to_string(&config).unwrap();
+    assert!(installed.starts_with("# user Fish settings\n"));
+    assert!(installed.contains("# >>> w11term dotfiles >>>"));
+    assert!(installed.contains("# >>> w11term tool PATH "));
+    assert!(!root.join(".config/fish").exists());
+
+    let edited = installed.replace("/prompt.fish", "/edited-prompt.fish");
+    fs::write(&config, &edited).unwrap();
+    let repair = |path: &str, review| Operation::RepairDotfileHooks {
+        shell: DotfileShell::Fish,
+        zdotdir: None,
+        fish_config_dir: Some(path.into()),
+        review,
+    };
+    let missing = guarded_job(&pane, None, repair("missing/fish", None))
+        .await
+        .unwrap_err();
+    assert!(
+        missing.contains("Fish configuration directory is missing"),
+        "{missing}"
+    );
+    let preview = guarded_job(&pane, None, repair(directory, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["files"][0]["path"],
+        "/xdg settings/fish/config.fish"
+    );
+    assert_eq!(preview["files"][0]["action"], "replace-hook");
+    let token = || Some(preview["review"].as_str().unwrap().to_owned());
+    let stale = guarded_job(&pane, None, repair("second/fish", token()))
+        .await
+        .unwrap_err();
+    assert!(stale.contains("review is stale"), "{stale}");
+    assert!(!second.join("config.fish").exists());
+    assert_eq!(fs::read_to_string(&config).unwrap(), edited);
+    guarded_job(&pane, None, repair(directory, token()))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&config).unwrap(), installed);
+    drop(pane);
+    let pane = connect_tools(&options);
+    wait_tool_login(&pane, 1, "current", Some("current")).await;
+    assert_eq!(fs::read_to_string(&config).unwrap(), installed);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2006,6 +2177,7 @@ async fn approved_tool_sync_installs_before_shell_and_respects_manual_changes() 
         shell: DotfileShell::Bash,
         bundle_sha256: None,
         zdotdir: None,
+        fish_config_dir: None,
         host: scope.host.clone(),
         user: scope.user.clone(),
         port: scope.port,
@@ -2246,6 +2418,7 @@ async fn tool_sync_skips_scope_changes_and_preserves_edited_startup_hooks() {
     zsh.tool_bundle.as_mut().unwrap().add_to_path = Some(ToolPath {
         shell: DotfileShell::Zsh,
         zdotdir: Some("config/zsh".into()),
+        fish_config_dir: None,
     });
     let pane = connect_tools(&zsh);
     wait_tool_login(&pane, 1, "current", Some("updated")).await;

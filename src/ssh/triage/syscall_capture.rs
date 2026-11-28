@@ -1,7 +1,7 @@
 use super::{
     ArtifactMessages, ConnectionShare, PendingChannel, Target,
     capture_job::{CaptureStop, Kind, validate_job},
-    diagnostic_destination, quote,
+    capture_settings, diagnostic_destination, quote,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -11,11 +11,14 @@ use std::{
     time::Duration,
 };
 
+mod report;
+pub use report::{SyscallCaptureReport, SyscallCaptureReportReview, verify_syscall_capture_report};
+
 const SCRIPT: &str = include_str!("syscall-capture.sh");
 const REVIEW_DEADLINE: Duration = Duration::from_secs(8);
 pub(crate) const CONTROL_SECONDS: u64 = 155;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SyscallFilter {
     #[default]
@@ -52,6 +55,14 @@ impl SyscallOptions {
     pub const DEFAULT_SECONDS: u8 = 15;
     pub const DEFAULT_MAX_MIB: u8 = 16;
     pub const DEFAULT_STRING_SIZE: u16 = 128;
+
+    pub fn load_settings(path: &Path) -> Result<Self> {
+        capture_settings::load::<Self>(path, "syscall capture", 64)?.validate()
+    }
+
+    pub fn settings_json(self) -> Result<String> {
+        capture_settings::json(self.validate()?)
+    }
 
     pub fn validate(self) -> Result<Self> {
         ensure!(
@@ -131,6 +142,14 @@ pub struct Capture {
     sha256: String,
     pub stop_reason: &'static str,
     pub command_exit_status: Option<u8>,
+    #[serde(skip)]
+    reviewed: Box<SyscallCaptureReportReview>,
+}
+
+impl Capture {
+    pub fn options(&self) -> &SyscallOptions {
+        &self.reviewed.options
+    }
 }
 
 impl Target {
@@ -387,6 +406,7 @@ async fn capture_and_download(
             sha256,
             stop_reason,
             command_exit_status,
+            reviewed: Box::new(plan.into()),
         },
     ))
 }

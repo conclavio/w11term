@@ -28,12 +28,19 @@ pub enum Field {
     StringSize,
 }
 
+#[derive(Clone, Copy)]
+pub enum SettingsFile {
+    Open,
+    Save,
+}
+
 pub enum Action {
     Open(TabId),
     Back(TabId),
     Select(TabId, Connection),
     Edit(TabId, Field, String),
     Preset(TabId, usize),
+    SettingsFile(TabId, SettingsFile),
     Review(TabId),
     Choose(TabId),
     Stop(TabId),
@@ -44,6 +51,8 @@ pub enum Outcome {
     Reviewed(Connection, Box<SyscallCapturePlan>),
     Destination(PathBuf),
     Saved(SyscallCapture, Result<Arc<Trace>, String>),
+    SettingsLoaded(PathBuf, SyscallOptions),
+    SettingsSaved(PathBuf),
 }
 
 struct Review {
@@ -76,6 +85,21 @@ impl Default for Inputs {
 }
 
 impl Inputs {
+    fn from_options(options: SyscallOptions) -> anyhow::Result<Self> {
+        Ok(Self {
+            program: options.program,
+            arguments: serde_json::to_string(&options.arguments)?,
+            directory: options.directory,
+            seconds: options.seconds.to_string(),
+            budget: options.max_mib.to_string(),
+            string_size: options.string_size.to_string(),
+            preset: PRESETS
+                .iter()
+                .position(|(_, filter)| *filter == options.filter)
+                .context("Unsupported syscall capture preset")?,
+        })
+    }
+
     fn options(&self) -> anyhow::Result<SyscallOptions> {
         let arguments = if self.arguments.trim().is_empty() {
             Vec::new()
@@ -127,6 +151,8 @@ pub(super) struct ViewState {
     source: Option<Connection>,
     review: Option<Review>,
     stop: Option<SyscallCaptureStop>,
+    settings_path: Option<PathBuf>,
+    repeat_source: Option<Arc<Trace>>,
 }
 
 impl Drop for ViewState {
@@ -189,19 +215,8 @@ impl TerminalApp {
             Action::Open(tab) => {
                 let targets = self.syscall_capture_targets();
                 if let Some(page) = self.syscall_page(tab).filter(|page| page.pending.is_none()) {
-                    let capture = &mut page.capture;
-                    capture.open = true;
+                    page.capture.open(&targets);
                     page.status = None;
-                    if !targets
-                        .iter()
-                        .any(|candidate| Some(candidate.source) == capture.source)
-                    {
-                        capture.source = match targets.as_slice() {
-                            [target] => Some(target.source),
-                            _ => None,
-                        };
-                        capture.review = None;
-                    }
                 }
             }
             Action::Back(tab) => {
@@ -240,6 +255,7 @@ impl TerminalApp {
                 }
             }
             Action::Review(tab) => self.review_syscall_capture(tab, ctx),
+            Action::SettingsFile(tab, choice) => self.syscall_settings_file(tab, choice, ctx),
             Action::Choose(tab) => self.choose_syscall_destination(tab, ctx),
             Action::Stop(tab) => {
                 if let Some(page) = self.syscall_page(tab)
@@ -280,15 +296,40 @@ impl TerminalApp {
                     Ok(Some(Outcome::Saved(capture, trace))) => {
                         page.capture.review = None;
                         let summary = capture_summary(&capture, &trace);
+                        let path = capture.path.clone();
                         if let Ok(trace) = trace {
+                            let repeat_source = page.capture.repeat_source.take();
                             page.load(trace);
+                            page.report.capture = Some(Arc::new(capture));
+                            page.report.repeat_source = repeat_source;
                         }
                         page.status = Some(summary);
                         self.remember_diagnostic(
                             w11term::diagnostic_history::Kind::SyscallTrace,
-                            [capture.path],
+                            [path],
                             ctx,
                         );
+                    }
+                    Ok(Some(Outcome::SettingsLoaded(path, options))) => {
+                        match Inputs::from_options(options) {
+                            Ok(inputs) => {
+                                page.capture.inputs = inputs;
+                                page.capture.review = None;
+                                page.status = Some(format!(
+                                    "Loaded syscall capture settings · {}",
+                                    safe_text(&path.display().to_string())
+                                ));
+                                page.capture.settings_path = Some(path);
+                            }
+                            Err(error) => page.status = Some(format!("{error:#}")),
+                        }
+                    }
+                    Ok(Some(Outcome::SettingsSaved(path))) => {
+                        page.status = Some(format!(
+                            "Saved syscall capture settings · {}",
+                            safe_text(&path.display().to_string())
+                        ));
+                        page.capture.settings_path = Some(path);
                     }
                     Ok(None) => (),
                     Err(error) => page.status = Some(error),
@@ -297,9 +338,76 @@ impl TerminalApp {
         }
     }
 
+    pub(super) fn repeat_syscall_capture(
+        &mut self,
+        original: Arc<Trace>,
+        options: SyscallOptions,
+        ctx: &ComponentContext<Self>,
+    ) -> anyhow::Result<()> {
+        let mut page = Box::<PageState>::default();
+        page.capture.inputs = Inputs::from_options(options)?;
+        page.capture.repeat_source = Some(original);
+        page.capture.open(&self.syscall_capture_targets());
+        self.new_syscall_viewer(page, ctx);
+        Ok(())
+    }
+
     fn syscall_capture_input(&mut self, tab: TabId) -> Option<&mut PageState> {
         self.syscall_page(tab)
             .filter(|page| page.capture.open && page.pending.is_none())
+    }
+
+    fn syscall_settings_file(
+        &mut self,
+        tab: TabId,
+        choice: SettingsFile,
+        ctx: &ComponentContext<Self>,
+    ) {
+        if self.tabs.active_id() != Some(tab) {
+            return;
+        }
+        let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
+            return;
+        };
+        let profile_path = self.store.path().to_owned();
+        let Some(page) = self.syscall_capture_input(tab) else {
+            return;
+        };
+        let saved_json = if matches!(choice, SettingsFile::Save) {
+            match page
+                .capture
+                .inputs
+                .options()
+                .and_then(SyscallOptions::settings_json)
+            {
+                Ok(json) => Some(json),
+                Err(error) => {
+                    page.status = Some(format!("{error:#}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let purpose = file_picker::Purpose::CaptureSettings {
+            current: page.capture.settings_path.clone().unwrap_or(profile_path),
+            kind: file_picker::CaptureFileKind::Syscall,
+            save: saved_json.is_some(),
+        };
+        let ticket = page.begin("Choosing a syscall capture settings file…");
+        run(ctx, tab, ticket, move || {
+            let Some(file) = file_picker::pick(owner, purpose)? else {
+                return Ok(None);
+            };
+            Ok(Some(if let Some(json) = saved_json {
+                w11term::transcript::save(&file.path, &json, false)
+                    .context("Saving new syscall capture settings")?;
+                Outcome::SettingsSaved(file.path)
+            } else {
+                let options = SyscallOptions::load_settings(&file.path)?;
+                Outcome::SettingsLoaded(file.path, options)
+            }))
+        });
     }
 
     fn review_syscall_capture(&mut self, tab: TabId, ctx: &ComponentContext<Self>) {
@@ -430,15 +538,7 @@ fn run(
 }
 
 fn capture_summary(capture: &SyscallCapture, trace: &Result<Arc<Trace>, String>) -> String {
-    let reason = match capture.stop_reason {
-        "stopped" => "Stopped by request".into(),
-        "time-limit" => "Time limit reached".into(),
-        "byte-budget" => "Byte budget reached. The final record may be incomplete.".into(),
-        _ => capture.command_exit_status.map_or_else(
-            || "Command completed".into(),
-            |code| format!("Command exit status {code}"),
-        ),
-    };
+    let reason = outcome_label(capture.stop_reason, capture.command_exit_status);
     let mut summary = format!(
         "Saved syscall trace\n{reason}\n{} bytes\n{}",
         capture.bytes,
@@ -450,17 +550,48 @@ fn capture_summary(capture: &SyscallCapture, trace: &Result<Arc<Trace>, String>)
     summary
 }
 
+pub(super) fn outcome_label(stop_reason: &str, exit_status: Option<u8>) -> String {
+    match stop_reason {
+        "stopped" => "Stopped by request".into(),
+        "time-limit" => "Time limit reached".into(),
+        "byte-budget" => "Byte budget reached. The final record may be incomplete.".into(),
+        _ => exit_status.map_or_else(
+            || "Command completed".into(),
+            |code| format!("Command exit status {code}"),
+        ),
+    }
+}
+
 impl ViewState {
+    fn open(&mut self, targets: &[Candidate]) {
+        self.open = true;
+        if !targets
+            .iter()
+            .any(|candidate| Some(candidate.source) == self.source)
+        {
+            self.source = match targets {
+                [target] => Some(target.source),
+                _ => None,
+            };
+            self.review = None;
+        }
+    }
+
     pub(super) fn offer(&mut self, source: Option<Connection>) {
         if !self.open && self.review.is_none() && source.is_some() {
             self.source = source;
         }
     }
 
-    pub(super) fn back(&mut self) {
+    fn back(&mut self) {
         self.open = false;
         self.review = None;
         self.stop = None;
+    }
+
+    pub(super) fn reset_for_loaded_trace(&mut self) {
+        self.back();
+        self.repeat_source = None;
     }
 
     pub(super) fn switch(
@@ -512,6 +643,26 @@ impl ViewState {
             ));
         }
         let mut fields = Vec::new();
+        fields.push(KeyedView::new(
+            "capture-settings-files",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    Button::new()
+                        .is_enabled(idle)
+                        .on_click(ctx.callback(move |_| {
+                            message(Action::SettingsFile(tab, SettingsFile::Open))
+                        }))
+                        .content("Load settings…"),
+                    Button::new()
+                        .is_enabled(idle && !self.inputs.program.trim().is_empty())
+                        .on_click(ctx.callback(move |_| {
+                            message(Action::SettingsFile(tab, SettingsFile::Save))
+                        }))
+                        .content("Save settings…"),
+                )),
+        ));
         if targets.is_empty() {
             fields.push(text(
                 "connect",
@@ -693,7 +844,7 @@ impl ViewState {
     }
 }
 
-fn text(key: &str, value: impl Into<String>) -> KeyedView {
+pub(super) fn text(key: &str, value: impl Into<String>) -> KeyedView {
     KeyedView::new(
         key,
         TextBlock::new()

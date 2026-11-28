@@ -1,11 +1,50 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::{borrow::Cow, io::Write};
-use w11term::command_reference::{self, Key, PLATFORMS, Page, PageSource, Platform, WINDOWS};
+use w11term::{
+    command_reference::{self, Key, Page, PageSource, Platform, WINDOWS},
+    control::Request,
+};
 
 pub(super) const VERB: &str = "command-reference";
 pub(super) const HELP: &str =
     "w11term-cli command-reference QUERY [--platform PLATFORM] [--search] [--format json|text]";
+pub(super) const OPEN_VERB: &str = "open-command-reference";
+pub(super) const OPEN_HELP: &str =
+    "w11term-cli [--pid PID] open-command-reference QUERY [--window ID] [--platform PLATFORM]";
+
+pub(super) fn parse_open(mut args: impl Iterator<Item = String>) -> Result<Request> {
+    let query = args
+        .next()
+        .filter(|query| !query.trim().is_empty() && !query.starts_with("--"))
+        .context("provide a command or subcommand name")?;
+    let mut window_id = None;
+    let mut platform = None;
+    while let Some(flag) = args.next() {
+        let mut value = || {
+            args.next()
+                .with_context(|| format!("{flag} requires a value"))
+        };
+        match flag.as_str() {
+            "--window" => {
+                ensure!(window_id.is_none(), "specify --window only once");
+                let id: std::num::NonZeroU64 =
+                    value()?.parse().context("provide a positive --window ID")?;
+                window_id = Some(id.get());
+            }
+            "--platform" => {
+                ensure!(platform.is_none(), "specify --platform only once");
+                platform = Some(command_reference::parse_platform(&value()?)?.0.to_owned());
+            }
+            _ => bail!("unknown option {flag} for {OPEN_VERB}"),
+        }
+    }
+    Ok(Request::OpenCommandReference {
+        query,
+        window_id,
+        platform,
+    })
+}
 
 struct Options<'a> {
     query: &'a str,
@@ -42,14 +81,10 @@ impl<'a> Options<'a> {
                     .with_context(|| format!("{flag} requires a value"))?,
             );
         }
-        let platform = match platform {
-            Some(name) => PLATFORMS
-                .iter()
-                .copied()
-                .find(|platform| platform.0.eq_ignore_ascii_case(name))
-                .with_context(|| format!("unknown command reference platform {name:?}"))?,
-            None => WINDOWS,
-        };
+        let platform = platform
+            .map(command_reference::parse_platform)
+            .transpose()?
+            .unwrap_or(WINDOWS);
         let text = match format {
             None | Some("json") => false,
             Some("text") => true,
@@ -204,4 +239,57 @@ fn write_text(report: &Report<'_>, search: bool, out: &mut dyn Write) -> Result<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, to_value};
+
+    #[test]
+    fn open_command_reference_builds_a_window_scoped_control_request() {
+        let invocation = super::super::parse_invocation(
+            [
+                "--pid",
+                "23",
+                OPEN_VERB,
+                "git checkout",
+                "--window",
+                "7",
+                "--platform",
+                "Linux",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(invocation.pid, Some(23));
+        assert_eq!(
+            to_value(invocation.request).unwrap(),
+            json!({
+                "verb": OPEN_VERB, "query": "git checkout", "window_id": 7, "platform": "linux",
+            })
+        );
+        assert_eq!(
+            to_value(parse_open(["git".to_owned()].into_iter()).unwrap()).unwrap(),
+            json!({"verb": OPEN_VERB, "query": "git"})
+        );
+    }
+
+    #[test]
+    fn open_command_reference_rejects_invalid_selectors() {
+        for args in [
+            &[][..],
+            &["--window", "7"],
+            &["git", "--window", "0"],
+            &["git", "--window", "2", "--window", "3"],
+            &["git", "--platform", "unsupported"],
+            &["git", "--platform", "common", "--platform", "linux"],
+            &["git", "--search"],
+        ] {
+            assert!(
+                parse_open(args.iter().copied().map(str::to_owned)).is_err(),
+                "{args:?}"
+            );
+        }
+    }
 }

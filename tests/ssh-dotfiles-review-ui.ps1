@@ -25,13 +25,16 @@ function Click([string]$Name) {
         }
     })
 }
+function Save-DotfileBundleDialog([string]$Path) {
+    $dialog = Wait-OwnedDialog 'Save new dotfiles bundle'
+    $null = Wait-Until 'enter a draft bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, "$Path.draft") }
+    $null = Wait-Until 'choose the bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, $Path) }
+    $null = Wait-Until 'submit the bundle picker' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
 function Save-RetainedDotfiles([string]$Path) {
     $prefix = "Saved dotfile bundle${dot}"
     Click 'Save selected dotfile bundle'
-    $dialog = Wait-OwnedDialog 'Save new dotfiles bundle'
-    $null = Wait-Until 'enter a draft retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, "$Path.draft") }
-    $null = Wait-Until 'choose the retained-bundle filename' { [FixtureDialog]::SetCommonDialogFilename($dialog, $Path) }
-    $null = Wait-Until 'save the retained bundle' { [FixtureDialog]::ClickButton($dialog, 1) }
+    Save-DotfileBundleDialog $Path
     $null = Wait-Until 'saved bundle is available at the selected Windows destination' {
         if ([IO.File]::Exists($Path)) {
             Get-NativeTextLabels | Where-Object {
@@ -426,6 +429,79 @@ try {
         $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.dotfiles
         $approved -and [FixtureDialog]::SameFile($profileSnapshot, $approved.bundle) -and
             !$approved.PSObject.Properties['bundle_sha256']
+    }
+    Click 'Revise selected dotfiles bundle'
+    $fishEnv = 'set -gx EDITOR vi'
+    $fishStartup = 'function fish_prompt; printf "fleet> "; end'
+    foreach ($fragment in @(@('Fish environment fragment', $fishEnv), @('Fish startup fragment', $fishStartup))) {
+        $search = @{ scroll = $null }
+        $null = Wait-Until "the bundle editor shows the input for '$($fragment[0])'" {
+            $entry = Find-Element $fragment[0] $edit
+            if (!$entry -or !$entry.Current.IsEnabled) { return }
+            if ($entry.Current.IsOffscreen) {
+                Move-NativeControlIntoView $entry $search
+                return
+            }
+            $field = $entry.GetCurrentPattern($value)
+            if ($field.Current.Value -ceq $fragment[1]) { return $true }
+            $field.SetValue($fragment[1])
+        }
+    }
+    Click 'Save dotfiles revision'
+    $fishBundle = Join-Path $State 'Fish profile bundle.json'
+    Save-DotfileBundleDialog $fishBundle
+    $null = Wait-Until 'the profile selects the saved Fish revision' {
+        $field = Find-Element 'Dotfiles bundle' $edit
+        $field -and [IO.File]::Exists($fishBundle) -and
+            [FixtureDialog]::SameFile($fishBundle, $field.GetCurrentPattern($value).Current.Value)
+    }
+    $saved = [IO.File]::ReadAllText($fishBundle) | ConvertFrom-Json
+    $original = $originalSnapshot | ConvertFrom-Json
+    if ($saved.fish_environment -cne $fishEnv -or $saved.fish -cne $fishStartup) {
+        throw 'The saved revision did not retain both Fish edits'
+    }
+    if ($saved.bash -cne $original.bash -or $saved.environment -cne $original.environment) {
+        throw 'The Fish revision changed the original Bash fragments'
+    }
+    Click 'Preview dotfile changes'
+    $null = Wait-Until 'the revision has no changes for the approved Bash shell' {
+        (Find-Element 'Compared with the approved bundle file on disk.') -and
+            (Find-Element 'No dotfile fragment lines changed.')
+    }
+    Select-NativeComboItem 'Dotfiles shell' 'Fish'
+    $fishDirectory = Wait-Until 'the profile shows the Fish configuration directory field' {
+        Find-Element 'Fish configuration directory (optional)' $edit
+    }
+    $fishDirectory.GetCurrentPattern($value).SetValue('xdg settings/fish')
+    Click 'Preview dotfile changes'
+    $null = Wait-Until 'the new shell preview has no approved Fish baseline' {
+        Find-Element 'No bundle is approved for this shell. Showing proposed fragments.'
+    }
+    Expand-ReviewDetail 'Prompt fragment preview'
+    $null = Wait-Until 'the Fish prompt is shown as a proposed line' {
+        Get-NativeTextLabels | Where-Object { $_.Contains('Proposed line 1') -and $_.Contains($fishStartup) }
+    }
+    $fishContents = [IO.File]::ReadAllText($fishBundle)
+    [IO.File]::WriteAllText($fishBundle, $fishContents.Replace('fleet> ', 'edited> '))
+    $savedProfile = [IO.File]::ReadAllText($profiles)
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'approval rejects a change made after preview' {
+        Get-NativeTextLabels | Where-Object { $_.Contains('The bundle changed since the preview') }
+    }
+    if ([IO.File]::ReadAllText($profiles) -cne $savedProfile) { throw 'The stale preview changed the saved profile' }
+    [IO.File]::WriteAllText($fishBundle, $fishContents)
+    Click 'Preview dotfile changes'
+    $null = Wait-Until 'the Fish revision has a fresh preview' {
+        (Find-Element 'No bundle is approved for this shell. Showing proposed fragments.') -and
+            !(Get-NativeTextLabels | Where-Object { $_.Contains('The bundle changed since the preview') })
+    }
+    Click 'Approve dotfiles sync'
+    $null = Wait-Until 'the profile can approve its Fish settings' { Find-Element "Approved for ${target}${dot}/" }
+    Save-ProfileEdit
+    $null = Wait-Until 'the Fish target and approved bundle survive saving the profile' {
+        $approved = ([IO.File]::ReadAllText($profiles) | ConvertFrom-Json).profiles.'palette-ssh'.dotfiles
+        $approved.shell -ceq 'fish' -and $approved.fish_config_dir -ceq 'xdg settings/fish' -and
+            [FixtureDialog]::SameFile($fishBundle, $approved.bundle)
     }
     if ([IO.File]::ReadAllText($selectorPath) -cne "$first`n") { throw 'Profile review changed the active remote version' }
 } finally {

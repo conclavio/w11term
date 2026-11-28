@@ -621,7 +621,7 @@ impl TerminalApp {
                     .is_some_and(|(_, work)| work.writing())
                 {
                     panel.tool_install = None;
-                    panel.focus = panel.focus.wrapping_add(1);
+                    panel.request_focus();
                 }
             }
             Action::Browse => {

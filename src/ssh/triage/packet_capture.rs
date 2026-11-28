@@ -24,10 +24,16 @@ const MAX_INTERFACES: usize = 512;
 const CAPTURE_OVERHEAD_SECONDS: u64 = 72;
 pub(crate) const CONTROL_SECONDS: u64 = 155;
 mod local;
+mod report;
 mod ring;
+mod settings;
 pub use local::{
     CaptureComparison, CaptureExcerpt, CaptureExcerptPlan, ConversationChange,
     ConversationEndpoints, ConversationQuery, LocalCapture, ip_protocol_label,
+};
+pub use report::{
+    CaptureReportDetails, CaptureReportReview, CaptureReportVerification,
+    verify_packet_capture_report,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -49,6 +55,7 @@ impl PacketCaptureOptions {
     pub const DEFAULT_SECONDS: u8 = 15;
     pub const DEFAULT_SNAP_LENGTH: u32 = 192;
     pub const DEFAULT_MAX_MIB: u8 = 16;
+    pub(crate) const MAX_MIB: u8 = 64;
 
     pub fn default_scratch_directory(tmpfs: bool) -> &'static str {
         if tmpfs { "/dev/shm" } else { "/tmp" }
@@ -72,8 +79,9 @@ impl PacketCaptureOptions {
             "Packet capture duration must be 1..=60 seconds"
         );
         ensure!(
-            (1..=64).contains(&self.max_mib),
-            "Packet capture budget must be 1..=64 MiB"
+            (1..=Self::MAX_MIB).contains(&self.max_mib),
+            "Packet capture budget must be 1..={} MiB",
+            Self::MAX_MIB,
         );
         ensure!(
             self.packet_limit != Some(0),
@@ -210,7 +218,7 @@ fn parse_interfaces(bytes: &[u8]) -> CaptureInterfaces {
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 pub struct Rotation {
     pub files: u8,
     pub bytes_per_file: u64,
@@ -235,7 +243,7 @@ pub struct Plan {
     pub review_id: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Capture {
     pub path: PathBuf,
     pub bytes: u64,
@@ -247,9 +255,17 @@ pub struct Capture {
     pub dropped_by_kernel: Option<u64>,
     pub stop_reason: &'static str,
     pub diagnostics: Vec<String>,
+    #[serde(skip)]
+    reviewed: Box<CaptureReportReview>,
 }
 
-#[derive(Serialize)]
+impl Capture {
+    pub fn options(&self) -> &PacketCaptureOptions {
+        &self.reviewed.options
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct RotationResult {
     pub retained_files: usize,
     pub overwritten_files: u64,
@@ -750,6 +766,7 @@ async fn capture_and_download(
                 .map(crate::events::display_field)
                 .filter(|line| !line.is_empty())
                 .collect(),
+            reviewed: Box::new(CaptureReportReview::from(plan)),
         },
     ))
 }

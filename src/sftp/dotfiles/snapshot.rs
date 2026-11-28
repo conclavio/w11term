@@ -30,16 +30,21 @@ impl Engine {
         self.check_entry_parent(&directory).await?;
         let [environment, prompt] = self.verified_dotfile_fragments(&home, shell, &id).await?;
         self.check_entry_parent(&directory).await?;
+        let environment = Some(manifest_fragment(environment));
+        let prompt = Some(manifest_fragment(prompt));
         let mut bundle = DotfileBundle {
             version: 1,
-            environment: Some(manifest_fragment(environment)),
+            environment: None,
             bash: None,
             zsh: None,
+            fish_environment: None,
+            fish: None,
         };
         match shell {
-            DotfileShell::Bash => bundle.bash = Some(manifest_fragment(prompt)),
-            DotfileShell::Zsh => bundle.zsh = Some(manifest_fragment(prompt)),
-        }
+            DotfileShell::Bash => (bundle.environment, bundle.bash) = (environment, prompt),
+            DotfileShell::Zsh => (bundle.environment, bundle.zsh) = (environment, prompt),
+            DotfileShell::Fish => (bundle.fish_environment, bundle.fish) = (environment, prompt),
+        };
         bundle.verify_version(shell, &id).context(
             "The retained fragments cannot be represented by an exact Windows dotfiles bundle",
         )?;

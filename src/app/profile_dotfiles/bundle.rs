@@ -1,18 +1,23 @@
 use super::*;
+use crate::app::shell_setup::Setup;
 use anyhow::Context;
 use std::cell::OnceCell;
 
 mod remote_excerpt;
 
-const FRAGMENTS: [&str; 3] = [
+const FRAGMENTS: [&str; 5] = [
     "Shared environment fragment",
     "Bash startup fragment",
     "Zsh startup fragment",
+    "Fish environment fragment",
+    "Fish startup fragment",
 ];
-const IMPORT_ITEMS: [&str; 3] = [
+const IMPORT_ITEMS: [&str; FRAGMENTS.len()] = [
     "Append to shared environment",
     "Append to Bash fragment",
     "Append to Zsh fragment",
+    "Append to Fish environment",
+    "Append to Fish fragment",
 ];
 
 #[derive(Clone)]
@@ -23,6 +28,7 @@ pub enum Action {
     Text(Arc<()>, usize, String),
     Import(Arc<()>, usize),
     Imported(Arc<()>, Result<Option<String>, String>),
+    AddSetup(Arc<()>, Setup),
     Excerpt(Arc<()>, Arc<()>, ExcerptAction),
     Save(Arc<()>),
     Saved(Arc<()>, Result<Option<String>, String>),
@@ -49,11 +55,12 @@ enum Phase {
 pub(super) struct Editor {
     ticket: Arc<()>,
     source: Option<PathBuf>,
-    fragments: [Option<String>; 3],
+    fragments: [Option<String>; FRAGMENTS.len()],
     import_menu: OnceCell<Menu>,
+    setup_menu: OnceCell<Menu>,
     remote: Option<Box<remote_excerpt::Source>>,
     phase: Phase,
-    error: Option<String>,
+    status: Option<String>,
 }
 
 fn message(id: TabId, action: Action) -> Message {
@@ -80,20 +87,27 @@ impl Editor {
             source,
             fragments: Default::default(),
             import_menu: OnceCell::new(),
+            setup_menu: OnceCell::new(),
             remote: None,
             phase,
-            error: None,
+            status: None,
         }
     }
 
     fn load(&mut self, bundle: DotfileBundle) {
-        self.fragments = [bundle.environment, bundle.bash, bundle.zsh]
-            .map(|text| text.as_deref().map(editor_text));
+        self.fragments = [
+            bundle.environment,
+            bundle.bash,
+            bundle.zsh,
+            bundle.fish_environment,
+            bundle.fish,
+        ]
+        .map(|text| text.as_deref().map(editor_text));
         self.phase = Phase::Ready;
     }
 
     fn bundle(&self) -> DotfileBundle {
-        let [environment, bash, zsh] = self
+        let [environment, bash, zsh, fish_environment, fish] = self
             .fragments
             .each_ref()
             .map(|text| text.as_deref().map(fragment_text));
@@ -102,6 +116,8 @@ impl Editor {
             environment,
             bash,
             zsh,
+            fish_environment,
+            fish,
         }
     }
 
@@ -116,6 +132,25 @@ impl Editor {
         } else {
             "dotfiles.json".into()
         }
+    }
+
+    fn add_setup(&mut self, setup: Setup) {
+        let index = match setup.shell() {
+            DotfileShell::Bash => 1,
+            DotfileShell::Zsh => 2,
+            DotfileShell::Fish => 4,
+        };
+        let existing = fragment_text(self.fragments[index].as_deref().unwrap_or_default());
+        self.status = Some(match setup.insert(&existing) {
+            Ok(updated) if updated == existing => {
+                format!("{} already includes this setup.", FRAGMENTS[index])
+            }
+            Ok(updated) => {
+                self.fragments[index] = Some(editor_text(&updated));
+                format!("{} now includes the selected setup.", FRAGMENTS[index])
+            }
+            Err(error) => format!("{error:#}"),
+        });
     }
 
     pub(super) fn view(&self, id: TabId, ctx: &ViewContext<TerminalApp>) -> View {
@@ -164,6 +199,29 @@ impl Editor {
                     .content("Import shell fragment")
                     .menu(menu.clone()),
             ));
+            let setup_menu = self.setup_menu.get_or_init(|| {
+                let ticket = self.ticket.clone();
+                Menu::new(
+                    Setup::ALL
+                        .map(|setup| MenuItem::item(setup.bundle_label(), setup.bundle_label())),
+                    ctx.callback(move |label: String| {
+                        Setup::ALL
+                            .into_iter()
+                            .find(|setup| setup.bundle_label() == label)
+                            .map_or(Message::ControlIdle, |setup| {
+                                message(id, Action::AddSetup(ticket.clone(), setup))
+                            })
+                    }),
+                )
+            });
+            views.push(KeyedView::new(
+                "bundle-editor-setup",
+                Button::new()
+                    .automation_name("Add shell setup")
+                    .is_enabled(self.phase == Phase::Ready)
+                    .content("Add shell setup")
+                    .menu(setup_menu.clone()),
+            ));
             for (index, name) in FRAGMENTS.into_iter().enumerate() {
                 let ticket = self.ticket.clone();
                 let text = self.fragments[index].as_deref().unwrap_or_default();
@@ -186,7 +244,7 @@ impl Editor {
                 ));
             }
         }
-        if let Some(status) = self.error.as_deref().or(match self.phase {
+        if let Some(status) = self.status.as_deref().or(match self.phase {
             Phase::Loading => Some("Reading the selected dotfiles bundle…"),
             Phase::Importing(_) => Some("Reading the selected shell fragment…"),
             Phase::Saving => Some("Saving the dotfiles bundle…"),
@@ -243,7 +301,7 @@ impl super::Editor {
         let remote = remote_excerpt::Source::new(endpoint, path, text)?;
         let editor = self.composer.get_or_insert_with(|| Editor::new(None));
         editor.remote = Some(Box::new(remote));
-        editor.error = None;
+        editor.status = None;
         self.error = None;
         self.expanded = true;
         Ok(())
@@ -258,7 +316,11 @@ impl super::Editor {
         ctx: &ComponentContext<TerminalApp>,
     ) {
         if matches!(action, Action::Create | Action::Revise) {
-            if self.composer.is_some() || self.checking.is_some() || self.browsing.is_some() {
+            if self.composer.is_some()
+                || self.checking.is_some()
+                || self.browsing.is_some()
+                || self.preview.loading()
+            {
                 return;
             }
             let source = if matches!(action, Action::Revise) {
@@ -307,6 +369,7 @@ impl super::Editor {
             | Action::Text(ticket, ..)
             | Action::Import(ticket, _)
             | Action::Imported(ticket, _)
+            | Action::AddSetup(ticket, _)
             | Action::Excerpt(ticket, ..)
             | Action::Save(ticket)
             | Action::Saved(ticket, _)
@@ -328,9 +391,10 @@ impl super::Editor {
                 let fragment = &mut editor.fragments[index];
                 if fragment.as_deref().unwrap_or_default() != text {
                     *fragment = (!text.is_empty()).then_some(text);
-                    editor.error = None;
+                    editor.status = None;
                 }
             }
+            Action::AddSetup(_, setup) if editor.phase == Phase::Ready => editor.add_setup(setup),
             Action::Import(ticket, index) if editor.phase == Phase::Ready => {
                 let Some(owner) = owner else { return };
                 let existing =
@@ -341,7 +405,7 @@ impl super::Editor {
                     .unwrap_or(profile_catalog)
                     .to_owned();
                 editor.phase = Phase::Importing(index);
-                editor.error = None;
+                editor.status = None;
                 let rejected = message(
                     id,
                     Action::Imported(ticket.clone(), Err("Fragment import unavailable".into())),
@@ -374,7 +438,7 @@ impl super::Editor {
                     match result {
                         Ok(Some(text)) => editor.fragments[index] = Some(editor_text(&text)),
                         Ok(None) => {}
-                        Err(error) => editor.error = Some(error),
+                        Err(error) => editor.status = Some(error),
                     }
                 }
             }
@@ -393,7 +457,7 @@ impl super::Editor {
                 let Some(owner) = owner else { return };
                 let bundle = editor.bundle();
                 if let Err(error) = bundle.validate_for_editing() {
-                    editor.error = Some(format!("{error:#}"));
+                    editor.status = Some(format!("{error:#}"));
                     return;
                 }
                 let purpose = file_picker::Purpose::SaveDotfilesBundle {
@@ -405,7 +469,7 @@ impl super::Editor {
                     suggestion: editor.suggestion(),
                 };
                 editor.phase = Phase::Saving;
-                editor.error = None;
+                editor.status = None;
                 let rejected = message(
                     id,
                     Action::Saved(ticket.clone(), Err("Bundle save unavailable".into())),
@@ -440,7 +504,7 @@ impl super::Editor {
                         self.composer = None;
                     }
                     Ok(None) => {}
-                    Err(error) => editor.error = Some(error),
+                    Err(error) => editor.status = Some(error),
                 }
             }
             Action::Cancel(_) if matches!(editor.phase, Phase::Loading | Phase::Ready) => {

@@ -1,4 +1,6 @@
-use super::{Action as ViewerAction, Outcome, Profile, message, text};
+use super::{
+    Action as ViewerAction, CapturedProfile, Outcome, Profile, ProfileSource, message, text,
+};
 use crate::app::*;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -15,6 +17,7 @@ pub struct Connection {
 
 pub enum Action {
     Open,
+    Repeat,
     Back,
     Edit(Field, String),
     Mode(usize),
@@ -45,6 +48,12 @@ pub struct Recording {
     review: Review,
     path: PathBuf,
     keep_raw: bool,
+    original: Option<ProfileSource>,
+}
+
+pub(super) struct Repeat {
+    review: Review,
+    keep_raw: bool,
 }
 
 #[derive(Clone)]
@@ -74,6 +83,8 @@ pub(super) struct Form {
     mode: CpuCallGraph,
     keep_raw: bool,
     source: Option<Connection>,
+    expected_process: Option<(Connection, u64)>,
+    original: Option<ProfileSource>,
     pub review: Option<Review>,
 }
 
@@ -86,6 +97,8 @@ impl Form {
             mode: CpuCallGraph::Fp,
             keep_raw: false,
             source: None,
+            expected_process: None,
+            original: None,
             review: None,
         }
     }
@@ -150,7 +163,10 @@ impl Form {
     }
 
     fn available(&self, active: Option<Connection>) -> bool {
-        active.is_some() && (self.source.is_none() || self.source == active)
+        let source = self
+            .source
+            .or(self.expected_process.map(|(connection, _)| connection));
+        active.is_some() && (source.is_none() || source == active)
     }
 
     pub fn fields(
@@ -268,6 +284,8 @@ impl Form {
                 "connection-needed",
                 if self.source.is_some() {
                     "Return to the SSH connection that collected this triage report."
+                } else if self.expected_process.is_some() {
+                    "Return to the original SSH connection or enter a PID for the selected pane."
                 } else {
                     "Select a connected Linux SSH pane."
                 },
@@ -309,6 +327,46 @@ impl Form {
             }
         }
         fields
+    }
+}
+
+impl Repeat {
+    fn draft(&self, active: Option<Connection>, original: ProfileSource) -> Form {
+        let mut form = Form {
+            keep_raw: self.keep_raw,
+            original: Some(original),
+            ..Form::new()
+        };
+        let (seconds, frequency, mode) = match &self.review.plan {
+            ReviewedTarget::Process(plan) => {
+                if active == Some(self.review.connection) {
+                    form.target = TargetInput::Process(plan.options.target_pid.to_string());
+                    form.expected_process =
+                        Some((self.review.connection, plan.process_start_ticks));
+                }
+                (
+                    plan.options.seconds,
+                    plan.options.frequency,
+                    plan.options.call_graph,
+                )
+            }
+            ReviewedTarget::Command(plan) => {
+                form.target = TargetInput::Command {
+                    program: plan.options.program.clone(),
+                    arguments: serde_json::json!(plan.options.arguments).to_string(),
+                    directory: plan.options.directory.clone(),
+                };
+                (
+                    plan.options.seconds,
+                    plan.options.frequency,
+                    plan.options.call_graph,
+                )
+            }
+        };
+        form.seconds = seconds.to_string();
+        form.frequency = frequency.to_string();
+        form.mode = mode;
+        form
     }
 }
 
@@ -425,6 +483,16 @@ impl TerminalApp {
                 self.flame_graph.status = None;
                 self.flame_graph.capture = Some(Form::new());
             }
+            Action::Repeat => {
+                let active = self.profile_connection();
+                let panel = &mut self.flame_graph;
+                if let Some(graph) = panel.visible_graph()
+                    && let Some(capture) = &graph.capture
+                {
+                    panel.capture = Some(capture.repeat.draft(active, graph.source()));
+                    panel.status = None;
+                }
+            }
             Action::Back => {
                 self.flame_graph.status = None;
                 self.flame_graph.capture = None;
@@ -442,6 +510,9 @@ impl TerminalApp {
                     };
                     if *current != value {
                         *current = value;
+                        if matches!(field, Field::Pid) {
+                            form.expected_process = None;
+                        }
                         form.review = None;
                         self.flame_graph.status = None;
                     }
@@ -461,6 +532,7 @@ impl TerminalApp {
                     } else {
                         TargetInput::Process(String::new())
                     };
+                    form.expected_process = None;
                     form.review = None;
                     self.flame_graph.status = None;
                 }
@@ -496,6 +568,7 @@ impl TerminalApp {
         let Some(connection) = connection.filter(|_| form.available(connection)) else {
             return;
         };
+        let expected_start = form.expected_process.map(|(_, ticks)| ticks);
         let result = form.options().and_then(|options| {
             let target = self
                 .triage_session()
@@ -524,10 +597,16 @@ impl TerminalApp {
         ));
         ctx.spawn_background_with_rejection(
             move |_| {
-                let result = options
-                    .preview(target)
-                    .map(|plan| Some(Outcome::Reviewed(Box::new(Review { connection, plan }))))
-                    .map_err(|error| format!("{error:#}"));
+                let result = (|| -> anyhow::Result<_> {
+                    let plan = options.preview(target)?;
+                    if let Some(expected) = expected_start {
+                        anyhow::ensure!(
+                            matches!(&plan, ReviewedTarget::Process(plan) if plan.process_start_ticks == expected),
+                            "The original PID now belongs to a different process. Enter the PID you want to profile."
+                        );
+                    }
+                    Ok(Some(Outcome::Reviewed(Box::new(Review { connection, plan }))))
+                })().map_err(|error| format!("{error:#}"));
                 message(ViewerAction::Finished(ticket, result))
             },
             rejected,
@@ -535,11 +614,12 @@ impl TerminalApp {
     }
 
     fn record_cpu_capture(&mut self, ctx: &ComponentContext<Self>) {
-        let Some((review, keep_raw)) = self
-            .flame_graph
-            .capture
-            .as_ref()
-            .and_then(|form| form.review.clone().map(|review| (review, form.keep_raw)))
+        let Some((review, keep_raw, original)) =
+            self.flame_graph.capture.as_ref().and_then(|form| {
+                form.review
+                    .clone()
+                    .map(|review| (review, form.keep_raw, form.original.clone()))
+            })
         else {
             return;
         };
@@ -584,6 +664,7 @@ impl TerminalApp {
                                     review,
                                     path: file.path,
                                     keep_raw,
+                                    original,
                                 }))
                             },
                         ),
@@ -602,6 +683,7 @@ impl TerminalApp {
             review,
             path,
             keep_raw,
+            original,
         } = recording;
         let (user, host, port) = match &review.plan {
             ReviewedTarget::Process(plan) => (&plan.user, &plan.host, plan.port),
@@ -644,7 +726,12 @@ impl TerminalApp {
                             path.display()
                         )
                     })?;
-                    Ok(Some(Outcome::Captured(Arc::new(profile), path, summary)))
+                    let capture = Box::new(CapturedProfile {
+                        summary,
+                        repeat: Repeat { review, keep_raw },
+                        original,
+                    });
+                    Ok(Some(Outcome::Captured(Arc::new(profile), path, capture)))
                 })()
                 .map_err(|error| format!("{error:#}"));
                 message(ViewerAction::Finished(ticket, result))

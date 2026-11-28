@@ -4,6 +4,7 @@ param([Parameter(Mandatory)][string]$Gui, [Parameter(Mandatory)][string]$Cli,
 Add-Type -Path (Join-Path $PSScriptRoot 'support/save-dialog.cs')
 
 $destination = Join-Path $State 'reviewed capture.pcap'
+$repeated = Join-Path $State 'reused settings.pcap'
 $olderCapture = Join-Path $State 'older capture.pcapng'
 $partialCapture = Join-Path $State 'incomplete capture.pcapng'
 $conversationCapture = Join-Path $State 'IP conversations.pcap'
@@ -16,6 +17,8 @@ $invalidCapture = Join-Path $State 'not a capture.pcap'
 $viewer = Join-Path $State 'Fixture Wireshark.exe'
 $startMarker = [IO.File]::ReadAllText((Join-Path $State 'pcap-start-marker'))
 $saveLabel = 'Capture and save' + [char]0x2026
+$reuseLabel = 'Reuse capture settings'
+$repeatCompareLabel = 'Compare with original capture'
 $openCaptureLabel = 'Open capture file' + [char]0x2026
 $compareCaptureLabel = 'Compare captures' + [char]0x2026
 $chooseViewerLabel = 'Choose Wireshark executable' + [char]0x2026
@@ -162,8 +165,11 @@ function Click([string]$Name, [System.Windows.Automation.ControlType]$Type = $bu
 }
 
 function Set-Field([string]$Name, [string]$Text) {
-    $field = Wait-Until "editable '$Name' field" { Find-Element $Name $edit }
-    $field.SetFocus()
+    $field = Wait-Until "editable '$Name' field" {
+        $item = Find-Element $Name $edit
+        if ($item -and $item.Current.IsEnabled) { $item }
+    }
+    try { $field.SetFocus() } catch { throw "Could not focus '$Name': $_" }
     $field = Wait-Until "focused '$Name' field" {
         $item = Find-Element $Name $edit
         if ($item -and $item.Current.HasKeyboardFocus) { $item }
@@ -174,12 +180,50 @@ function Set-Field([string]$Name, [string]$Text) {
     }
 }
 
+function Read-CaptureField([string]$Name) {
+    $field = Find-Element $Name $edit
+    if ($field) { $field.GetCurrentPattern($value).Current.Value }
+}
+
+function Wait-ReusedSettings {
+    $expected = @{
+        'Linux network interface' = 'lo'
+        'Capture filter (optional)' = 'udp and dst port 4321'
+        'Duration in seconds' = '15'
+        'Snap length in bytes' = '192'
+        'Maximum capture size in MiB' = '1'
+        'Packet limit (optional)' = '3'
+        'Rolling capture files (optional)' = '2'
+        'Remote scratch directory (optional)' = '/dev/shm'
+    }
+    $null = Wait-Until 'recorded packet settings populate the focused form and require review' {
+        foreach ($name in $expected.Keys) {
+            if ((Read-CaptureField $name) -cne $expected[$name]) { return }
+        }
+        $interface = Find-Element 'Linux network interface' $edit
+        $ram = Find-Element 'Use RAM-backed scratch storage' $check
+        $interface -and $interface.Current.HasKeyboardFocus -and
+            $ram -and $ram.GetCurrentPattern($toggle).Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On -and
+            !(Find-Element $saveLabel $button)
+    }
+}
+
 function Select-Capture([string]$Path, [string]$Trigger = $openCaptureLabel, [string]$Title = 'Open packet capture') {
     Click $Trigger
     $dialog = Wait-Until 'owned source capture picker' { Find-OwnedDialog $Title }
     $null = Wait-Until 'enter the source capture path' { [FixtureDialog]::SetFilename($dialog, $Path, '') }
     $null = Wait-Until 'select the source capture' { [FixtureDialog]::ClickButton($dialog, 1) }
     $null = Wait-Until 'source capture picker closed' { !(Find-OwnedDialog $Title) }
+}
+
+function Select-CaptureReport([string]$Path, [string]$Suggested) {
+    Click ('Verify capture report' + [char]0x2026)
+    $dialog = Wait-Until 'owned packet capture verification picker' { Find-OwnedDialog 'Open packet capture report' }
+    $null = Wait-Until 'select the packet report path' {
+        [FixtureDialog]::SetFilename($dialog, $Path, $Suggested) -or
+            [FixtureDialog]::SetCommonDialogFilename($dialog, $Path)
+    }
+    $null = Wait-Until 'verify the selected report' { [FixtureDialog]::ClickButton($dialog, 1) }
 }
 
 function Test-CaptureFile([string]$Path) {
@@ -296,10 +340,10 @@ try {
     Select-Capture $olderCapture
     $null = Wait-Until 'an earlier capture opens before any SSH connection' {
         (Find-Element "PCAPNG${dot}292 bytes") -and
-            (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated") -and
+            (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated${dot}16 original bytes") -and
             (Find-Element "Timestamp span 0.500 s${dot}2 of 3 packets timestamped") -and
             (Find-Element "Interfaces 2${dot}Ethernet, Linux cooked v2") -and
-            (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated") -and
+            (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated${dot}12 original bytes") -and
             (Find-Element "Reported${dot}Received 12") -and
             (Find-Element "Reported${dot}Interface drops 1")
     }
@@ -313,17 +357,18 @@ try {
     Select-NativeComboItem 'Saved capture interfaces' "Section 1${dot}Interface 1${dot}wireless"
     $null = Wait-Until 'the selected interface shows its own capture totals and snap length' {
         (Find-Element "wireless${dot}Linux cooked v2${dot}Unlimited snap length") -and
-            (Find-Element "Interface packets 1${dot}4 captured bytes${dot}0 truncated") -and
+            (Find-Element "Interface packets 1${dot}4 captured bytes${dot}0 truncated${dot}4 original bytes") -and
             (Find-Element "Reported${dot}Received 100") -and
             (Find-Element "Reported${dot}Interface drops 0${dot}OS drops 5")
     }
     $summary = & $Cli inspect-packet-capture $olderCapture | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or !$summary.complete -or $summary.format -cne 'pcapng' -or
         $summary.file_bytes -ne 292 -or $summary.packets -ne 3 -or $summary.captured_bytes -ne 12 -or
-        $summary.truncated_packets -ne 1 -or $summary.timestamped_packets -ne 2 -or
+        $summary.original_bytes -ne 16 -or $summary.truncated_packets -ne 1 -or $summary.timestamped_packets -ne 2 -or
         $summary.timestamp_span_ns -cne '500000000' -or $summary.interfaces -ne 2 -or
         $summary.link_types.Count -ne 2 -or $summary.link_types[0] -ne 1 -or $summary.link_types[1] -ne 276 -or
         $summary.interface_details[0].name -cne 'wired' -or $summary.interface_details[0].packets -ne 2 -or
+        $summary.interface_details[0].original_bytes -ne 12 -or
         $summary.interface_details[1].name -cne 'wireless' -or $summary.interface_details[1].packets -ne 1 -or
         $summary.interface_details[1].snap_length -ne $null -or
         $summary.interface_details[0].capture_statistics.os_dropped -ne $null -or
@@ -348,7 +393,7 @@ try {
     Click ('Reopen ' + [IO.Path]::GetFileName($olderCapture))
     $null = Wait-Until 'recent packet capture reopens and is validated again' {
         (Find-Element "PCAPNG${dot}292 bytes") -and
-        (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated") -and
+        (Find-Element "Interface packets 2${dot}8 captured bytes${dot}1 truncated${dot}12 original bytes") -and
         !(Find-Element 'Choose a PCAP or PCAPNG capture file') -and
         !(Find-Element 'Diagnostics overview panel')
     }
@@ -386,7 +431,7 @@ try {
         $open = Find-Element 'Open in Wireshark' $button
         $open -and $open.Current.IsEnabled -and
             (Find-Element "Partial packet summary${dot}Incomplete or invalid PCAPNG block length") -and
-            (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated")
+            (Find-Element "Packets 3${dot}12 captured bytes${dot}1 truncated${dot}16 original bytes")
     }
     $partial = & $Cli inspect-packet-capture $partialCapture | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or $partial.complete -or $partial.packets -ne 3 -or
@@ -443,7 +488,7 @@ try {
     $null = Wait-Until 'comparison shows both files, signed capture changes, and the changed IP pair' {
         (Find-Element "Before${dot}IP conversations.pcap${dot}PCAP") -and
         (Find-Element "After${dot}older capture.pcapng${dot}PCAPNG") -and
-        (Find-Element "Capture change${dot}-4 packets${dot}-330 captured bytes${dot}+1 truncated") -and
+        (Find-Element "Capture change${dot}-4 packets${dot}-330 captured bytes${dot}+1 truncated${dot}-326 original bytes") -and
         (Find-Element "After average${dot}Unavailable") -and
         (Find-Element 'IP conversation changes 3') -and
         (Find-Element "192.0.2.1 $bothDirections 192.0.2.2") -and
@@ -505,10 +550,10 @@ try {
     }
     Select-Capture $slowerCapture $compareCaptureLabel 'Choose after packet capture'
     $null = Wait-Until 'equal packet counts show slower rates across the longer capture window' {
-        (Find-Element "Capture change${dot}+0 packets${dot}+0 captured bytes${dot}+0 truncated") -and
-        (Find-Element "Before average${dot}1.167 packets/s, 57.000 captured bytes/s") -and
-        (Find-Element "After average${dot}0.583 packets/s, 28.500 captured bytes/s") -and
-        (Find-Element "Average change${dot}-0.583 packets/s, -28.500 captured bytes/s") -and
+        (Find-Element "Capture change${dot}+0 packets${dot}+0 captured bytes${dot}+0 truncated${dot}+0 original bytes") -and
+        (Find-Element "Before average${dot}1.167 packets/s, 57.000 captured bytes/s, 57.000 original bytes/s") -and
+        (Find-Element "After average${dot}0.583 packets/s, 28.500 captured bytes/s, 28.500 original bytes/s") -and
+        (Find-Element "Average change${dot}-0.583 packets/s, -28.500 captured bytes/s, -28.500 original bytes/s") -and
         (Find-Element 'IP conversation changes 3') -and
         (Find-Element "Average change${dot}-0.250 packets/s, -12.167 captured bytes/s")
     }
@@ -583,7 +628,7 @@ try {
     Click 'Compare selected interval'
     $null = Wait-Until 'the comparison counts only packets within the selected interval' {
         (Find-Element "Comparing elapsed interval${dot}+0.786432 to +1.048576 s") -and
-        (Find-Element "Capture change${dot}-1 packets${dot}-38 captured bytes${dot}+0 truncated") -and
+        (Find-Element "Capture change${dot}-1 packets${dot}-38 captured bytes${dot}+0 truncated${dot}-38 original bytes") -and
         (Find-Element 'Average rates over the selected elapsed interval') -and
         (Find-Element 'IP conversation changes 1')
     }
@@ -629,7 +674,7 @@ try {
     Click 'Compare selected interval'
     $null = Wait-Until 'the report compares the complete selected range' {
         (Find-Element "Comparing elapsed interval${dot}+0.786432 to +3.145728 s") -and
-        (Find-Element "Capture change${dot}-2 packets${dot}-68 captured bytes${dot}+0 truncated") -and
+        (Find-Element "Capture change${dot}-2 packets${dot}-68 captured bytes${dot}+0 truncated${dot}-68 original bytes") -and
         (Find-Element 'IP conversation changes 1') -and
         (Find-Element "2001:db8::1 $bothDirections 2001:db8::2")
     }
@@ -988,6 +1033,70 @@ try {
         (Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","3","-w","-","--","udp and dst port 4321"]') -and
             (Find-Element "Keep up to 2 files${dot}524288 bytes per file. The oldest file is replaced when the buffer fills.")
     }
+
+    $settingsFile = Join-Path $State 'packet capture settings.json'
+    $settingsSection = Open-PacketSection 'packet-capture-settings'
+    Click ('Save settings' + [char]0x2026)
+    $dialog = Wait-Until 'owned packet settings save dialog' { Find-OwnedDialog 'Save packet capture settings' }
+    $null = Wait-Until 'enter the settings destination' {
+        [FixtureDialog]::SetFilename($dialog, $settingsFile, 'packet-capture-settings.json')
+    }
+    $null = Wait-Until 'save packet capture settings' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the saved capture settings and enabled inputs' {
+        $field = Find-Element 'Capture filter (optional)' $edit
+        [IO.File]::Exists($settingsFile) -and $field -and $field.Current.IsEnabled
+    }
+    $settings = [IO.File]::ReadAllText($settingsFile) | ConvertFrom-Json
+    if ($settings.schema_version -ne 1 -or $settings.options.interface -cne 'lo' -or
+        $settings.options.filter -cne 'udp and dst port 4321' -or $settings.options.snap_length -ne 192 -or
+        $settings.options.seconds -ne 15 -or $settings.options.max_mib -ne 1 -or
+        $settings.options.packet_limit -ne 3 -or $settings.options.rotate_files -ne 2 -or
+        !$settings.options.require_tmpfs -or $settings.options.scratch_directory -cne '/dev/shm' -or
+        @($settings.PSObject.Properties.Name).Count -ne 2) {
+        throw 'The packet settings file changed the reviewed inputs or contained execution scope'
+    }
+    $cliSettings = Join-Path $State 'scripted capture settings.json'
+    $created = & $Cli save-packet-capture-settings --interface lo --filter 'udp and dst port 4321' `
+        --snap-length 192 --seconds 15 --max-mib 1 --packet-limit 3 --rotate-files 2 --tmpfs `
+        --output-file $cliSettings | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or !$created.ok -or ![IO.File]::Exists($cliSettings) -or
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliSettings)) -cne
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($settingsFile))) {
+        throw 'The CLI-generated capture settings differ from the Windows export'
+    }
+
+    Set-Field 'Capture filter (optional)' 'udp and dst port 1234'
+    Set-Field 'Duration in seconds' '10'
+    Click 'Review packet capture'
+    $null = Wait-Until 'changed inputs have their own review' {
+        Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","3","-w","-","--","udp and dst port 1234"]'
+    }
+    Select-Capture $cliSettings ('Load settings' + [char]0x2026) 'Open packet capture settings'
+    $null = Wait-Until 'loading restores the original filter and clears the previous review' {
+        $field = Find-Element 'Capture filter (optional)' $edit
+        $duration = Find-Element 'Duration in seconds' $edit
+        $field -and $field.Current.IsEnabled -and
+            $field.GetCurrentPattern($value).Current.Value -ceq 'udp and dst port 4321' -and
+            $duration -and $duration.GetCurrentPattern($value).Current.Value -ceq '15' -and
+            !(Find-Element $saveLabel $button)
+    }
+    $plan = (Control @('preview-packet-capture','--pane',"$remote",'--settings',$settingsFile)).plan
+    if (@($plan.options.PSObject.Properties.Name).Count -ne @($settings.options.PSObject.Properties.Name).Count) {
+        throw 'The CLI preview returned a different set of capture options'
+    }
+    foreach ($property in $settings.options.PSObject.Properties) {
+        $preview = $plan.options.PSObject.Properties[$property.Name]
+        if ($null -eq $preview -or $preview.Value -cne $property.Value) {
+            throw "The CLI preview differs from the exported packet setting $($property.Name)"
+        }
+    }
+    if ([IO.File]::Exists($startMarker)) { throw 'Loading or reviewing settings started a capture' }
+    $settingsSection.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
+    Click 'Review packet capture'
+    $null = Wait-Until 'the reloaded packet settings receive a fresh review' {
+        Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","3","-w","-","--","udp and dst port 4321"]'
+    }
+
     $null = Control @('focus-pane','--pane',"$local")
     Wait-Focus $local
     $null = Wait-Until 'the other pane cannot start the reviewed capture' {
@@ -1020,6 +1129,12 @@ try {
             (Find-Element "Rolling capture${dot}3 captured${dot}2 files kept${dot}1 overwritten") -and
             [IO.File]::Exists($destination)
     }
+    if (Find-Element $repeatCompareLabel $button) {
+        throw 'A standalone packet capture offered comparison with an unrelated original'
+    }
+    Set-Field 'Duration in seconds' '5'
+    Click $reuseLabel
+    Wait-ReusedSettings
 
     $null = Control @('close-pane','--pane',"$remote")
     Wait-Focus $local
@@ -1029,12 +1144,164 @@ try {
         Find-Element ('Reopen ' + [IO.Path]::GetFileName($destination)) $button
     }
     Click 'Open Packet capture activity'
+    $reportPath = $destination + '.json'
+    Click ('Save capture report' + [char]0x2026)
+    $dialog = Wait-Until 'owned packet capture report picker' { Find-OwnedDialog 'Save packet capture report' }
+    $null = Wait-Until 'accept the suggested packet capture report location' {
+        [FixtureDialog]::SetFilename($dialog, $reportPath, [IO.Path]::GetFileName($reportPath))
+    }
+    $null = Wait-Until 'save the packet capture report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the capture report is saved after closing SSH' {
+        [IO.File]::Exists($reportPath) -and (Find-Element 'Open in Wireshark' $button).Current.IsEnabled
+    }
+    $report = [IO.File]::ReadAllText($reportPath) | ConvertFrom-Json
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($destination))).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $sha256.Dispose()
+    }
+    if ($report.schema_version -ne 1 -or $report.file_name -cne [IO.Path]::GetFileName($destination) -or
+        $report.sha256 -cne $digest -or
+        $report.bytes -ne 64 -or $report.packets -ne 2 -or $report.stop_reason -cne 'stopped' -or
+        $report.dropped_by_kernel -ne 0 -or $report.rotation.overwritten_files -ne 1 -or
+        $report.reviewed.host_key_fingerprint -cne $plan.host_key_fingerprint -or
+        $report.reviewed.options.filter -cne 'udp and dst port 4321' -or
+        $report.reviewed.options.rotate_files -ne 2 -or $report.reviewed.scratch_filesystem -cne 'tmpfs') {
+        throw 'The saved report does not describe the verified packet capture and its reviewed settings'
+    }
+    $reportSettings = Join-Path $State 'verified packet settings.json'
+    $verified = & $Cli verify-packet-capture-report $destination $reportPath --save-settings $reportSettings | ConvertFrom-Json
+    $details = $verified.result.details
+    if ($LASTEXITCODE -ne 0 -or !$verified.ok -or $verified.result.sha256 -cne $digest -or $verified.result.bytes -ne 64 -or
+        $details.file_name -cne $report.file_name -or $details.stop_reason -cne 'stopped' -or
+        $null -eq $details.dropped_by_kernel -or $details.dropped_by_kernel -ne 0 -or
+        $details.rotation.overwritten_files -ne 1 -or $details.reviewed.host_key_fingerprint -cne $plan.host_key_fingerprint -or
+        $details.reviewed.options.snap_length -ne 192 -or $details.reviewed.options.filter -cne 'udp and dst port 4321') {
+        throw 'The CLI did not verify the Windows capture with the recorded report details'
+    }
+    if (![FixtureDialog]::SameFile($reportSettings, $verified.result.settings_path) -or
+        [IO.File]::ReadAllText($reportSettings) -cne [IO.File]::ReadAllText($settingsFile)) {
+        throw 'The verified packet report did not reproduce the original settings file'
+    }
+    Select-Capture $destination
+    $null = Wait-Until 'the saved packet file reopens in offline inspection' {
+        (Find-Element "PCAP${dot}64 bytes") -and !(Find-Element ('Save capture report' + [char]0x2026) $button) -and
+            !(Find-Element $reuseLabel $button)
+    }
+    $reportName = [IO.Path]::GetFileName($reportPath)
+    Select-CaptureReport $reportPath $reportName
+    $null = Wait-Until 'the offline viewer verifies the matching report' {
+        (Find-Element "Capture matches report${dot}64 bytes verified") -and
+            (Find-Element 'Details from capture report') -and
+            (Find-Element "Capture filter${dot}udp and dst port 4321") -and
+            (Find-Element "Stopped by request${dot}2 packets saved")
+    }
+    Set-Field 'Capture filter (optional)' 'udp and dst port 2345'
+    Click $reuseLabel
+    Wait-ReusedSettings
+    $review = Find-Element 'Review packet capture' $button
+    if (!$review -or $review.Current.IsEnabled -or !(Find-Element 'Details from capture report')) {
+        throw 'Offline reuse did not retain the report or required SSH review'
+    }
     Select-Viewer
     if ([IO.File]::Exists($destination + '.opened')) { throw 'Selecting a viewer opened it without activation' }
     Click 'Open in Wireshark'
     $null = Wait-Until 'viewer receives the saved path and -r flag' {
         $opened = $destination + '.opened'
         [IO.File]::Exists($opened) -and [IO.File]::ReadAllText($opened) -ceq '-r'
+    }
+    $other = Join-Path (Split-Path -Parent $destination) 'packet-report-empty.pcap'
+    Write-CaptureFixture $other 1 @()
+    Select-Capture $other
+    $null = Wait-Until 'switching the capture clears the previous report details' {
+        (Test-CaptureFile $other) -and
+            (Find-Element "PCAP${dot}24 bytes") -and
+            !(Find-Element 'Details from capture report') -and
+            !(Find-Element "Capture matches report${dot}64 bytes verified") -and !(Find-Element $reuseLabel $button)
+    }
+
+    Select-Capture $destination
+    $invalidReport = Join-Path $State 'invalid packet capture settings.json'
+    $report.reviewed.options.seconds = 0
+    [IO.File]::WriteAllText($invalidReport, ($report | ConvertTo-Json -Depth 8))
+    Select-CaptureReport $invalidReport $reportName
+    $null = Wait-Until 'the report with invalid settings still verifies the capture bytes' {
+        (Find-Element "Capture matches report${dot}64 bytes verified") -and
+            (Find-Element "Interface lo${dot}192-byte snap length${dot}0 seconds${dot}1 MiB")
+    }
+    Set-Field 'Duration in seconds' '5'
+    Click $reuseLabel
+    $null = Wait-Until 'invalid recorded options leave the editable draft intact' {
+        (Find-Element 'Invalid recorded capture settings: Packet capture duration must be 1..=60 seconds') -and
+            (Read-CaptureField 'Duration in seconds') -ceq '5'
+    }
+    Select-CaptureReport $reportPath $reportName
+    Click $reuseLabel
+    Wait-ReusedSettings
+    $startStamp = [IO.File]::GetLastWriteTimeUtc($startMarker)
+    $remote = (Control @('open','--profile','palette-ssh','--activate')).pane
+    Wait-Focus $remote
+    $null = Control @('wait-ssh-connected','--pane',"$remote",'--timeout','15')
+    Run-Palette 'Packet capture'
+    Set-Field 'Duration in seconds' '5'
+    Click 'Review packet capture'
+    $null = Wait-Until 'the edited draft has a different review' {
+        (Find-Element "5 seconds${dot}1 MiB${dot}Packet ceiling 3") -and
+            (Find-Element $saveLabel $button)
+    }
+    Click $reuseLabel
+    Wait-ReusedSettings
+    Click 'Review packet capture'
+    $null = Wait-Until 'restored packet settings are reviewed on the new SSH connection' {
+        (Find-Element 'tcpdump ["-i","lo","-nn","-p","-s","192","-c","3","-w","-","--","udp and dst port 4321"]') -and
+            (Find-Element '/dev/shm (tmpfs)')
+    }
+    Click $saveLabel
+    $dialog = Wait-OwnedDialog 'Save packet capture'
+    if ([IO.File]::GetLastWriteTimeUtc($startMarker) -ne $startStamp) {
+        throw 'The repeated packet capture started before destination approval'
+    }
+    $null = Wait-Until 'enter the new capture path' {
+        [FixtureDialog]::SetFilename($dialog, $repeated, 'packet-capture.pcap')
+    }
+    $null = Wait-Until 'save the new capture path' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the repeated packet capture starts' {
+        [IO.File]::GetLastWriteTimeUtc($startMarker) -gt $startStamp
+    }
+    Click 'Stop and save'
+    $null = Wait-Until 'the repeated packet capture is saved' {
+        (Find-Element 'Saved packet capture') -and [IO.File]::Exists($repeated) -and
+            (Find-Element $repeatCompareLabel $button)
+    }
+
+    $original = [IO.File]::ReadAllBytes($destination)
+    $changed = [byte[]]$original.Clone()
+    $changed[$changed.Length - 1] = [byte]($changed[$changed.Length - 1] -bxor 1)
+    try {
+        [IO.File]::WriteAllBytes($destination, $changed)
+        Click $repeatCompareLabel
+        $null = Wait-Until 'a size-preserving change to the original capture is rejected' {
+            (Find-Element 'Opening the original capture: File SHA-256 differs from the expected digest') -and
+                !(Find-Element 'Back to capture' $button)
+        }
+    } finally {
+        [IO.File]::WriteAllBytes($destination, $original)
+    }
+    Click $repeatCompareLabel
+    $null = Wait-Until 'the original and repeat are compared in capture order' {
+        (Find-Element "Before${dot}reviewed capture.pcap${dot}PCAP") -and
+            (Find-Element "After${dot}reused settings.pcap${dot}PCAP") -and
+            (Find-Element 'Back to capture' $button)
+    }
+    Click 'Back to capture'
+    $null = Wait-Until 'the repeated result and its report export remain available' {
+        (Test-CaptureFile $repeated) -and (Find-Element $repeatCompareLabel $button) -and
+            (Find-Element ('Save capture report' + [char]0x2026) $button)
+    }
+    Select-Capture $other
+    $null = Wait-Until 'opening another capture clears the repeat link' {
+        (Test-CaptureFile $other) -and !(Find-Element $repeatCompareLabel $button)
     }
 } finally {
     Close-FixtureApp $app

@@ -24,6 +24,9 @@ public static class FixtureMessages {
     [DllImport("user32.dll", SetLastError=true)] public static extern bool PostMessage(
         IntPtr hwnd, uint msg, UIntPtr key, IntPtr detail);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr window, int command);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr window);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("user32.dll")] private static extern uint MapVirtualKeyW(uint key, uint mapping);
     public static bool PostKey(IntPtr hwnd, uint msg, uint key) {
@@ -327,14 +330,17 @@ function Wait-CheckBox([string]$Name, [System.Windows.Automation.ToggleState]$St
         }
     }
 }
-function Get-NativeExpander([string]$Name) {
+function Get-NativeExpanderElement([string]$Name) {
     $label = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
     $expandable = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::IsExpandCollapsePatternAvailableProperty, $true)
     $query = [System.Windows.Automation.AndCondition]::new($label, $expandable)
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
-    $element = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $query)
+    $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $query)
+}
+function Get-NativeExpander([string]$Name) {
+    $element = Get-NativeExpanderElement $Name
     if ($element -and $element.Current.IsEnabled) {
         $element.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
     }

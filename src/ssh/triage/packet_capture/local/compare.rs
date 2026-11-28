@@ -18,7 +18,7 @@ mod rates;
 mod timeline;
 mod window;
 use protocols::{ProtocolChange, TcpFlagComparison};
-use rates::AverageRateComparison;
+use rates::{AverageRateComparison, RateSample};
 use timeline::TimelineComparison;
 use window::ComparedWindow;
 
@@ -53,6 +53,7 @@ pub struct CaptureSide {
     pub format: &'static str,
     pub packets: u32,
     pub captured_bytes: u64,
+    pub original_bytes: u64,
     pub truncated_packets: u32,
     pub timestamped_packets: u32,
     #[serde(serialize_with = "serialize_span")]
@@ -71,6 +72,7 @@ pub struct CaptureSide {
 pub struct CountsDelta {
     pub packets: i64,
     pub captured_bytes: i64,
+    pub original_bytes: i64,
     pub truncated_packets: i64,
 }
 
@@ -219,6 +221,7 @@ impl CaptureComparison {
         let totals_delta = complete.then(|| CountsDelta {
             packets: i64::from(after.packets) - i64::from(before.packets),
             captured_bytes: bytes_delta(before.captured_bytes, after.captured_bytes),
+            original_bytes: bytes_delta(before.original_bytes, after.original_bytes),
             truncated_packets: i64::from(after.truncated_packets)
                 - i64::from(before.truncated_packets),
         });
@@ -233,9 +236,12 @@ impl CaptureComparison {
         );
         let average_rates = AverageRateComparison::new(
             sides.map(|side| {
-                Some(Traffic {
-                    packets: side.packets,
-                    captured_bytes: side.captured_bytes,
+                Some(RateSample {
+                    traffic: Traffic {
+                        packets: side.packets,
+                        captured_bytes: side.captured_bytes,
+                    },
+                    original_bytes: Some(side.original_bytes),
                 })
             }),
             rate_spans,
@@ -346,8 +352,8 @@ impl CaptureComparison {
             }
             writeln!(
                 output,
-                "Packets {} · {} captured bytes · {} truncated",
-                side.packets, side.captured_bytes, side.truncated_packets
+                "Packets {} · {} captured bytes · {} truncated · {} original bytes",
+                side.packets, side.captured_bytes, side.truncated_packets, side.original_bytes
             )?;
             if let Some(span) = side.timestamp_span_ns {
                 writeln!(
@@ -386,11 +392,7 @@ impl CaptureComparison {
             }
         }
         if let Some(delta) = &self.totals_delta {
-            writeln!(
-                output,
-                "\nCapture change · {:+} packets · {:+} captured bytes · {:+} truncated",
-                delta.packets, delta.captured_bytes, delta.truncated_packets
-            )?;
+            writeln!(output, "\n{}", delta.summary(),)?;
         } else if self.window.is_some() {
             writeln!(
                 output,
@@ -473,7 +475,10 @@ fn compare_pairs<T: IntoIterator<Item = (ConversationEndpoints, DirectionalTraff
             let before = before.or_else(|| missing_is_zero[0].then(DirectionalTraffic::default));
             let after = after.or_else(|| missing_is_zero[1].then(DirectionalTraffic::default));
             let totals = [before, after].map(|traffic| traffic.map(DirectionalTraffic::total));
-            let average_rates = AverageRateComparison::new(totals, rate_spans);
+            let average_rates = AverageRateComparison::new(
+                totals.map(|total| total.map(RateSample::from)),
+                rate_spans,
+            );
             if before == after && !average_rates.changed() {
                 return None;
             }
@@ -573,6 +578,7 @@ impl From<&LocalCapture> for CaptureSide {
             format: source.format_label(),
             packets: stats.packets,
             captured_bytes: stats.captured_bytes,
+            original_bytes: stats.original_bytes,
             truncated_packets: stats.truncated_packets,
             timestamped_packets: stats.timestamped_packets,
             timestamp_span_ns: stats.span_ns(),
@@ -585,6 +591,15 @@ impl From<&LocalCapture> for CaptureSide {
             complete: summary.issue.is_none(),
             issue: summary.issue.clone(),
         }
+    }
+}
+
+impl CountsDelta {
+    pub fn summary(&self) -> String {
+        format!(
+            "Capture change · {:+} packets · {:+} captured bytes · {:+} truncated · {:+} original bytes",
+            self.packets, self.captured_bytes, self.truncated_packets, self.original_bytes,
+        )
     }
 }
 

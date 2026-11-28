@@ -63,27 +63,39 @@ impl Engine {
     pub(in crate::sftp) async fn repair_dotfile_hooks(
         &self,
         shell: DotfileShell,
-        zdotdir: Option<&str>,
+        startup_directory: Option<&str>,
         review: Option<&str>,
         stage: &mut JobStage,
     ) -> Result<Value> {
-        validate_zdotdir(shell, zdotdir)?;
         let home = self.dotfile_home().await?;
+        let directories = if shell == DotfileShell::Fish && startup_directory.is_none() {
+            self.missing_fish_startup_directories(&home).await?
+        } else {
+            Vec::new()
+        };
         let edits = self
-            .dotfile_hooks(&home, shell, zdotdir)
+            .dotfile_hooks(&home, shell, startup_directory)
             .await?
-            .map(repair_hook);
+            .into_iter()
+            .map(repair_hook)
+            .collect::<Vec<_>>();
         let atomic = self.extension(editor::POSIX_RENAME, "1").is_ok();
         let mut report = json!({
             "operation": "repair-dotfile-hooks",
             "home": home,
             "shell": shell,
-            "zdotdir": zdotdir,
+            "zdotdir": (shell == DotfileShell::Zsh).then_some(startup_directory).flatten(),
             "files": edits.iter().map(Edit::report).collect::<Vec<_>>(),
             "supports_atomic_replace": atomic,
             "ready": edits.iter().all(|edit| edit.after.is_some()
                 && (atomic || edit.before.is_none() || !edit.changed())),
         });
+        if shell == DotfileShell::Fish {
+            report["directories_to_create"] = json!(directories);
+            if let Some(path) = startup_directory {
+                report["fish_config_dir"] = json!(path);
+            }
+        }
         let Some(review) = review else {
             report["review"] = json!(self.dotfiles_review(&report)?);
             return Ok(report);
@@ -102,13 +114,17 @@ impl Engine {
             );
         }
         let mut changed = Vec::new();
+        for path in &directories {
+            self.create_dotfile_directory(path).await?;
+        }
         for edit in edits.iter().filter(|edit| edit.changed()) {
-            let current = self.startup_files(&home, shell, zdotdir).await?;
+            let current = self.startup_files(&home, shell, startup_directory).await?;
             ensure!(
-                current
-                    .iter()
-                    .zip(&edits)
-                    .all(|((path, _), edit)| *path == edit.path),
+                current.len() == edits.len()
+                    && current
+                        .iter()
+                        .zip(&edits)
+                        .all(|((path, _), edit)| *path == edit.path),
                 "The startup files changed. Review the hooks again."
             );
             self.write_dotfile(edit, stage).await?;

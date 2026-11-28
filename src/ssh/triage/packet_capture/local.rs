@@ -111,6 +111,7 @@ struct CountersReport<'a> {
 struct StatsReport {
     packets: u32,
     captured_bytes: u64,
+    original_bytes: u64,
     truncated_packets: u32,
     timestamped_packets: u32,
     timestamp_span_ns: Option<String>,
@@ -121,6 +122,7 @@ impl From<&PacketStats> for StatsReport {
         Self {
             packets: stats.packets,
             captured_bytes: stats.captured_bytes,
+            original_bytes: stats.original_bytes,
             truncated_packets: stats.truncated_packets,
             timestamped_packets: stats.timestamped_packets,
             // Use a decimal string to preserve precision outside 53-bit JSON readers.
@@ -134,6 +136,13 @@ impl LocalCapture {
         Self::scan(path, None, None)
     }
 
+    /// Read the verified capture through the same handle that checked its digest.
+    pub fn open_verified(path: PathBuf, bytes: u64, sha256: &str) -> Result<Self> {
+        ensure!(path.is_absolute(), "Choose an absolute capture file path");
+        let file = crate::sftp::open_local_verified(&path, bytes, sha256)?;
+        Self::scan_file(path, file, None, None)
+    }
+
     fn scan(
         path: PathBuf,
         offsets: Option<Range<i128>>,
@@ -141,6 +150,15 @@ impl LocalCapture {
     ) -> Result<Self> {
         ensure!(path.is_absolute(), "Choose an absolute capture file path");
         let file = File::open(&path).context("Opening the capture file")?;
+        Self::scan_file(path, file, offsets, expected)
+    }
+
+    fn scan_file(
+        path: PathBuf,
+        file: File,
+        offsets: Option<Range<i128>>,
+        expected: Option<SourceStamp>,
+    ) -> Result<Self> {
         let metadata = file.metadata().context("Reading capture file metadata")?;
         ensure!(metadata.is_file(), "Choose a capture file");
         let source_stamp = SourceStamp::from(&metadata);

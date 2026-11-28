@@ -12,11 +12,15 @@ const COMPARISON_LIMIT: &str =
 
 pub enum Action {
     Open(TabId),
+    OpenRepeat(TabId),
+    Swap(TabId),
+    Swapped(TabId, Arc<()>, Result<SwappedRuns, &'static str>),
     Back(TabId),
     Ready(TabId, Arc<()>, Result<Option<Arc<Comparison>>, String>),
     Select(TabId, Arc<Comparison>, usize),
     Page(TabId, bool),
     Evidence(TabId, bool),
+    OpenEvidence(TabId, usize),
     SetTimingAnchor(TabId),
     ClearTimingAnchor(TabId),
     Timing(TabId, bool),
@@ -30,6 +34,19 @@ pub enum Action {
 pub struct AppliedFilter {
     query: String,
     matches: Vec<ComparisonMatch>,
+}
+
+impl AppliedFilter {
+    fn search(compare: &Comparison, query: String) -> Self {
+        let matches = compare.search(&query);
+        Self { query, matches }
+    }
+}
+
+pub struct SwappedRuns {
+    compare: Arc<Comparison>,
+    applied: Option<AppliedFilter>,
+    anchor: Option<ComparisonTimingAnchor>,
 }
 
 #[derive(Default)]
@@ -59,6 +76,10 @@ enum Input {
         before: Vec<PathBuf>,
         after: Vec<PathBuf>,
     },
+    Loaded {
+        working: Arc<Trace>,
+        failing: Arc<Trace>,
+    },
 }
 
 impl TerminalApp {
@@ -68,13 +89,38 @@ impl TerminalApp {
         after: Vec<PathBuf>,
         ctx: &ComponentContext<Self>,
     ) {
-        let tab = self.new_saved_syscall_viewer(ctx);
+        let tab = self.new_syscall_viewer(Box::default(), ctx);
         self.read_trace_comparison(tab, Input::Saved { before, after }, ctx);
     }
 
     pub(super) fn syscall_compare_action(&mut self, action: Action, ctx: &ComponentContext<Self>) {
         match action {
             Action::Open(tab) => self.open_trace_comparison(tab, ctx),
+            Action::OpenRepeat(tab) => self.open_repeat_trace_comparison(tab, ctx),
+            Action::Swap(tab) => self.swap_syscall_runs(tab, ctx),
+            Action::Swapped(tab, ticket, result) => {
+                if let Some(page) = self.syscall_page(tab)
+                    && page.finish(&ticket)
+                {
+                    match result {
+                        Ok(swapped) => {
+                            let state = &mut page.comparison;
+                            if state.anchor.is_some() && swapped.anchor.is_none() {
+                                page.status = Some(
+                                    "The timing reference is unavailable with the runs swapped."
+                                        .into(),
+                                );
+                            }
+                            state.compare = Some(swapped.compare);
+                            state.applied = swapped.applied;
+                            state.anchor = swapped.anchor;
+                            state.select(None);
+                            state.filter(false);
+                        }
+                        Err(error) => page.status = Some(error.into()),
+                    }
+                }
+            }
             Action::Ready(tab, ticket, result) => {
                 if let Some(AppTab {
                     page: Page::SyscallTrace(page),
@@ -120,8 +166,19 @@ impl TerminalApp {
                 }
             }
             Action::Back(tab) => {
-                if let Some(state) = self.comparison_input(tab) {
-                    state.open = false;
+                if let Some(page) = self.syscall_page(tab).filter(|page| page.pending.is_none())
+                    && let Some(working) = page.comparison.working().cloned()
+                {
+                    if page
+                        .loaded
+                        .as_ref()
+                        .is_some_and(|trace| Arc::ptr_eq(trace, &working))
+                    {
+                        page.comparison.open = false;
+                    } else {
+                        page.capture.activity = None;
+                        page.load(working);
+                    }
                 }
             }
             Action::Select(tab, comparison, index) => {
@@ -152,6 +209,7 @@ impl TerminalApp {
                     state.sample = step(state.sample, row.evidence_count(), next);
                 }
             }
+            Action::OpenEvidence(tab, side) => self.open_syscall_evidence(tab, side, ctx),
             Action::SetTimingAnchor(tab) => {
                 if let Some(state) = self.comparison_input(tab)
                     && let Some(anchor) = state.selected_timing_anchor()
@@ -225,6 +283,76 @@ impl TerminalApp {
         (page.comparison.open && page.pending.is_none()).then_some(&mut page.comparison)
     }
 
+    fn swap_syscall_runs(&mut self, tab: TabId, ctx: &ComponentContext<Self>) {
+        if self.tabs.active_id() != Some(tab) {
+            return;
+        }
+        let Some(page) = self
+            .syscall_page(tab)
+            .filter(|page| page.comparison.open && page.pending.is_none())
+        else {
+            return;
+        };
+        let state = &page.comparison;
+        let Some(compare) = &state.compare else {
+            return;
+        };
+        let [working, failing] = compare.traces().clone();
+        let sources = state.anchor.and_then(|anchor| {
+            let source = |side: usize| {
+                let raw = compare.traces()[side].events()[anchor.event(side)]
+                    .originals()
+                    .next()?;
+                Some((raw.source_number(), raw.line))
+            };
+            Some([source(1)?, source(0)?])
+        });
+        let query = state.applied.as_ref().map(|filter| filter.query.clone());
+        let ticket = page.begin("Comparing syscall traces with the runs swapped…");
+        let rejected = message(Action::Swapped(
+            tab,
+            ticket.clone(),
+            Err("Trace comparison worker unavailable"),
+        ));
+        ctx.spawn_background_with_rejection(
+            move |scope| {
+                let result = if scope.is_cancelled() {
+                    Err("Swapping syscall traces was cancelled")
+                } else {
+                    let compare = Arc::new(Comparison::build(failing, working));
+                    let anchor =
+                        sources.and_then(|sources| compare.timing_anchor_for_sources(sources));
+                    let applied = query.map(|query| AppliedFilter::search(&compare, query));
+                    Ok(SwappedRuns {
+                        compare,
+                        applied,
+                        anchor,
+                    })
+                };
+                message(Action::Swapped(tab, ticket, result))
+            },
+            rejected,
+        );
+    }
+
+    fn open_syscall_evidence(&mut self, tab: TabId, side: usize, ctx: &ComponentContext<Self>) {
+        if self.tabs.active_id() != Some(tab) {
+            return;
+        }
+        let Some((trace, event)) = self.comparison_input(tab).and_then(|state| {
+            let (comparison, row) = state.current()?;
+            let trace = comparison.traces().get(side)?.clone();
+            let event = comparison.event(row, side, state.sample)?;
+            Some((trace, event))
+        }) else {
+            return;
+        };
+        let mut page = Box::<PageState>::default();
+        if page.load_evidence(trace, event).is_some() {
+            self.new_syscall_viewer(page, ctx);
+        }
+    }
+
     fn filter_trace_comparison(&mut self, tab: TabId, ctx: &ComponentContext<Self>) {
         if self.tabs.active_id() != Some(tab) {
             return;
@@ -255,11 +383,10 @@ impl TerminalApp {
         ));
         ctx.spawn_background_with_rejection(
             move |_| {
-                let matches = compare.search(&query);
                 message(Action::Filtered(
                     tab,
                     ticket,
-                    Ok(AppliedFilter { query, matches }),
+                    Ok(AppliedFilter::search(&compare, query)),
                 ))
             },
             rejected,
@@ -273,10 +400,28 @@ impl TerminalApp {
         let Some(owner) = self.keyboard.hwnd().map(|window| window.0 as usize) else {
             return;
         };
-        let Some(working) = self.syscall_page(tab).and_then(|page| page.loaded.clone()) else {
+        let Some(working) = self
+            .syscall_page(tab)
+            .and_then(|page| page.comparison.working().or(page.loaded.as_ref()).cloned())
+        else {
             return;
         };
         self.read_trace_comparison(tab, Input::Picker { working, owner }, ctx);
+    }
+
+    fn open_repeat_trace_comparison(&mut self, tab: TabId, ctx: &ComponentContext<Self>) {
+        if self.tabs.active_id() != Some(tab) {
+            return;
+        }
+        let Some((working, failing)) = self
+            .syscall_page(tab)
+            .filter(|page| page.pending.is_none() && !page.capture.open)
+            .and_then(|page| page.report.repeat_source.clone().zip(page.loaded.clone()))
+        else {
+            return;
+        };
+        let comparison = self.new_syscall_viewer(Box::default(), ctx);
+        self.read_trace_comparison(comparison, Input::Loaded { working, failing }, ctx);
     }
 
     fn read_trace_comparison(&mut self, tab: TabId, input: Input, ctx: &ComponentContext<Self>) {
@@ -286,6 +431,7 @@ impl TerminalApp {
         let status = match &input {
             Input::Picker { .. } => "Opening the failing trace and comparing syscall sequences…",
             Input::Saved { .. } => "Comparing saved syscall traces…",
+            Input::Loaded { .. } => "Comparing the original and repeated syscall traces…",
         };
         let ticket = page.begin(status);
         let rejected = message(Action::Ready(
@@ -312,6 +458,9 @@ impl TerminalApp {
                             Arc::new(Trace::open(before).context("Opening the baseline trace")?),
                             after,
                         ),
+                        Input::Loaded { working, failing } => {
+                            return Ok(Some(Arc::new(Comparison::build(working, failing))));
+                        }
                     };
                     if files.is_empty() || scope.is_cancelled() {
                         return Ok(None);
@@ -329,6 +478,13 @@ impl TerminalApp {
 }
 
 impl ViewState {
+    pub(super) fn working(&self) -> Option<&Arc<Trace>> {
+        self.compare
+            .as_ref()
+            .filter(|_| self.open)
+            .map(|compare| &compare.traces()[0])
+    }
+
     fn filter(&mut self, prefer_match: bool) {
         let Some(compare) = &self.compare else { return };
         let show = |&index: &usize| compare.row_visible(index, self.timing);
@@ -398,14 +554,31 @@ impl ViewState {
         &self,
         tab: TabId,
         idle: bool,
+        has_repeat_source: bool,
         ctx: &ViewContext<TerminalApp>,
     ) -> KeyedView {
-        KeyedView::new(
-            "compare-traces",
+        let mut actions = vec![KeyedView::new(
+            "select-trace",
             Button::new()
                 .is_enabled(idle)
                 .on_click(ctx.callback(move |_| message(Action::Open(tab))))
                 .content("Compare with failing trace…"),
+        )];
+        if has_repeat_source {
+            actions.push(KeyedView::new(
+                "original-trace",
+                Button::new()
+                    .is_enabled(idle)
+                    .on_click(ctx.callback(move |_| message(Action::OpenRepeat(tab))))
+                    .content("Compare with original trace"),
+            ));
+        }
+        KeyedView::new(
+            "compare-traces",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .keyed_children(actions),
         )
     }
 
@@ -436,6 +609,11 @@ impl ViewState {
                         .is_enabled(idle)
                         .on_click(ctx.callback(move |_| message(Action::Open(tab))))
                         .content("Choose another failing trace…"),
+                    Button::new()
+                        .automation_name("Swap working and failing traces")
+                        .is_enabled(idle)
+                        .on_click(ctx.callback(move |_| message(Action::Swap(tab))))
+                        .content("Swap runs"),
                     CheckBox::new()
                         .is_enabled(idle)
                         .is_checked(self.timing)
@@ -738,19 +916,22 @@ impl ViewState {
                     .columns([GridLength::Star(1.0), GridLength::Star(1.0)])
                     .column_spacing(12.0)
                     .children((
-                        self.evidence_column(compare, current, 0),
+                        self.evidence_column(tab, compare, current, 0, idle, ctx),
                         Border::new()
                             .grid_column(1)
-                            .content(self.evidence_column(compare, current, 1)),
+                            .content(self.evidence_column(tab, compare, current, 1, idle, ctx)),
                     )),
             ))
     }
 
     fn evidence_column(
         &self,
+        tab: TabId,
         compare: &Comparison,
         row: Option<&ComparisonRow>,
         side: usize,
+        idle: bool,
+        ctx: &ViewContext<TerminalApp>,
     ) -> View {
         let trace = &compare.traces()[side];
         let first = trace.first_path();
@@ -764,18 +945,28 @@ impl ViewState {
         } else {
             "comparison-failing-original"
         };
+        let can_open = row.is_some_and(|row| compare.event(row, side, self.sample).is_some());
         let evidence = row.map_or_else(String::new, |row| {
             evidence_text(compare, row, side, self.sample, self.anchor)
         });
         Grid::new()
-            .rows([GridLength::Auto, GridLength::Star(1.0)])
+            .rows([GridLength::Auto, GridLength::Auto, GridLength::Star(1.0)])
             .row_spacing(6.0)
             .children((
                 TextBlock::new()
                     .font_size(16.0)
                     .text(format!("{label} · {}", safe_text(&name)))
                     .text_wrapping(TextWrapping::Wrap),
-                ScrollViewer::new().grid_row(1).content(
+                Button::new()
+                    .grid_row(1)
+                    .is_enabled(idle && can_open)
+                    .on_click(ctx.callback(move |_| message(Action::OpenEvidence(tab, side))))
+                    .content(if side == 0 {
+                        "Open working evidence"
+                    } else {
+                        "Open failing evidence"
+                    }),
+                ScrollViewer::new().grid_row(2).content(
                     TextBlock::new()
                         .automation_id(automation_id)
                         .is_text_selection_enabled(true)

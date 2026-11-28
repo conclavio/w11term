@@ -90,16 +90,13 @@ try {
     $cancelled = Join-Path $downloads 'cancelled.zip'
     [IO.File]::WriteAllText((Join-Path $State 'release-download-cancel'), 'requested')
     Start-ZipSave $cancelled
-    $null = Wait-Until 'part of the archive reaches the client' {
-        [IO.File]::Exists((Join-Path $State 'release-download-cancel-ready'))
-    }
+    Wait-ZipStatus $expected.partial_download
     Invoke-Button (Wait-Until 'Cancel ZIP download to be enabled' {
         $control = Find-Element 'Cancel ZIP download' $button
         if ($control -and $control.Current.IsEnabled) { $control }
     })
-    Wait-ZipStatus 'Cancelling the ZIP download'
-    [IO.File]::WriteAllText((Join-Path $State 'release-download-cancelled'), 'proceed')
     Wait-ZipStatus 'ZIP download cancelled'
+    [IO.File]::WriteAllText((Join-Path $State 'release-download-cancelled'), 'observed')
     $saved = @([IO.Directory]::GetFileSystemEntries($downloads))
     if ($saved.Count -ne 1 -or [IO.Path]::GetFileName($saved[0]) -cne [IO.Path]::GetFileName($good)) {
         throw 'A failed or cancelled download left a file in the destination'

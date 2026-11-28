@@ -109,6 +109,49 @@ try {
     Wait-Focus $pane
     Click 'Remove reviewed PATH blocks'
     $null = Wait-Until 'managed PATH removal completed' { Find-Element 'Managed PATH blocks removed for new shells' }
+
+    Select-NativeComboItem 'PATH setup shell' 'Fish'
+    Click 'Review PATH setup'
+    $null = Wait-Until 'Fish PATH review lists the new startup directory and file' {
+        (Find-Element "Create directory${dot}/.config/fish") -and
+            (Find-Element "Create${dot}/.config/fish/config.fish") -and
+            (Find-Element 'Apply reviewed PATH setup' $button).Current.IsEnabled
+    }
+    if ([IO.Directory]::Exists((Split-Path -Parent $fixture.fishStartup))) {
+        throw 'Fish PATH review created the startup directory before confirmation'
+    }
+    Click 'Apply reviewed PATH setup'
+    $null = Wait-Until 'Fish PATH setup writes a native marked block' {
+        (Find-Element 'Managed PATH added for new shells') -and
+            [IO.File]::ReadAllText($fixture.fishStartup).Contains('builtin set -gx PATH')
+    }
+    [IO.File]::AppendAllText($fixture.fishStartup, "# keep Fish settings`n")
+    Click 'Review PATH removal'
+    $null = Wait-Until 'Fish removal names the reviewed startup file' {
+        (Find-Element "Remove managed block from${dot}/.config/fish/config.fish") -and
+            (Find-Element 'Remove reviewed PATH blocks' $button).Current.IsEnabled
+    }
+    Click 'Remove reviewed PATH blocks'
+    $null = Wait-Until 'Fish PATH removal preserves unrelated config' {
+        (Find-Element 'Managed PATH blocks removed for new shells') -and
+            [IO.File]::ReadAllText($fixture.fishStartup) -ceq "# keep Fish settings`n"
+    }
+    $null = [IO.Directory]::CreateDirectory((Split-Path -Parent $fixture.fishCustomStartup))
+    $fishDirectory = Wait-Until 'the Fish PATH setup shows the custom directory field' {
+        Find-Element 'PATH setup Fish configuration directory' $edit
+    }
+    $fishDirectory.GetCurrentPattern($value).SetValue('xdg settings/fish')
+    Click 'Review PATH setup'
+    $null = Wait-Until 'Fish PATH setup reviews the selected config file' {
+        (Find-Element "Create${dot}/xdg settings/fish/config.fish") -and
+            (Find-Element 'Apply reviewed PATH setup' $button).Current.IsEnabled
+    }
+    Click 'Apply reviewed PATH setup'
+    $null = Wait-Until 'Fish PATH setup writes only the alternate file' {
+        [IO.File]::Exists($fixture.fishCustomStartup) -and
+            [IO.File]::ReadAllText($fixture.fishCustomStartup).Contains('builtin set -gx PATH') -and
+            [IO.File]::ReadAllText($fixture.fishStartup) -ceq "# keep Fish settings`n"
+    }
     [IO.File]::WriteAllText($fixture.probe, $probe)
     Click 'Back to tool installer'
     Click 'Back to command reference'

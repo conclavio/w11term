@@ -1,19 +1,52 @@
 use super::*;
-use std::io::Read;
+use std::{
+    fs::File,
+    io::{Read, Seek},
+};
 use upload_directory::{Source, open_source};
 use windows::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_SHARE_READ};
 
 /// Hash a selected file through one read-only handle that denies writes and deletes.
 pub fn local_sha256(path: &Path, cancel: &TransferCancel) -> Result<String> {
+    local_sha256_with_size(path, None, cancel)
+}
+
+pub(crate) fn local_sha256_with_size(
+    path: &Path,
+    expected_bytes: Option<u64>,
+    cancel: &TransferCancel,
+) -> Result<String> {
     ensure!(!cancel.is_cancelled(), "SHA-256 comparison cancelled");
-    let Source::File(file, size) = open_source(path, FILE_READ_DATA, FILE_SHARE_READ)? else {
-        bail!("Choose a regular file for SHA-256 comparison");
-    };
+    let (file, size) = open_local_for_hash(path, expected_bytes)?;
     hash_local_handle(file, size, None, cancel)
 }
 
+pub(crate) fn open_local_verified(path: &Path, bytes: u64, sha256: &str) -> Result<File> {
+    let (mut file, size) = open_local_for_hash(path, Some(bytes))?;
+    let found = hash_local_handle(&mut file, size, None, &TransferCancel::default())?;
+    ensure!(
+        found == sha256,
+        "File SHA-256 differs from the expected digest"
+    );
+    file.rewind()?;
+    Ok(file)
+}
+
+fn open_local_for_hash(path: &Path, expected_bytes: Option<u64>) -> Result<(File, u64)> {
+    let Source::File(file, size) = open_source(path, FILE_READ_DATA, FILE_SHARE_READ)? else {
+        bail!("Choose a regular file for SHA-256 comparison");
+    };
+    if let Some(expected) = expected_bytes {
+        ensure!(
+            size == expected,
+            "File byte count differs from the expected {expected} bytes (found {size})"
+        );
+    }
+    Ok((file, size))
+}
+
 pub(super) fn hash_local_handle(
-    mut file: std::fs::File,
+    mut file: impl Read,
     size: u64,
     max_bytes: Option<u64>,
     cancel: &TransferCancel,

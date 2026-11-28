@@ -5,6 +5,7 @@ use w11term::syscall_trace::{self as trace, Filter, Group, Raw, Trace};
 mod capture;
 mod compare;
 mod handles;
+mod report;
 mod summary;
 
 pub(super) const LABEL: &str = "Syscall trace viewer";
@@ -29,6 +30,7 @@ pub enum Action {
     Summary(summary::Action),
     Compare(compare::Action),
     Capture(capture::Action),
+    Report(report::Action),
 }
 
 #[derive(Default)]
@@ -42,10 +44,12 @@ pub(super) struct PageState {
     group_page: usize,
     raw_page: usize,
     selected: Option<usize>,
+    evidence_event: Option<usize>,
     descriptors: handles::ViewState,
     timing: summary::ViewState,
     comparison: compare::ViewState,
     capture: capture::ViewState,
+    report: report::ViewState,
 }
 
 impl TerminalApp {
@@ -88,7 +92,7 @@ impl TerminalApp {
             }
             Action::Open(id) => self.open_syscall_trace(id, None, ctx),
             Action::OpenRecent(paths) => {
-                let tab = self.new_saved_syscall_viewer(ctx);
+                let tab = self.new_syscall_viewer(Box::default(), ctx);
                 self.open_syscall_trace(tab, Some(paths), ctx);
             }
             Action::Apply(id) => self.filter_syscall_trace(id, ctx),
@@ -175,15 +179,16 @@ impl TerminalApp {
             Action::Summary(action) => self.syscall_summary_action(action, ctx),
             Action::Compare(action) => self.syscall_compare_action(action, ctx),
             Action::Capture(action) => self.syscall_capture_action(action, ctx),
+            Action::Report(action) => self.syscall_report_action(action, ctx),
             Action::Show => (),
         }
     }
 
-    fn new_saved_syscall_viewer(&mut self, ctx: &ComponentContext<Self>) -> TabId {
+    fn new_syscall_viewer(&mut self, page: Box<PageState>, ctx: &ComponentContext<Self>) -> TabId {
         self.set_diagnostics_drawer(None);
         let tab = self.tabs.insert(AppTab {
             label: LABEL.into(),
-            page: Page::SyscallTrace(Box::default()),
+            page: Page::SyscallTrace(page),
         });
         self.sync_selection(ctx);
         self.activate(ctx);
@@ -299,8 +304,23 @@ impl PageState {
         self.descriptors = Default::default();
         self.timing = Default::default();
         self.comparison = Default::default();
-        self.capture.back();
+        self.report = Default::default();
+        self.capture.reset_for_loaded_trace();
+        self.evidence_event = None;
         self.reset_position();
+    }
+
+    fn load_evidence(&mut self, trace: Arc<Trace>, event: usize) -> Option<()> {
+        let group = trace
+            .groups()
+            .partition_point(|group| group.range.end <= event);
+        let start = trace.groups().get(group)?.range.start;
+        self.load(trace);
+        self.selected = Some(group);
+        self.group_page = group / GROUPS_PER_PAGE;
+        self.raw_page = (event - start) / CALLS_PER_PAGE;
+        self.evidence_event = Some(event);
+        Some(())
     }
 
     fn begin(&mut self, status: &str) -> Arc<()> {
@@ -360,7 +380,7 @@ impl PageState {
         if self.capture.open {
             return self.capture.view(id, targets, header, idle, ctx);
         }
-        let Some(trace) = &self.loaded else {
+        let Some(trace) = self.comparison.working().or(self.loaded.as_ref()) else {
             header.push(KeyedView::new(
                 "empty",
                 TextBlock::new()
@@ -406,7 +426,13 @@ impl PageState {
         if self.comparison.open {
             return self.comparison.view(id, header, idle, ctx);
         }
-        header.push(self.comparison.launch(id, idle, ctx));
+        if trace.file_count() == 1 {
+            header.push(self.report.view(id, idle, ctx));
+        }
+        header.push(
+            self.comparison
+                .launch(id, idle, self.report.repeat_source.is_some(), ctx),
+        );
         header.push(self.descriptors.switch(id, idle, ctx));
         if self.descriptors.open {
             return self.descriptors.view(id, trace, header, idle, ctx);
@@ -531,11 +557,13 @@ impl PageState {
         let start = group.range.start + self.raw_page * CALLS_PER_PAGE;
         let end = (start + CALLS_PER_PAGE).min(group.range.end);
         let mut original = String::new();
-        for raw in trace.events()[start..end]
-            .iter()
-            .flat_map(|event| event.originals())
-        {
-            append_raw(&mut original, trace, raw);
+        for (offset, event) in trace.events()[start..end].iter().enumerate() {
+            if self.evidence_event == Some(start + offset) {
+                original.push_str("Comparison evidence\n");
+            }
+            for raw in event.originals() {
+                append_raw(&mut original, trace, raw);
+            }
         }
         let detail = format!(
             "Calls {}–{} of {}",
@@ -653,4 +681,27 @@ fn safe_text(text: &str) -> String {
         }
     }
     safe
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evidence_selects_later_group_and_record_pages() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut records = "42 getpid() = 42\n42 getppid() = 41\n".repeat(32);
+        records.push_str("42 getpid() = 42\n");
+        records.push_str(&"42 read(3</tmp/data>, \"a\", 1) = 1\n".repeat(25));
+        std::fs::write(file.path(), records).unwrap();
+        let trace = Arc::new(Trace::open(vec![file.path().to_owned()]).unwrap());
+        let event = 87;
+        let mut page = PageState::default();
+        page.load_evidence(trace, event).unwrap();
+
+        assert_eq!(page.group_page, 1);
+        assert_eq!(page.selection().unwrap().range, 65..90);
+        assert_eq!(page.raw_page, 1);
+        assert_eq!(page.evidence_event, Some(event));
+    }
 }

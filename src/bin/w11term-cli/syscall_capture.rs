@@ -2,18 +2,78 @@ use super::offline;
 use anyhow::{Context, Result, bail, ensure};
 use std::{collections::BTreeMap, io::Write, path, sync::Arc};
 use w11term::{
-    control::{Request, SyscallFilter, SyscallOptions},
+    control::{Reply, Request, SyscallFilter, SyscallOptions},
+    ssh::verify_syscall_capture_report,
     syscall_trace::{Comparison, SummarySort, Trace},
 };
 
 pub(super) const HELP: &str = concat!(
-    "w11term-cli [--pid PID] preview-syscall-capture --pane ID --program PROGRAM [TRACE OPTIONS]\n",
-    "w11term-cli [--pid PID] capture-syscalls --pane ID --program PROGRAM [TRACE OPTIONS] ",
-    "--connection-generation N --review-id ID --job-id HEX --output-file PATH\n",
+    "w11term-cli [--pid PID] preview-syscall-capture --pane ID (--program PROGRAM [TRACE OPTIONS] | --settings-file PATH)\n",
+    "w11term-cli [--pid PID] capture-syscalls --pane ID (--program PROGRAM [TRACE OPTIONS] | --settings-file PATH) ",
+    "--connection-generation N --review-id ID --job-id HEX --output-file PATH [--report-file PATH]\n",
     "w11term-cli [--pid PID] stop-syscall-capture --pane ID --connection-generation N --job-id HEX\n",
     "TRACE OPTIONS: [--arg ARG ...] [--directory PATH] [--seconds N] [--max-mib N] ",
     "[--string-size N] [--filter all|files|processes|network]",
 );
+
+pub(super) const VERIFY_REPORT_VERB: &str = "verify-syscall-capture-report";
+pub(super) const VERIFY_REPORT_HELP: &str =
+    "w11term-cli verify-syscall-capture-report TRACE REPORT [--save-settings PATH]";
+
+pub(super) fn verify_report(args: &[String], stdout: &mut dyn Write) -> Result<()> {
+    let offline::CaptureReportPaths {
+        capture,
+        report,
+        settings,
+    } = offline::CaptureReportPaths::parse(args)?;
+    let verified = verify_syscall_capture_report(&capture, &report)?;
+    if let Some(path) = &settings {
+        let contents = verified.reviewed.options.clone().settings_json()?;
+        w11term::transcript::save(path, &contents, false)
+            .context("Saving verified syscall capture settings")?;
+    }
+    let mut result = serde_json::json!({
+        "capture_path": capture,
+        "report_path": report,
+        "report": verified,
+    });
+    if let Some(path) = settings {
+        result["settings_path"] = serde_json::json!(path);
+    }
+    let reply = Reply::from_result(Ok(result));
+    serde_json::to_writer(&mut *stdout, &reply)?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+const TRACE_FLAGS: &[&str] = &[
+    "--program",
+    "--arg",
+    "--directory",
+    "--seconds",
+    "--max-mib",
+    "--string-size",
+    "--filter",
+];
+
+pub(super) const SAVE_SETTINGS_VERB: &str = "save-syscall-capture-settings";
+pub(super) const SAVE_SETTINGS_HELP: &str = concat!(
+    "w11term-cli save-syscall-capture-settings --program PROGRAM [--arg ARG ...] ",
+    "[--directory PATH] [--seconds N] [--max-mib N] [--string-size N] ",
+    "[--filter all|files|processes|network] [--output-file PATH]",
+);
+
+pub(super) fn save_settings(args: &[String], output: &mut dyn Write) -> Result<()> {
+    let mut inputs = read_flags(SAVE_SETTINGS_VERB, args.iter().cloned(), |flag| {
+        TRACE_FLAGS.contains(&flag) || flag == "--output-file"
+    })?;
+    let json = capture_options(&mut inputs.flags, inputs.arguments)?.settings_json()?;
+    offline::write_report(
+        output,
+        inputs.flags.get("--output-file").map(String::as_str),
+        |writer| writer.write_all(json.as_bytes()),
+    )
+}
 
 pub(super) const INSPECT_VERB: &str = "inspect-syscall-trace";
 pub(super) const INSPECT_HELP: &str = concat!(
@@ -151,43 +211,22 @@ fn parse_anchor(value: &str) -> Result<[(usize, u32); 2]> {
 
 pub(super) fn parse(
     verb: &str,
-    mut args: impl Iterator<Item = String>,
+    args: impl Iterator<Item = String>,
     pane: Option<u64>,
 ) -> Result<Request> {
     let stop = verb == "stop-syscall-capture";
     let preview = verb == "preview-syscall-capture";
-    let mut flags = BTreeMap::new();
-    let mut arguments = Vec::new();
-    while let Some(flag) = args.next() {
-        ensure!(
-            flag == "--pane"
-                || !preview && matches!(flag.as_str(), "--connection-generation" | "--job-id")
-                || !preview && !stop && matches!(flag.as_str(), "--output-file" | "--review-id")
-                || !stop
-                    && matches!(
-                        flag.as_str(),
-                        "--program"
-                            | "--arg"
-                            | "--directory"
-                            | "--seconds"
-                            | "--max-mib"
-                            | "--string-size"
-                            | "--filter"
-                    ),
-            "Unsupported option {flag} for {verb}"
-        );
-        let value = args
-            .next()
-            .with_context(|| format!("{flag} requires a value"))?;
-        if flag == "--arg" {
-            arguments.push(value);
-        } else {
-            ensure!(
-                flags.insert(flag.clone(), value).is_none(),
-                "Specify {flag} only once"
-            );
-        }
-    }
+    let TraceInputs {
+        mut flags,
+        arguments,
+    } = read_flags(verb, args, |flag| {
+        flag == "--pane"
+            || !preview && matches!(flag, "--connection-generation" | "--job-id")
+            || !preview
+                && !stop
+                && matches!(flag, "--output-file" | "--report-file" | "--review-id")
+            || !stop && (TRACE_FLAGS.contains(&flag) || flag == "--settings-file")
+    })?;
     let explicit = flags
         .remove("--pane")
         .map(|value| value.parse())
@@ -211,7 +250,77 @@ pub(super) fn parse(
             job_id: flags.remove("--job-id").context("Provide --job-id")?,
         });
     }
-    let options = SyscallOptions {
+    let options = if let Some(file) = flags.remove("--settings-file") {
+        ensure!(
+            arguments.is_empty() && !TRACE_FLAGS.iter().any(|flag| flags.contains_key(*flag)),
+            "Use --settings-file by itself for syscall capture options"
+        );
+        SyscallOptions::load_settings(path::Path::new(&file))?
+    } else {
+        capture_options(&mut flags, arguments)?
+    };
+    if preview {
+        return Ok(Request::PreviewSyscallCapture { pane, options });
+    }
+    Ok(Request::CaptureSyscalls {
+        pane,
+        options,
+        connection_generation: flags
+            .remove("--connection-generation")
+            .context("Provide --connection-generation from the review")?
+            .parse()?,
+        review_id: flags
+            .remove("--review-id")
+            .context("Provide --review-id from the review")?,
+        job_id: flags
+            .remove("--job-id")
+            .context("Provide a unique --job-id")?,
+        output_file: path::absolute(
+            flags
+                .remove("--output-file")
+                .context("Provide --output-file")?,
+        )?,
+        report_file: flags
+            .remove("--report-file")
+            .map(path::absolute)
+            .transpose()?,
+    })
+}
+
+struct TraceInputs {
+    flags: BTreeMap<String, String>,
+    arguments: Vec<String>,
+}
+
+fn read_flags(
+    verb: &str,
+    mut args: impl Iterator<Item = String>,
+    accepts: impl Fn(&str) -> bool,
+) -> Result<TraceInputs> {
+    let mut flags = BTreeMap::new();
+    let mut arguments = Vec::new();
+    while let Some(flag) = args.next() {
+        ensure!(accepts(&flag), "Unsupported option {flag} for {verb}");
+        let value = args
+            .next()
+            .with_context(|| format!("{flag} requires a value"))?;
+        if flag == "--arg" {
+            arguments.push(value);
+        } else {
+            ensure!(
+                flags.insert(flag.clone(), value).is_none(),
+                "Specify {flag} only once"
+            );
+        }
+    }
+    Ok(TraceInputs { flags, arguments })
+}
+
+fn capture_options(
+    flags: &mut BTreeMap<String, String>,
+    arguments: Vec<String>,
+) -> Result<SyscallOptions> {
+    SyscallOptions {
         program: flags.remove("--program").context("Provide --program")?,
         arguments,
         directory: flags.remove("--directory").unwrap_or_default(),
@@ -241,29 +350,7 @@ pub(super) fn parse(
             Some(_) => bail!("Choose --filter all, files, processes or network"),
         },
     }
-    .validate()?;
-    if preview {
-        return Ok(Request::PreviewSyscallCapture { pane, options });
-    }
-    Ok(Request::CaptureSyscalls {
-        pane,
-        options,
-        connection_generation: flags
-            .remove("--connection-generation")
-            .context("Provide --connection-generation from the review")?
-            .parse()?,
-        review_id: flags
-            .remove("--review-id")
-            .context("Provide --review-id from the review")?,
-        job_id: flags
-            .remove("--job-id")
-            .context("Provide a unique --job-id")?,
-        output_file: path::absolute(
-            flags
-                .remove("--output-file")
-                .context("Provide --output-file")?,
-        )?,
-    })
+    .validate()
 }
 
 #[cfg(test)]
@@ -294,5 +381,88 @@ mod tests {
         };
         assert_eq!(options.arguments, ["--", "a 'file'\n$"]);
         assert!(matches!(options.filter, SyscallFilter::Files));
+    }
+
+    #[test]
+    fn settings_supply_options_for_a_new_preview_and_reviewed_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("syscall settings.json");
+        let options = SyscallOptions {
+            program: "/bin/cat".into(),
+            arguments: vec!["--".into(), "a 'file'\n$".into(), String::new()],
+            directory: "/var/tmp".into(),
+            seconds: 7,
+            max_mib: 3,
+            string_size: 96,
+            filter: SyscallFilter::Files,
+        };
+        std::fs::write(&settings, options.clone().settings_json().unwrap()).unwrap();
+        let file = settings.to_str().unwrap();
+        let call =
+            |verb, flags: &[&str]| parse(verb, flags.iter().map(|flag| (*flag).into()), Some(9));
+        let request = call("preview-syscall-capture", &["--settings-file", file]).unwrap();
+        let Request::PreviewSyscallCapture {
+            pane,
+            options: preview,
+        } = request
+        else {
+            panic!()
+        };
+        assert_eq!(pane, 9);
+        let expected = serde_json::to_value(options).unwrap();
+        assert_eq!(serde_json::to_value(preview).unwrap(), expected);
+        let result = call(
+            "capture-syscalls",
+            &[
+                "--settings-file",
+                file,
+                "--connection-generation",
+                "6",
+                "--review-id",
+                "fresh-review",
+                "--job-id",
+                "1234567890abcdef1234567890abcdef",
+                "--output-file",
+                "new.strace",
+                "--report-file",
+                "run report.json",
+            ],
+        )
+        .unwrap();
+        let Request::CaptureSyscalls {
+            pane,
+            options: capture,
+            connection_generation,
+            review_id,
+            output_file,
+            report_file,
+            ..
+        } = result
+        else {
+            panic!()
+        };
+        assert_eq!(pane, 9);
+        assert_eq!(connection_generation.get(), 6);
+        assert_eq!(review_id, "fresh-review");
+        assert!(output_file.ends_with("new.strace"));
+        assert!(report_file.unwrap().ends_with("run report.json"));
+        assert_eq!(serde_json::to_value(capture).unwrap(), expected);
+        for flag in TRACE_FLAGS {
+            let error = call(
+                "preview-syscall-capture",
+                &["--settings-file", file, flag, "override"],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("Use --settings-file by itself"));
+        }
+        assert!(call("capture-syscalls", &["--settings-file", file]).is_err());
+        assert!(call("stop-syscall-capture", &["--settings-file", file]).is_err());
+        assert!(
+            call(
+                "preview-syscall-capture",
+                &["--settings-file", file, "--report-file", "unused.json"]
+            )
+            .is_err()
+        );
     }
 }

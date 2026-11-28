@@ -27,7 +27,7 @@ use shared::run_gui;
 mod properties_ui;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reviews a native SSH trace, requests Stop and opens the verified capture"]
+#[ignore = "round-trips syscall settings and reports, then repeats a stopped native SSH trace"]
 async fn native_syscall_capture_reviews_stops_and_opens_the_verified_trace() {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, _, server) =
@@ -46,10 +46,9 @@ async fn native_syscall_capture_reviews_stops_and_opens_the_verified_trace() {
     let request = fs::read_to_string(started).unwrap();
     assert!(request.starts_with("capture 30 1048576 64 'all' '/home/test' '/bin/sh'"));
     assert!(request.ends_with("'one argument' '$literal' '--flag'"));
-    assert_eq!(
-        fs::read(state.path().join("stopped capture.strace")).unwrap(),
-        SYSCALL_FIXTURE
-    );
+    for name in ["stopped capture.strace", "Repeated capture.strace"] {
+        assert_eq!(fs::read(state.path().join(name)).unwrap(), SYSCALL_FIXTURE);
+    }
     assert!(remote.path().join("syscall-verified").is_file());
     assert_eq!(transports.load(Ordering::Relaxed), 1);
     server.abort();
@@ -184,11 +183,11 @@ fn native_saved_diagnostics_open_directly_without_terminal_panes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reviews an SSH packet capture, saves verified bytes and opens a local viewer"]
+#[ignore = "reviews and repeats packet captures, verifies saved reports, and opens a local viewer"]
 async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
     let transports = Arc::new(AtomicUsize::new(0));
     let (Source::Ssh(ssh), remote, _, server) =
-        fixture_counting_accepts(false, 1, transports.clone()).await
+        fixture_counting_accepts(false, 2, transports.clone()).await
     else {
         unreachable!()
     };
@@ -208,11 +207,10 @@ async fn native_packet_capture_saves_verified_bytes_and_opens_wireshark() {
     assert!(remote.path().join("pcap-verified").is_file());
     let mut expected = packet_ring_segment(1);
     expected.extend_from_slice(&packet_ring_segment(0)[24..]);
-    assert_eq!(
-        fs::read(state.path().join("reviewed capture.pcap")).unwrap(),
-        expected
-    );
-    assert_eq!(transports.load(Ordering::Relaxed), 1);
+    for name in ["reviewed capture.pcap", "reused settings.pcap"] {
+        assert_eq!(fs::read(state.path().join(name)).unwrap(), expected);
+    }
+    assert_eq!(transports.load(Ordering::Relaxed), 2);
     server.abort();
 }
 
@@ -237,13 +235,23 @@ async fn native_cpu_launch_reviews_literal_arguments_and_saves_the_stopped_profi
     drive_mixed_gui("cpu-launch-ui.ps1", &ssh, state.path());
     assert!(marker.exists());
     assert_eq!(transports.load(Ordering::Relaxed), 1);
-    assert_eq!(channels.load(Ordering::Relaxed), 3);
+    assert_eq!(channels.load(Ordering::Relaxed), 5);
     server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "records a reviewed CPU profile from the native Linux triage report"]
 async fn native_cpu_profile_reviews_the_triage_connection_before_recording() {
+    record_cpu_profile_from_triage(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "records a reviewed CPU profile from top when pidstat is missing"]
+async fn native_cpu_profile_uses_top_when_pidstat_is_missing() {
+    record_cpu_profile_from_triage(true).await;
+}
+
+async fn record_cpu_profile_from_triage(top_fallback: bool) {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     let transports = Arc::new(AtomicUsize::new(0));
@@ -257,10 +265,25 @@ async fn native_cpu_profile_reviews_the_triage_connection_before_recording() {
         "09:40:01 1000 42 78.00 2.00 0.00 0.00 80.00 1 worker\n",
         "09:40:01 1000 80 1.00 0.00 0.00 0.00 1.00 1 helper\n",
     ));
-    let triage = TRIAGE_RESPONSE.replace(
-        "pidstat\t1000\t2000\t0\t\t",
-        &format!("pidstat\t1000\t2000\t0\t{pidstat}\t"),
-    );
+    let top = if top_fallback {
+        "42 worker 20 0 100m 48m 5m R 80.0 0.5 1:20.00 worker\n"
+    } else {
+        "99 worker 20 0 100m 48m 5m R 95.0 0.5 1:20.00 top-only\n"
+    };
+    let top = STANDARD.encode(format!(
+        "top - 09:40:00 up 4 days, 1 user\n\nPID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND\n{top}"
+    ));
+    let pidstat_row = if top_fallback {
+        "pidstat\t1000\t2000\t127\t\t".into()
+    } else {
+        format!("pidstat\t1000\t2000\t0\t{pidstat}\t")
+    };
+    let triage = TRIAGE_RESPONSE
+        .replace("pidstat\t1000\t2000\t0\t\t", &pidstat_row)
+        .replace(
+            "top\t1000\t1010\t0\t\t",
+            &format!("top\t1000\t1010\t0\t{top}\t"),
+        );
     fs::write(remote.path().join("triage-response"), triage).unwrap();
     fs::write(remote.path().join("profile-wait-for-stop"), []).unwrap();
     fs::write(
@@ -276,16 +299,27 @@ async fn native_cpu_profile_reviews_the_triage_connection_before_recording() {
     )
     .unwrap();
     let state = tempfile::tempdir().unwrap();
+    let measurement = if top_fallback {
+        "CPU in top snapshot"
+    } else {
+        "peak CPU"
+    };
+    fs::write(state.path().join("profile-measurement"), measurement).unwrap();
     let captured = remote.path().join("profile-captured");
     fs::write(
         state.path().join("capture-marker"),
         captured.to_str().unwrap(),
     )
     .unwrap();
+    fs::write(
+        state.path().join("profile-ticks-path"),
+        remote.path().join("profile-start-ticks").to_str().unwrap(),
+    )
+    .unwrap();
     drive_mixed_gui("capture-cpu-profile-ui.ps1", &ssh, state.path());
     assert!(captured.exists());
     assert_eq!(transports.load(Ordering::Relaxed), 1);
-    assert_eq!(channels.load(Ordering::Relaxed), 5);
+    assert_eq!(channels.load(Ordering::Relaxed), 6);
     server.abort();
 }
 
@@ -2994,6 +3028,8 @@ async fn native_command_reference_installs_a_selected_catalog_tool() {
         serde_json::to_vec(&json!({
             "conflict": conflict, "pin": pin, "startup": startup, "login": login,
             "probe": root.join("utility-probe-response"),
+            "fishStartup": root.join(".config/fish/config.fish"),
+            "fishCustomStartup": root.join("xdg settings/fish/config.fish"),
         }))
         .unwrap(),
     )
@@ -4585,6 +4621,153 @@ async fn native_saving_an_ssh_profile_keeps_the_original_live_pane() {
         "one login per live pane"
     );
     server.abort();
+}
+
+#[test]
+#[ignore = "reviews and applies a selected SSH profile bundle rollout in the Windows editor"]
+fn native_dotfile_rollout_updates_reviewed_saved_profiles() {
+    use w11term::sftp::{DotfileBundle, DotfileShell};
+
+    let state = tempfile::tempdir().unwrap();
+    let key = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let baseline = state.path().join("previous.json");
+    fs::write(&baseline, br#"{"version":1,"bash":"PS1=before"}"#).unwrap();
+    let pinned = DotfileBundle::load(&baseline)
+        .unwrap()
+        .content_version(DotfileShell::Bash)
+        .unwrap();
+    let profile = |host: &str, shell: &str, pin: Option<&str>| {
+        json!({
+            "host": host, "user": "operator", "auth": "agent", "host_key": key,
+            "dotfiles": {
+                "host": host, "user": "operator", "port": 22, "fingerprint": key, "home": "/home/operator",
+                "shell": shell, "bundle": "previous.json", "bundle_sha256": pin,
+            },
+        })
+    };
+    fs::write(state.path().join("profiles.json"), json!({"profiles": {
+        "East": profile("east.example.test", "bash", Some(&pinned)),
+        "West": profile("west.example.test", "fish", None),
+        "Other": profile("other.example.test", "bash", None),
+        "Fixture local": {"backend": "local", "executable": "powershell.exe", "args": ["-NoProfile", "-NoLogo"]},
+    }}).to_string()).unwrap();
+    fs::write(
+        state.path().join("revision.json"),
+        br#"{"version":1,"bash":"PS1=reviewed","fish":"set -g fish_greeting reviewed"}"#,
+    )
+    .unwrap();
+    drive_gui("dotfile-rollout-ui.ps1", state.path());
+}
+
+#[test]
+#[ignore = "audits saved SSH tool approvals, prepares pinned downloads and opens an existing Windows profile draft"]
+fn native_tool_profile_audit_filters_refreshes_and_preserves_a_draft() {
+    let state = tempfile::tempdir().unwrap();
+    let root = state.path();
+    let key = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let manifest = |sha256: String| {
+        json!({"version": 1, "name": "fleet", "tools": [{"name": "rg", "builds": [{
+            "architecture": "x86_64", "path": "rg", "sha256": sha256,
+        }, {
+            "architecture": "x86_64", "sha256": sha256,
+            "download": {"format": "raw", "url": "https://tools.example.test/rg"},
+        }]}]})
+        .to_string()
+    };
+    let executable = super::utilities::executable(w11term::sftp::UtilityArchitecture::X86_64, None);
+    let previous = manifest(super::utilities::tool_sha256(&executable));
+    let current = manifest("b".repeat(64));
+    let previous_pin = super::utilities::tool_sha256(previous.as_bytes());
+    let current_pin = super::utilities::tool_sha256(current.as_bytes());
+    fs::write(root.join("previous-tools.json"), previous).unwrap();
+    fs::write(root.join("west-tools.json"), &current).unwrap();
+    fs::write(root.join("east-tools.json"), current).unwrap();
+    fs::write(root.join("rg"), executable).unwrap();
+    let profile = |host: &str, bundle: &str, pin: Option<&str>| {
+        json!({
+            "host": host, "user": "ops", "auth": "agent", "host_key": key,
+            "tool_bundle": {
+                "host": host, "user": "ops", "port": 22, "fingerprint": key, "home": "/home/ops",
+                "name": "fleet", "bin_directory": ".local/bin", "bundle": bundle,
+                "manifest_sha256": pin,
+            },
+        })
+    };
+    let mut north = profile("north.example.test", "east-tools.json", None);
+    north["tool_bundle"]["add_to_path"] = json!({"shell": "fish", "fish_config_dir": "../fish"});
+    fs::write(
+        root.join("profiles.json"),
+        json!({"profiles": {
+            "East": profile("east.example.test", "east-tools.json", Some(&current_pin)),
+            "West": profile("west.example.test", "west-tools.json", Some(&previous_pin)),
+            "North": north,
+            "Missing": profile("missing.example.test", "missing.json", None),
+            "Fixture local": {"backend": "local", "executable": "powershell.exe"},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    drive_gui("tool-profile-audit-ui.ps1", root);
+}
+
+#[test]
+#[ignore = "verifies candidate builds and rolls out or restores tool manifests in Windows"]
+fn native_tool_profile_rollout_preserves_the_open_profile_draft() {
+    let state = tempfile::tempdir().unwrap();
+    let root = state.path();
+    let key = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let manifest =
+        |commands: &[(&str, char)]| {
+            let tools: Vec<_> = commands.iter().map(|(name, pin)| {
+            json!({"name": name, "builds": [{
+                "architecture": "x86_64", "path": name, "sha256": pin.to_string().repeat(64),
+            }]})
+        }).collect();
+            json!({"version": 1, "name": "fleet", "tools": tools}).to_string()
+        };
+    let before = manifest(&[("rg", 'a'), ("ncdu", 'c')]);
+    let cached_tool =
+        super::utilities::executable(w11term::sftp::UtilityArchitecture::X86_64, None);
+    let tool_pin = super::utilities::tool_sha256(&cached_tool);
+    fs::write(root.join("candidate-executable"), cached_tool).unwrap();
+    let mut next: serde_json::Value =
+        serde_json::from_str(&manifest(&[("rg", 'b'), ("jq", 'd')])).unwrap();
+    next["tools"][0]["builds"] = json!([
+        {"architecture": "x86_64", "sha256": &tool_pin,
+         "download": {"format": "raw", "url": "https://tools.example.test/rg"}},
+        {"architecture": "aarch64", "path": "rg-arm64", "sha256": "e".repeat(64)},
+    ]);
+    next["tools"][1]["builds"][0]["sha256"] = json!(tool_pin);
+    let next = next.to_string();
+    let previous_pin = super::utilities::tool_sha256(before.as_bytes());
+    let next_pin = super::utilities::tool_sha256(next.as_bytes());
+    fs::write(root.join("previous.json"), before).unwrap();
+    fs::write(root.join("Fleet revision.json"), next).unwrap();
+    fs::write(root.join("candidate-pin"), next_pin).unwrap();
+    let profile = |host: &str, pin: Option<&str>| {
+        json!({
+            "host": host, "user": "ops", "auth": "agent", "host_key": key,
+            "tool_bundle": {
+                "host": host, "user": "ops", "port": 22, "fingerprint": key, "home": "/home/ops",
+                "name": "fleet", "bin_directory": ".local/bin", "bundle": "previous.json",
+                "manifest_sha256": pin, "add_to_path": {"shell": "bash"},
+            },
+        })
+    };
+    let mut different = profile("different.example.test", None);
+    different["tool_bundle"]["bin_directory"] = json!(".local/other");
+    fs::write(
+        root.join("profiles.json"),
+        json!({"profiles": {
+            "East": profile("east.example.test", Some(&previous_pin)),
+            "West": profile("west.example.test", None),
+            "Other": profile("other.example.test", Some(&previous_pin)),
+            "Different": different,
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    drive_gui("tool-profile-rollout-ui.ps1", root);
 }
 
 #[test]

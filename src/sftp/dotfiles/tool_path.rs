@@ -7,6 +7,7 @@ use crate::sftp::{
 };
 
 struct PathPlan {
+    create: Vec<String>,
     edits: Vec<Edit>,
     atomic: bool,
 }
@@ -33,8 +34,13 @@ impl PathPlan {
     }
 }
 
-fn path_hook(bin: &str) -> String {
+fn path_hook(shell: DotfileShell, bin: &str) -> String {
     let id = digest_hex(Sha256::new_with_prefix(bin.as_bytes()));
+    if shell == DotfileShell::Fish {
+        return include_str!("tool-path.fish")
+            .replace("@ID@", &id)
+            .replace("@BIN@", bin);
+    }
     format!(
         "# >>> w11term tool PATH {id} >>>\n\
          case \":${{PATH-}}:\" in\n\
@@ -94,12 +100,20 @@ impl Engine {
         settings: &ToolPath,
         mode: PathEdit,
     ) -> Result<PathPlan> {
-        validate_zdotdir(settings.shell, settings.zdotdir.as_deref())?;
+        let startup_directory = settings.startup_directory(home)?;
         ensure!(
             valid_bin_directory(bin),
             "Invalid approved tool bin directory"
         );
-        let hook = path_hook(bin);
+        let hook = path_hook(settings.shell, bin);
+        let create = if settings.shell == DotfileShell::Fish
+            && startup_directory.is_none()
+            && mode != PathEdit::Remove
+        {
+            self.missing_fish_startup_directories(home).await?
+        } else {
+            Vec::new()
+        };
         let files = if mode == PathEdit::Remove && settings.shell == DotfileShell::Bash {
             // A higher-priority login file may have appeared since setup.
             let mut files = Vec::with_capacity(4);
@@ -110,15 +124,15 @@ impl Engine {
             }
             files
         } else {
-            self.startup_files(home, settings.shell, settings.zdotdir.as_deref())
+            self.startup_files(home, settings.shell, startup_directory)
                 .await?
-                .into()
         };
         let edits = files
             .into_iter()
             .map(|(path, original)| plan_edit(path, original, hook.clone(), mode))
             .collect();
         Ok(PathPlan {
+            create,
             edits,
             atomic: self.extension(editor::POSIX_RENAME, "1").is_ok(),
         })
@@ -126,6 +140,9 @@ impl Engine {
 
     async fn apply_tool_path(&self, plan: &PathPlan, stage: &mut JobStage) -> Result<bool> {
         plan.check()?;
+        for path in &plan.create {
+            self.create_dotfile_directory(path).await?;
+        }
         let mut changed = false;
         for edit in plan.changed() {
             self.write_dotfile(edit, stage).await?;
@@ -218,10 +235,6 @@ impl Engine {
         review: Option<&str>,
         stage: &mut JobStage,
     ) -> Result<Value> {
-        ensure!(
-            !home.contains(':'),
-            "The account home contains a PATH separator"
-        );
         let remove = installed.is_some_and(|target| target.remove);
         let mode = if remove {
             PathEdit::Remove
@@ -240,6 +253,9 @@ impl Engine {
             "blocked": block,
             "ready": ready,
         });
+        if path.shell == DotfileShell::Fish {
+            report["directories_to_create"] = json!(plan.create);
+        }
         if let Some(target) = installed {
             report["bundle"] = json!(target.bundle);
             report["bundle_sha256"] = json!(target.bundle_sha256);

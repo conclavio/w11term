@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    events::{ToolBundleSyncStatus, ToolPathSyncStatus},
-    options::ToolSync,
-};
+use crate::events::{ToolBundleSyncStatus, ToolPathSyncStatus};
 
 pub(crate) struct ToolSyncResult {
     pub status: ToolBundleSyncStatus,
@@ -24,14 +21,7 @@ pub(crate) async fn sync_login_tools(
     session: &russh::client::Handle<crate::ssh::Handler>,
     settings: &ToolSync,
 ) -> Result<ToolSyncResult> {
-    ensure!(
-        safe_component(&settings.name) && !settings.name.starts_with('.'),
-        "Invalid approved tool bundle name"
-    );
-    ensure!(
-        valid_bin_directory(&settings.bin_directory),
-        "Invalid approved tool bin directory"
-    );
+    settings.validate_bundle_destination()?;
     let engine = Engine::connect(session).await?;
     let home = engine.dotfile_home().await?;
     ensure!(
@@ -55,13 +45,17 @@ pub(crate) async fn sync_login_tools(
         "Choose a Windows tool bundle manifest"
     );
     let path = settings.bundle.clone();
-    let bundle = tokio::task::spawn_blocking(move || UtilityBundle::load(&path))
-        .await?
-        .context("Reading the configured tool bundle")?;
-    ensure!(
-        bundle.name == settings.name && bundle.bin_directory == settings.bin_directory,
-        "The manifest name or bin directory changed. Approve the tool bundle again."
-    );
+    let (bundle, digest) =
+        tokio::task::spawn_blocking(move || UtilityBundle::load_with_manifest_sha256(&path))
+            .await?
+            .context("Reading the configured tool bundle")?;
+    if let Some(pin) = settings.manifest_pin()? {
+        ensure!(
+            digest == pin,
+            "The tool manifest changed after approval. Review and approve it again."
+        );
+    }
+    settings.validate_manifest_destination(&bundle)?;
     let plan = engine
         .utility_plan(session, bundle, InstallMode::Sync)
         .await?;
@@ -90,15 +84,11 @@ pub(crate) async fn sync_login_tools(
     };
     if let Some(path) = &settings.add_to_path {
         // Profiles on separate connections can share the same shell startup files.
-        let result = install::with_lock(session, &home, async {
-            ensure!(
-                !home.contains(':'),
-                "The account home contains a PATH separator"
-            );
-            engine
-                .sync_tool_path(&home, &settings.bin_directory, path)
-                .await
-        })
+        let result = install::with_lock(
+            session,
+            &home,
+            engine.sync_tool_path(&home, &settings.bin_directory, path),
+        )
         .await;
         match result {
             Ok(changed) => {
