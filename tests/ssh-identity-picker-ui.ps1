@@ -60,6 +60,61 @@ function File-Sha256([string]$Path) {
         $hash.Dispose()
     }
 }
+function Test-ReviewedToolBuilds([string]$Body, [hashtable[]]$Builds) {
+    $lines = @($Body -split '\r\n|\r|\n' | Where-Object { $_ -ne '' })
+    $index = 0
+    foreach ($build in $Builds) {
+        if ($lines[$index] -cne $build.Architecture -or $lines[$index + 2] -cne "Executable SHA-256 $($build.Digest)") {
+            return $false
+        }
+        if ($build.File) {
+            if (![FixtureDialog]::SameFile($build.File, $lines[$index + 1])) { return $false }
+        } elseif ($lines[$index + 1] -cne $build.Url) {
+            return $false
+        }
+        $index += 3
+        if ($build.Member) {
+            if ($lines[$index] -cne "Archive member $($build.Member)" -or
+                $lines[$index + 1] -cne "Archive SHA-256 $($build.ArchiveDigest)") { return $false }
+            $index += 2
+        }
+    }
+    return $index -eq $lines.Count
+}
+function Wait-ToolBuildReview([string]$Name, [hashtable[]]$Builds) {
+    Set-NativeExpansion $Name $true
+    $text = [System.Windows.Automation.TextPattern]::Pattern
+    $typedText = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+    $hasText = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::IsTextPatternAvailableProperty, $true)
+    $query = [System.Windows.Automation.OrCondition]::new($typedText, $hasText)
+    $observed = @{ Offscreen = $null; Text = '(missing)' }
+    $search = @{ scroll = $null }
+    try {
+        $null = Wait-Until "the reviewed builds for '$Name'" {
+            try {
+                $expander = Get-NativeExpanderElement $Name
+                if (!$expander) { return }
+                $observed.Offscreen = $expander.Current.IsOffscreen
+                $contents = foreach ($item in $expander.FindAll([System.Windows.Automation.TreeScope]::Descendants, $query)) {
+                    $provider = $null
+                    if ($item.TryGetCurrentPattern($text, [ref]$provider)) { $provider.DocumentRange.GetText(-1) }
+                    $item.Current.Name
+                }
+                $observed.Text = $contents -join ' | '
+                foreach ($body in $contents) {
+                    if (Test-ReviewedToolBuilds $body $Builds) { return $true }
+                }
+                Move-NativeControlIntoView $expander $search
+            } catch [System.Windows.Automation.ElementNotAvailableException] {
+                $search.scroll = $null
+            }
+        }
+    } catch {
+        throw "$_ Expander offscreen=$($observed.Offscreen). Last review text [$($observed.Text)]."
+    }
+}
 function Pick-LinuxExecutable([string]$Action, [string]$Name) {
     Click $Action
     $dialog = Wait-OwnedDialog 'Choose a Linux executable'
@@ -346,6 +401,8 @@ try {
     $archiveUrl = 'https://example.test/rg-arm64.tar.gz'
     $archiveMember = 'rg/bin/rg'
     $archivePin = 'c' * 64
+    $localTool = Join-Path $State 'rg'
+    [IO.File]::WriteAllText($localTool, 'test placeholder')
     $localToolPin = 'a' * 64
     $downloadedToolPin = 'b' * 64
     $manifest = @{
@@ -398,16 +455,11 @@ try {
     $null = Wait-Until 'tool bundle, launcher directory and manifest digest reviewed' {
         (Find-Element $review) -and (Find-Element "Reviewed manifest SHA-256 $manifestHash")
     }
-    $rgBuilds = "rg${dot}ARM64, x86-64"
-    Set-NativeExpansion $rgBuilds $true
-    $null = Wait-Until 'the review shows the local build and exact archive member' {
-        $texts = Get-NativeTextLabels
-        ($texts | Where-Object { $_.Contains((Join-Path $State 'rg')) -and
-            $_.Contains("Executable SHA-256 $localToolPin") }) -and
-        ($texts | Where-Object { $_.Contains($archiveUrl) -and
-            $_.Contains("Executable SHA-256 $downloadedToolPin") -and
-            $_.Contains("Archive member $archiveMember") -and $_.Contains("Archive SHA-256 $archivePin") })
-    }
+    Wait-ToolBuildReview "rg${dot}ARM64, x86-64" @(
+        @{ Architecture = 'x86-64'; File = $localTool; Digest = $localToolPin }
+        @{ Architecture = 'ARM64'; Url = $archiveUrl; Digest = $downloadedToolPin
+            Member = $archiveMember; ArchiveDigest = $archivePin }
+    )
     Click 'Approve tool sync'
     $null = Wait-Until 'tool sync approved with a pinned manifest' {
         (Find-Element 'Approved tool bundle: portable') -and (Find-Element "Pinned manifest SHA-256 $manifestHash")
@@ -583,14 +635,12 @@ try {
     }
     Click 'Review tool bundle'
     $null = Wait-Until 'new revision reviewed' { Find-Element $review }
-    Set-NativeExpansion "operator${dot}ARM64, x86-64" $true
     $replacementPin = $revisionBundle.tools.builds[0].sha256
     $retainedPin = $createdBundle.tools.builds[1].sha256
-    $null = Wait-Until 'the revision review shows the replacement and retained builds' {
-        $texts = Get-NativeTextLabels
-        ($texts | Where-Object { $_.Contains('operator-x64-next') -and $_.Contains("Executable SHA-256 $replacementPin") }) -and
-        ($texts | Where-Object { $_.Contains('operator-arm') -and $_.Contains("Executable SHA-256 $retainedPin") })
-    }
+    Wait-ToolBuildReview "operator${dot}ARM64, x86-64" @(
+        @{ Architecture = 'x86-64'; File = (Join-Path $State 'operator-x64-next'); Digest = $replacementPin }
+        @{ Architecture = 'ARM64'; File = (Join-Path $State 'operator-arm'); Digest = $retainedPin }
+    )
     Click 'Approve tool sync'
     Click 'Save profile changes'
     $null = Wait-Until 'revision approval saved' {

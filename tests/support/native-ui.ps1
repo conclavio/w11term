@@ -330,14 +330,17 @@ function Wait-CheckBox([string]$Name, [System.Windows.Automation.ToggleState]$St
         }
     }
 }
-function Get-NativeExpander([string]$Name) {
+function Get-NativeExpanderElement([string]$Name) {
     $label = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::NameProperty, $Name)
     $expandable = [System.Windows.Automation.PropertyCondition]::new(
         [System.Windows.Automation.AutomationElement]::IsExpandCollapsePatternAvailableProperty, $true)
     $query = [System.Windows.Automation.AndCondition]::new($label, $expandable)
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($window)
-    $element = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $query)
+    $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $query)
+}
+function Get-NativeExpander([string]$Name) {
+    $element = Get-NativeExpanderElement $Name
     if ($element -and $element.Current.IsEnabled) {
         $element.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
     }
