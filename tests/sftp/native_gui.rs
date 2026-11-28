@@ -69,6 +69,106 @@ fn native_saved_command_reference_pages_keep_their_platform_after_restart() {
     drive_gui("command-reference-saved-pages-ui.ps1", state.path());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens the exact source-platform manual beside a retained SSH command without writing to the shell"]
+async fn native_history_opens_the_source_platform_command_manual() {
+    run_palette_fixture(
+        "command-history-reference-ui.ps1",
+        b"",
+        Some(concat!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07custom-report report-argument\r\n",
+            "\x1b]133;C\x07report output\r\n\x1b]133;D;0\x07",
+            "\x1b]133;A\x07$ \x1b]133;B\x07sudo -n /usr/bin/git log -5 --review-token sample-word\r\n",
+            "\x1b]133;C\x07retained git output\r\n\x1b]133;D;0\x07history-reference-ready\r\n",
+        )),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens platform manuals from a long selected SSH command and retains ordinary reference search"]
+async fn native_selected_terminal_command_resolves_a_subcommand_offline() {
+    let history = format!(
+        "sudo -n /usr/bin/git log -5 --note={}/end\r\nfleet outage\r\nselection-reference-ready\r\n",
+        "r".repeat(108)
+    );
+    run_palette_fixture("selected-command-reference-ui.ps1", b"", Some(&history)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens an SSH manual from a PowerShell window-history search and restores its filtered result"]
+async fn native_window_history_opens_the_selected_capture_and_manual() {
+    run_palette_fixture(
+        "window-history-reference-ui.ps1",
+        b"",
+        Some(concat!(
+            "\x1b]133;A\x07$ \x1b]133;B\x07git log -5\r\n",
+            "\x1b]133;C\x07earlier output audit-token\r\n\x1b]133;D;5\x07",
+            "\x1b]133;A\x07$ \x1b]133;B\x07git status --short\r\n",
+            "\x1b]133;C\x07latest output audit-token\r\n\x1b]133;D;2\x07",
+            "\x1b]133;A\x07$ \x1b]133;B\x07git diff\r\n",
+            "\x1b]133;C\x07successful output audit-token\r\n\x1b]133;D;0\x07",
+            "window-history-reference-ready\r\n",
+        )),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "follows offline See also links by platform and restores the previous manual search"]
+async fn native_related_command_reference_preserves_platform_and_search() {
+    run_palette_fixture(
+        "related-command-reference-ui.ps1",
+        b"",
+        Some("related-reference-ready\r\n"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "uses the Windows Markdown picker to review and save a private command manual"]
+async fn native_private_manual_import_edits_only_the_draft_until_save() {
+    run_palette_fixture(
+        "import-private-manual-ui.ps1",
+        b"",
+        Some("private-manual-ready\r\n"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "exports a private manual draft through the Windows Save dialog without updating the catalog"]
+async fn native_private_manual_export_keeps_the_saved_manual_and_draft() {
+    run_palette_fixture(
+        "export-private-manual-ui.ps1",
+        b"",
+        Some("private-manual-export-ready\r\n"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews private manual removal, protects an external edit and shows its bundled fallback"]
+async fn native_private_manual_removal_archives_and_restores_the_bundled_page() {
+    run_palette_fixture(
+        "remove-private-manual-ui.ps1",
+        b"",
+        Some("private-manual-removal-ready\r\n"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reviews older private manual archives and loads a selected draft without saving it"]
+async fn native_private_manual_recovery_previews_and_restores_the_selected_archive() {
+    run_palette_fixture(
+        "recover-private-manual-ui.ps1",
+        b"",
+        Some("private-manual-recovery-ready\r\n"),
+    )
+    .await;
+}
+
 #[test]
 #[ignore = "saves an offline manual example and recalls it in a real PowerShell pane"]
 fn native_reference_examples_save_offline_and_require_explicit_shell_submit() {

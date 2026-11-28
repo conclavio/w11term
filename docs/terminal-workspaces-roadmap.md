@@ -364,11 +364,29 @@ English tldr-pages are bundled for offline lookup. The platform defaults to Wind
 
 **Saved pages** brings frequently used manuals back by command and platform. Keep a private and a bundled variant in the list together, reopen them offline after a restart, and remove shortcuts from the panel.
 
+Use **Import Markdown…** in the private page editor to review a local manual as a draft and save it for the chosen command and platform.
+
+Use **Export Markdown…** to share a copy of the current private manual draft as UTF-8 Markdown.
+
+Review removal of a saved private manual before archiving its Markdown. The offline catalog immediately shows the bundled fallback when one exists.
+
+Open **Archived versions…** in the editor to review past versions for the current command and platform, newest first. Recover a version into the editable draft before saving it.
+
 **Find saved manual…** searches saved page titles, commands, and platforms from the command palette. Opening a result restores that exact page beside the current pane.
 
 Save an edited example to the shared **Saved commands** library from Command reference. Open the example editor offline, choose a name for the exact line, and recall it from the palette or a group later.
 
 Fill named values and choose flag spellings in a manual example. A repeated placeholder uses one value across the command. Review the preview and apply it to the editable draft before saving or inserting the example.
+
+Look up a retained command from **Command history**. Use the source pane's platform and the longest matching command prefix so an invocation such as `git log -5` opens its subcommand manual beside the recorded output.
+
+Look up a manual directly from a result in **Find command history…**. The manual opens beside the highlighted capture, and **Back to search results** restores the search.
+
+**Look up selected command** applies the same command matching to highlighted shell text and honors the platform dropdown. Selections without an exact manual stay available for task search.
+
+Follow a **See also** link to another offline manual. Links prefer the chosen platform and fall back to Common. **Back to previous manual** restores the previous page and search result.
+
+Use `w11term-cli command-reference` for exact offline lookup or ranked task search from a shell. It reads the same bundled or cached pages and private overrides as the side panel. [CLI examples](../CONTROL.md#offline-command-reference)
 
 **Acceptance.** Look up a shared command and a platform-specific command in local PowerShell and a Linux SSH pane with the page update service unreachable. Search for a task in the bundled and private manuals. Check that the examples come from the correct platform, an override is visible, and inserting an example leaves it ready for the user to edit.
 

@@ -1,5 +1,6 @@
 use super::*;
 use command_history::{HistoryOrder, ORDER_OPTIONS, STATUS_OPTIONS, WindowHistoryOptions};
+use std::ops::Range;
 use w11term::control::CommandStatus;
 use w11term::events::CommandLink;
 mod export;
@@ -18,6 +19,7 @@ pub enum Action {
     Edit(Arc<()>, Edit),
     Ready(Arc<()>, Option<Report>),
     Save(Arc<()>),
+    Manual(Arc<()>, Selection),
 }
 
 pub enum Edit {
@@ -56,6 +58,16 @@ impl Drop for Search {
 }
 
 impl Picker {
+    fn selected_window_command(&self) -> Option<(Selection, Option<Range<usize>>)> {
+        let row = self.commands.get(self.selected).filter(|row| row.enabled)?;
+        match &row.id {
+            command_palette::CommandId::OpenWindowCommand(pane, link, hit) => {
+                Some(((*pane, *link), hit.clone()))
+            }
+            _ => None,
+        }
+    }
+
     fn set_window_history_rows(
         &mut self,
         rows: Vec<command_palette::Row>,
@@ -154,6 +166,40 @@ impl Picker {
             .row_spacing(if narrow { 4.0 } else { 0.0 })
             .children((include, status, order))
     }
+
+    pub(in crate::app) fn window_history_actions(
+        &self,
+        narrow: bool,
+        app: &TerminalApp,
+        ctx: &ViewContext<TerminalApp>,
+    ) -> View {
+        let launch = self.launch.clone();
+        let target = self
+            .selected_window_command()
+            .map(|(target, _)| target)
+            .filter(|&(pane, link)| app.captured_reference_query(pane, link).is_some());
+        StackPanel::new()
+            .orientation(if narrow {
+                Orientation::Vertical
+            } else {
+                Orientation::Horizontal
+            })
+            .spacing(4.0)
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .children((
+                Button::new()
+                    .style(ButtonStyle::Subtle)
+                    .horizontal_alignment(HorizontalAlignment::Right)
+                    .is_enabled(target.is_some())
+                    .on_click(ctx.callback(move |_| {
+                        target.map_or(Message::ControlIdle, |target| {
+                            Message::WindowHistory(Action::Manual(launch.clone(), target))
+                        })
+                    }))
+                    .content("Look up command manual"),
+                self.history_export_button(app, ctx),
+            ))
+    }
 }
 
 impl TerminalApp {
@@ -238,6 +284,28 @@ impl TerminalApp {
                     && picker.mode == Mode::Commands(command_palette::Search::CommandHistory) =>
             {
                 self.save_window_history(ctx);
+            }
+            Action::Manual(launch, target)
+                if Arc::ptr_eq(&launch, &picker.launch)
+                    && picker.mode == Mode::Commands(command_palette::Search::CommandHistory) =>
+            {
+                let Some((selection @ (pane, link), hit)) = picker.selected_window_command() else {
+                    return;
+                };
+                if selection != target {
+                    return;
+                }
+                let Some(lookup) = self.captured_reference_query(pane, link) else {
+                    return;
+                };
+                let search = self.window_history_return(selection);
+                self.close_picker(ctx);
+                if self.open_command_history_preview(pane, Some(link), hit, search, ctx) {
+                    self.open_recorded_reference(lookup, ctx);
+                } else {
+                    self.window_error =
+                        Some("That command is no longer retained in its source pane.".into());
+                }
             }
             _ => {}
         }
