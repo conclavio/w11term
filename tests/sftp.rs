@@ -468,13 +468,16 @@ impl server::Handler for Peer {
                 STANDARD.encode(program),
             );
             let argv = r#"'one arg' 'it'\''s $literal' '' '--child'"#;
-            let inspect = format!(" 2 73 fp 32768 4096 '{directory}' './cpu worker' '' '' {argv}");
-            let launch = format!(
-                " 2 73 fp 32768 4096 '{directory}' './cpu worker' '{directory}' '{program}' {argv}"
-            );
+            let matches_target = |resolved_dir: &str, resolved_program: &str| {
+                [73, 79].into_iter().any(|frequency| {
+                    command.ends_with(&format!(
+                        " 2 {frequency} fp 32768 4096 '{directory}' './cpu worker' '{resolved_dir}' '{resolved_program}' {argv}"
+                    ))
+                })
+            };
             fs::write(self.root.join("profile-launch-wire"), command)?;
             s.channel_success(c)?;
-            if command.ends_with(&launch) {
+            if matches_target(directory, program) {
                 fs::write(self.root.join("profile-launched"), [])?;
                 let raw = command.contains(" 74 launch-raw ");
                 let outcome = if self.root.join("profile-wait-for-stop").is_file() {
@@ -495,7 +498,7 @@ impl server::Handler for Peer {
                     s.data(c, perf_data_header().into_bytes())?;
                     s.data(c, PERF_DATA_FIXTURE.to_vec())?;
                 }
-            } else if !command.ends_with(&inspect) {
+            } else if !matches_target("", "") {
                 let tail = command.chars().rev().take(200).collect::<Vec<_>>();
                 let tail: String = tail.into_iter().rev().collect();
                 s.extended_data(

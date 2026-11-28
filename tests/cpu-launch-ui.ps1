@@ -8,6 +8,7 @@ $folded = Join-Path $State 'launched workload.folded'
 $raw = [IO.Path]::ChangeExtension($folded, 'perf.data')
 $reportPath = "$folded.json"
 $repeated = Join-Path $State 'repeated workload.folded'
+$repeatedReport = "$repeated.json"
 $compareOriginal = 'Compare with original profile'
 $dot = ' ' + [char]0xb7 + ' '
 $marker = [IO.File]::ReadAllText((Join-Path $State 'launch-marker'))
@@ -51,6 +52,22 @@ function Verify-LaunchedReport([string]$Path) {
         [FixtureDialog]::SetFilename($dialog, $Path, [IO.Path]::GetFileName($reportPath))
     }
     $null = Wait-Until 'confirm the CPU profile report' { [FixtureDialog]::ClickButton($dialog, 1) }
+}
+
+function Save-LaunchedReport([string]$Path) {
+    Click-LaunchButton ('Save capture report' + [char]0x2026)
+    $dialog = Wait-OwnedDialog 'Save CPU profile report'
+    $null = Wait-Until 'choose the command capture report destination' {
+        [FixtureDialog]::SetFilename($dialog, $Path, [IO.Path]::GetFileName($Path))
+    }
+    $null = Wait-Until 'confirm the command capture report destination' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'command capture report is saved' { Find-Element 'Saved CPU profile report' }
+}
+
+function Find-SamplingComparison {
+    (Find-Element ('2 seconds' + $dot + '73 Hz' + $dot + 'Frame pointers' + $dot + 'cpu-clock:u')) -and
+        (Find-Element ('2 seconds' + $dot + '79 Hz' + $dot + 'Frame pointers' + $dot + 'cpu-clock:u')) -and
+        (Find-Element ('Sampling settings differ' + $dot + 'frequency'))
 }
 
 function Wait-LaunchedDraft {
@@ -166,13 +183,7 @@ try {
     $expected = [Text.Encoding]::ASCII.GetBytes('PERFILE2') +
         [byte[]]@(0,255,13,10) + [Text.Encoding]::ASCII.GetBytes('raw perf fixture') + [byte]0
     if (($actual -join ',') -cne ($expected -join ',')) { throw 'The raw perf recording was not preserved byte for byte' }
-    Click-LaunchButton ('Save capture report' + [char]0x2026)
-    $dialog = Wait-OwnedDialog 'Save CPU profile report'
-    $null = Wait-Until 'choose the command capture report destination' {
-        [FixtureDialog]::SetFilename($dialog, $reportPath, [IO.Path]::GetFileName($reportPath))
-    }
-    $null = Wait-Until 'confirm the command capture report destination' { [FixtureDialog]::ClickButton($dialog, 1) }
-    $null = Wait-Until 'command capture report is saved' { Find-Element 'Saved CPU profile report' }
+    Save-LaunchedReport $reportPath
     $proof = & $Cli verify-cpu-profile-report $folded $reportPath --perf-data $raw | ConvertFrom-Json
     $report = $proof.result.report
     $target = $report.reviewed.target
@@ -195,6 +206,11 @@ try {
     Click-LaunchButton ('Repeat from report' + [char]0x2026)
     Wait-LaunchedDraft
     if ([IO.File]::Exists($marker)) { throw 'Opening a repeat draft launched the command' }
+    Set-LaunchField 'Sampling frequency in Hz' '79'
+    $null = Wait-Until 'use the edited frequency in the new review' {
+        $frequency = Find-Element 'Sampling frequency in Hz' $editType
+        $frequency -and $frequency.GetCurrentPattern($valuePattern).Current.Value -eq '79'
+    }
     Click-LaunchButton 'Review CPU profile'
     $null = Wait-Until 'the fresh review retains the raw recording option' {
         (Find-Element 'Executable "/tmp/work space/cpu worker"') -and
@@ -219,6 +235,7 @@ try {
         ([IO.File]::ReadAllBytes([IO.Path]::ChangeExtension($repeated, 'perf.data')) -join ',') -cne ($actual -join ',')) {
         throw 'The repeated profile did not preserve the folded stacks and raw recording'
     }
+    Save-LaunchedReport $repeatedReport
     $moved = Join-Path $State 'original profile moved.folded'
     [IO.File]::Move($folded, $moved)
     try {
@@ -226,7 +243,8 @@ try {
         $null = Wait-Until 'the loaded original and repeated profiles are compared in order' {
             (Find-Element "Before${dot}launched workload.folded${dot}2 samples") -and
                 (Find-Element "After${dot}repeated workload.folded${dot}2 samples") -and
-                (Find-Element 'No changes in call stack sample shares.')
+                (Find-Element 'No changes in call stack sample shares.') -and
+                (Find-SamplingComparison)
         }
     } finally {
         [IO.File]::Move($moved, $folded)
@@ -248,6 +266,27 @@ try {
             (Find-Element 'Executable /tmp/work space/cpu worker') -and
             (Find-Element ('2 seconds' + $dot + '73 Hz' + $dot + 'Frame pointers' + $dot + 'cpu-clock:u'))
     }
+
+    Click-LaunchButton 'Compare profiles'
+    $dialog = Wait-OwnedDialog 'Open folded stacks'
+    $null = Wait-Until 'choose the saved After profile' {
+        [FixtureDialog]::SetFilename($dialog, $repeated, '')
+    }
+    $null = Wait-Until 'open the saved After profile' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the comparison carries the verified Before report' {
+        (Find-Element ('2 seconds' + $dot + '73 Hz' + $dot + 'Frame pointers' + $dot + 'cpu-clock:u')) -and
+            (Find-Element 'Capture report unavailable')
+    }
+    Click-LaunchButton ('Verify After report' + [char]0x2026)
+    $dialog = Wait-OwnedDialog 'Open CPU profile report'
+    $null = Wait-Until 'select the After report' {
+        [FixtureDialog]::SetFilename($dialog, $repeatedReport, [IO.Path]::GetFileName($repeatedReport))
+    }
+    $null = Wait-Until 'verify the After report' { [FixtureDialog]::ClickButton($dialog, 1) }
+    $null = Wait-Until 'the saved pair shows both verified settings and their difference' {
+        (Find-Element 'After capture report verified') -and (Find-SamplingComparison)
+    }
+    Click-LaunchButton 'Back to flame graph'
 
     $changedRaw = Join-Path $State 'changed raw.data'
     $actual[0] = 0

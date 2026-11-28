@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use w11term::cpu_profile::flame_graph::{Differential, ProfileSide, ROW_HEIGHT, Range};
 use w11term::cpu_profile::{FilteredComparison, Profile, Search, sample_share};
 use w11term::diagnostic_history::Kind as ArtifactKind;
-use w11term::ssh::{CaptureStop, CpuProfileSummary};
+use w11term::ssh::{CaptureStop, CpuProfileCaptureReport, CpuProfileSummary};
 
 mod capture;
 mod compare;
@@ -49,6 +49,7 @@ pub enum Outcome {
         install_baseline: bool,
     },
     ComparisonFiltered(FilteredComparison),
+    ComparisonReport(ProfileSide, Arc<CpuProfileCaptureReport>),
     Reviewed(Box<capture::Review>),
     Destination(Box<capture::Recording>),
     Captured(Arc<Profile>, PathBuf, Box<CapturedProfile>),
@@ -66,6 +67,21 @@ pub struct CapturedProfile {
 struct ProfileSource {
     profile: Arc<Profile>,
     path: PathBuf,
+    report: Option<Arc<CpuProfileCaptureReport>>,
+}
+
+impl ProfileSource {
+    fn open(path: PathBuf) -> anyhow::Result<Self> {
+        let profile = Arc::new(
+            Profile::open(&path)
+                .with_context(|| format!("Opening CPU profile {}", path.display()))?,
+        );
+        Ok(Self {
+            profile,
+            path,
+            report: None,
+        })
+    }
 }
 
 struct Loaded {
@@ -302,6 +318,14 @@ impl Loaded {
         ProfileSource {
             profile: self.profile.clone(),
             path: self.path.clone(),
+            report: report::capture_report(self)
+                .filter(|report| report::matches_profile(&self.profile, report))
+                .or_else(|| {
+                    self.verified_report
+                        .as_ref()
+                        .map(|verified| &verified.report)
+                })
+                .cloned(),
         }
     }
 
@@ -670,16 +694,10 @@ impl TerminalApp {
                     if scope.is_cancelled() {
                         return Ok(None);
                     }
-                    let baseline = Profile::open(&before)
-                        .with_context(|| format!("Opening before profile {}", before.display()))?;
-                    let candidate = Profile::open(&after)
-                        .with_context(|| format!("Opening after profile {}", after.display()))?;
+                    let before = ProfileSource::open(before).context("Reading Before profile")?;
+                    let after = ProfileSource::open(after).context("Reading After profile")?;
                     Ok(Some(Outcome::Compared {
-                        view: Box::new(compare::ViewState::new(
-                            Arc::new(baseline),
-                            Arc::new(candidate),
-                            [before, after],
-                        )),
+                        view: Box::new(compare::ViewState::new(before, after)),
                         install_baseline: true,
                     }))
                 })()
@@ -797,11 +815,7 @@ impl TerminalApp {
                 ctx.spawn_background_with_rejection(
                     move |scope| {
                         let outcome = (!scope.is_cancelled()).then(|| Outcome::Compared {
-                            view: Box::new(compare::ViewState::new(
-                                before.profile,
-                                after.profile,
-                                [before.path, after.path],
-                            )),
+                            view: Box::new(compare::ViewState::new(before, after)),
                             install_baseline: false,
                         });
                         message(Action::Finished(ticket, Ok(outcome)))
@@ -837,7 +851,8 @@ impl TerminalApp {
                 }
                 let path =
                     loaded.map_or_else(|| self.store.path().into(), |loaded| loaded.path.clone());
-                let compare_path = matches!(action, Action::CompareFile).then(|| path.clone());
+                let compare = matches!(action, Action::CompareFile);
+                let before = loaded.filter(|_| compare).map(Loaded::source);
                 let profile = loaded.map(|loaded| loaded.profile.clone());
                 let zoom = loaded.map_or(0, |loaded| loaded.zoom);
                 let differential = loaded.and_then(|loaded| loaded.differential.clone());
@@ -845,7 +860,7 @@ impl TerminalApp {
                     "Opening folded stacks…"
                 } else if export {
                     "Choose an SVG destination…"
-                } else if compare_path.is_some() {
+                } else if compare {
                     "Choose the after profile…"
                 } else {
                     "Choose a folded stacks file…"
@@ -877,15 +892,11 @@ impl TerminalApp {
                                     profile.context("Open folded stacks before exporting")?;
                                 plot::export(&profile, zoom, &file, differential.as_ref())?;
                                 Ok(Some(Outcome::Exported))
-                            } else if let Some(before_path) = compare_path {
-                                let before = profile.context("Open a before profile to compare")?;
-                                let after = Arc::new(Profile::open(&file)?);
+                            } else if compare {
+                                let before = before.context("Open a before profile to compare")?;
+                                let after = ProfileSource::open(file)?;
                                 Ok(Some(Outcome::Compared {
-                                    view: Box::new(compare::ViewState::new(
-                                        before,
-                                        after,
-                                        [before_path, file],
-                                    )),
+                                    view: Box::new(compare::ViewState::new(before, after)),
                                     install_baseline: false,
                                 }))
                             } else {
@@ -912,6 +923,12 @@ impl TerminalApp {
                     compare::Action::Query(query) => view.query = query,
                     compare::Action::Page(forward) => view.page(forward),
                     compare::Action::Select(comparison, id) => view.select(&comparison, id),
+                    compare::Action::CaptureSettingsExpanded(expanded) => {
+                        view.capture_settings_expanded(expanded);
+                    }
+                    compare::Action::VerifyReport(side) => {
+                        self.choose_cpu_comparison_report(side, ctx)
+                    }
                     compare::Action::Inspect(side) => {
                         if panel.open
                             && let Some((profile, path, frame)) = view.selected_source(side)
@@ -1017,6 +1034,11 @@ impl TerminalApp {
                     Ok(Some(Outcome::ComparisonFiltered(results))) => {
                         if let Some(comparison) = &mut panel.comparison {
                             comparison.filtered(results);
+                        }
+                    }
+                    Ok(Some(Outcome::ComparisonReport(side, report))) => {
+                        if let Some(comparison) = &mut panel.comparison {
+                            panel.status = Some(comparison.attach_report(side, report).into());
                         }
                     }
                     Ok(Some(Outcome::Reviewed(review))) => {
