@@ -4590,6 +4590,34 @@ async fn native_saving_an_ssh_profile_keeps_the_original_live_pane() {
 }
 
 #[test]
+#[ignore = "reviews and applies a selected SSH profile bundle rollout in the Windows editor"]
+fn native_dotfile_rollout_updates_reviewed_saved_profiles() {
+    let state = tempfile::tempdir().unwrap();
+    let key = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let profile = |host: &str, shell: &str, pin: Option<&str>| {
+        json!({
+            "host": host, "user": "operator", "auth": "agent", "host_key": key,
+            "dotfiles": {
+                "host": host, "user": "operator", "port": 22, "fingerprint": key, "home": "/home/operator",
+                "shell": shell, "bundle": "previous.json", "bundle_sha256": pin,
+            },
+        })
+    };
+    fs::write(state.path().join("profiles.json"), json!({"profiles": {
+        "East": profile("east.example.test", "bash", Some(&"a".repeat(64))),
+        "West": profile("west.example.test", "fish", None),
+        "Other": profile("other.example.test", "bash", None),
+        "Fixture local": {"backend": "local", "executable": "powershell.exe", "args": ["-NoProfile", "-NoLogo"]},
+    }}).to_string()).unwrap();
+    fs::write(
+        state.path().join("revision.json"),
+        br#"{"version":1,"bash":"PS1=reviewed","fish":"set -g fish_greeting reviewed"}"#,
+    )
+    .unwrap();
+    drive_gui("dotfile-rollout-ui.ps1", state.path());
+}
+
+#[test]
 #[ignore = "selects SSH key, dotfiles and tool bundles through native dialogs and saves a profile"]
 fn native_ssh_identity_picker_preserves_draft_and_saves_the_selected_path() {
     let state = tempfile::tempdir().unwrap();

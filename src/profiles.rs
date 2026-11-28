@@ -10,6 +10,7 @@ use std::{
 mod bookmarks;
 pub use bookmarks::{BookmarkPeer, bookmark_directory};
 mod dotfiles;
+pub use dotfiles::{DotfileRolloutProfile, DotfileRolloutReport};
 mod folder_permissions;
 pub(crate) use folder_permissions::{FolderEpoch, FolderGrantGate, FolderMutationPermit};
 mod group_file;

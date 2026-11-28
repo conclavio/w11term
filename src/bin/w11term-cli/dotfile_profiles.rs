@@ -104,7 +104,10 @@ pub(super) fn rollout(args: &[String], output: &mut dyn Write) -> Result<()> {
     let candidate =
         path::absolute(candidate.context("Choose a dotfiles bundle with --candidate")?)?;
     let result = profile_store(catalog)?.rollout_dotfiles(&profiles, &candidate, review)?;
-    serde_json::to_writer(&mut *output, &Reply::from_result(Ok(result)))?;
+    serde_json::to_writer(
+        &mut *output,
+        &Reply::from_result(Ok(serde_json::to_value(result)?)),
+    )?;
     writeln!(output)?;
     Ok(())
 }

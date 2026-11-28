@@ -11,6 +11,7 @@ use w11term::{
 
 mod bundle;
 mod review;
+mod rollout;
 
 const TITLE: &str = "SSH dotfiles";
 
@@ -95,6 +96,7 @@ pub enum Action {
     Approve,
     Reviewed(Arc<()>, Box<DotfileSync>, Result<Option<String>, String>),
     Bundle(bundle::Action),
+    Rollout(rollout::Action),
     Disable,
 }
 
@@ -114,6 +116,7 @@ pub(super) struct Editor {
     preview: review::Preview,
     browsing: Option<Arc<()>>,
     composer: Option<bundle::Editor>,
+    rollout: Option<Box<rollout::Panel>>,
     error: Option<String>,
 }
 
@@ -249,6 +252,9 @@ impl Editor {
         if let Some(composer) = &self.composer {
             return self.section(id, header, composer.view(id, ctx), ctx);
         }
+        if let Some(rollout) = &self.rollout {
+            return self.section(id, header, rollout.view(id, ctx), ctx);
+        }
         let can_compose =
             self.browsing.is_none() && self.checking.is_none() && !self.preview.loading();
         let mut content = vec![
@@ -276,6 +282,10 @@ impl Editor {
                         .is_enabled(can_compose && !self.bundle.trim().is_empty())
                         .on_click(send(Action::Bundle(bundle::Action::Revise)))
                         .content("Revise selected dotfiles bundle"),
+                    Button::new()
+                        .is_enabled(can_compose && !self.bundle.trim().is_empty())
+                        .on_click(send(Action::Rollout(rollout::Action::Open)))
+                        .content("Roll out to saved profiles"),
                 )),
             ),
             KeyedView::new(
@@ -513,6 +523,7 @@ impl TerminalApp {
             return;
         };
         match action {
+            Action::Rollout(action) => self.edit_profile_rollout(id, action, ctx),
             Action::Bundle(action) => draft.dotfiles.edit_bundle(
                 id,
                 action,
